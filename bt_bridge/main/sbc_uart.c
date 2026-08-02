@@ -95,13 +95,17 @@ static void tx_task(void *arg)
         uart_write_bytes(UART_PORT, item, len);
         vRingbufferReturnItem(s_ring, item);
 
-        static int64_t last_report;
+        /* Report only when the count moves. Reprinting a static total every
+         * five seconds makes a finished startup burst look like an ongoing
+         * fault, which is worse than saying nothing. */
+        static uint32_t last_reported;
+        static int64_t last_report_at;
         int64_t now = esp_timer_get_time();
-        if (now - last_report > 5000000) {
-            last_report = now;
-            if (s_dropped) {
-                ESP_LOGW(TAG, "queue full: %" PRIu32 " packets dropped total", s_dropped);
-            }
+        if (s_dropped != last_reported && now - last_report_at > 2000000) {
+            ESP_LOGW(TAG, "queue full: %" PRIu32 " dropped (+%" PRIu32 ")",
+                     s_dropped, s_dropped - last_reported);
+            last_reported = s_dropped;
+            last_report_at = now;
         }
     }
 }
