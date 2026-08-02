@@ -293,7 +293,55 @@ optimises a term nobody can hear.
 
 ---
 
-## 8. What is still unsolved
+## 8. Holding position, not just rate
+
+Aligning the start instant and matching rates is not enough. A servo on buffer
+depth keeps the playback *rate* equal to the arrival rate, but says nothing
+about *position* -- and depth moves with network jitter, so each unit nudges its
+rate in response to noise. Two units seeing different jitter end up with rates
+differing by ~0.03% at any moment, which is several ms of relative movement.
+
+Measured: 10-25 ms of wander between hub and satellite while each unit's own
+buffer sat perfectly stable at ~200 ms, with the satellite's rate visibly
+hunting (44100 -> 44113 -> 44100 -> 44086).
+
+Every packet already carries the instant its first sample is due. Recording that
+against the ring position the audio lands at gives a direct phase reading when
+playback arrives there: where we are, versus where the timeline says we should
+be. Both units servo on that instead, the hub included -- it publishes the
+timeline, so it must hold itself to it or the reference itself moves.
+
+Buffer depth is kept only as a guard against running empty or overflowing, which
+phase control alone would not see coming.
+
+### Measured
+
+| | Result |
+|---|---|
+| Clock offset between boards | ~300 us (M4, two independent methods) |
+| Playback start vs schedule | +6 us (hub), +0 us (satellite) |
+| Phase at startup | -42 ms (hub), -26 ms (satellite) |
+| Phase after ~45 s | under 1 ms (hub), ~2 ms (satellite) |
+| Hub-to-satellite audio | 10-25 ms before, **2-4 ms** after |
+
+The startup offset is output pipeline latency -- DMA depth plus where playback
+began within the buffer -- which nothing accounts for at anchor time. The servo
+absorbs it over ~45 s. Compensating it at anchor would start near zero instead,
+and is the obvious next improvement.
+
+### Known wart
+
+The hub's absolute phase reading does not settle: it wanders +6 ms to +24 ms with
+steps too large to be rate effects. Both units share whatever causes it, so the
+*difference* between them stays small -- which is why cross-unit alignment
+measures 2-4 ms while the absolute figures swing. The cause has not been found.
+
+Treat the cross-unit measurement as the meaningful one, and the absolute phase
+figure as indicative only.
+
+---
+
+## 9. What is still unsolved
 
 **Drift.** Our two boards differ by 10.6 ppm, so the offset does not hold still:
 
@@ -319,7 +367,7 @@ produces exactly 900 µs of error.
 
 ---
 
-## 9. Code map
+## 10. Code map
 
 | File | Responsibility |
 |---|---|
@@ -337,7 +385,7 @@ radio airtime does not scale with unit count.
 
 ---
 
-## 10. Verification
+## 11. Verification
 
 **Estimator** — `cd sync_test/test && make check`. Eight cases covering exactness
 on symmetric paths, outlier rejection, the asymmetry floor, window ageing, and
