@@ -1,0 +1,29 @@
+menu "Dancefloor"
+
+    config DANCEFLOOR_BLINK_GPIO
+        int "GPIO to pulse for scope measurement"
+        default 4
+        help
+            Set per board -- the two units do not need the same pin, and board
+            silkscreens rarely agree. This is an output only; do NOT wire the two
+            boards' pins together. Avoid strapping pins (0, 2, 5, 12, 15), flash
+            pins (6-11), and 25/26/27 if this board also drives I2S.
+
+    config DANCEFLOOR_MONITOR_GPIO
+        int "GPIO the master watches for the satellite's pulse"
+        default 21
+        help
+            Master only. Wire the SATELLITE's blink output to this INPUT pin on
+            the master, plus a common ground. The master then times the incoming
+            edge against its own blink deadline and prints the sync error, so no
+            oscilloscope is needed. Must differ from the blink GPIO.
+
+    config DANCEFLOOR_ROLE_MASTER
+        bool "This unit is the master (runs SoftAP, owns the clock)"
+        default y
+        help
+            Master runs the SoftAP, answers time probes and announces blink times.
+            Satellites join the AP and follow. Flash one board with this on and
+            the other with it off.
+
+endmenu

@@ -1,0 +1,19 @@
+menu "Dancefloor satellite"
+
+    config DANCEFLOOR_I2S_LRCK_PIN
+        int "I2S LRCK (WS) GPIO"
+        default 27
+
+    config DANCEFLOOR_I2S_BCK_PIN
+        int "I2S BCK GPIO"
+        default 26
+
+    config DANCEFLOOR_I2S_DATA_PIN
+        int "I2S DATA GPIO"
+        default 25
+
+    config DANCEFLOOR_AP_OPEN
+        bool "Hub SoftAP has no password (must match the hub)"
+        default n
+
+endmenu

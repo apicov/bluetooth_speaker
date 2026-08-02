@@ -1,0 +1,27 @@
+CONFIG_BT_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_DAC_DMA_AUTO_16BIT_ALIGN=n
+
+# Name the phone sees when pairing.
+CONFIG_EXAMPLE_LOCAL_DEVICE_NAME="Dancefloor"
+
+# BT stack alone is ~950 kB; the stock 1 MB factory partition leaves 10% free.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# NOTE: do NOT set CONFIG_BT_ACL_CONNECTIONS=1 here. It was added during the
+# single-chip memory crisis and it sizes Bluedroid's ACL buffer pools -- with it
+# the link stays active but audio trickles in at a few percent of the rate, so
+# the sink ringbuffer underflows continuously. This chip has ~63 kB DRAM spare;
+# there is nothing to gain.
+
+# No WiFi on this chip at all -- that is the entire point of the split. With
+# Bluedroid alone there is ~200 kB of DRAM spare instead of 164 bytes.
+
+# Forward undecoded SBC to the hub instead of decoding here. Both callbacks are
+# already wired in main.c; this selects the undecoded one.
+CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC=y

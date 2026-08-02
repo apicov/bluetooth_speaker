@@ -1,0 +1,6 @@
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# esp_wifi_internal_set_fix_rate() returns ESP_ERR_NOT_SUPPORTED while TX AMPDU
+# is enabled, and pinning the multicast rate is required for throughput.
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n

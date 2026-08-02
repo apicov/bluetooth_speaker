@@ -1,0 +1,56 @@
+menu "I2S loopback test"
+
+choice DANCEFLOOR_LOOPBACK_ROLE
+    prompt "Role for this board"
+    default DANCEFLOOR_LOOPBACK_BOTH
+    help
+        TX_ONLY on the bridge board and RX_ONLY on the hub board tests the real
+        four-wire link between them. BOTH runs the whole thing on one board with
+        three jumpers, which isolates the driver from the wiring.
+
+    config DANCEFLOOR_LOOPBACK_BOTH
+        bool "Both (single board, self-loopback)"
+
+    config DANCEFLOOR_LOOPBACK_TX_ONLY
+        bool "TX only (flash to the bridge board)"
+
+    config DANCEFLOOR_LOOPBACK_RX_ONLY
+        bool "RX only (flash to the hub board)"
+endchoice
+
+config DANCEFLOOR_LOOPBACK_RX_IS_MASTER
+    bool "Invert clock ownership: RX generates BCLK/WS, TX follows"
+    default n
+    help
+        Normally the transmitter is I2S master, so the receiver samples a clock
+        from a foreign crystal. With this set the receiver generates the clocks
+        and the transmitter follows, so the receiver's sampling is coherent with
+        its own APB clock.
+
+        MUST be set identically on both boards. No rewiring is needed -- BCLK and
+        WS simply change which end drives them.
+
+config DANCEFLOOR_LOOPBACK_SLAVE_BCLK_INV
+    bool "Slave drives data on the opposite BCLK edge"
+    default n
+    depends on DANCEFLOOR_LOOPBACK_RX_IS_MASTER
+    help
+        With the receiver as master, the data path is a full round trip: master
+        drives BCLK, slave sees it, slave drives DATA, master samples. That has
+        to close inside half a BCLK period (355 us/1000 at 44.1 kHz 16-bit
+        stereo), and across two boards it does not -- the symptom is every frame
+        arriving but with wrong bit alignment (channel swaps).
+
+        Inverting BCLK on the slave makes it drive data half a period earlier,
+        which is the standard remedy. Set on BOTH boards.
+
+config DANCEFLOOR_LOOPBACK_DRIVE
+    int "TX pin drive strength (0=~5mA, 1=~10mA, 2=~20mA default, 3=~40mA)"
+    default 2
+    depends on !DANCEFLOOR_LOOPBACK_RX_ONLY
+    help
+        Lower drive gives slower edges, which ring less on an unterminated link
+        between two boards. Too low and the edges may not make it cleanly across
+        a long wire, so it is worth A/B testing rather than assuming.
+
+endmenu

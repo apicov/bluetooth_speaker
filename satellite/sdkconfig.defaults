@@ -1,0 +1,3 @@
+# Playback start is scheduled to sub-millisecond precision; the default 100 Hz
+# tick makes vTaskDelay granularity 10 ms.
+CONFIG_FREERTOS_HZ=1000
