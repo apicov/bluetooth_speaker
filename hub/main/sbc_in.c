@@ -133,6 +133,18 @@ static void rx_task(void *arg)
                     ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
                              m->track_id, m->title, m->artist, m->album);
                     streamer_send_meta(payload, len);
+
+                    /* A new track is the one moment a splice is inaudible, so
+                     * take it: flag the next audio packet and let every unit
+                     * null its phase error when playback reaches it. Metadata is
+                     * resent for the same track, so act on the id, not arrival. */
+                    static uint32_t last_track_id;
+                    static bool have_track;
+                    if (have_track && m->track_id != last_track_id) {
+                        streamer_request_restart();
+                    }
+                    last_track_id = m->track_id;
+                    have_track = true;
                 }
                 consume(sizeof(sbc_link_hdr_t) + len);
                 continue;

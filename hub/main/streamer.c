@@ -104,6 +104,12 @@ static phase_pt_t s_phase_q[PHASE_Q_LEN];
 static volatile uint32_t s_phase_head, s_phase_tail;
 static volatile int32_t s_phase_err_us;   /* + = playing late */
 static volatile bool s_phase_valid;
+static volatile bool s_restart_pending;   /* flag the next packet */
+static volatile int32_t s_restart_pos = -1;
+
+/* Never splice more than this in one go -- a larger error means something a
+ * splice will not fix, and 150 ms is audible even at a track change. */
+#define MAX_SPLICE_MS 150
 
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
@@ -243,6 +249,11 @@ void streamer_mark_here(void)
  */
 static int32_t s_pending_pos;
 
+void streamer_request_restart(void)
+{
+    s_restart_pending = true;
+}
+
 void streamer_send_meta(const uint8_t *meta, uint16_t len)
 {
     if (sock < 0 || len > sizeof(((meta_msg_t *)0)->payload)) {
@@ -290,6 +301,8 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_marker_sample = -1;
         s_phase_head = s_phase_tail = 0;
         s_phase_valid = false;
+        s_restart_pos = -1;
+        s_restart_pending = false;
         ESP_LOGI(TAG, "timeline start");
     } else if (llabs(next_play_at - target) > RESYNC_US) {
         static int64_t last_warn;
@@ -308,7 +321,14 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     msg.sample_rate = sample_rate;
     msg.frames = frames;
     msg.marker = marker ? 1 : 0;
-    msg.reserved = 0;
+    msg.restart = s_restart_pending ? 1 : 0;
+    if (s_restart_pending) {
+        s_restart_pending = false;
+        if (s_restart_pos < 0) {
+            s_restart_pos = s_pending_pos;   /* our own copy of the same boundary */
+        }
+        ESP_LOGW(TAG, "track boundary flagged at seq %" PRIu32, msg.seq);
+    }
 
     /* Position captured before the audio was fed, paired with the time it is
      * due -- the playback task compares the two when it gets there. */
@@ -624,6 +644,44 @@ static void local_play_task(void *arg)
                 s_phase_err_us = (int32_t)(esp_timer_get_time() - s_phase_q[s_phase_tail].play_at);
                 s_phase_valid = true;
                 s_phase_tail = (s_phase_tail + 1) % PHASE_Q_LEN;
+            }
+
+            /* Track boundary: snap phase to zero instead of letting the servo
+             * walk it off over ~45 s. Only inaudible here. */
+            int32_t rp = s_restart_pos;
+            if (rp >= 0 && samples_played >= rp) {
+                s_restart_pos = -1;
+                int32_t max_frames = (int32_t)sample_rate * MAX_SPLICE_MS / 1000;
+                int32_t adj = (int32_t)((int64_t)s_phase_err_us * sample_rate / 1000000);
+                if (adj > max_frames)  adj = max_frames;
+                if (adj < -max_frames) adj = -max_frames;
+
+                if (adj > 0) {
+                    int32_t left = adj;
+                    while (left > 0) {
+                        size_t want = (size_t)(left > AUDIO_FRAMES ? AUDIO_FRAMES : left)
+                                      * AUDIO_CHANNELS * sizeof(int16_t);
+                        size_t g = xStreamBufferReceive(local_ring, chunk, want, 0);
+                        if (g == 0) break;
+                        left -= g / (AUDIO_CHANNELS * sizeof(int16_t));
+                    }
+                    samples_played += (adj - left);
+                    ESP_LOGW(TAG, "track boundary: skipped %ld ms to null phase",
+                             (long)((adj - left) * 1000 / (int32_t)sample_rate));
+                } else if (adj < 0) {
+                    static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
+                    int32_t left = -adj;
+                    size_t w = 0;
+                    while (left > 0) {
+                        int32_t n = left > AUDIO_FRAMES ? AUDIO_FRAMES : left;
+                        i2s_channel_write(i2s_tx, quiet,
+                                          (size_t)n * AUDIO_CHANNELS * sizeof(int16_t),
+                                          &w, portMAX_DELAY);
+                        left -= n;
+                    }
+                    ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
+                             (long)(-adj * 1000 / (int32_t)sample_rate));
+                }
             }
 
             int32_t mark = s_marker_sample;

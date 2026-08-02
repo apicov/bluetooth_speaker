@@ -113,7 +113,17 @@ typedef struct __attribute__((packed)) {
     uint8_t  type;
     uint8_t  format;        /* audio_fmt_t */
     uint8_t  marker;        /* 1 = pulse the sync GPIO when this audio plays */
-    uint8_t  reserved;
+    /*
+     * 1 = a track boundary starts here. When playback reaches this audio, snap
+     * the accumulated phase error to zero by skipping or inserting samples.
+     *
+     * The splice must happen HERE, not when the track-change notification
+     * arrives: at that moment the buffer still holds ~200 ms of the previous
+     * track, and correcting immediately would cut its ending. Waiting until
+     * playback arrives puts the splice exactly at the boundary, where a track
+     * change makes it inaudible.
+     */
+    uint8_t  restart;
     uint16_t payload_len;
     uint32_t seq;
     uint32_t sample_rate;

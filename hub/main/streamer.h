@@ -27,6 +27,10 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 /* Tag the audio about to be fed as a sync marker point. */
 void streamer_mark_here(void);
 
+/* Flag the next audio packet as a track boundary, so every unit snaps its
+ * phase error to zero when playback reaches it. */
+void streamer_request_restart(void);
+
 /* Forward track metadata to every registered satellite. Rare and small, so it
  * simply goes out alongside the audio unicast. */
 void streamer_send_meta(const uint8_t *meta, uint16_t len);

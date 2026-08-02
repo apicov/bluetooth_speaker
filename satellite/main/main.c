@@ -103,6 +103,12 @@ static phase_pt_t phase_q[PHASE_Q_LEN];
 static volatile uint32_t phase_head, phase_tail;
 static volatile int32_t phase_err_us;         /* + = playing late */
 static volatile bool phase_valid;
+static volatile int32_t restart_pos = -1;     /* ring position of a track boundary */
+
+/* Never splice more than this in one go. A larger error means something is
+ * wrong that a splice will not fix, and a 150 ms jump is very audible even at a
+ * track change. */
+#define MAX_SPLICE_MS 150
 
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
@@ -309,6 +315,7 @@ static void handle_audio(const audio_msg_t *msg)
         marker_sample = -1;
         phase_head = phase_tail = 0;
         phase_valid = false;
+        restart_pos = -1;
         expect_seq = msg->seq;
         have_seq = true;
         xStreamBufferReset(ring);
@@ -344,6 +351,10 @@ static void handle_audio(const audio_msg_t *msg)
      * audio and travels through the buffer with it. */
     if (msg->marker && marker_sample < 0) {
         marker_sample = samples_in;
+    }
+
+    if (msg->restart && restart_pos < 0) {
+        restart_pos = samples_in;
     }
 
     /* Same idea, for every packet: remember where this audio lands and when it
@@ -577,6 +588,47 @@ static void play_task(void *arg)
                 phase_err_us = (int32_t)(now_master - due);
                 phase_valid = true;
                 phase_tail = (phase_tail + 1) % PHASE_Q_LEN;
+            }
+
+            /*
+             * Track boundary reached: snap phase to zero rather than letting the
+             * servo walk it off over ~45 s. Skipping or inserting audio is
+             * inaudible here and nowhere else.
+             */
+            int32_t rp = restart_pos;
+            if (rp >= 0 && samples_played >= rp) {
+                restart_pos = -1;
+                int32_t max_frames = (int32_t)stream_rate * MAX_SPLICE_MS / 1000;
+                int32_t adj = (int32_t)((int64_t)phase_err_us * stream_rate / 1000000);
+                if (adj > max_frames)  adj = max_frames;
+                if (adj < -max_frames) adj = -max_frames;
+
+                if (adj > 0) {
+                    /* Late: discard input so playback jumps forward in content.
+                     * samples_played tracks input consumed, so it advances too. */
+                    int32_t left = adj;
+                    while (left > 0) {
+                        size_t want = (size_t)(left > (int32_t)AUDIO_FRAMES ? AUDIO_FRAMES : left)
+                                      * AUDIO_CHANNELS * sizeof(int16_t);
+                        size_t got2 = xStreamBufferReceive(ring, chunk, want, 0);
+                        if (got2 == 0) break;
+                        left -= got2 / (AUDIO_CHANNELS * sizeof(int16_t));
+                    }
+                    samples_played += (adj - left);
+                    ESP_LOGW(TAG, "track boundary: skipped %ld ms to null phase",
+                             (long)((adj - left) * 1000 / (int32_t)stream_rate));
+                } else if (adj < 0) {
+                    /* Early: emit silence so the timeline catches up with us. */
+                    static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
+                    int32_t left = -adj;
+                    while (left > 0) {
+                        int32_t n = left > (int32_t)AUDIO_FRAMES ? (int32_t)AUDIO_FRAMES : left;
+                        write_audio(quiet, (size_t)n * AUDIO_CHANNELS * sizeof(int16_t));
+                        left -= n;
+                    }
+                    ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
+                             (long)(-adj * 1000 / (int32_t)stream_rate));
+                }
             }
 
             int32_t mark = marker_sample;
