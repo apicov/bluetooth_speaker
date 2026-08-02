@@ -48,6 +48,24 @@ typedef struct __attribute__((packed)) {
     int64_t play_at;  /* master clock, microseconds */
 } blink_msg_t;
 
+/*
+ * Audio alignment measurement.
+ *
+ * Every unit pulses a GPIO at the moment it plays the sample whose *master-clock*
+ * time crosses a multiple of MARKER_PERIOD_US. If two units are in sync their
+ * pulses coincide; the gap between them is the sync error, measured on the audio
+ * itself rather than inferred from clock estimates.
+ *
+ * Master-clock time is used rather than a sample count from each unit's own
+ * start, so a satellite that joins late still marks the same instants.
+ *
+ * The pulse fires when a chunk is written to the output, not when it reaches the
+ * DAC, so it sits ahead of the sound by the DMA depth. That offset is identical
+ * on every unit and cancels in the comparison.
+ */
+#define MARKER_PERIOD_US 2000000
+#define MARKER_PULSE_US  200
+
 typedef enum {
     AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */
     AUDIO_FMT_SBC = 1,   /* one or more back-to-back SBC frames */

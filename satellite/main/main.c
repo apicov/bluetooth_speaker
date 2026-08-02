@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
 #include "driver/dac_continuous.h"
@@ -62,6 +63,7 @@ static i2s_chan_handle_t i2s_tx;
 static volatile int64_t stream_start_local;
 static volatile uint32_t stream_rate = 44100;
 static uint32_t tx_rate = 44100;      /* what the output clock is actually set to */
+static int64_t stream_offset;         /* clock offset used when anchoring */
 
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
@@ -255,6 +257,7 @@ static void handle_audio(const audio_msg_t *msg)
         stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
+        stream_offset = offset;       /* markers need it to reach master time */
         expect_seq = msg->seq;
         have_seq = true;
         xStreamBufferReset(ring);
@@ -446,6 +449,11 @@ static void play_task(void *arg)
             /* spin the last stretch, as in the M4 blink task */
         }
         ESP_LOGI(TAG, "playback started");
+        int64_t samples_played = 0;
+        /* Marker instants are on the MASTER clock, so a unit that joins late
+         * still marks the same moments as everyone else. */
+        int64_t start_master = stream_start_local + stream_offset;
+        int64_t next_marker = (start_master / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
 
         while (1) {
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -457,6 +465,16 @@ static void play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
+            int64_t chunk_master = start_master +
+                                   samples_played * 1000000LL / (int64_t)stream_rate;
+            if (chunk_master >= next_marker) {
+                gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
+                esp_rom_delay_us(MARKER_PULSE_US);
+                gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 0);
+                next_marker = (chunk_master / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
+            }
+            samples_played += AUDIO_FRAMES;
+
             write_audio(chunk, sizeof(chunk));
         }
     }
@@ -494,6 +512,13 @@ void app_main(void)
     socket_start();
     i2s_start(44100);
     tx_rate = 44100;
+
+    gpio_config_t marker = {
+        .pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_MARKER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&marker));
+    ESP_LOGI(TAG, "sync marker on GPIO %d", CONFIG_DANCEFLOOR_MARKER_GPIO);
 
     xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
     xTaskCreate(rx_task, "rx", 4096, NULL, 7, NULL);

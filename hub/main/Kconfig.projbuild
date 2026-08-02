@@ -54,6 +54,24 @@ menu "Dancefloor hub"
             the AP itself is not coming up properly and the credentials are a red
             herring. Satellites must be built to match.
 
+    comment "Sync measurement"
+
+    config DANCEFLOOR_MARKER_GPIO
+        int "GPIO pulsed when playback crosses a marker instant"
+        default 4
+        help
+            Every unit pulses this when it plays the sample landing on a
+            master-clock marker. Wire a satellite's marker pin to this board's
+            monitor pin and the hub reports the gap directly -- the sync error
+            measured on audio rather than on clock estimates.
+
+    config DANCEFLOOR_MONITOR_GPIO
+        int "GPIO watching a satellite's marker pulse"
+        default 21
+        help
+            Input. Wire the SATELLITE's marker GPIO here, plus a common ground.
+            Must differ from the marker GPIO.
+
     comment "Diagnostics"
 
     config DANCEFLOOR_VERIFY_PATTERN

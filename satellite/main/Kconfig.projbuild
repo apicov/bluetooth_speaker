@@ -12,6 +12,15 @@ menu "Dancefloor satellite"
         int "I2S DATA GPIO"
         default 25
 
+    config DANCEFLOOR_MARKER_GPIO
+        int "GPIO pulsed when playback crosses a marker instant"
+        default 4
+        help
+            Wire this to the hub's monitor GPIO, plus a common ground, and the
+            hub reports how far this unit's audio is from its own. That is the
+            end-to-end sync error, measured on the audio rather than inferred
+            from clock estimates.
+
     config DANCEFLOOR_USE_INTERNAL_DAC
         bool "Play through the ESP32's built-in 8-bit DACs (no hardware needed)"
         default n

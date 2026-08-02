@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_private/wifi.h"
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "nvs_flash.h"
 
@@ -354,6 +355,74 @@ static void socket_start(void)
     assert(bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0);
 }
 
+/* ------------------------------------------------------ sync measurement */
+
+static volatile int64_t s_marker_at;      /* local time we last pulsed */
+static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
+
+static void IRAM_ATTR monitor_isr(void *arg)
+{
+    (void)arg;
+    int64_t now = esp_timer_get_time();
+    BaseType_t hp = pdFALSE;
+    xQueueSendFromISR(s_edge_q, &now, &hp);
+    if (hp) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+/*
+ * Reports how far a satellite's audio is from this unit's, by comparing when
+ * each pulsed for the same master-clock instant. This is the end-to-end number
+ * the whole design exists to deliver -- everything else (clock offset, buffer
+ * level, packet loss) is a means to it.
+ */
+static void monitor_task(void *arg)
+{
+    (void)arg;
+    int64_t edge;
+    while (xQueueReceive(s_edge_q, &edge, portMAX_DELAY) == pdTRUE) {
+        int64_t mine = s_marker_at;
+        if (mine == 0) {
+            continue;
+        }
+        int64_t err = edge - mine;
+        /* Markers are 2 s apart; anything near that is a missed pulse rather
+         * than a sync error, and reporting it as one would mislead. */
+        if (err > 500000 || err < -500000) {
+            continue;
+        }
+        ESP_LOGW(TAG, "AUDIO SYNC: satellite %+lld us (%s)", err,
+                 err >= 0 ? "late" : "early");
+    }
+}
+
+static void marker_start(void)
+{
+    gpio_config_t out = {
+        .pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_MARKER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&out));
+
+    gpio_config_t in = {
+        .pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_MONITOR_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&in));
+
+    s_edge_q = xQueueCreate(4, sizeof(int64_t));
+    assert(s_edge_q);
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(CONFIG_DANCEFLOOR_MONITOR_GPIO, monitor_isr, NULL));
+    xTaskCreate(monitor_task, "syncmon", 3072, NULL, 9, NULL);
+
+    ESP_LOGI(TAG, "sync markers on GPIO %d, watching GPIO %d",
+             CONFIG_DANCEFLOOR_MARKER_GPIO, CONFIG_DANCEFLOOR_MONITOR_GPIO);
+}
+
 /* --------------------------------------------------- local delayed playback */
 
 /* I2S_NUM_1 by history: port 0 used to be the slave receiver from the bridge.
@@ -416,6 +485,8 @@ static void local_play_task(void *arg)
             /* spin the last stretch */
         }
         ESP_LOGI(TAG, "local playback started");
+        int64_t samples_played = 0;
+        int64_t next_marker = (local_start / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
 
         while (1) {
             if (retuning) {
@@ -433,6 +504,17 @@ static void local_play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
+            /* On the hub, local time IS master time. */
+            int64_t chunk_master = local_start + samples_played * 1000000LL / (int64_t)sample_rate;
+            if (chunk_master >= next_marker) {
+                gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
+                s_marker_at = esp_timer_get_time();
+                esp_rom_delay_us(MARKER_PULSE_US);
+                gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 0);
+                next_marker = (chunk_master / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
+            }
+            samples_played += AUDIO_FRAMES;
+
             size_t written = 0;
             if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,
                                   portMAX_DELAY) != ESP_OK) {
@@ -524,6 +606,7 @@ void streamer_start(void)
     wifi_start_ap();
     socket_start();
     i2s_start(sample_rate);
+    marker_start();
 
     ESP_LOGI(TAG, "free heap after WiFi init: %" PRIu32 " bytes", esp_get_free_heap_size());
 
