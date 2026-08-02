@@ -1,6 +1,8 @@
 #include "visualiser.h"
 
 #include <array>
+#include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <optional>
@@ -24,7 +26,10 @@ constexpr const char *TAG = "vis";
  * split bought the ~20 kB back. */
 constexpr int FFT_N        = 1024;
 constexpr int SAMPLE_RATE  = 44100;
-constexpr int STREAM_BYTES = FFT_N * 4 * 2;   /* ~2 analysis frames of stereo int16 */
+constexpr int CHANNELS     = 2;
+/* Four analysis frames of headroom, not two. A short send loses audio AND
+ * breaks the block alignment, so the buffer is sized to make that rare. */
+constexpr int STREAM_BYTES = FFT_N * CHANNELS * (int)sizeof(int16_t) * 4;
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 
@@ -72,6 +77,22 @@ int64_t master_offset()
     portEXIT_CRITICAL(&s_offset_lock);
     return v;
 }
+
+/* Block alignment, and the statistics that make a disagreement between two units
+ * diagnosable instead of a matter of opinion. All touched only by the feed
+ * (audio task) except the counters, which the report reads and clears. */
+bool    s_align_pending = true;
+int32_t s_skip_frames;
+/* Atomic, not volatile: these are incremented by the audio task and read and
+ * cleared by the analysis task, and C++20 deprecates compound assignment on a
+ * volatile. Relaxed ordering -- they are statistics, not a handshake. */
+std::atomic<uint32_t> s_dropped;  /* PCM bytes lost because the analysis fell behind */
+std::atomic<uint32_t> s_aligns;   /* re-alignments; should settle to 0 per window */
+std::atomic<uint32_t> s_onsets;
+std::atomic<uint32_t> s_frames;
+
+uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
+void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
 
 /* FFT scratch. File scope rather than stack: 12 kB would blow a task stack. */
 alignas(16) float fft_buf[FFT_N * 2];   /* complex interleaved */
@@ -181,6 +202,7 @@ void visualiser_task(void *arg)
     float level = 0.0f;
     size_t filled = 0;
     int64_t last_render_us = esp_timer_get_time();
+    int64_t last_report_us = last_render_us;
 
     while (true) {
         /*
@@ -220,13 +242,28 @@ void visualiser_task(void *arg)
         const int64_t now = esp_timer_get_time();
         const int64_t offset = master_offset();
         float strength = 0.0f;
+        bump(s_frames);
         if (beat_det_update(&beat, band, now, &strength)) {
             level = 0.3f + 0.7f * strength;
+            bump(s_onsets);
         } else {
             level = decay(level, now - last_render_us);
         }
         last_render_us = now;
         render(level, band[0], now + offset);
+
+        /*
+         * Report every 5 s. The point is comparability: run two units side by
+         * side and their `onsets` should match closely, because they are
+         * analysing identical windows of identical audio. A persistent
+         * difference means they are not -- check `drop` first.
+         */
+        if (now - last_report_us >= 5000000) {
+            ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
+                          " | drop %" PRIu32 " B | aligns %" PRIu32,
+                     take(s_frames), take(s_onsets), take(s_dropped), take(s_aligns));
+            last_report_us = now;
+        }
     }
 }
 
@@ -234,9 +271,60 @@ void visualiser_task(void *arg)
 
 void visualiser_feed(const uint8_t *pcm, uint32_t len)
 {
-    if (pcm_stream) {
-        /* 0 ticks: never block the audio task that calls this. */
-        xStreamBufferSend(pcm_stream, pcm, len, 0);
+    if (!pcm_stream) {
+        return;
+    }
+
+    /*
+     * Align the analysis blocks to the shared timeline before anything else.
+     *
+     * The detector chops the stream into fixed 1024-frame blocks, and where
+     * those boundaries fall used to depend on when each unit's task happened to
+     * see its first byte -- an arbitrary offset of up to 1023 frames, 23 ms,
+     * between two units. A drum hit landing near a boundary is split across two
+     * blocks on one unit and sits in the middle of one block on the other, so
+     * its spectral flux differs and a marginal onset crosses the threshold on
+     * one unit and not the other. Worse, the threshold is adaptive over the last
+     * 43 blocks, so once two units disagree they keep disagreeing.
+     *
+     * Discarding a few frames here puts every unit's boundaries on the same
+     * absolute positions in the stream, so they analyse identical windows and
+     * reach identical decisions.
+     *
+     * Done at feed time, not read time: this runs in the playback task at the
+     * moment the audio is handed to the DAC, so the clock reading refers to the
+     * audio in hand. At read time it would refer to whatever is queued, which is
+     * a varying amount ahead.
+     */
+    const uint32_t frame_bytes = CHANNELS * sizeof(int16_t);
+    if (s_align_pending) {
+        const int64_t idx = ((esp_timer_get_time() + master_offset())
+                             * SAMPLE_RATE) / 1000000;
+        const int32_t into_block = static_cast<int32_t>(idx % FFT_N);
+        s_skip_frames = into_block ? (FFT_N - into_block) : 0;
+        s_align_pending = false;
+        bump(s_aligns);
+    }
+    if (s_skip_frames > 0) {
+        const uint32_t have = len / frame_bytes;
+        const uint32_t drop = s_skip_frames < static_cast<int32_t>(have)
+                              ? static_cast<uint32_t>(s_skip_frames) : have;
+        s_skip_frames -= static_cast<int32_t>(drop);
+        pcm += drop * frame_bytes;
+        len -= drop * frame_bytes;
+        if (len == 0) {
+            return;
+        }
+    }
+
+    /* 0 ticks: never block the audio task that calls this. A short send means
+     * the analysis task fell behind and audio was lost -- which both breaks the
+     * block alignment and makes this unit analyse different audio from its
+     * neighbours, so count it and re-align rather than losing it silently. */
+    const size_t sent = xStreamBufferSend(pcm_stream, pcm, len, 0);
+    if (sent < len) {
+        bump(s_dropped, len - sent);
+        s_align_pending = true;
     }
 }
 
