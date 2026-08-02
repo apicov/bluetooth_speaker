@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Desktop satellite -- listens to the hub's multicast audio and plays it.
+Desktop satellite -- listens to the hub's audio, plays it, and records it.
 
 Exists because there is no DAC yet, so nothing in this project has ever actually
 been *heard*. Every conclusion so far rests on counters. This turns the stream
@@ -17,10 +17,23 @@ rate tried, while unicast gets link-layer retransmission and measures clean.
 Usage:
 
     # join the hub's WiFi first: SSID "dancefloor", password "dancefloor"
+    #   nmcli device wifi connect dancefloor password dancefloor
+
+    # listen
     python3 desktop_satellite.py | aplay -f S16_LE -r 44100 -c 2 -
 
-    # or, if you prefer ffplay
+    # listen, and keep one WAV per track for tuning beat detection
+    python3 desktop_satellite.py --record ~/dancefloor-tracks \
+        | aplay -f S16_LE -r 44100 -c 2 --buffer-time=1000000 -
+
+    # or play through ffplay instead
     python3 desktop_satellite.py | ffplay -f s16le -ar 44100 -ch_layout stereo -i - -nodisp
+
+Stop with Ctrl-C rather than killing it: that is what writes the final WAV
+header, without which the last recording of a session is unreadable.
+
+Spotify ad breaks arrive as ordinary tracks and are recognised by their artist
+field, so they play but are not saved. See --skip.
 
 PCM goes to stdout, statistics to stderr, so the pipe stays clean. The only
 dependency is ffmpeg, which needs its `sbc` decoder (check with
