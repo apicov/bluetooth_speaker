@@ -71,6 +71,16 @@ static void retune_dac(uint32_t hz);
 /* Held across a DAC retune. i2s_channel_write() returns immediately once the
  * channel is disabled, so without this the play task spins through the ring at
  * memory speed -- a measured 54 ms correction cost 177 ms of buffer. */
+static volatile int64_t s_marker_at;      /* local time we last pulsed */
+
+/*
+ * Ring position at which a tagged packet's audio begins, or -1 for none
+ * pending. Playback pulses when it reaches this, so the pulse tracks the audio
+ * through the buffer rather than being predicted from a clock.
+ */
+static volatile int64_t s_marker_sample = -1;
+static int64_t s_samples_in;              /* frames written into local_ring */
+
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
 
@@ -180,9 +190,18 @@ void streamer_feed(const uint8_t *pcm, uint32_t len)
     if (sent < len) {
         s_feed_dropped += len - sent;
     }
+    s_samples_in += sent / (AUDIO_CHANNELS * sizeof(int16_t));
 }
 
-void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames)
+/* Called as a tagged packet is about to be queued: its audio starts here. */
+void streamer_mark_here(void)
+{
+    if (s_marker_sample < 0) {
+        s_marker_sample = s_samples_in;
+    }
+}
+
+void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool marker)
 {
     static audio_msg_t msg;
     static uint32_t seq;
@@ -216,6 +235,8 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames)
     msg.seq = seq++;
     msg.sample_rate = sample_rate;
     msg.frames = frames;
+    msg.marker = marker ? 1 : 0;
+    msg.reserved = 0;
     msg.play_at = next_play_at;
     memcpy(msg.payload, sbc, len);
 
@@ -357,7 +378,6 @@ static void socket_start(void)
 
 /* ------------------------------------------------------ sync measurement */
 
-static volatile int64_t s_marker_at;      /* local time we last pulsed */
 static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
 
 static void IRAM_ATTR monitor_isr(void *arg)
@@ -484,9 +504,15 @@ static void local_play_task(void *arg)
         while (esp_timer_get_time() < local_start) {
             /* spin the last stretch */
         }
-        ESP_LOGI(TAG, "local playback started");
+        /* On the hub local time IS master time, so this is directly comparable
+         * with the satellite's figure. A difference here is a difference in the
+         * audio each unit is playing, which no amount of clock accuracy fixes. */
+        ESP_LOGI(TAG, "local playback started: scheduled %lld, actual %lld (%+lld us)",
+                 local_start, esp_timer_get_time(), esp_timer_get_time() - local_start);
+        /* Counted in the same units as s_samples_in, so the two meet. */
         int64_t samples_played = 0;
-        int64_t next_marker = (local_start / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
+        s_samples_in = 0;
+        s_marker_sample = -1;
 
         while (1) {
             if (retuning) {
@@ -504,14 +530,13 @@ static void local_play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
-            /* On the hub, local time IS master time. */
-            int64_t chunk_master = local_start + samples_played * 1000000LL / (int64_t)sample_rate;
-            if (chunk_master >= next_marker) {
+            int64_t mark = s_marker_sample;
+            if (mark >= 0 && samples_played >= mark) {
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
                 s_marker_at = esp_timer_get_time();
                 esp_rom_delay_us(MARKER_PULSE_US);
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 0);
-                next_marker = (chunk_master / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
+                s_marker_sample = -1;
             }
             samples_played += AUDIO_FRAMES;
 

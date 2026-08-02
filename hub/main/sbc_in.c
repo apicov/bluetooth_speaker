@@ -130,6 +130,14 @@ static void rx_task(void *arg)
             /* One A2DP packet holds several SBC frames back to back. Decode for
              * this unit's own speaker, and count frames so the streamer knows
              * how far to advance the timeline for the copy it sends on. */
+            /* Tag before feeding, so the mark lands at the start of this
+             * packet's audio in the ring. */
+            static uint32_t mark_count;
+            bool tagged = (mark_count++ % MARKER_EVERY_PKTS) == 0;
+            if (tagged) {
+                streamer_mark_here();
+            }
+
             uint32_t frames_here = 0;
             size_t off = 0;
             while (off < len) {
@@ -155,7 +163,7 @@ static void rx_task(void *arg)
             }
 
             /* Satellites get the SBC itself, not what we decoded from it. */
-            streamer_send_sbc(payload, len, frames_here);
+            streamer_send_sbc(payload, len, frames_here, tagged);
 
             consume(sizeof(sbc_link_hdr_t) + len);
         }

@@ -64,6 +64,8 @@ static volatile int64_t stream_start_local;
 static volatile uint32_t stream_rate = 44100;
 static uint32_t tx_rate = 44100;      /* what the output clock is actually set to */
 static int64_t stream_offset;         /* clock offset used when anchoring */
+static volatile int64_t marker_sample = -1;   /* ring position of a tagged packet */
+static int64_t samples_in;                    /* frames written into the ring */
 
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
@@ -257,7 +259,9 @@ static void handle_audio(const audio_msg_t *msg)
         stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
-        stream_offset = offset;       /* markers need it to reach master time */
+        stream_offset = offset;
+        samples_in = 0;
+        marker_sample = -1;
         expect_seq = msg->seq;
         have_seq = true;
         xStreamBufferReset(ring);
@@ -289,6 +293,12 @@ static void handle_audio(const audio_msg_t *msg)
     expect_seq = msg->seq + 1;
     have_seq = true;
 
+    /* Tag before queuing, so the mark lands at the start of this packet's
+     * audio and travels through the buffer with it. */
+    if (msg->marker && marker_sample < 0) {
+        marker_sample = samples_in;
+    }
+
     /* Decode here rather than at the hub: that is the entire point of sending
      * SBC, and it costs a quarter of the airtime. */
     size_t off = 0;
@@ -303,10 +313,11 @@ static void handle_audio(const audio_msg_t *msg)
             break;
         }
         off += consumed;
-        if (xStreamBufferSend(ring, pcm, samples * sizeof(int16_t), 0)
-                != samples * sizeof(int16_t)) {
+        size_t want = samples * sizeof(int16_t);
+        if (xStreamBufferSend(ring, pcm, want, 0) != want) {
             ESP_LOGW(TAG, "ring full, dropping audio");
         }
+        samples_in += samples / AUDIO_CHANNELS;
     }
 }
 
@@ -367,6 +378,12 @@ static void drift_task(void *arg)
     (void)arg;
     int32_t err_ema = 0;
     bool err_ema_valid = false;
+    /*
+     * Windows to wait after a retune before considering another. The buffer
+     * takes tens of seconds to respond, and acting again before it has is how
+     * a servo ends up chasing its own corrections.
+     */
+    int cooldown = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (stream_start_local == 0) {
@@ -416,11 +433,12 @@ static void drift_task(void *arg)
          * starts to matter between two speakers, while jitter no longer reaches
          * it at all.
          */
-        if (desired > tx_rate + tx_rate / 5000 || desired < tx_rate - tx_rate / 5000) {
+        if (cooldown > 0) {
+            cooldown--;
+        } else if (desired > tx_rate + tx_rate / 5000 ||
+                   desired < tx_rate - tx_rate / 5000) {
             retune_output(desired);
-            /* Re-seed: the level will take a while to respond, and chasing it
-             * again before then would overshoot. */
-            err_ema_valid = false;
+            cooldown = 4;        /* ~20 s, against a 40 s correction time */
         }
 #endif
     }
@@ -448,12 +466,14 @@ static void play_task(void *arg)
         while (esp_timer_get_time() < stream_start_local) {
             /* spin the last stretch, as in the M4 blink task */
         }
-        ESP_LOGI(TAG, "playback started");
+        int64_t actual_master = esp_timer_get_time() + stream_offset;
+        int64_t sched_master = stream_start_local + stream_offset;
+        ESP_LOGI(TAG, "playback started: scheduled %lld, actual %lld (%+lld us) [master]",
+                 sched_master, actual_master, actual_master - sched_master);
+        /* Counted in the same units as samples_in, so the two meet. */
         int64_t samples_played = 0;
-        /* Marker instants are on the MASTER clock, so a unit that joins late
-         * still marks the same moments as everyone else. */
-        int64_t start_master = stream_start_local + stream_offset;
-        int64_t next_marker = (start_master / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
+        samples_in = 0;
+        marker_sample = -1;
 
         while (1) {
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -465,13 +485,12 @@ static void play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
-            int64_t chunk_master = start_master +
-                                   samples_played * 1000000LL / (int64_t)stream_rate;
-            if (chunk_master >= next_marker) {
+            int64_t mark = marker_sample;
+            if (mark >= 0 && samples_played >= mark) {
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
                 esp_rom_delay_us(MARKER_PULSE_US);
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 0);
-                next_marker = (chunk_master / MARKER_PERIOD_US + 1) * MARKER_PERIOD_US;
+                marker_sample = -1;
             }
             samples_played += AUDIO_FRAMES;
 

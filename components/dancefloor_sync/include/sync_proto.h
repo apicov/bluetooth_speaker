@@ -63,8 +63,24 @@ typedef struct __attribute__((packed)) {
  * DAC, so it sits ahead of the sound by the DMA depth. That offset is identical
  * on every unit and cancels in the comparison.
  */
-#define MARKER_PERIOD_US 2000000
-#define MARKER_PULSE_US  200
+/*
+ * Marked by CONTENT, not by time: every unit pulses when the audio from a
+ * tagged packet reaches its output, so both are marking the same sample.
+ *
+ * The first attempt derived the instant from samples_played / sample_rate using
+ * the nominal 44100. Each unit actually plays at whatever its drift servo last
+ * set, so a 0.4% difference accumulated ~8 ms between markers and the two units'
+ * pulses slid apart independently -- the measurement reported servo divergence
+ * rather than audio misalignment.
+ *
+ * Tying the marker to a packet removes rate from the question entirely: if two
+ * units emit the same sample at the same instant they are in sync, whatever
+ * their clocks are doing.
+ *
+ * Packets arrive ~50/s, so every 100th is about 2 s.
+ */
+#define MARKER_EVERY_PKTS 100
+#define MARKER_PULSE_US   200
 
 typedef enum {
     AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */
@@ -93,6 +109,8 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint8_t  type;
     uint8_t  format;        /* audio_fmt_t */
+    uint8_t  marker;        /* 1 = pulse the sync GPIO when this audio plays */
+    uint8_t  reserved;
     uint16_t payload_len;
     uint32_t seq;
     uint32_t sample_rate;
