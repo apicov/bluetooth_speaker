@@ -36,6 +36,12 @@ void visualiser_start(void);
 void visualiser_set_master_offset(int64_t offset_us);
 
 /*
+ * Switch pattern by name. See pattern_count()/pattern_at() in patterns.hpp for
+ * what exists; tools/pattern_lab lists them and runs them against a WAV.
+ */
+void visualiser_set_pattern(const char *name);
+
+/*
  * Feed interleaved 16-bit stereo PCM. Non-blocking: never delays audio.
  *
  * Feed this from the PLAYBACK path -- where samples are handed to the DAC -- and

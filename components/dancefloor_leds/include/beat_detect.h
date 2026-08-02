@@ -33,6 +33,8 @@ extern "C" {
 #define BEAT_REFRACTORY_US 120000
 
 typedef struct {
+    float last_flux;      /* exposed for tuning; see beat_det_last_flux() */
+    float last_threshold;
     float prev[BEAT_BANDS];
     float hist[BEAT_HIST];
     int hist_n;
@@ -70,6 +72,16 @@ void beat_det_init(beat_det_t *d);
  */
 bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
                      int64_t now_us, float *strength);
+
+/*
+ * The flux and the adaptive threshold from the most recent update.
+ *
+ * Only interesting for tuning: plotted against a real recording they show
+ * directly whether BEAT_THRESHOLD_K sits in a sensible place, which is a
+ * question nobody has yet answered with anything but synthetic kicks.
+ */
+float beat_det_last_flux(const beat_det_t *d);
+float beat_det_last_threshold(const beat_det_t *d);
 
 #ifdef __cplusplus
 }

@@ -77,6 +77,8 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
     if (threshold < BEAT_FLUX_FLOOR) {
         threshold = BEAT_FLUX_FLOOR;
     }
+    d->last_flux = flux;
+    d->last_threshold = threshold;
 
     hist_push(d, flux);
 
@@ -98,3 +100,6 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
     }
     return true;
 }
+
+float beat_det_last_flux(const beat_det_t *d)      { return d->last_flux; }
+float beat_det_last_threshold(const beat_det_t *d) { return d->last_threshold; }
