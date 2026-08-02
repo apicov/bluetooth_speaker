@@ -756,7 +756,11 @@ static void play_task(void *arg)
             if (rp >= 0 && samples_played >= rp) {
                 restart_pos = -1;
                 int32_t max_frames = (int32_t)stream_rate * MAX_SPLICE_MS / 1000;
-                int32_t adj = (int32_t)((int64_t)phase_err_us * stream_rate / 1000000);
+                /* Same guard as the hub: phase_err_us survives a re-anchor, so
+                 * a boundary reached before the first measurement of the new
+                 * stream would splice on a number describing the old one. */
+                int32_t adj = phase_valid
+                    ? (int32_t)((int64_t)phase_err_us * stream_rate / 1000000) : 0;
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
 

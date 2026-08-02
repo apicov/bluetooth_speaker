@@ -304,10 +304,18 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     int64_t now = esp_timer_get_time();
     int64_t target = now + LEAD_US;
 
+    /*
+     * Recovering from a local underrun. The flag cannot be raised here: the
+     * timeline-start branch below clears s_restart_pending, because a start
+     * throws away any track boundary that was waiting for the old timeline. So
+     * the request to bring the satellites with us was set and then wiped in the
+     * same call, and no satellite has ever received it.
+     */
+    bool recovered = false;
     if (s_underrun_recover) {
         s_underrun_recover = false;
         next_play_at = 0;              /* fall into the timeline-start path */
-        s_restart_pending = true;      /* and bring the satellites with us */
+        recovered = true;
     }
 
     /* A timeline start invalidates the position this packet captured, because
@@ -344,13 +352,32 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     msg.sample_rate = sample_rate;
     msg.frames = frames;
     msg.marker = marker ? 1 : 0;
-    msg.restart = s_restart_pending ? 1 : 0;
+    /*
+     * Two different events wear the same flag on the wire, and they differ in
+     * whether this unit splices too.
+     *
+     * A track boundary: every unit nulls its phase when playback reaches the
+     * flagged audio, this one included. That is the case the flag was built for.
+     *
+     * A timeline restart after a local underrun: the satellites did NOT restart
+     * with us. They are still playing against the old timeline, and the stamps
+     * they are about to receive step by up to RESYNC_US -- inside the 150 ms a
+     * splice can absorb, which is why telling them is worth doing at all. We
+     * must not splice: our phase was just re-anchored to zero by construction,
+     * while s_phase_err_us still holds whatever it read before the underrun.
+     * Acting on that would cut up to MAX_SPLICE_MS out of the first audio of
+     * the new timeline for no reason.
+     */
+    msg.restart = (s_restart_pending || recovered) ? 1 : 0;
     if (s_restart_pending) {
         s_restart_pending = false;
         if (s_restart_pos < 0) {
             s_restart_pos = s_pending_pos;   /* our own copy of the same boundary */
         }
         ESP_LOGW(TAG, "track boundary flagged at seq %" PRIu32, msg.seq);
+    } else if (recovered) {
+        ESP_LOGW(TAG, "timeline restart flagged at seq %" PRIu32
+                      " -- satellites re-splice, we do not", msg.seq);
     }
 
     /*
@@ -712,7 +739,15 @@ static void local_play_task(void *arg)
             if (rp >= 0 && samples_played >= rp) {
                 s_restart_pos = -1;
                 int32_t max_frames = (int32_t)sample_rate * MAX_SPLICE_MS / 1000;
-                int32_t adj = (int32_t)((int64_t)s_phase_err_us * sample_rate / 1000000);
+                /*
+                 * Nothing measured since the last re-anchor: s_phase_err_us is
+                 * whatever it read against the previous timeline, and it is not
+                 * cleared. Splicing on it would cut up to MAX_SPLICE_MS of real
+                 * audio to correct an error that no longer exists. Drop the
+                 * boundary instead -- the servo will take out anything genuine.
+                 */
+                int32_t adj = s_phase_valid
+                    ? (int32_t)((int64_t)s_phase_err_us * sample_rate / 1000000) : 0;
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
 
