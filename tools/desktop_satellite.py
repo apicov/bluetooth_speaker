@@ -130,6 +130,12 @@ def safe_name(txt):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", txt).strip(". ")[:80]
 
 
+# Spotify labels ads in the artist field: "Werbung . 1 von 2" in German,
+# "Advertisement . 1 of 2" in English, and so on. Locale-dependent and therefore
+# imperfect, which is why it is a command-line option rather than hard-wired.
+DEFAULT_SKIP = r"werbung|advertisement|publicidad|pubblicit|an[uú]ncio|reclame|annonce"
+
+
 class Recorder:
     """Writes decoded PCM to one WAV per track.
 
@@ -142,8 +148,9 @@ class Recorder:
     is what these recordings are for.
     """
 
-    def __init__(self, directory):
+    def __init__(self, directory, skip_re):
         self.dir = directory
+        self.skip_re = skip_re
         self.lock = threading.Lock()
         self.wav = None
         self.path = None
@@ -162,6 +169,19 @@ class Recorder:
     def set_meta(self, title, artist, album):
         with self.lock:
             self.meta = (title, artist, album)
+            if not self.wav or not self.skip_re:
+                return
+            # The ad marker usually arrives after recording has started, since
+            # the artist field is not in the first metadata response. So the
+            # file has to be discarded rather than never opened.
+            if self.skip_re.search(artist) or self.skip_re.search(title):
+                self.wav.close()
+                self.wav = None
+                try:
+                    os.remove(self.path)
+                except OSError:
+                    pass
+                log(f"    (advert -- not saved)")
 
     def _close_locked(self):
         if not self.wav:
@@ -231,6 +251,9 @@ def main():
                     help="PCM held back before playback starts")
     ap.add_argument("--record", metavar="DIR",
                     help="save one WAV per track here, for offline analysis")
+    ap.add_argument("--skip", metavar="REGEX", default=DEFAULT_SKIP,
+                    help="discard recordings whose title or artist matches "
+                         "(case-insensitive); pass an empty string to keep everything")
     args = ap.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -241,7 +264,8 @@ def main():
     log(f"listening on port {PORT}; audio arrives by unicast once probing starts")
 
     ff = start_ffmpeg()
-    recorder = Recorder(args.record)
+    skip_re = re.compile(args.skip, re.I) if args.skip else None
+    recorder = Recorder(args.record, skip_re)
     if args.record:
         log(f"recording one WAV per track into {args.record}")
     prebuffer = args.buffer_ms * RATE * CHANNELS * SAMPLE_WIDTH // 1000
