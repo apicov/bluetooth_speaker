@@ -329,6 +329,46 @@ began within the buffer -- which nothing accounts for at anchor time. The servo
 absorbs it over ~45 s. Compensating it at anchor would start near zero instead,
 and is the obvious next improvement.
 
+### Track-boundary re-anchoring
+
+The servo alone walks error off over a couple of minutes, which leaves the start
+of a session -- and any recovery -- audibly out. Correcting faster means skipping
+or inserting audio, and that is a splice.
+
+A track change is the one moment a splice is inaudible, and AVRCP reports it
+rather than making us infer it. Silence detection was considered and rejected: a
+quiet passage would trigger it and splice something audible, whereas a track
+change is unambiguous.
+
+The correction is applied when playback *reaches* the flagged packet, not when
+the notification arrives -- at that moment the buffer still holds ~200 ms of the
+previous track, and correcting immediately would cut its ending.
+
+Measured over a session, corrections shrink as the servo converges:
+
+```
+track boundary: skipped 8 ms to null phase
+track boundary: skipped 2 ms to null phase
+```
+
+### Settled behaviour
+
+After convergence, with track-boundary corrections active:
+
+| | Value |
+|---|---|
+| Smoothed phase | within +-1 to 2 ms |
+| Instantaneous phase | within +-5 ms (delivery jitter) |
+| Buffer | 165-250 ms around a 200 ms target |
+| Hub-to-satellite audio | 0.2 to 3 ms |
+| Playback start vs schedule | +5 us (hub), +1 us (satellite), same instant |
+
+Servo gain matters more than it looks. At a 40 s correction time both units
+converged and then overshot to +10 ms, oscillating rather than settling -- the
+buffer takes tens of seconds to respond, so the loop was still correcting after
+the error had gone. At ~100 s it settles. Real drift is ~0.8 ms per minute, so
+the loop can afford to be far gentler than the disturbance it corrects.
+
 ### Known wart
 
 The hub's absolute phase reading does not settle: it wanders +6 ms to +24 ms with
