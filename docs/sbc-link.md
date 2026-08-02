@@ -147,9 +147,11 @@ quietly goes missing further down.
 
 ---
 
-## Still to do
+## Done since
 
-The hub decodes to PCM and multicasts **PCM** to satellites, so the WiFi link
-still carries 1.4 Mbps. Forwarding SBC over the air would quarter the airtime and
-let satellites hold four times the buffer for the same memory. It requires the
-satellite to decode, which the shared `sbc_decoder` component already supports.
+The hub used to decode and send **PCM** over WiFi, carrying 1.4 Mbps. It now
+forwards the SBC undecoded and each satellite decodes for itself, quartering the
+airtime. Measured, PCM cost ~7% of packets rejected by a full transmit queue plus
+~13% lost on the air; both went away.
+
+The over-the-air side is described in [`architecture.md`](architecture.md) §9.

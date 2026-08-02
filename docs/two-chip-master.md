@@ -3,12 +3,17 @@
 The master unit is **two ESP32s**. Satellites remain single-chip.
 
 ```
-          A2DP                I2S                    WiFi multicast
+          A2DP           UART, raw SBC              WiFi unicast
  phone ─────────▶ bt_bridge ────────▶ hub ──────────────────────────▶ satellites
                   (ESP32)             (ESP32)
                   Bluedroid           SoftAP, clock master, streamer
-                  I2S master out      I2S slave in, own DAC, own LEDs
+                  forwards SBC        decodes, own DAC, own LEDs
 ```
+
+> The link between the chips was originally I2S carrying decoded PCM. It lost
+> ~1.15% of frames and was replaced by UART carrying undecoded SBC — see
+> [`sbc-link.md`](sbc-link.md). The reasoning below for *splitting* the chips is
+> unaffected; only the wire between them changed.
 
 Both chips sit in the master enclosure. **The master is still a full speaker**:
 the hub chip drives its own DAC and its own LED strip, exactly like a satellite.
@@ -70,15 +75,13 @@ around by resyncs would hand it a start time up to 50 ms wrong.
 
 ## Wiring between the chips
 
-Four wires. The bridge is I2S **master** (it generates the clocks); the hub is
-I2S **slave**.
+**One signal wire**, plus grounds. See [`sbc-link.md`](sbc-link.md) for the link
+itself.
 
 | bt_bridge (out) | hub (in) | Signal |
 |---|---|---|
-| GPIO 26 | GPIO 21 | BCK — bit clock |
-| GPIO 27 | GPIO 22 | WS / LRCK — word select |
-| GPIO 25 | GPIO 23 | DATA |
-| GND | GND | **required** — common reference |
+| GPIO 25 (UART TX) | GPIO 23 (UART RX) | the only signal |
+| GND ×4 | GND ×4 | **required** — and keep all of them |
 
 Pins are configurable under `menuconfig`; the hub's are in *Dancefloor hub*.
 
@@ -89,29 +92,26 @@ Pins are configurable under `menuconfig`; the hub's are in *Dancefloor hub*.
 The hub separately drives its own DAC on GPIO 26/27/25 and its LED strip on
 GPIO 18. No conflict — those are different chips' pin 26.
 
-### Why two I2S ports on the hub
-
-`I2S_NUM_0` is the slave receiver from the bridge; `I2S_NUM_1` is the master
-transmitter to the DAC. They cannot share a port: one follows the bridge's clock,
-the other generates its own.
+The hub now uses only one I2S port, `I2S_NUM_0`, as the master transmitter to
+its DAC. The second port existed to receive from the bridge and became free when
+that link moved to UART.
 
 ---
 
 ## Sample rate
 
-The hub is an I2S slave, so it plays at whatever rate the bridge clocks. Rather
-than assume 44.1 kHz, `audio_in.c` counts frames over 5-second windows and
-reports the measured rate to the streamer. A phone negotiating 48 kHz would
-otherwise put every timeline calculation out by 9%.
+The hub owns its output clock, but the *input* rate is whatever the phone
+negotiated. It is read from each SBC frame header rather than assumed: a phone
+negotiating 48 kHz would otherwise put every timeline calculation out by 9%.
 
 Watch for this line:
 
 ```
-I audio_in: measured input rate 44098 Hz
+I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 | fed-drop 0 B
 ```
 
-A number near the nominal rate means the link is healthy. Something far off means
-either a wiring fault or an unexpected negotiated rate.
+`eff` is the effective rate actually reaching playback. Near the nominal rate
+means healthy; far off means a wiring fault or an unexpected negotiated rate.
 
 ---
 
