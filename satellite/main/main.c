@@ -337,6 +337,12 @@ static void handle_audio(const audio_msg_t *msg)
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
         stream_offset = offset;
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+        /* Patterns that advance on their own must do so on the shared clock, or
+         * two units beat against each other. Re-published on every anchor
+         * because the offset is re-measured each time. */
+        visualiser_set_master_offset(offset);
+#endif
         samples_in = 0;
         marker_sample = -1;
         phase_head = phase_tail = 0;

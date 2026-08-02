@@ -58,6 +58,21 @@ StreamBufferHandle_t pcm_stream;
 std::optional<LedStrip> strip;
 beat_det_t beat;
 
+/* esp_timer_get_time() + this = master-clock time. Written by the audio task on
+ * anchoring, read by the render task; 64-bit, so both sides go through a
+ * critical section rather than risking a torn read of a value that changes by
+ * minutes. */
+portMUX_TYPE s_offset_lock = portMUX_INITIALIZER_UNLOCKED;
+int64_t s_master_offset_raw;
+
+int64_t master_offset()
+{
+    portENTER_CRITICAL(&s_offset_lock);
+    const int64_t v = s_master_offset_raw;
+    portEXIT_CRITICAL(&s_offset_lock);
+    return v;
+}
+
 /* FFT scratch. File scope rather than stack: 12 kB would blow a task stack. */
 alignas(16) float fft_buf[FFT_N * 2];   /* complex interleaved */
 float window[FFT_N];
@@ -108,19 +123,22 @@ Rgb hsv2rgb(float h, float s, float v)
              static_cast<uint8_t>((bf + m) * 255.0f) };
 }
 
-void render(float level, float bass)
+void render(float level, float bass, int64_t master_us)
 {
     /* One pattern: brightness tracks the beat envelope, hue drifts slowly so a
      * static room does not look frozen between hits.
      *
-     * Every unit runs this against audio it is playing in sync with every other
-     * unit, so they agree without exchanging anything. The hue phase does not
-     * agree -- it is seeded from each board's own boot -- which is fine for a
-     * pulse and would not be for a chase across units. That needs seeding from
-     * the shared master clock, and is not built. */
-    static float hue = 0.0f;
-    hue += 0.3f;
-    if (hue >= 360.0f) hue -= 360.0f;
+     * Hue is a function of master-clock time, not of a counter incremented once
+     * per render. Two units do not render at the same rate -- audio arrives in
+     * different-sized lumps and a starved unit renders extra decay frames -- so
+     * an accumulated hue drifts apart between units and beats in and out of
+     * agreement over tens of seconds. Computed from the shared clock it is
+     * identical on every unit by construction, and a unit that stalls for a
+     * second rejoins in the right place instead of lagging forever. */
+    constexpr float HUE_PERIOD_US = 28.0f * 1000000.0f;   /* one full cycle */
+    float hue = std::fmod(static_cast<float>(master_us % static_cast<int64_t>(HUE_PERIOD_US))
+                          / HUE_PERIOD_US * 360.0f, 360.0f);
+    if (hue < 0.0f) hue += 360.0f;      /* master_us is positive, but % is not */
 
     const Rgb c = hsv2rgb(hue, 1.0f, level * BRIGHTNESS);
 
@@ -144,12 +162,25 @@ void render(float level, float bass)
     }
 }
 
+/* Envelope decay expressed as a time constant rather than a per-frame factor,
+ * for the same reason the hue is: a unit that renders more often would otherwise
+ * decay faster and its pulses would visibly differ in shape. 0.85 per 23 ms
+ * frame, which is what this replaces, is a ~140 ms time constant. */
+constexpr float DECAY_TAU_US = 140000.0f;
+
+float decay(float level, int64_t dt_us)
+{
+    if (dt_us <= 0) return level;
+    return level * std::exp(-static_cast<float>(dt_us) / DECAY_TAU_US);
+}
+
 void visualiser_task(void *arg)
 {
     (void)arg;
     static int16_t raw[FFT_N * 2];        /* stereo interleaved */
     float level = 0.0f;
     size_t filled = 0;
+    int64_t last_render_us = esp_timer_get_time();
 
     while (true) {
         /*
@@ -168,8 +199,11 @@ void visualiser_task(void *arg)
                 /* Genuinely starved, not merely mid-frame: decay to black rather
                  * than freezing on the last frame. Bounded to one render per
                  * timeout, so this cannot become a spin. */
-                level *= 0.8f;
-                render(level, 0.0f);
+                const int64_t now = esp_timer_get_time();
+                const int64_t offset = master_offset();
+                level = decay(level, now - last_render_us);
+                last_render_us = now;
+                render(level, 0.0f, now + offset);
             }
             continue;
         }
@@ -183,13 +217,16 @@ void visualiser_task(void *arg)
         float band[BEAT_BANDS];
         compute_bands(band);
 
+        const int64_t now = esp_timer_get_time();
+        const int64_t offset = master_offset();
         float strength = 0.0f;
-        if (beat_det_update(&beat, band, esp_timer_get_time(), &strength)) {
+        if (beat_det_update(&beat, band, now, &strength)) {
             level = 0.3f + 0.7f * strength;
         } else {
-            level *= 0.85f;               /* ~23 ms per frame, so a visible decay */
+            level = decay(level, now - last_render_us);
         }
-        render(level, band[0]);
+        last_render_us = now;
+        render(level, band[0], now + offset);
     }
 }
 
@@ -201,6 +238,13 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len)
         /* 0 ticks: never block the audio task that calls this. */
         xStreamBufferSend(pcm_stream, pcm, len, 0);
     }
+}
+
+void visualiser_set_master_offset(int64_t offset_us)
+{
+    portENTER_CRITICAL(&s_offset_lock);
+    s_master_offset_raw = offset_us;
+    portEXIT_CRITICAL(&s_offset_lock);
 }
 
 void visualiser_start(void)

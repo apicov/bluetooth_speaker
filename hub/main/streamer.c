@@ -843,6 +843,13 @@ void streamer_start(void)
 
     ESP_LOGI(TAG, "free heap after WiFi init: %" PRIu32 " bytes", esp_get_free_heap_size());
 
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /* The hub's local clock IS the master clock, so the offset is zero. Said
+     * explicitly rather than left to the zero-initialiser, because it is the
+     * other half of a contract the satellite has to honour. */
+    visualiser_set_master_offset(0);
+#endif
+
     xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
     xTaskCreatePinnedToCore(local_play_task, "play", 4096, NULL, 8, NULL, 1);
     xTaskCreate(ring_monitor_task, "ringmon", 3072, NULL, 3, NULL);

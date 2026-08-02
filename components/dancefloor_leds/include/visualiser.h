@@ -21,6 +21,21 @@ extern "C" {
 void visualiser_start(void);
 
 /*
+ * Add this to esp_timer_get_time() to get master-clock time. The hub passes 0,
+ * since its local clock IS the master clock; a satellite passes the offset it
+ * anchored playback with, and again whenever it re-anchors.
+ *
+ * Anything in a pattern that advances on its own -- a hue drift, a chase, a
+ * decay -- has to be a function of this rather than of how many frames this
+ * board happens to have rendered. Render counts differ between units: audio
+ * arrives in different-sized lumps, tasks are scheduled differently, and a
+ * starved unit renders extra decay frames. Keyed to frame count, two units
+ * drift apart and beat against each other. Keyed to the shared clock they
+ * agree, and cannot accumulate error, because nothing is being integrated.
+ */
+void visualiser_set_master_offset(int64_t offset_us);
+
+/*
  * Feed interleaved 16-bit stereo PCM. Non-blocking: never delays audio.
  *
  * Feed this from the PLAYBACK path -- where samples are handed to the DAC -- and
