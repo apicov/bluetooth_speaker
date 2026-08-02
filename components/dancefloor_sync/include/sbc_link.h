@@ -39,13 +39,47 @@
 /* One A2DP packet can hold several SBC frames. */
 #define SBC_LINK_MAX_PAYLOAD 1024
 
+/*
+ * Link payload kinds. Audio dominates; metadata is occasional.
+ *
+ * A packet's kind is carried in the header rather than inferred from length,
+ * because SBC payloads vary in size and guessing would eventually be wrong.
+ */
+typedef enum {
+    LINK_KIND_SBC  = 0,   /* one or more SBC frames */
+    LINK_KIND_META = 1,   /* track metadata, see link_meta_t */
+} link_kind_t;
+
 typedef struct __attribute__((packed)) {
     uint8_t  sync0;
     uint8_t  sync1;
+    uint8_t  kind;        /* link_kind_t */
+    uint8_t  pad;
     uint16_t len;         /* payload bytes following the header */
     uint32_t seq;         /* detects loss without needing a timer */
     uint8_t  checksum;    /* XOR of payload; cheap, and enough to spot corruption */
 } sbc_link_hdr_t;
+
+/*
+ * Track metadata from AVRCP.
+ *
+ * `track_id` increments on every track-change notification, so a receiver can
+ * tell "same song, metadata resent" from "new song" without comparing strings.
+ * That distinction is what makes this usable as a re-anchor trigger later: a
+ * track change is an unambiguous moment when a splice is inaudible, unlike
+ * silence detection which can false-trigger on a quiet passage.
+ *
+ * Fixed-size fields rather than packed strings: trivially parsed, and a
+ * truncated title is a better failure than a malformed packet.
+ */
+#define META_TEXT_LEN 64
+
+typedef struct __attribute__((packed)) {
+    uint32_t track_id;
+    char     title[META_TEXT_LEN];
+    char     artist[META_TEXT_LEN];
+    char     album[META_TEXT_LEN];
+} link_meta_t;
 
 static inline uint8_t sbc_link_checksum(const uint8_t *p, uint16_t n)
 {

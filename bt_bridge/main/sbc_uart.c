@@ -46,12 +46,38 @@ void sbc_uart_send(const uint8_t *sbc, uint16_t len)
 
     pkt.hdr.sync0 = SBC_LINK_SYNC0;
     pkt.hdr.sync1 = SBC_LINK_SYNC1;
+    pkt.hdr.kind = LINK_KIND_SBC;
+    pkt.hdr.pad = 0;
     pkt.hdr.len = len;
     pkt.hdr.seq = s_seq++;
     pkt.hdr.checksum = sbc_link_checksum(sbc, len);
     memcpy(pkt.payload, sbc, len);
 
     if (xRingbufferSend(s_ring, &pkt, sizeof(sbc_link_hdr_t) + len, 0) != pdTRUE) {
+        s_dropped++;
+    }
+}
+
+void sbc_uart_send_meta(const link_meta_t *meta)
+{
+    if (!s_ring) {
+        return;
+    }
+    struct {
+        sbc_link_hdr_t hdr;
+        link_meta_t    meta;
+    } pkt;
+
+    pkt.hdr.sync0 = SBC_LINK_SYNC0;
+    pkt.hdr.sync1 = SBC_LINK_SYNC1;
+    pkt.hdr.kind = LINK_KIND_META;
+    pkt.hdr.pad = 0;
+    pkt.hdr.len = sizeof(link_meta_t);
+    pkt.hdr.seq = s_seq++;
+    pkt.hdr.checksum = sbc_link_checksum((const uint8_t *)meta, sizeof(link_meta_t));
+    pkt.meta = *meta;
+
+    if (xRingbufferSend(s_ring, &pkt, sizeof(pkt), 0) != pdTRUE) {
         s_dropped++;
     }
 }

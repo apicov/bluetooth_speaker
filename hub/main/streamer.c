@@ -243,6 +243,27 @@ void streamer_mark_here(void)
  */
 static int32_t s_pending_pos;
 
+void streamer_send_meta(const uint8_t *meta, uint16_t len)
+{
+    if (sock < 0 || len > sizeof(((meta_msg_t *)0)->payload)) {
+        return;
+    }
+    meta_msg_t msg = { .type = MSG_META };
+    memcpy(msg.payload, meta, len);
+
+    portENTER_CRITICAL(&s_clients_lock);
+    client_t snapshot[MAX_CLIENTS];
+    memcpy(snapshot, s_clients, sizeof(snapshot));
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (snapshot[i].last_seen) {
+            sendto(sock, &msg, sizeof(msg), 0,
+                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr));
+        }
+    }
+}
+
 void streamer_begin_packet(void)
 {
     s_pending_pos = s_samples_in;

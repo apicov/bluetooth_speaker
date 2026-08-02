@@ -35,6 +35,7 @@
 #include "nvs_flash.h"
 
 #include "sync_proto.h"
+#include "sbc_link.h"
 #include "sbc_decoder.h"
 
 #define AP_SSID    "dancefloor"
@@ -379,6 +380,7 @@ static void handle_audio(const audio_msg_t *msg)
 static void rx_task(void *arg)
 {
     (void)arg;
+    /* Sized for the largest message we can receive, which is audio. */
     static uint8_t buf[sizeof(audio_msg_t)];
 
     while (1) {
@@ -392,6 +394,10 @@ static void rx_task(void *arg)
             time_msg_t msg;
             memcpy(&msg, buf, sizeof(msg));
             sync_est_add(&est, msg.t1, msg.t2, msg.t3, t4);
+        } else if (buf[0] == MSG_META && n >= (int)sizeof(meta_msg_t)) {
+            const link_meta_t *m = (const link_meta_t *)((const meta_msg_t *)buf)->payload;
+            ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
+                     m->track_id, m->title, m->artist, m->album);
         } else if (buf[0] == MSG_AUDIO && n >= (int)AUDIO_MSG_BYTES(0)) {
             handle_audio((const audio_msg_t *)buf);
         }

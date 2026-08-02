@@ -23,6 +23,7 @@
 #endif
 
 #include "sbc_uart.h"
+#include "avrcp_meta.h"
 
 /* device name */
 static const char local_device_name[] = CONFIG_EXAMPLE_LOCAL_DEVICE_NAME;
@@ -124,6 +125,9 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         esp_bt_gap_register_callback(bt_app_gap_cb);
 
         esp_a2d_register_callback(&bt_app_a2d_cb);
+        /* Before A2DP starts, so the phone sees AVRCP advertised on connect --
+         * this is what was refusing its PSM 23 request. */
+        avrcp_meta_start();
         assert(esp_a2d_sink_init() == ESP_OK);
 
 #if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE

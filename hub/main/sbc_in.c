@@ -98,11 +98,12 @@ static void rx_task(void *arg)
                 break;                      /* header still arriving */
             }
 
+            uint8_t kind = s_buf[2];
             uint16_t len;
             uint32_t seq;
-            memcpy(&len, s_buf + 2, 2);
-            memcpy(&seq, s_buf + 4, 4);
-            uint8_t crc = s_buf[8];
+            memcpy(&len, s_buf + 4, 2);
+            memcpy(&seq, s_buf + 6, 4);
+            uint8_t crc = s_buf[10];
 
             if (len == 0 || len > SBC_LINK_MAX_PAYLOAD) {
                 s_bad_sync++;
@@ -125,6 +126,17 @@ static void rx_task(void *arg)
             }
             expect_seq = seq + 1;
             have_seq = true;
+
+            if (kind == LINK_KIND_META) {
+                if (len == sizeof(link_meta_t)) {
+                    const link_meta_t *m = (const link_meta_t *)payload;
+                    ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
+                             m->track_id, m->title, m->artist, m->album);
+                    streamer_send_meta(payload, len);
+                }
+                consume(sizeof(sbc_link_hdr_t) + len);
+                continue;
+            }
             s_packets++;
 
             /* One A2DP packet holds several SBC frames back to back. Decode for

@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "sbc_link.h"
+
 #define SYNC_PORT        5001
 #define SYNC_MCAST_ADDR  "239.12.34.56"
 #define SYNC_WINDOW      10      /* probes retained for the median */
@@ -19,7 +21,8 @@ typedef enum {
     MSG_TIME_REQ = 1,   /* satellite -> master */
     MSG_TIME_RSP = 2,   /* master -> satellite, unicast */
     MSG_BLINK    = 3,   /* master -> all, multicast */
-    MSG_AUDIO    = 4,   /* master -> all, multicast */
+    MSG_AUDIO    = 4,   /* master -> listeners */
+    MSG_META     = 5,   /* master -> listeners, track metadata */
 } msg_type_t;
 
 /*
@@ -118,6 +121,16 @@ typedef struct __attribute__((packed)) {
     int64_t  play_at;
     uint8_t  payload[AUDIO_MAX_PAYLOAD];
 } audio_msg_t;
+
+/* Track metadata forwarded from the bridge. Carries link_meta_t verbatim, so
+ * there is exactly one definition of the fields (see sbc_link.h). */
+typedef struct __attribute__((packed)) {
+    uint8_t type;           /* MSG_META */
+    uint8_t payload[196];   /* sizeof(link_meta_t) */
+} meta_msg_t;
+
+/* The two definitions must not drift apart; sbc_link.h owns the fields. */
+_Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.payload");
 
 /* Bytes to send for a payload of `n`. */
 #define AUDIO_MSG_BYTES(n) (sizeof(audio_msg_t) - AUDIO_MAX_PAYLOAD + (n))
