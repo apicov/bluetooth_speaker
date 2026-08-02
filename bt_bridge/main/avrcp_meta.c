@@ -15,6 +15,22 @@ static link_meta_t s_meta;
 static uint8_t s_tl;              /* AVRCP transaction label, wraps at 16 */
 static bool s_connected;
 
+/*
+ * Last track element id seen.
+ *
+ * AVRCP notifications are one-shot, so each must be re-registered after it
+ * fires -- and registering returns an *interim* response carrying the current
+ * value, which fires the callback again. Every real track change therefore
+ * arrives twice, a few hundred ms apart.
+ *
+ * That matters because track_id is meant to be the re-anchor trigger: acting on
+ * the duplicate would splice a second time, by which point the new track is
+ * already playing and the splice is audible. Comparing the element id tells a
+ * genuine change from an echo of the same track.
+ */
+static uint8_t s_last_elm[8];
+static bool s_have_elm;
+
 /* Metadata arrives one attribute per response, so send whatever we have and let
  * later responses fill the rest. A receiver keyed on track_id can tell an
  * update from a new track. */
@@ -59,6 +75,7 @@ void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *rc)
         ESP_LOGI(TAG, "AVRCP %s", s_connected ? "connected" : "disconnected");
         if (s_connected) {
             memset(&s_meta, 0, sizeof(s_meta));
+            s_have_elm = false;
             register_track_change();
             request_metadata();
         }
@@ -66,6 +83,18 @@ void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *rc)
 
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
         if (rc->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE) {
+            const uint8_t *elm = rc->change_ntf.event_parameter.elm_id;
+            bool same = s_have_elm && memcmp(elm, s_last_elm, sizeof(s_last_elm)) == 0;
+            memcpy(s_last_elm, elm, sizeof(s_last_elm));
+            s_have_elm = true;
+
+            if (same) {
+                /* Re-registration echo, not a new track. Re-arm and refresh the
+                 * text, but do not advance track_id. */
+                register_track_change();
+                request_metadata();
+                break;
+            }
             s_meta.track_id++;
             /* Clear rather than keep stale text: a wrong title is worse than
              * none while the new one is being fetched. */
