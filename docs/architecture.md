@@ -638,9 +638,32 @@ cd satellite && idf.py -p /dev/ttyUSB2 flash monitor   # each satellite
 Host-side unit tests need no hardware:
 
 ```sh
-cd sync_test/test && make check     # 8 cases on the clock estimator
-cd hub/test       && make check     # beat detection
+cd sync_test/test                && make check   # 8 cases on the clock estimator
+cd components/dancefloor_leds/test && make check # FFT, beat detection, patterns,
+                                                 # block alignment, cross-unit
+                                                 # determinism
 ```
+
+The LED suite moved in alongside the code it exercises when the visualiser was
+split into `analysis.cpp` and `patterns.cpp`; `hub/test` is gone. Two of its
+cases are worth knowing about: `test_align` pins that two units cut and label
+their analysis blocks identically, and `test_pattern_sync` pins that a pattern
+handed those blocks renders identical pixels whatever its unit's join time,
+render count or drop history. Those two properties are why nothing about the
+lights is transmitted between units.
+
+The same pipeline runs on a laptop, which is where pattern work belongs:
+
+```sh
+cd tools/pattern_lab && make
+./pattern_lab track.wav                  # live in the terminal
+./pattern_lab track.wav --png out.png    # whole track as an image
+./pattern_lab track.wav --csv trace.csv  # per-frame numbers for tuning
+```
+
+It compiles `analysis.cpp`, `patterns.cpp` and `beat_detect.c` straight out of
+the component rather than copying them, so it cannot drift from what the strips
+do. Feed it the WAVs `desktop_satellite.py --record` writes.
 
 > The user's shell profile puts the xtensa toolchain on `PATH`, which breaks
 > host `gcc` builds. Both test Makefiles pin `PATH=/usr/bin:/bin` for this

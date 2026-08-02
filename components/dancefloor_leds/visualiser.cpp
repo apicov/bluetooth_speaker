@@ -276,14 +276,6 @@ void visualiser_realign(void)
     s_align_pending = true;
 }
 
-void visualiser_set_master_offset(int64_t offset_us)
-{
-    (void)offset_us;
-    /* Retained for source compatibility. Nothing needs it any more: block
-     * boundaries and every animation now come from the scheduled instant that
-     * arrives with the audio, which is already master-clock time. */
-}
-
 void visualiser_set_pattern(const char *name)
 {
     df::Pattern *p = df::pattern_by_name(name);

@@ -9,8 +9,10 @@ multi-speaker system rests on.
 asymmetry plus ~300 µs of scatter, with no accumulating drift. See §7 for how it
 got there and §8 for what remains.
 
-Implemented in `sync_test/main/sync_proto.{c,h}` (the estimator, no ESP-IDF
-dependencies, host-testable) and `sync_test/main/main.c` (WiFi, sockets, tasks).
+Implemented in `components/dancefloor_sync/` (the estimator and the wire format,
+no ESP-IDF dependencies, host-testable). `sync_test/main/main.c` is the M4
+harness that first exercised it; the hub and satellite use the component
+directly.
 
 ---
 
@@ -411,10 +413,14 @@ produces exactly 900 µs of error.
 
 | File | Responsibility |
 |---|---|
-| `sync_test/main/sync_proto.h` | Wire format, estimator state, `sync_to_local()` |
-| `sync_test/main/sync_proto.c` | Offset maths and min-RTT selection. No ESP-IDF deps |
-| `sync_test/main/main.c` | SoftAP, UDP sockets, probe/announce/blink tasks |
+| `components/dancefloor_sync/include/sync_proto.h` | Wire format, estimator state, `sync_to_local()` |
+| `components/dancefloor_sync/sync_proto.c` | Offset maths and min-RTT selection. No ESP-IDF deps |
+| `sync_test/main/main.c` | The M4 harness: SoftAP, UDP sockets, probe/announce/blink tasks |
 | `sync_test/test/` | Host tests — `make check` |
+
+The estimator moved into a component when the hub and satellite came to need it
+too. `sync_test` still builds against it and is still the quickest way to see
+the clock alone, without audio in the way.
 
 The estimator is deliberately free of platform dependencies. It is the part most
 likely to be subtly wrong, and hardware bring-up is a bad place to discover that.
