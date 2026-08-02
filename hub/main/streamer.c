@@ -650,15 +650,53 @@ static void i2s_start(uint32_t rate)
              (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate));
 }
 
+/*
+ * Widest DRIFT correction the servo may ask for, in Hz. Deliberately not
+ * applied inside retune_dac(): the initial match to the measured input rate is
+ * a different thing and is legitimately several percent (44100 nominal against
+ * ~42600 measured), so a bound tight enough to be useful here would refuse it.
+ */
+#define RATE_TRIM_MAX_HZ 100
+
+/* What could conceivably be an audio sample rate at all. Anything outside this
+ * is a broken calculation, whoever asked for it. */
+#define RATE_SANE_MIN 8000
+#define RATE_SANE_MAX 192000
+
 static void retune_dac(uint32_t hz)
 {
+    /*
+     * Nothing computed may panic the speaker. The satellite aborted on exactly
+     * this path when a wrapped phase error asked for a 4.29 GHz sample rate:
+     * ESP_ERROR_CHECK turned a bad number into a dead unit. A refused retune
+     * costs sync, which is recoverable; an abort is not.
+     */
+    if (hz < RATE_SANE_MIN || hz > RATE_SANE_MAX) {
+        ESP_LOGE(TAG, "refusing a %" PRIu32 " Hz retune -- not a sample rate", hz);
+        return;
+    }
+
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
     retuning = true;
     vTaskDelay(pdMS_TO_TICKS(2));        /* let the play task notice and park */
-    ESP_ERROR_CHECK(i2s_channel_disable(i2s_tx));
-    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(i2s_tx, &clk));
-    ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
+
+    esp_err_t err = i2s_channel_disable(i2s_tx);
+    if (err == ESP_OK) {
+        err = i2s_channel_reconfig_std_clock(i2s_tx, &clk);
+        /* Re-enable either way: leaving the channel down stalls playback
+         * silently, which looks like a dead board rather than a failed trim. */
+        const esp_err_t on = i2s_channel_enable(i2s_tx);
+        if (err == ESP_OK) {
+            err = on;
+        }
+    }
     retuning = false;
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "retune to %" PRIu32 " Hz failed (%s), staying at %" PRIu32,
+                 hz, esp_err_to_name(err), tx_rate);
+        return;
+    }
     ESP_LOGW(TAG, "DAC clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
     tx_rate = hz;
 }
@@ -905,6 +943,10 @@ static void ring_monitor_task(void *arg)
          * far slower than the correction needs to be.
          */
         int32_t adj = (int32_t)((int64_t)s_phase_err_us * rate_ema / 100000000LL);
+        /* The drift correction is small by nature -- real drift is ~14 ppm.
+         * Anything larger is a bad phase reading, not a rate error. */
+        if (adj >  RATE_TRIM_MAX_HZ) adj =  RATE_TRIM_MAX_HZ;
+        if (adj < -RATE_TRIM_MAX_HZ) adj = -RATE_TRIM_MAX_HZ;
         if (depth_ms < -120) {
             adj = -20;
         } else if (depth_ms > 120) {

@@ -21,6 +21,14 @@
 #define SYNC_WINDOW      10      /* probes retained for the median */
 #define SYNC_MIN_SAMPLES 3       /* below this the estimate is not trusted */
 
+/*
+ * Offset step between consecutive probes that means the master's clock changed
+ * origin rather than drifted -- see sync_est_add(). Drift moves it by a few
+ * microseconds per probe and asymmetry by a few milliseconds; a second is
+ * neither.
+ */
+#define SYNC_STEP_US     1000000
+
 typedef enum {
     MSG_TIME_REQ = 1,   /* satellite -> master */
     MSG_TIME_RSP = 2,   /* master -> satellite, unicast */

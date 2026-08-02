@@ -127,6 +127,17 @@ static volatile bool phase_stepped;
  * track change. */
 #define MAX_SPLICE_MS 150
 
+/*
+ * Beyond this, the phase reading is not describing our playback at all.
+ *
+ * Drift is ~0.8 ms per minute and delivery jitter is a few ms, so a whole
+ * second cannot be either. What it does mean is that the stamps arriving now
+ * were issued against a different clock origin than the one playback anchored
+ * to. Servoing on that is meaningless; re-anchoring is the only thing that
+ * helps.
+ */
+#define PHASE_INSANE_US 1000000
+
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
 #define RING_TARGET_MS 200
@@ -486,13 +497,52 @@ static void rx_task(void *arg)
 
 /* ----------------------------------------------------------------- drift */
 
+/*
+ * Widest trim the servo may ever ask for. Real drift is ~14 ppm and the buffer
+ * safety net asks for 20 Hz, so 100 Hz is already absurd -- anything beyond it
+ * is a broken measurement, not a correction.
+ */
+#define RATE_TRIM_MAX_HZ 100
+
 #if !CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
 static void retune_output(uint32_t hz)
 {
+    /*
+     * Nothing the servo computes may panic the speaker.
+     *
+     * This aborted the board with ESP_ERROR_CHECK when a wrapped phase error
+     * produced a rate of ~4.29e9 Hz: the servo arithmetic went wrong, and what
+     * the room heard was a satellite rebooting. A refused retune costs sync; an
+     * abort costs the unit. Clamp, log, carry on playing at the current rate.
+     */
+    const int64_t low  = (int64_t)stream_rate - RATE_TRIM_MAX_HZ;
+    const int64_t high = (int64_t)stream_rate + RATE_TRIM_MAX_HZ;
+    if ((int64_t)hz < low || (int64_t)hz > high) {
+        ESP_LOGE(TAG, "refusing a %" PRIu32 " Hz retune (nominal %" PRIu32
+                      ") -- the servo input is not trustworthy", hz, stream_rate);
+        return;
+    }
+
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
-    ESP_ERROR_CHECK(i2s_channel_disable(i2s_tx));
-    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(i2s_tx, &clk));
-    ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
+    esp_err_t err = i2s_channel_disable(i2s_tx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "retune: disable failed (%s)", esp_err_to_name(err));
+        return;
+    }
+    err = i2s_channel_reconfig_std_clock(i2s_tx, &clk);
+    if (err != ESP_OK) {
+        /* Put the channel back at the rate it had rather than leaving it down,
+         * which would stall playback silently. */
+        ESP_LOGE(TAG, "retune to %" PRIu32 " Hz failed (%s), staying at %" PRIu32,
+                 hz, esp_err_to_name(err), tx_rate);
+        i2s_channel_enable(i2s_tx);
+        return;
+    }
+    err = i2s_channel_enable(i2s_tx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "retune: enable failed (%s)", esp_err_to_name(err));
+        return;
+    }
     ESP_LOGW(TAG, "output clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
     tx_rate = hz;
 }
@@ -584,6 +634,11 @@ static void drift_task(void *arg)
          * disturbance it corrects.
          */
         int32_t adj = (int32_t)((int64_t)err_ema * stream_rate / 100000000LL);
+        /* Belt and braces against the arithmetic above, which has produced
+         * -138000 once already. retune_output() refuses anything wilder, but
+         * the number should not get that far in the first place. */
+        if (adj >  RATE_TRIM_MAX_HZ) adj =  RATE_TRIM_MAX_HZ;
+        if (adj < -RATE_TRIM_MAX_HZ) adj = -RATE_TRIM_MAX_HZ;
 
         /* Safety net: if the buffer is heading for empty or full, that matters
          * more than phase. */
@@ -733,10 +788,32 @@ static void play_task(void *arg)
 
             /* Has playback reached a recorded packet boundary? If so, compare
              * now against when that sample was due. */
+            bool timeline_changed = false;
             while (phase_tail != phase_head && samples_played >= phase_q[phase_tail].pos) {
                 int64_t due = phase_q[phase_tail].play_at;
                 int64_t now_master = esp_timer_get_time() + stream_offset;
-                phase_err_us = (int32_t)(now_master - due);
+                int64_t err = now_master - due;
+                /*
+                 * Seconds of error is not drift and not jitter. It means the
+                 * stamps are being issued against a different clock origin than
+                 * the one playback anchored to -- the hub rebooted or was
+                 * reflashed while this unit kept playing -- and no servo can
+                 * correct that, because there is nothing wrong with the rate.
+                 *
+                 * It used to be cast straight into an int32: an hour of error
+                 * wrapped to -699 seconds, the smoothing overflowed on top of
+                 * it, and the servo asked for a 4.29 GHz sample rate, which
+                 * aborted the board. Re-anchor instead, which is the one action
+                 * that actually fixes it -- it re-reads the offset against the
+                 * clock the hub is really using now.
+                 */
+                if (err > PHASE_INSANE_US || err < -PHASE_INSANE_US) {
+                    ESP_LOGE(TAG, "phase %lld us -- not the timeline we anchored to, "
+                                  "re-anchoring", err);
+                    timeline_changed = true;
+                    break;
+                }
+                phase_err_us = (int32_t)err;
                 phase_valid = true;
                 /* Keep the last point: interpolating from it labels each chunk
                  * with the instant it is DUE. Every unit gets the same play_at
@@ -745,6 +822,17 @@ static void play_task(void *arg)
                 anchor_pos = phase_q[phase_tail].pos;
                 anchor_due = due;
                 phase_tail = (phase_tail + 1) % PHASE_Q_LEN;
+            }
+            if (timeline_changed) {
+                /* Same exit as an underrun: handle_audio() re-anchors on the
+                 * next packet, which re-seeds stream_offset from a current
+                 * estimate rather than one describing a hub that no longer
+                 * exists. Drop the smoothing with it -- every sample in it was
+                 * measured against the old origin. */
+                stream_start_local = 0;
+                phase_valid = false;
+                phase_stepped = true;
+                break;
             }
 
             /*

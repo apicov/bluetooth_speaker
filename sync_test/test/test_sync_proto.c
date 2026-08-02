@@ -130,7 +130,71 @@ int main(void)
         check("min-RTT picks the symmetric probe", err < 100, d);
     }
 
-    /* 8. Round-trip conversion is what actually schedules playback. */
+    /*
+     * 8. The master rebooting is not drift.
+     *
+     * Its clock then counts from a new origin, and every sample already in the
+     * window is wrong by its entire previous uptime. The window spans 2.5 s and
+     * minimum-RTT selection may pick any sample in it, so without this a
+     * satellite anchors on an offset that is an hour stale, schedules playback
+     * for a time that never arrives, and hands the phase servo a number no
+     * correction can fix. Observed on hardware as a satellite reporting -699
+     * seconds of phase and then aborting on the sample rate that produced.
+     */
+    {
+        sync_est_t e; sync_est_init(&e);
+        for (int i = 0; i < SYNC_WINDOW; i++)
+            probe(&e, 1000 * (i + 1), TRUE_OFFSET, 1000, 100, 1000);
+        check("a full window is settled", sync_est_settled(&e), NULL);
+
+        /* Master reboots: its clock restarts, so the offset drops by its uptime. */
+        const int64_t after = TRUE_OFFSET - 3595000000LL;
+        probe(&e, 20000, after, 1000, 100, 1000);
+
+        check("a clock-origin step is not trusted as an estimate",
+              !sync_est_settled(&e), "window discarded, playback holds");
+
+        /* One surviving sample is not an estimate, and the caller is told so
+         * rather than handed it. */
+        check("no estimate is offered from the remains",
+              !sync_est_offset(&e, &est), "count fell below SYNC_MIN_SAMPLES");
+
+        /* Once enough probes on the new clock have landed, it is the new offset
+         * that comes out. The stale one is gone entirely, not merely outvoted. */
+        for (int i = 0; i < SYNC_MIN_SAMPLES; i++)
+            probe(&e, 21000 + 1000 * i, after, 1000, 100, 1000);
+        char d[80];
+        snprintf(d, sizeof d, "est=%" PRId64 ", stale would be %" PRId64,
+                 sync_est_offset(&e, &est) ? est : 0, TRUE_OFFSET);
+        check("the stale window cannot be selected from", llabs(est - after) < 100, d);
+
+        /* And it settles again on the new clock rather than wedging. */
+        for (int i = 0; i < SYNC_WINDOW; i++)
+            probe(&e, 30000 + 1000 * i, after, 1000, 100, 1000);
+        sync_est_offset(&e, &est);
+        check("it re-settles on the new origin",
+              sync_est_settled(&e) && llabs(est - after) < 100, NULL);
+    }
+
+    /*
+     * 9. A single corrupt probe must cost two samples, not the whole session:
+     *    the garbage becomes the baseline, the next good sample steps away from
+     *    it and resets again, seeded correctly that time.
+     */
+    {
+        sync_est_t e; sync_est_init(&e);
+        for (int i = 0; i < 5; i++)
+            probe(&e, 1000 * (i + 1), TRUE_OFFSET, 1000, 100, 1000);
+        probe(&e, 6000, TRUE_OFFSET + 9000000000LL, 1000, 100, 1000);   /* garbage */
+        for (int i = 0; i < SYNC_WINDOW; i++)
+            probe(&e, 10000 + 1000 * i, TRUE_OFFSET, 1000, 100, 1000);
+        sync_est_offset(&e, &est);
+        char d[64]; snprintf(d, sizeof d, "est=%" PRId64, est);
+        check("one corrupt probe does not wedge the estimator",
+              sync_est_settled(&e) && llabs(est - TRUE_OFFSET) < 100, d);
+    }
+
+    /* 10. Round-trip conversion is what actually schedules playback. */
     {
         int64_t master_now = 9000000;
         int64_t local = sync_to_local(master_now, TRUE_OFFSET);
