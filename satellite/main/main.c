@@ -28,6 +28,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 
@@ -67,6 +69,27 @@ static uint32_t tx_rate = 44100;      /* what the output clock is actually set t
 
 /* ------------------------------------------------------------------- wifi */
 
+/*
+ * Without this a failed association is completely silent: esp_wifi_connect() is
+ * called once, and if it does not succeed nothing logs it and nothing retries.
+ * A satellite that quietly never joins is far worse than one that says so.
+ */
+static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *d = data;
+        ESP_LOGW(TAG, "disconnected from \"%s\" (reason %d), retrying",
+                 AP_SSID, d->reason);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *e = data;
+        ESP_LOGI(TAG, "joined \"%s\", IP " IPSTR, AP_SSID, IP2STR(&e->ip_info.ip));
+    }
+}
+
 static void wifi_start_sta(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -84,11 +107,16 @@ static void wifi_start_sta(void)
 #else
     strcpy((char *)wc.sta.password, AP_PASS);
 #endif
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                       wifi_event, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                       wifi_event, NULL, NULL));
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_ERROR_CHECK(esp_wifi_connect());
+    /* STA_START triggers the first connect; disconnects retry from the handler. */
 }
 
 static void socket_start(void)
