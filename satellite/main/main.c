@@ -513,10 +513,16 @@ static void drift_task(void *arg)
 #else
         /*
          * Late (positive error) means we are behind the timeline, so play
-         * faster. Spread over ~40 s, which keeps the rate change well under the
-         * ~1% a listener would hear.
+         * faster.
+         *
+         * Spread over ~100 s, not 40. The buffer takes tens of seconds to
+         * respond, so a 40 s loop was still correcting after the error had gone
+         * and sailed past it -- both units converged to near zero then
+         * overshot to +10 ms and oscillated. Real drift is only ~0.8 ms per
+         * minute, so the loop can afford to be much gentler than the
+         * disturbance it corrects.
          */
-        int32_t adj = (int32_t)((int64_t)err_ema * stream_rate / 40000000LL);
+        int32_t adj = (int32_t)((int64_t)err_ema * stream_rate / 100000000LL);
 
         /* Safety net: if the buffer is heading for empty or full, that matters
          * more than phase. */

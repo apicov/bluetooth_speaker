@@ -781,10 +781,16 @@ static void ring_monitor_task(void *arg)
         if (!s_phase_valid) {
             continue;
         }
-        /* Phase drives the correction; buffer depth is only a guard against
+        /*
+         * Phase drives the correction; buffer depth is only a guard against
          * running empty or overflowing, which phase control would not see
-         * coming. Late means behind the timeline, so play faster. */
-        int32_t adj = (int32_t)((int64_t)s_phase_err_us * rate_ema / 40000000LL);
+         * coming. Late means behind the timeline, so play faster.
+         *
+         * Spread over ~100 s: at 40 s the loop was still correcting after the
+         * error had gone and overshot to +8 ms. Real drift is ~0.8 ms/minute,
+         * far slower than the correction needs to be.
+         */
+        int32_t adj = (int32_t)((int64_t)s_phase_err_us * rate_ema / 100000000LL);
         if (depth_ms < -120) {
             adj = -20;
         } else if (depth_ms > 120) {
@@ -792,11 +798,18 @@ static void ring_monitor_task(void *arg)
         }
         uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
 
-        /* Only act on a meaningful error: every retune is an audible click. */
-        if (desired > tx_rate + tx_rate / 5000 || desired < tx_rate - tx_rate / 5000) {
+        /* Wait for the buffer to respond before correcting again -- the hub
+         * had no cooldown at all, so it retuned every window and chased its own
+         * previous correction. */
+        static int cooldown;
+        if (cooldown > 0) {
+            cooldown--;
+        } else if (desired > tx_rate + tx_rate / 5000 ||
+                   desired < tx_rate - tx_rate / 5000) {
             ESP_LOGI(TAG, "servo: phase %+ld us, buffer %+ld ms -> DAC %" PRIu32 " Hz",
                      (long)s_phase_err_us, (long)depth_ms, desired);
             retune_dac(desired);
+            cooldown = 4;              /* ~20 s against a 100 s correction */
         }
     }
 }
