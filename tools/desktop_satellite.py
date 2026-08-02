@@ -28,18 +28,22 @@ dependency is ffmpeg, which needs its `sbc` decoder (check with
 """
 
 import argparse
+import os
+import re
 import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
+import wave
 
 PORT = 5001
 
 MSG_TIME_REQ = 1
 MSG_TIME_RSP = 2
 MSG_AUDIO = 4
+MSG_META = 5
 AUDIO_FMT_PCM = 0
 AUDIO_FMT_SBC = 1
 
@@ -49,6 +53,12 @@ SYNC_WINDOW = 10               # probes retained, as in the firmware
 
 # time_msg_t: uint8_t type; uint32_t seq; int64_t t1, t2, t3
 TIME = struct.Struct("<BIqqq")
+
+# meta_msg_t: uint8_t type; then link_meta_t --
+#   uint32_t track_id; char title[64]; char artist[64]; char album[64]
+META = struct.Struct("<B I 64s 64s 64s")
+RATE = 44100
+SAMPLE_WIDTH = 2
 
 # Mirrors audio_msg_t in components/dancefloor_sync/include/sync_proto.h:
 #   uint8_t type; uint8_t format; uint16_t payload_len; uint32_t seq;
@@ -110,7 +120,84 @@ def start_ffmpeg():
         sys.exit(1)
 
 
-def pump(src, dst, prebuffer_bytes):
+def clean(raw):
+    """Trim a fixed-size C string and drop anything awkward in a filename."""
+    txt = raw.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+    return txt
+
+
+def safe_name(txt):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", txt).strip(". ")[:80]
+
+
+class Recorder:
+    """Writes decoded PCM to one WAV per track.
+
+    Files open with a provisional name because metadata arrives one attribute at
+    a time -- title first, then artist, then album -- so the full name is not
+    known until well after the audio has started. They are renamed on close.
+
+    The split lands wherever the decode pipeline happens to be, so it is off by
+    a few hundred ms from the true boundary. Irrelevant for beat analysis, which
+    is what these recordings are for.
+    """
+
+    def __init__(self, directory):
+        self.dir = directory
+        self.lock = threading.Lock()
+        self.wav = None
+        self.path = None
+        self.meta = ("", "", "")
+        self.track_id = None
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+    def write(self, data):
+        if not self.dir:
+            return
+        with self.lock:
+            if self.wav:
+                self.wav.writeframes(data)
+
+    def set_meta(self, title, artist, album):
+        with self.lock:
+            self.meta = (title, artist, album)
+
+    def _close_locked(self):
+        if not self.wav:
+            return
+        self.wav.close()
+        self.wav = None
+        title, artist, _ = self.meta
+        label = " - ".join(x for x in (artist, title) if x)
+        if label:
+            new = os.path.join(self.dir, f"{self.track_id:03d} - {safe_name(label)}.wav")
+            try:
+                os.replace(self.path, new)
+                log(f"saved {new}")
+                return
+            except OSError as e:
+                log(f"could not rename: {e}")
+        log(f"saved {self.path}")
+
+    def new_track(self, track_id):
+        if not self.dir:
+            return
+        with self.lock:
+            self._close_locked()
+            self.track_id = track_id
+            self.path = os.path.join(self.dir, f"{track_id:03d}.wav")
+            self.wav = wave.open(self.path, "wb")
+            self.wav.setnchannels(CHANNELS)
+            self.wav.setsampwidth(SAMPLE_WIDTH)
+            self.wav.setframerate(RATE)
+
+    def close(self):
+        with self.lock:
+            self._close_locked()
+
+
+def pump(src, dst, prebuffer_bytes, recorder):
     """Shovel decoded PCM to stdout on its own thread, so decode latency never
     stalls the receive loop and costs us packets.
 
@@ -126,12 +213,14 @@ def pump(src, dst, prebuffer_bytes):
         if started:
             dst.write(chunk)
             dst.flush()
+            recorder.write(chunk)
             continue
         buf += chunk
         if len(buf) >= prebuffer_bytes:
             log(f"prebuffered {len(buf) * 1000 // (44100 * CHANNELS * 2)} ms, playing")
             dst.write(buf)
             dst.flush()
+            recorder.write(buf)
             buf.clear()
             started = True
 
@@ -140,6 +229,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--buffer-ms", type=int, default=400,
                     help="PCM held back before playback starts")
+    ap.add_argument("--record", metavar="DIR",
+                    help="save one WAV per track here, for offline analysis")
     args = ap.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -150,8 +241,12 @@ def main():
     log(f"listening on port {PORT}; audio arrives by unicast once probing starts")
 
     ff = start_ffmpeg()
-    prebuffer = args.buffer_ms * 44100 * CHANNELS * 2 // 1000
-    threading.Thread(target=pump, args=(ff.stdout, sys.stdout.buffer, prebuffer),
+    recorder = Recorder(args.record)
+    if args.record:
+        log(f"recording one WAV per track into {args.record}")
+    prebuffer = args.buffer_ms * RATE * CHANNELS * SAMPLE_WIDTH // 1000
+    threading.Thread(target=pump,
+                     args=(ff.stdout, sys.stdout.buffer, prebuffer, recorder),
                      daemon=True).start()
 
     stop = threading.Event()
@@ -160,12 +255,14 @@ def main():
         "(registers for unicast audio)")
 
     expect_seq = None
+    last_track = None
     pkts = gaps = bad = 0
     payload_bytes = 0
     sync_samples = []
     last_report = time.time()
 
-    while True:
+    try:
+      while True:
         try:
             data, _ = sock.recvfrom(2048)
         except socket.timeout:
@@ -178,6 +275,18 @@ def main():
             # NTP-style: offset = ((t2-t1) + (t3-t4)) / 2, rtt = (t4-t1) - (t3-t2)
             sync_samples.append((((t2 - t1) + (t3 - t4)) // 2, (t4 - t1) - (t3 - t2)))
             del sync_samples[:-SYNC_WINDOW]
+            continue
+
+        if data and data[0] == MSG_META and len(data) >= META.size:
+            _t, track_id, t_raw, a_raw, al_raw = META.unpack_from(data, 0)
+            title, artist, album = clean(t_raw), clean(a_raw), clean(al_raw)
+            if track_id != last_track:
+                last_track = track_id
+                log(f"--- track #{track_id} ---")
+                recorder.new_track(track_id)
+            recorder.set_meta(title, artist, album)
+            desc = " - ".join(x for x in (artist, title) if x) or "(no metadata yet)"
+            log(f"    {desc}" + (f"  [{album}]" if album else ""))
             continue
 
         if len(data) < HDR.size or data[0] != MSG_AUDIO:
@@ -228,6 +337,10 @@ def main():
                 f"{payload_bytes / (now - last_report) / 1024:.0f} kB/s SBC{sync}")
             pkts = gaps = bad = payload_bytes = 0
             last_report = now
+    finally:
+        # wave.close() is what writes the header -- without it the last file of
+        # a session is unreadable, which is exactly the one you just recorded.
+        recorder.close()
 
 
 if __name__ == "__main__":
