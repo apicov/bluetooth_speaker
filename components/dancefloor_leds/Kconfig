@@ -46,15 +46,18 @@ menu "Dancefloor LEDs"
 
     config DANCEFLOOR_LED_BRIGHTNESS
         int "Brightness cap (percent)"
-        default 40
+        default 10
         range 1 100
         depends on DANCEFLOOR_ENABLE_VISUALISER
         help
-            Scales every pixel before it is sent. 40% is the design figure, for
-            two reasons: eyes are dark-adapted outdoors at night and cannot tell
-            the difference, and LEDs are the largest single load in the power
-            budget -- ~150 pixels at full white is ~45 W against ~15 W here.
+            Scales every pixel before it is sent. LEDs are the largest single
+            load in the power budget -- ~150 pixels at full white is ~45 W --
+            and eyes are dark-adapted outdoors at night, so a low figure looks
+            no dimmer than a high one and reclaims most of that.
 
-            Raise it for daylight bench testing, then put it back.
+            40 was the original design figure and was too bright on the bench.
+            Below about 10 the 8-bit colour resolution starts to show: the
+            brightest component becomes 25, so hue steps get visibly coarse and
+            the dim tail of the beat envelope quantises to black.
 
 endmenu
