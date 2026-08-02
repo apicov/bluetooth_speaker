@@ -105,6 +105,16 @@ static volatile uint32_t s_phase_head, s_phase_tail;
 static volatile int32_t s_phase_err_us;   /* + = playing late */
 static volatile bool s_phase_valid;
 static volatile bool s_restart_pending;   /* flag the next packet */
+/*
+ * Set when local playback underruns. The play task then waits for local_start,
+ * which is only assigned at a timeline start -- so without this the hub stays
+ * silent until the stream stops and restarts, discarding every incoming byte in
+ * the meantime (seen as fed-drop climbing to the full stream rate).
+ *
+ * Recovery restarts the timeline, which also re-anchors every satellite, so the
+ * system comes back aligned rather than merely audible.
+ */
+static volatile bool s_underrun_recover;
 static volatile int32_t s_restart_pos = -1;
 
 /* Never splice more than this in one go -- a larger error means something a
@@ -292,6 +302,12 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 
     int64_t now = esp_timer_get_time();
     int64_t target = now + LEAD_US;
+
+    if (s_underrun_recover) {
+        s_underrun_recover = false;
+        next_play_at = 0;              /* fall into the timeline-start path */
+        s_restart_pending = true;      /* and bring the satellites with us */
+    }
 
     if (next_play_at == 0) {
         next_play_at = target;
@@ -631,8 +647,9 @@ static void local_play_task(void *arg)
             }
             size_t got = xStreamBufferReceive(local_ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
             if (got == 0) {
-                ESP_LOGW(TAG, "local underrun, awaiting new stream");
+                ESP_LOGW(TAG, "local underrun, restarting timeline");
                 local_start = 0;
+                s_underrun_recover = true;
                 break;
             }
             if (got < sizeof(chunk)) {
