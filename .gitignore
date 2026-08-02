@@ -11,3 +11,10 @@ dependencies.lock
 sync_test/test/test_sync_proto
 hub/test/test_beat_detect
 i2s_loopback/test_*
+
+# Python bytecode from running tools/
+__pycache__/
+
+# A nested repo by this name appeared here briefly and was swept in by
+# `git add -A`. It is gone now; this keeps it out if it comes back.
+esp32c3_neopixel/

@@ -1,12 +1,5 @@
 menu "Dancefloor hub"
 
-    config DANCEFLOOR_NOMINAL_RATE
-        int "Nominal audio sample rate (Hz)"
-        default 44100
-        help
-            Seeds the presentation timeline until the first SBC frame reports
-            the real rate, so it only needs to be roughly right.
-
     comment "I2S output -- to this unit's own DAC (this chip is the MASTER)"
 
     config DANCEFLOOR_I2S_LRCK_PIN
@@ -30,20 +23,18 @@ menu "Dancefloor hub"
             a fixed, known slice of the band. Costs nothing.
 
     config DANCEFLOOR_WIFI_PHY_RATE_MBPS
-        int "Fixed multicast PHY rate in Mbps (6, 12, 24; 0 = driver default)"
+        int "Pin the PHY rate in Mbps (6, 12, 24; 0 = rate adaptation)"
         default 6
         help
-            Multicast must be pinned, and the rate is a real tradeoff measured on
-            this hardware:
+            Diagnostic. Pinning was mandatory while audio went out by multicast,
+            because group-addressed frames fall back to the 1 Mbps basic rate and
+            the stream physically did not fit. Audio is unicast now and rate
+            adaptation works properly, so 0 is very likely the right value --
+            it is left at 6 only because the system was measured working there
+            and the change wants a listening test.
 
-              driver default -> falls back to the 1 Mbps basic rate. A 1041-byte
-                                frame takes 8.3 ms, and 172 packets/s needs 1.43
-                                seconds of airtime per second. 52% loss.
-              24 Mbps        -> only 6% airtime, but needs good SNR and
-                                multicast is never retried. 23% loss.
-              6 Mbps         -> 24% airtime, far more robust. The compromise.
-
-            Forwarding SBC rather than PCM would cut all of these by four.
+            Note this pins ALL transmission on the interface, unicast included,
+            so any non-zero value disables rate adaptation entirely.
 
     config DANCEFLOOR_AP_OPEN
         bool "Run the SoftAP with no password (diagnostic)"
@@ -72,24 +63,6 @@ menu "Dancefloor hub"
             Input. Wire the SATELLITE's marker GPIO here, plus a common ground.
             Must differ from the marker GPIO.
 
-    comment "Diagnostics"
-
-    config DANCEFLOOR_VERIFY_PATTERN
-        bool "Verify counter test pattern on the I2S input"
-        default n
-        help
-            Expects the bridge to be running i2s_loopback in TX_ONLY mode rather
-            than real audio. Counts actually-missing samples instead of inferring
-            loss from a rate deficit -- and unlike the standalone loopback test,
-            it does so with WiFi, streaming and playback all running.
-
-    config DANCEFLOOR_NO_STREAM_TX
-        bool "Bring WiFi up but do not multicast audio"
-        default n
-        help
-            Separates the radio simply being associated and beaconing from the
-            load of pushing ~170 audio packets/s. Local playback continues.
-
     comment "LEDs"
 
     config DANCEFLOOR_ENABLE_VISUALISER
@@ -97,10 +70,7 @@ menu "Dancefloor hub"
         default y
         help
             Turn off to test whether the FFT and LED refresh are stealing time
-            from the I2S receive task. With a clean I2S link the loopback test
-            loses zero frames on an idle chip; the hub loses ~1.3%, and the
-            visualiser is the heaviest thing sharing its core.
-
+            from audio -- it is the heaviest thing sharing core 1 with playback.
 
     config DANCEFLOOR_LED_GPIO
         int "WS2812 data GPIO"

@@ -13,6 +13,10 @@
 #include "sbc_link.h"
 
 #define SYNC_PORT        5001
+
+/* Used only by the M4 harness in sync_test/, which still multicasts its blink
+ * announcements. The audio path unicasts to registered listeners and touches
+ * neither this nor MSG_BLINK -- see hub/main/streamer.c. */
 #define SYNC_MCAST_ADDR  "239.12.34.56"
 #define SYNC_WINDOW      10      /* probes retained for the median */
 #define SYNC_MIN_SAMPLES 3       /* below this the estimate is not trusted */
@@ -20,7 +24,7 @@
 typedef enum {
     MSG_TIME_REQ = 1,   /* satellite -> master */
     MSG_TIME_RSP = 2,   /* master -> satellite, unicast */
-    MSG_BLINK    = 3,   /* master -> all, multicast */
+    MSG_BLINK    = 3,   /* sync_test harness only, multicast */
     MSG_AUDIO    = 4,   /* master -> listeners */
     MSG_META     = 5,   /* master -> listeners, track metadata */
 } msg_type_t;

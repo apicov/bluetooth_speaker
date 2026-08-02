@@ -661,14 +661,14 @@ the *difference* between them stays small — which is why cross-unit alignment
 measures 2–4 ms while the absolute figures swing. Treat the cross-unit number as
 the meaningful one.
 
-**The PHY rate is pinned interface-wide.** `esp_wifi_internal_set_fix_rate()`
-applies to all AP-interface transmission, not just multicast, so with multicast
-gone this now fixes *unicast* at 6 Mbps and disables rate adaptation. At ~7%
-airtime it is not hurting anything, but the setting and its help text both
-describe a path that no longer exists.
-
-**Some comments and Kconfig help still say "multicast"** where the code now
-unicasts. `hub/main/streamer.h` and `hub/main/main.c` are the main offenders.
+**The PHY rate is still pinned interface-wide.**
+`esp_wifi_internal_set_fix_rate()` applies to all AP-interface transmission, not
+just multicast, so with multicast gone it fixes *unicast* at 6 Mbps and disables
+rate adaptation — the very mechanism that fixed the earlier 23% loss. At ~7%
+airtime it is not hurting anything measurable, and
+`CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS=0` is very likely the right value. It is
+left at 6 because the system was measured working there and the change deserves
+a listening test rather than a reasoned argument.
 
 **The beat detector has never been verified against real music.**
 `BEAT_THRESHOLD_K` (1.8) and `BAND_GAIN` (12.0) were tuned against synthetic

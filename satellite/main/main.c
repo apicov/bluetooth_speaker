@@ -2,7 +2,8 @@
  * Dancefloor satellite -- M5.
  *
  * Joins the master's SoftAP, keeps its clock aligned with the master's, receives
- * multicast PCM chunks and plays them at the instant each chunk was stamped for.
+ * unicast SBC packets, decodes them, and plays each at the instant it was
+ * stamped for.
  *
  * No Bluetooth here: the master owns the phone connection. This board only
  * listens on WiFi and drives a DAC.

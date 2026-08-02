@@ -439,27 +439,28 @@ static void wifi_start_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     /*
-     * TX power is left at the driver default (full). The PHY rate is pinned --
-     * see below, it cannot be left to the driver.
-     *
-     * They were previously capped at 13 dBm and pinned to 24 Mbps, to stop this
-     * radio swamping the Bluetooth receiver when both shared one chip. The
-     * two-chip split removed that need, and the settings then did real harm:
-     * multicast frames are never acknowledged, so at a fixed 24 Mbps -- a rate
-     * needing good SNR -- 23% of audio packets were lost outright, audible as
-     * constant dropouts. Rate adaptation picks something the link can carry, and
-     * full power gives it the margin to do so.
+     * TX power is left at the driver default (full). It was once capped at
+     * 13 dBm to stop this radio swamping the Bluetooth receiver when both shared
+     * one chip; the two-chip split removed that need, and the cap did real harm
+     * by denying rate adaptation the SNR margin it needs.
      *
      * The channel stays pinned: it costs nothing and helps Bluetooth's adaptive
      * frequency hopping route around us.
      */
 #if CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS > 0
     /*
-     * Multicast is never acknowledged and never retried, and left alone it goes
-     * out at the 1 Mbps basic rate -- where a 1041-byte frame costs 8.3 ms and
-     * 172 packets/s would need 1.43 s of airtime per second. It physically
-     * cannot fit, and half the audio is dropped in the queue. Pinning the rate
-     * is required for throughput, not just to be polite to Bluetooth.
+     * Pinning the PHY rate exists for a reason that no longer applies, and is
+     * kept only as a diagnostic knob. Set the rate to 0 to leave it alone.
+     *
+     * It was mandatory while audio went out by multicast: group-addressed frames
+     * fall back to the 1 Mbps basic rate, where a 1041-byte frame costs 8.3 ms
+     * and 172 packets/s needs 1.43 s of airtime per second -- it physically
+     * cannot fit, and half the audio was dropped in the queue.
+     *
+     * Unicast has no such fallback. It uses rate adaptation, which is what fixed
+     * the 23% loss that a fixed 24 Mbps caused. Note esp_wifi_internal_set_fix_rate()
+     * applies to ALL transmission on the interface, so any non-zero value here
+     * now pins unicast and disables that adaptation.
      */
 #if   CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS >= 24
     const wifi_phy_rate_t want = WIFI_PHY_RATE_24M;
@@ -473,7 +474,9 @@ static void wifi_start_ap(void)
         ESP_LOGE(TAG, "could not fix PHY rate (%s); needs "
                       "CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n", esp_err_to_name(rerr));
     } else {
-        ESP_LOGI(TAG, "multicast pinned to %d Mbps", CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS);
+        ESP_LOGW(TAG, "PHY rate pinned to %d Mbps -- rate adaptation is OFF for "
+                      "unicast too; set to 0 to restore it",
+                 CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS);
     }
 #endif
     ESP_LOGI(TAG, "SoftAP \"%s\" pass \"%s\" ch %d, radio at defaults",
@@ -836,5 +839,5 @@ void streamer_start(void)
     xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
     xTaskCreatePinnedToCore(local_play_task, "play", 4096, NULL, 8, NULL, 1);
     xTaskCreate(ring_monitor_task, "ringmon", 3072, NULL, 3, NULL);
-    ESP_LOGI(TAG, "streaming to %s:%d", SYNC_MCAST_ADDR, SYNC_PORT);
+    ESP_LOGI(TAG, "streaming on port %d, unicast to registered listeners", SYNC_PORT);
 }

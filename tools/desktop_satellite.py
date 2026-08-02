@@ -101,8 +101,8 @@ def probe_loop(sock, stop):
     """Announce ourselves and measure the clock offset.
 
     Registration is the important part: the hub unicasts audio to whatever has
-    probed in the last 10 s. Stop probing and it falls back to multicast, which
-    loses packets.
+    probed in the last 10 s, and to nothing else. Stop probing and the audio
+    stops within 10 s.
     """
     seq = 0
     while not stop.is_set():

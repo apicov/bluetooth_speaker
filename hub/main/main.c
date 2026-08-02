@@ -1,12 +1,12 @@
 /*
  * Dancefloor hub -- chip B of the two-chip master.
  *
- *   phone --A2DP--> [bt_bridge ESP32] --I2S--> [this chip] --WiFi--> satellites
- *                                                          --I2S---> its own DAC
+ *   phone --A2DP--> [bt_bridge ESP32] --UART--> [this chip] --WiFi--> satellites
+ *                                     raw SBC              --I2S---> its own DAC
  *                                                          --SPI---> its own LEDs
  *
  * This chip runs no Bluetooth. It owns the clock the whole system syncs to,
- * multicasts the audio, and is a full speaker in its own right.
+ * sends the audio on to the satellites, and is a full speaker in its own right.
  *
  * Splitting the master in two is what makes that possible: Bluedroid and the
  * WiFi stack together left 164 bytes of DRAM free on one chip, which forced the

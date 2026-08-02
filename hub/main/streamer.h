@@ -1,10 +1,14 @@
 /*
- * M5 master side: re-broadcast the A2DP audio to satellites over WiFi.
+ * M5 master side: re-send the A2DP audio to satellites over WiFi.
  *
  * Runs a SoftAP (there is no router in a field), answers satellite time probes,
- * and multicasts PCM chunks tagged with the master-clock instant each should be
- * played. Multicast rather than per-satellite unicast so radio airtime does not
- * scale with the number of speakers.
+ * and sends undecoded SBC tagged with the master-clock instant each packet
+ * should be played at.
+ *
+ * Unicast to each registered listener, not multicast. Group-addressed frames are
+ * never acknowledged and so never retried, which cost ~20% of packets at every
+ * PHY rate tried; see streamer.c. Airtime scales with speaker count as a result,
+ * which is affordable because the payload is SBC rather than PCM.
  */
 #pragma once
 
@@ -17,7 +21,7 @@ void streamer_start(void);
 void streamer_feed(const uint8_t *pcm, uint32_t len);
 
 /*
- * Multicast one SBC packet to the satellites, undecoded.
+ * Send one SBC packet to every registered satellite, undecoded.
  *
  * `frames` is how many PCM frames it decodes to -- the caller knows, having just
  * decoded it, and the presentation timeline advances by exactly that much.
