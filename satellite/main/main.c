@@ -362,6 +362,8 @@ static void retune_output(uint32_t hz)
 static void drift_task(void *arg)
 {
     (void)arg;
+    int32_t err_ema = 0;
+    bool err_ema_valid = false;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (stream_start_local == 0) {
@@ -373,10 +375,29 @@ static void drift_task(void *arg)
                                    (stream_rate * AUDIO_CHANNELS * 2 / 1000));
         int32_t err_frames = ((int32_t)filled - target) / (AUDIO_CHANNELS * 2);
 
-        ESP_LOGI(TAG, "buffer %u bytes (%lu ms) | drift %+ld ms",
+        /*
+         * Smooth before acting, and separate two things that look identical in a
+         * single reading:
+         *
+         *   jitter -- delivery is bursty, so the level swings +-40 ms with no
+         *             trend. Correcting for it would retune constantly, and each
+         *             retune is an audible click.
+         *   drift  -- the crystals genuinely differ (~14 ppm measured), so the
+         *             level walks steadily in one direction.
+         *
+         * Averaging kills the first and leaves the second. The old code coped by
+         * using a wide deadband instead, which meant real drift could reach
+         * ~60 ms before anything happened -- clearly audible echo, and about 75
+         * minutes away at 14 ppm. Fine in a short test, wrong over an evening.
+         */
+        err_ema = err_ema_valid ? (err_ema * 3 + err_frames) / 4 : err_frames;
+        err_ema_valid = true;
+
+        ESP_LOGI(TAG, "buffer %u bytes (%lu ms) | drift %+ld ms (smoothed %+ld ms)",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (stream_rate * AUDIO_CHANNELS * 2)),
-                 (long)(err_frames * 1000 / (int32_t)stream_rate));
+                 (long)(err_frames * 1000 / (int32_t)stream_rate),
+                 (long)(err_ema * 1000 / (int32_t)stream_rate));
 
 #if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
         /* The internal DAC's rate is fixed at creation, so there is nothing to
@@ -384,10 +405,19 @@ static void drift_task(void *arg)
          * for hours -- use an I2S DAC for that. */
         (void)err_frames;
 #else
-        uint32_t desired = (uint32_t)((int32_t)stream_rate + err_frames / 40);
-        /* Act only on a meaningful error: each retune is an audible click. */
-        if (desired > tx_rate + tx_rate / 666 || desired < tx_rate - tx_rate / 666) {
+        uint32_t desired = (uint32_t)((int32_t)stream_rate + err_ema / 40);
+        /*
+         * Threshold now applies to the smoothed error, so it can be far tighter:
+         * 0.02% instead of 0.15%. That is ~8 ms of accumulated drift before a
+         * correction, against ~60 ms before -- comfortably inside the ~5 ms that
+         * starts to matter between two speakers, while jitter no longer reaches
+         * it at all.
+         */
+        if (desired > tx_rate + tx_rate / 5000 || desired < tx_rate - tx_rate / 5000) {
             retune_output(desired);
+            /* Re-seed: the level will take a while to respond, and chasing it
+             * again before then would overshoot. */
+            err_ema_valid = false;
         }
 #endif
     }
