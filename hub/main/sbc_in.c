@@ -132,6 +132,8 @@ static void rx_task(void *arg)
              * how far to advance the timeline for the copy it sends on. */
             /* Tag before feeding, so the mark lands at the start of this
              * packet's audio in the ring. */
+            streamer_begin_packet();
+
             static uint32_t mark_count;
             bool tagged = (mark_count++ % MARKER_EVERY_PKTS) == 0;
             if (tagged) {

@@ -27,6 +27,10 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 /* Tag the audio about to be fed as a sync marker point. */
 void streamer_mark_here(void);
 
+/* Call before feeding a packet's audio: records where it starts, so it can be
+ * paired with the play_at that streamer_send_sbc() assigns to it. */
+void streamer_begin_packet(void);
+
 /* From ESP_A2D_AUDIO_CFG_EVT. The presentation timeline advances at this rate,
  * so getting it wrong makes every satellite drift against the master. */
 void streamer_set_sample_rate(uint32_t hz);

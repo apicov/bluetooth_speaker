@@ -73,6 +73,36 @@ static int64_t stream_offset;         /* clock offset used when anchoring */
 static volatile int32_t marker_sample = -1;   /* ring position of a tagged packet */
 static volatile int32_t samples_in;           /* frames written into the ring */
 
+/*
+ * Phase tracking.
+ *
+ * Servoing on buffer depth matches the playback RATE to the arrival rate, but
+ * says nothing about POSITION. Depth also moves with network jitter, so the
+ * servo nudges the rate in response to noise -- and two units seeing different
+ * jitter end up with rates differing by ~0.03% at any instant, which is
+ * several ms of relative movement between markers. Observed as 10-25 ms of
+ * wander between hub and satellite, with each unit's own buffer perfectly
+ * stable.
+ *
+ * Every packet says exactly when its first sample should play. Recording that
+ * against the ring position it lands at gives a direct phase measurement when
+ * playback reaches it: where we are, versus where the timeline says we should
+ * be. Correcting that holds position rather than merely matching rates.
+ *
+ * Single producer (receive task), single consumer (playback), 32-bit indices,
+ * so no locking is needed.
+ */
+#define PHASE_Q_LEN 32
+typedef struct {
+    int32_t pos;        /* ring frame position where this packet's audio starts */
+    int64_t play_at;    /* master-clock instant that sample should be heard */
+} phase_pt_t;
+
+static phase_pt_t phase_q[PHASE_Q_LEN];
+static volatile uint32_t phase_head, phase_tail;
+static volatile int32_t phase_err_us;         /* + = playing late */
+static volatile bool phase_valid;
+
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
 #define RING_TARGET_MS 200
@@ -162,7 +192,12 @@ static void i2s_start(uint32_t rate)
     };
     ESP_ERROR_CHECK(dac_continuous_new_channels(&cfg, &dac_tx));
     ESP_ERROR_CHECK(dac_continuous_enable(dac_tx));
-    ESP_LOGW(TAG, "internal DAC output: GPIO 25 = left, GPIO 26 = right (8-bit)");
+    /* Depth matters for the sync marker: the pulse fires when a chunk is
+     * written, so any difference in output buffering between units appears as a
+     * fixed offset that has nothing to do with clock sync. */
+    ESP_LOGW(TAG, "OUTPUT: internal DAC (8-bit), GPIO 25=L 26=R, "
+                  "buffer 8 x 2048 B = %d ms",
+             (8 * 2048) * 1000 / (int)(rate * 2));
 }
 
 /* int16 signed interleaved -> uint8 unsigned, which is what the DAC wants. */
@@ -202,6 +237,9 @@ static void i2s_start(uint32_t rate)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
+    ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms",
+             chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
+             (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate));
 }
 
 static void write_audio(const uint8_t *pcm, size_t bytes)
@@ -268,6 +306,8 @@ static void handle_audio(const audio_msg_t *msg)
         stream_offset = offset;
         samples_in = 0;
         marker_sample = -1;
+        phase_head = phase_tail = 0;
+        phase_valid = false;
         expect_seq = msg->seq;
         have_seq = true;
         xStreamBufferReset(ring);
@@ -303,6 +343,15 @@ static void handle_audio(const audio_msg_t *msg)
      * audio and travels through the buffer with it. */
     if (msg->marker && marker_sample < 0) {
         marker_sample = samples_in;
+    }
+
+    /* Same idea, for every packet: remember where this audio lands and when it
+     * is due, so playback can measure its own phase on arrival. */
+    uint32_t next = (phase_head + 1) % PHASE_Q_LEN;
+    if (next != phase_tail) {
+        phase_q[phase_head].pos = samples_in;
+        phase_q[phase_head].play_at = msg->play_at;
+        phase_head = next;
     }
 
     /* Decode here rather than at the hub: that is the entire point of sending
@@ -416,14 +465,16 @@ static void drift_task(void *arg)
          * ~60 ms before anything happened -- clearly audible echo, and about 75
          * minutes away at 14 ppm. Fine in a short test, wrong over an evening.
          */
-        err_ema = err_ema_valid ? (err_ema * 3 + err_frames) / 4 : err_frames;
+        /* Smoothed phase error is what the servo acts on now. Buffer depth is
+         * kept only as a safety net against underrun or overflow, which phase
+         * control alone would not notice until it was too late. */
+        int32_t ph = phase_valid ? phase_err_us : 0;
+        err_ema = err_ema_valid ? (err_ema * 3 + ph) / 4 : ph;
         err_ema_valid = true;
 
-        ESP_LOGI(TAG, "buffer %u bytes (%lu ms) | drift %+ld ms (smoothed %+ld ms)",
-                 (unsigned)filled,
+        ESP_LOGI(TAG, "buffer %lu ms | phase %+ld us (smoothed %+ld us)",
                  (unsigned long)(filled * 1000 / (stream_rate * AUDIO_CHANNELS * 2)),
-                 (long)(err_frames * 1000 / (int32_t)stream_rate),
-                 (long)(err_ema * 1000 / (int32_t)stream_rate));
+                 (long)ph, (long)err_ema);
 
 #if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
         /* The internal DAC's rate is fixed at creation, so there is nothing to
@@ -431,7 +482,21 @@ static void drift_task(void *arg)
          * for hours -- use an I2S DAC for that. */
         (void)err_frames;
 #else
-        uint32_t desired = (uint32_t)((int32_t)stream_rate + err_ema / 40);
+        /*
+         * Late (positive error) means we are behind the timeline, so play
+         * faster. Spread over ~40 s, which keeps the rate change well under the
+         * ~1% a listener would hear.
+         */
+        int32_t adj = (int32_t)((int64_t)err_ema * stream_rate / 40000000LL);
+
+        /* Safety net: if the buffer is heading for empty or full, that matters
+         * more than phase. */
+        if (err_frames * 1000 / (int32_t)stream_rate < -120) {
+            adj = -20;                       /* nearly empty: slow down */
+        } else if (err_frames * 1000 / (int32_t)stream_rate > 120) {
+            adj = 20;                        /* nearly full: speed up */
+        }
+        uint32_t desired = (uint32_t)((int32_t)stream_rate + adj);
         /*
          * Threshold now applies to the smoothed error, so it can be far tighter:
          * 0.02% instead of 0.15%. That is ~8 ms of accumulated drift before a
@@ -439,6 +504,9 @@ static void drift_task(void *arg)
          * starts to matter between two speakers, while jitter no longer reaches
          * it at all.
          */
+        if (!phase_valid) {
+            continue;                        /* nothing measured yet */
+        }
         if (cooldown > 0) {
             cooldown--;
         } else if (desired > tx_rate + tx_rate / 5000 ||
@@ -495,6 +563,16 @@ static void play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
+            /* Has playback reached a recorded packet boundary? If so, compare
+             * now against when that sample was due. */
+            while (phase_tail != phase_head && samples_played >= phase_q[phase_tail].pos) {
+                int64_t due = phase_q[phase_tail].play_at;
+                int64_t now_master = esp_timer_get_time() + stream_offset;
+                phase_err_us = (int32_t)(now_master - due);
+                phase_valid = true;
+                phase_tail = (phase_tail + 1) % PHASE_Q_LEN;
+            }
+
             int32_t mark = marker_sample;
             if (mark >= 0 && samples_played >= mark) {
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);

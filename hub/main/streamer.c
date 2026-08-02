@@ -86,6 +86,25 @@ static volatile int64_t s_marker_at;      /* local time we last pulsed */
 static volatile int32_t s_marker_sample = -1;
 static volatile int32_t s_samples_in;     /* frames written into local_ring */
 
+/*
+ * Phase tracking, matching the satellite.
+ *
+ * This unit publishes the timeline, so it should hold itself to it. Servoing on
+ * buffer depth alone matches its playback RATE to its input but lets its
+ * POSITION wander -- and since it wanders independently of every satellite, the
+ * speakers separate even though each one's buffer looks perfectly stable.
+ */
+#define PHASE_Q_LEN 32
+typedef struct {
+    int32_t pos;
+    int64_t play_at;
+} phase_pt_t;
+
+static phase_pt_t s_phase_q[PHASE_Q_LEN];
+static volatile uint32_t s_phase_head, s_phase_tail;
+static volatile int32_t s_phase_err_us;   /* + = playing late */
+static volatile bool s_phase_valid;
+
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
 
@@ -214,6 +233,21 @@ void streamer_mark_here(void)
     }
 }
 
+/*
+ * Capture where the next packet's audio will start, before it is fed.
+ *
+ * Needed because a packet's play_at is not known until streamer_send_sbc()
+ * computes it, by which point s_samples_in has already advanced past that
+ * packet's audio. The pair only means anything if both halves refer to the
+ * same instant in the stream.
+ */
+static int32_t s_pending_pos;
+
+void streamer_begin_packet(void)
+{
+    s_pending_pos = s_samples_in;
+}
+
 void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool marker)
 {
     static audio_msg_t msg;
@@ -233,6 +267,8 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         xStreamBufferReset(local_ring);
         s_samples_in = 0;                  /* same origin as the reset ring */
         s_marker_sample = -1;
+        s_phase_head = s_phase_tail = 0;
+        s_phase_valid = false;
         ESP_LOGI(TAG, "timeline start");
     } else if (llabs(next_play_at - target) > RESYNC_US) {
         static int64_t last_warn;
@@ -252,6 +288,15 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     msg.frames = frames;
     msg.marker = marker ? 1 : 0;
     msg.reserved = 0;
+
+    /* Position captured before the audio was fed, paired with the time it is
+     * due -- the playback task compares the two when it gets there. */
+    uint32_t nq = (s_phase_head + 1) % PHASE_Q_LEN;
+    if (nq != s_phase_tail) {
+        s_phase_q[s_phase_head].pos = s_pending_pos;
+        s_phase_q[s_phase_head].play_at = next_play_at;
+        s_phase_head = nq;
+    }
     msg.play_at = next_play_at;
     memcpy(msg.payload, sbc, len);
 
@@ -481,6 +526,12 @@ static void i2s_start(uint32_t rate)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
     tx_rate = rate;
+    /* Compare this against the satellite's line. The sync marker fires when a
+     * chunk is written, not when it is heard, so unequal output buffering shows
+     * up as a fixed offset unrelated to clock sync. */
+    ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms",
+             chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
+             (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate));
 }
 
 static void retune_dac(uint32_t hz)
@@ -546,6 +597,14 @@ static void local_play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
+            /* Local time IS master time here, so this is a direct read of how
+             * far playback has slipped from the published timeline. */
+            while (s_phase_tail != s_phase_head && samples_played >= s_phase_q[s_phase_tail].pos) {
+                s_phase_err_us = (int32_t)(esp_timer_get_time() - s_phase_q[s_phase_tail].play_at);
+                s_phase_valid = true;
+                s_phase_tail = (s_phase_tail + 1) % PHASE_Q_LEN;
+            }
+
             int32_t mark = s_marker_sample;
             if (mark >= 0 && samples_played >= mark) {
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
@@ -612,21 +671,35 @@ static void ring_monitor_task(void *arg)
         }
 
         size_t filled = LOCAL_RING_BYTES - xStreamBufferSpacesAvailable(local_ring);
-        ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | tx-fail %" PRIu32 "/5s",
+        ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us | tx-fail %" PRIu32 "/5s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
-                 s_tx_fail);
+                 (long)s_phase_err_us, s_tx_fail);
         s_tx_fail = 0;
 
         const int32_t target = (int32_t)(LEAD_US / 1000) *
                                (int32_t)(rate_ema * AUDIO_CHANNELS * 2 / 1000);
         int32_t err_frames = ((int32_t)filled - target) / (AUDIO_CHANNELS * 2);
-        uint32_t desired = (uint32_t)((int32_t)rate_ema + err_frames / 40);
+        int32_t depth_ms = err_frames * 1000 / (int32_t)rate_ema;
+
+        if (!s_phase_valid) {
+            continue;
+        }
+        /* Phase drives the correction; buffer depth is only a guard against
+         * running empty or overflowing, which phase control would not see
+         * coming. Late means behind the timeline, so play faster. */
+        int32_t adj = (int32_t)((int64_t)s_phase_err_us * rate_ema / 40000000LL);
+        if (depth_ms < -120) {
+            adj = -20;
+        } else if (depth_ms > 120) {
+            adj = 20;
+        }
+        uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
 
         /* Only act on a meaningful error: every retune is an audible click. */
-        if (desired > tx_rate + tx_rate / 666 || desired < tx_rate - tx_rate / 666) {
-            ESP_LOGI(TAG, "servo: ring err %+ld ms -> DAC %" PRIu32 " Hz",
-                     (long)(err_frames * 1000 / (int32_t)rate_ema), desired);
+        if (desired > tx_rate + tx_rate / 5000 || desired < tx_rate - tx_rate / 5000) {
+            ESP_LOGI(TAG, "servo: phase %+ld us, buffer %+ld ms -> DAC %" PRIu32 " Hz",
+                     (long)s_phase_err_us, (long)depth_ms, desired);
             retune_dac(desired);
         }
     }
