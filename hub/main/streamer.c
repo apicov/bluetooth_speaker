@@ -78,8 +78,13 @@ static volatile int64_t s_marker_at;      /* local time we last pulsed */
  * pending. Playback pulses when it reaches this, so the pulse tracks the audio
  * through the buffer rather than being predicted from a clock.
  */
-static volatile int64_t s_marker_sample = -1;
-static int64_t s_samples_in;              /* frames written into local_ring */
+/*
+ * 32-bit, not 64: read by the playback task while the receive task writes them,
+ * and a 64-bit load is two instructions here -- a torn read gives a garbage
+ * position and a wild marker. int32 holds 13 hours of frames at 44.1 kHz.
+ */
+static volatile int32_t s_marker_sample = -1;
+static volatile int32_t s_samples_in;     /* frames written into local_ring */
 
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
@@ -181,16 +186,24 @@ uint32_t streamer_take_dropped(void)
 
 void streamer_feed(const uint8_t *pcm, uint32_t len)
 {
-    /* Straight to the local ring. There is no longer an intermediate PCM buffer:
-     * satellites receive SBC, so nothing needs PCM except this speaker. */
-    if (!local_ring || local_start == 0) {
+    /*
+     * Straight to the local ring. There is no intermediate PCM buffer any more:
+     * satellites receive SBC, so nothing needs PCM except this speaker.
+     *
+     * Deliberately not gated on local_start. sbc_in decodes and feeds a packet
+     * before calling streamer_send_sbc(), which is what sets local_start -- so
+     * gating discarded the first packet's audio here while the satellites got
+     * it, leaving this unit permanently one packet (~20 ms) behind them. The
+     * ring is reset at timeline start, so anything fed early is cleared anyway.
+     */
+    if (!local_ring) {
         return;
     }
     size_t sent = xStreamBufferSend(local_ring, pcm, len, 0);   /* must not block */
     if (sent < len) {
         s_feed_dropped += len - sent;
     }
-    s_samples_in += sent / (AUDIO_CHANNELS * sizeof(int16_t));
+    s_samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
 }
 
 /* Called as a tagged packet is about to be queued: its audio starts here. */
@@ -218,6 +231,8 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         next_play_at = target;
         local_start = target;              /* our own speaker joins the timeline */
         xStreamBufferReset(local_ring);
+        s_samples_in = 0;                  /* same origin as the reset ring */
+        s_marker_sample = -1;
         ESP_LOGI(TAG, "timeline start");
     } else if (llabs(next_play_at - target) > RESYNC_US) {
         static int64_t last_warn;
@@ -509,10 +524,11 @@ static void local_play_task(void *arg)
          * audio each unit is playing, which no amount of clock accuracy fixes. */
         ESP_LOGI(TAG, "local playback started: scheduled %lld, actual %lld (%+lld us)",
                  local_start, esp_timer_get_time(), esp_timer_get_time() - local_start);
-        /* Counted in the same units as s_samples_in, so the two meet. */
-        int64_t samples_played = 0;
-        s_samples_in = 0;
-        s_marker_sample = -1;
+        /* samples_played counts from the first sample played, which is the
+         * first sample fed after the ring was reset at timeline start. Both
+         * counters therefore share an origin -- do NOT reset s_samples_in here,
+         * it has legitimately been counting the audio buffered during the wait. */
+        int32_t samples_played = 0;
 
         while (1) {
             if (retuning) {
@@ -530,7 +546,7 @@ static void local_play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
-            int64_t mark = s_marker_sample;
+            int32_t mark = s_marker_sample;
             if (mark >= 0 && samples_played >= mark) {
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
                 s_marker_at = esp_timer_get_time();

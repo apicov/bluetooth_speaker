@@ -64,8 +64,14 @@ static volatile int64_t stream_start_local;
 static volatile uint32_t stream_rate = 44100;
 static uint32_t tx_rate = 44100;      /* what the output clock is actually set to */
 static int64_t stream_offset;         /* clock offset used when anchoring */
-static volatile int64_t marker_sample = -1;   /* ring position of a tagged packet */
-static int64_t samples_in;                    /* frames written into the ring */
+/*
+ * 32-bit, not 64: these are read by the playback task while the receive task
+ * writes them, and a 64-bit load is two instructions on this CPU -- a torn read
+ * yields a garbage position and a wild marker. int32 holds 13 hours of frames
+ * at 44.1 kHz, which is longer than any party.
+ */
+static volatile int32_t marker_sample = -1;   /* ring position of a tagged packet */
+static volatile int32_t samples_in;           /* frames written into the ring */
 
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
@@ -317,7 +323,7 @@ static void handle_audio(const audio_msg_t *msg)
         if (xStreamBufferSend(ring, pcm, want, 0) != want) {
             ESP_LOGW(TAG, "ring full, dropping audio");
         }
-        samples_in += samples / AUDIO_CHANNELS;
+        samples_in += (int32_t)(samples / AUDIO_CHANNELS);
     }
 }
 
@@ -470,10 +476,14 @@ static void play_task(void *arg)
         int64_t sched_master = stream_start_local + stream_offset;
         ESP_LOGI(TAG, "playback started: scheduled %lld, actual %lld (%+lld us) [master]",
                  sched_master, actual_master, actual_master - sched_master);
-        /* Counted in the same units as samples_in, so the two meet. */
-        int64_t samples_played = 0;
-        samples_in = 0;
-        marker_sample = -1;
+        /*
+         * samples_played counts from the first sample played, which is the
+         * first sample queued after the ring was reset on anchoring. The two
+         * counters therefore share an origin -- do NOT reset samples_in here.
+         * It has legitimately been counting the audio buffered during the wait,
+         * and zeroing it shifts every marker by the buffer depth.
+         */
+        int32_t samples_played = 0;
 
         while (1) {
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -485,7 +495,7 @@ static void play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
-            int64_t mark = marker_sample;
+            int32_t mark = marker_sample;
             if (mark >= 0 && samples_played >= mark) {
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
                 esp_rom_delay_us(MARKER_PULSE_US);
