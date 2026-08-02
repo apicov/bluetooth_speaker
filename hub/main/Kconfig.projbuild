@@ -63,24 +63,6 @@ menu "Dancefloor hub"
             Input. Wire the SATELLITE's marker GPIO here, plus a common ground.
             Must differ from the marker GPIO.
 
-    comment "LEDs"
-
-    config DANCEFLOOR_ENABLE_VISUALISER
-        bool "Enable LED visualiser (FFT + strip)"
-        default y
-        help
-            Turn off to test whether the FFT and LED refresh are stealing time
-            from audio -- it is the heaviest thing sharing core 1 with playback.
-
-    config DANCEFLOOR_LED_GPIO
-        int "WS2812 data GPIO"
-        default 18
-        help
-            SPI2 MOSI via the GPIO matrix. Needs a 74AHCT125 level shifter:
-            3.3 V data into a 5 V WS2812 is unreliable without one.
-
-    config DANCEFLOOR_LED_COUNT
-        int "Number of LEDs"
-        default 60
+    comment "LEDs are under 'Dancefloor LEDs' -- shared with the satellite"
 
 endmenu

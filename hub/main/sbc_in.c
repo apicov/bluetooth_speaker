@@ -13,7 +13,6 @@
 #include "sbc_link.h"
 #include "sbc_decoder.h"
 #include "streamer.h"
-#include "visualiser.h"
 
 #define UART_PORT   UART_NUM_1
 #define UART_RX_PIN 23          /* reuses the old I2S DATA wire */
@@ -182,9 +181,10 @@ static void rx_task(void *arg)
 
                 const uint8_t *bytes = (const uint8_t *)pcm;
                 size_t nbytes = samples * sizeof(int16_t);
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-                visualiser_feed(bytes, nbytes);
-#endif
+                /* The visualiser is deliberately NOT fed here. This is the
+                 * arrival path, and ~200 ms of buffer sits between it and the
+                 * speaker -- lights driven from here run that far ahead of the
+                 * sound. streamer.c feeds it from the playback path instead. */
                 streamer_feed(bytes, nbytes);
             }
 

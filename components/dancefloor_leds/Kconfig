@@ -1,0 +1,54 @@
+menu "Dancefloor LEDs"
+
+    config DANCEFLOOR_ENABLE_VISUALISER
+        bool "Enable LED visualiser (FFT + beat detection + strip)"
+        default y
+        help
+            Turn off to test whether the FFT and LED refresh are stealing time
+            from audio -- it is the heaviest thing sharing core 1 with playback.
+
+    config DANCEFLOOR_LED_GPIO
+        int "WS2812 data GPIO"
+        default 18
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Driven as SPI2 MOSI through the GPIO matrix. Needs a 74AHCT125 level
+            shifter: 3.3 V data into a 5 V WS2812 is unreliable without one.
+
+    config DANCEFLOOR_LED_COUNT
+        int "Number of LEDs"
+        default 60
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+
+    choice DANCEFLOOR_LED_TYPE
+        prompt "Strip model"
+        default DANCEFLOOR_LED_TYPE_WS2812
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Wire order differs between models. Getting this wrong swaps colours
+            rather than failing, so it looks like a bug in the patterns.
+
+        config DANCEFLOOR_LED_TYPE_WS2812
+            bool "WS2812 / WS2812B (5 V, GRB)"
+
+        config DANCEFLOOR_LED_TYPE_WS2811
+            bool "WS2811 (12 V, BRG as wired here, 1 IC per 3 LEDs)"
+
+        config DANCEFLOOR_LED_TYPE_SK6812
+            bool "SK6812 RGBW (5 V, GRBW)"
+    endchoice
+
+    config DANCEFLOOR_LED_BRIGHTNESS
+        int "Brightness cap (percent)"
+        default 40
+        range 1 100
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Scales every pixel before it is sent. 40% is the design figure, for
+            two reasons: eyes are dark-adapted outdoors at night and cannot tell
+            the difference, and LEDs are the largest single load in the power
+            budget -- ~150 pixels at full white is ~45 W against ~15 W here.
+
+            Raise it for daylight bench testing, then put it back.
+
+endmenu

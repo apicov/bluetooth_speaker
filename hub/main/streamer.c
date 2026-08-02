@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 
 #include "sync_proto.h"
+#include "visualiser.h"
 
 #define AP_SSID   "dancefloor"
 #define AP_PASS   "dancefloor"
@@ -714,6 +715,12 @@ static void local_play_task(void *arg)
             }
             samples_played += AUDIO_FRAMES;
 
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+            /* Fed here, at the DAC, and not where the audio arrived: ~200 ms of
+             * buffer separates the two, and lights driven from the arrival side
+             * run that far ahead of this unit's own speaker. */
+            visualiser_feed(chunk, sizeof(chunk));
+#endif
             size_t written = 0;
             if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,
                                   portMAX_DELAY) != ESP_OK) {

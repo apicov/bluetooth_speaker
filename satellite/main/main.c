@@ -38,6 +38,7 @@
 #include "sync_proto.h"
 #include "sbc_link.h"
 #include "sbc_decoder.h"
+#include "visualiser.h"
 
 #define AP_SSID    "dancefloor"
 #define AP_PASS    "dancefloor"
@@ -217,7 +218,7 @@ static void i2s_start(uint32_t rate)
 }
 
 /* int16 signed interleaved -> uint8 unsigned, which is what the DAC wants. */
-static void write_audio(const uint8_t *pcm, size_t bytes)
+static void dac_write(const uint8_t *pcm, size_t bytes)
 {
     static uint8_t u8[1024];
     const int16_t *src = (const int16_t *)pcm;
@@ -258,12 +259,28 @@ static void i2s_start(uint32_t rate)
              (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate));
 }
 
-static void write_audio(const uint8_t *pcm, size_t bytes)
+static void dac_write(const uint8_t *pcm, size_t bytes)
 {
     size_t written = 0;
     i2s_channel_write(i2s_tx, pcm, bytes, &written, portMAX_DELAY);
 }
 #endif
+
+/*
+ * Every sample that reaches the speaker goes through here, which is exactly what
+ * the LEDs should be reacting to.
+ *
+ * Not the receive path: ~200 ms of ring buffer sits between the two, and lights
+ * driven from arrival run that far ahead of the sound. Splice silence goes
+ * through here too, and should -- it is genuinely played.
+ */
+static void write_audio(const uint8_t *pcm, size_t bytes)
+{
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    visualiser_feed(pcm, bytes);
+#endif
+    dac_write(pcm, bytes);
+}
 
 /* --------------------------------------------------------------- receiving */
 
@@ -705,6 +722,12 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(gpio_config(&marker));
     ESP_LOGI(TAG, "sync marker on GPIO %d", CONFIG_DANCEFLOOR_MARKER_GPIO);
+
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    visualiser_start();
+#else
+    ESP_LOGW(TAG, "visualiser DISABLED (menuconfig) -- LEDs will stay dark");
+#endif
 
     xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
     xTaskCreate(rx_task, "rx", 4096, NULL, 7, NULL);

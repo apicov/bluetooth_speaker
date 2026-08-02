@@ -15,6 +15,7 @@ i2s_loopback/test_*
 # Python bytecode from running tools/
 __pycache__/
 
-# A nested repo by this name appeared here briefly and was swept in by
-# `git add -A`. It is gone now; this keeps it out if it comes back.
+# A separate project, kept here for reference: components/led_strip_wrapper is
+# vendored from it. It has its own git repository, so it must not be committed
+# into this one -- a nested repo would go in as an unusable gitlink.
 esp32c3_neopixel/

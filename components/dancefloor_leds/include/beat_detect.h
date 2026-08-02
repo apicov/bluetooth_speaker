@@ -14,6 +14,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Compiled as C (and unit-tested as C on the host), but called from the C++
+ * visualiser, which would otherwise mangle these names and fail to link. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define BEAT_BANDS 4      /* roughly: kick, low-mid, presence, air */
 #define BEAT_HIST  43     /* ~0.5 s of history at a 512-sample hop / 44.1 kHz */
 
@@ -45,3 +51,7 @@ void beat_det_init(beat_det_t *d);
  */
 bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
                      int64_t now_us, float *strength);
+
+#ifdef __cplusplus
+}
+#endif

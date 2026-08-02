@@ -1,3 +1,2 @@
-dependencies:
-  espressif/led_strip: "^3"
-  espressif/esp-dsp: "*"
+# LED and FFT dependencies live with components/dancefloor_leds, which owns them.
+dependencies: {}

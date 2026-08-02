@@ -484,6 +484,38 @@ Four bands, roughly kick / low-mid / presence / air.
 Otherwise the lights lead the sound by the entire buffer depth — 200 ms, which
 looks obviously wrong.
 
+Both units therefore feed the analysis from the point where samples are handed
+to the DAC: `write_audio()` on the satellite, and immediately before
+`i2s_channel_write()` in the hub's `local_play_task`. The hub originally fed
+from the packet-arrival path in `sbc_in.c` and its lights genuinely did run
+~200 ms early.
+
+The pulse agrees across units for free, because each is analysing audio that is
+already synchronised. The *hue* does not — it is seeded from each board's own
+boot — which is fine for a pulse and would not be for a chase across units. A
+chase needs its phase seeded from the shared master clock, and is not built.
+
+#### Where the code lives
+
+`components/dancefloor_leds/` is shared by the hub and every satellite: the same
+FFT, the same detector, the same patterns, one copy. Its `Kconfig` owns the LED
+options for both firmwares — GPIO, count, strip model, and a **brightness cap
+defaulting to 40%**, which is the figure the power budget assumes and which
+dark-adapted eyes cannot distinguish from full outdoors.
+
+The strip itself is driven through `components/led_strip_wrapper/`, an RAII C++
+wrapper vendored from the `esp32c3_neopixel` project:
+
+```cpp
+LedStrip strip{GPIO_NUM_18, 60, LedStrip::Type::WS2812, LedStrip::Backend::SPI};
+strip.set(i, r, g, b);
+strip.show();
+```
+
+The `Backend` parameter is the one thing added to it, and it exists because of
+the next section. It defaults to `RMT`, so the upstream project — a separate
+repository, left untouched — still compiles against this copy unchanged.
+
 #### Never bit-bang WS2812
 
 WS2812 pixels are timed to ~150 ns. The common Arduino-style approach disables
@@ -683,7 +715,7 @@ are still to be wired.
 | Milestone | State |
 |---|---|
 | M1–M2 Bluetooth speaker + LEDs | Done, on logs and desktop audio |
-| M3 Beat detection driving LEDs | **In progress** — tuning against recorded music |
+| M3 Beat detection driving LEDs | Built on both hub and satellite; **thresholds unverified against real music** |
 | M4–M6 Clock sync, streaming, drift | Done and measured |
 | M7 Coexistence | Done — resolved by splitting the chips |
 | M8 Power, enclosure, field test | **Untouched** |
@@ -704,8 +736,8 @@ budget.
 | `bt_bridge/main/avrcp_meta.c` | Track metadata and change notifications |
 | `hub/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo |
 | `hub/main/sbc_in.c` | UART receive, decode, feed |
-| `hub/main/visualiser.c` | FFT → bands → strip |
-| `hub/main/beat_detect.c` | Spectral flux onset detection |
+| `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
+| `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
 | `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |
 | `sync_test/`, `i2s_loopback/` | Measurement harnesses |
 
