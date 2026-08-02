@@ -74,9 +74,17 @@ RATE = 44100
 SAMPLE_WIDTH = 2
 
 # Mirrors audio_msg_t in components/dancefloor_sync/include/sync_proto.h:
-#   uint8_t type; uint8_t format; uint16_t payload_len; uint32_t seq;
-#   uint32_t sample_rate; uint32_t frames; int64_t play_at; uint8_t payload[]
-HDR = struct.Struct("<BBHIIIq")
+#   uint8_t type; uint8_t format; uint8_t marker; uint8_t restart;
+#   uint16_t payload_len; uint32_t seq; uint32_t sample_rate; uint32_t frames;
+#   int64_t play_at; uint8_t payload[]
+#
+# `marker` and `restart` were added to the C struct after this was written and
+# not mirrored here, which shifted every later field two bytes early. It failed
+# quietly rather than loudly: payload_len was read from marker/restart, which are
+# 0 in almost every packet, so plen came out 0, the "did we get the whole
+# payload" check compared 0 against 0 and passed, and an empty payload went to
+# ffmpeg. Packets counted, statistics looked healthy, and nothing made a sound.
+HDR = struct.Struct("<BBBBHIIIq")
 CHANNELS = 2
 
 
@@ -330,9 +338,12 @@ def main():
             bad += 1
             continue
 
-        _type, fmt, plen, seq, rate, frames, _play_at = HDR.unpack_from(data, 0)
+        _type, fmt, _marker, _restart, plen, seq, rate, frames, _play_at = \
+            HDR.unpack_from(data, 0)
         payload = data[HDR.size:HDR.size + plen]
-        if len(payload) != plen:
+        # plen == 0 is rejected explicitly: an empty payload is never legitimate,
+        # and treating it as valid is what hid the header mismatch above.
+        if not plen or len(payload) != plen:
             bad += 1
             continue
 
