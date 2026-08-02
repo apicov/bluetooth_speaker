@@ -26,9 +26,10 @@
  *   - anything random or uninitialised
  *
  * Use f.due_us for anything time-based and f.index for anything counted. Both
- * are shared. test_pattern_sync.c enforces this mechanically by running a
- * pattern as two units with different skew and drop histories and requiring
- * byte-identical output.
+ * are shared. test_pattern_sync.cpp enforces this mechanically by running a
+ * pattern as two units with different join times, render counts and drop
+ * histories and requiring byte-identical output, and it carries a deliberately
+ * wrong pattern that it requires to fail.
  */
 #pragma once
 

@@ -7,11 +7,14 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 
-# Host test binaries
+# Host test binaries and their intermediates
 sync_test/test/test_sync_proto
 components/dancefloor_leds/test/test_align
 components/dancefloor_leds/test/test_pattern
 components/dancefloor_leds/test/test_beat_detect
+components/dancefloor_leds/test/test_fft
+components/dancefloor_leds/test/test_pattern_sync
+components/dancefloor_leds/test/*.o
 i2s_loopback/test_*
 
 # Python bytecode from running tools/
