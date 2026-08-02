@@ -11,6 +11,7 @@
  * board's own crystal, so the two units drift apart at ~14 ppm -- that is M6's
  * problem, and the buffer-level log below is the signal it will act on.
  */
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -20,6 +21,9 @@
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
 #include "driver/i2s_std.h"
+#if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+#include "driver/dac_continuous.h"
+#endif
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -45,12 +49,21 @@ static const char *TAG = "sat";
 static int sock = -1;
 static sync_est_t est;
 static StreamBufferHandle_t ring;
+#if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+static dac_continuous_handle_t dac_tx;
+#else
 static i2s_chan_handle_t i2s_tx;
+#endif
 
 /* Local-clock instant the next byte entering the ring should reach the DAC.
  * Zero means playback has not started. */
 static volatile int64_t stream_start_local;
 static volatile uint32_t stream_rate = 44100;
+static uint32_t tx_rate = 44100;      /* what the output clock is actually set to */
+
+/* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
+ * that much should be sitting here waiting. */
+#define RING_TARGET_MS 200
 
 /* ------------------------------------------------------------------- wifi */
 
@@ -95,6 +108,44 @@ static void socket_start(void)
 
 /* -------------------------------------------------------------------- i2s */
 
+#if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+static void i2s_start(uint32_t rate)
+{
+    /* ALTER mode walks the DMA buffer across both channels in turn, so a stream
+     * of interleaved left/right bytes comes out as stereo on GPIO 25 and 26. */
+    dac_continuous_config_t cfg = {
+        .chan_mask = DAC_CHANNEL_MASK_ALL,
+        .desc_num = 8,
+        .buf_size = 2048,
+        .freq_hz = rate,
+        .offset = 0,
+        .clk_src = DAC_DIGI_CLK_SRC_DEFAULT,
+        .chan_mode = DAC_CHANNEL_MODE_ALTER,
+    };
+    ESP_ERROR_CHECK(dac_continuous_new_channels(&cfg, &dac_tx));
+    ESP_ERROR_CHECK(dac_continuous_enable(dac_tx));
+    ESP_LOGW(TAG, "internal DAC output: GPIO 25 = left, GPIO 26 = right (8-bit)");
+}
+
+/* int16 signed interleaved -> uint8 unsigned, which is what the DAC wants. */
+static void write_audio(const uint8_t *pcm, size_t bytes)
+{
+    static uint8_t u8[1024];
+    const int16_t *src = (const int16_t *)pcm;
+    size_t samples = bytes / sizeof(int16_t);
+
+    while (samples) {
+        size_t n = samples > sizeof(u8) ? sizeof(u8) : samples;
+        for (size_t i = 0; i < n; i++) {
+            u8[i] = (uint8_t)((src[i] >> 8) + 128);
+        }
+        size_t loaded = 0;
+        dac_continuous_write(dac_tx, u8, n, &loaded, -1);
+        src += n;
+        samples -= n;
+    }
+}
+#else
 static void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -114,6 +165,13 @@ static void i2s_start(uint32_t rate)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
 }
+
+static void write_audio(const uint8_t *pcm, size_t bytes)
+{
+    size_t written = 0;
+    i2s_channel_write(i2s_tx, pcm, bytes, &written, portMAX_DELAY);
+}
+#endif
 
 /* --------------------------------------------------------------- receiving */
 
@@ -151,8 +209,21 @@ static void handle_audio(const audio_msg_t *msg)
     }
 
     if (!have_seq || stream_start_local == 0) {
-        /* First chunk of a stream: this is the only moment playback timing is
-         * decided. Everything after is carried by I2S clocking itself. */
+        /*
+         * First chunk of a stream: the only moment playback timing is decided,
+         * so it must use a settled clock estimate. Three probes are enough to
+         * produce *an* offset but not a good one -- minimum-RTT selection needs
+         * a full window to find a genuinely uncongested round trip, and any
+         * error here is baked in for the life of the stream.
+         */
+        if (!sync_est_settled(&est)) {
+            static bool told;
+            if (!told) {
+                told = true;
+                ESP_LOGI(TAG, "holding playback until the clock estimate settles");
+            }
+            return;
+        }
         stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
@@ -230,6 +301,70 @@ static void rx_task(void *arg)
     }
 }
 
+/* ----------------------------------------------------------------- drift */
+
+#if !CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+static void retune_output(uint32_t hz)
+{
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
+    ESP_ERROR_CHECK(i2s_channel_disable(i2s_tx));
+    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(i2s_tx, &clk));
+    ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
+    ESP_LOGW(TAG, "output clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
+    tx_rate = hz;
+}
+#endif
+
+/*
+ * Hold the buffer level steady, which is what keeps this speaker in step with
+ * the hub.
+ *
+ * The start instant is set once from play_at. After that this board's DAC runs
+ * on its own crystal -- measured ~14 ppm from the hub's, which is 0.8 ms of
+ * drift per minute and 50 ms per hour. Inaudible at first, then unmistakable
+ * slapback. Aligning the start is not enough on its own.
+ *
+ * The buffer level is the integral of the rate error, so nulling it matches the
+ * rates and preserves the phase established at start. Correcting over ~40 s
+ * keeps every adjustment far below the ~1% shift a listener could notice.
+ *
+ * Same approach as the hub's ring servo; the difference is only which clock is
+ * being trimmed.
+ */
+static void drift_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (stream_start_local == 0) {
+            continue;
+        }
+
+        size_t filled = RING_BYTES - xStreamBufferSpacesAvailable(ring);
+        int32_t target = (int32_t)(RING_TARGET_MS *
+                                   (stream_rate * AUDIO_CHANNELS * 2 / 1000));
+        int32_t err_frames = ((int32_t)filled - target) / (AUDIO_CHANNELS * 2);
+
+        ESP_LOGI(TAG, "buffer %u bytes (%lu ms) | drift %+ld ms",
+                 (unsigned)filled,
+                 (unsigned long)(filled * 1000 / (stream_rate * AUDIO_CHANNELS * 2)),
+                 (long)(err_frames * 1000 / (int32_t)stream_rate));
+
+#if CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+        /* The internal DAC's rate is fixed at creation, so there is nothing to
+         * trim. Fine for bench listening, not for a unit that must stay in sync
+         * for hours -- use an I2S DAC for that. */
+        (void)err_frames;
+#else
+        uint32_t desired = (uint32_t)((int32_t)stream_rate + err_frames / 40);
+        /* Act only on a meaningful error: each retune is an audible click. */
+        if (desired > tx_rate + tx_rate / 666 || desired < tx_rate - tx_rate / 666) {
+            retune_output(desired);
+        }
+#endif
+    }
+}
+
 /* --------------------------------------------------------------- playback */
 
 static void play_task(void *arg)
@@ -264,32 +399,10 @@ static void play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
-            size_t written = 0;
-            i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written, portMAX_DELAY);
+            write_audio(chunk, sizeof(chunk));
         }
     }
 }
-
-/*
- * The ring's fill level is the drift signal. With both boards nominally at
- * 44.1 kHz but ~14 ppm apart, a satellite clocking slightly slow accumulates
- * audio it cannot consume, and one clocking fast drains toward underrun.
- * M6 will act on this number; for now it just has to be visible.
- */
-static void monitor_task(void *arg)
-{
-    (void)arg;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        if (stream_start_local != 0) {
-            size_t filled = RING_BYTES - xStreamBufferSpacesAvailable(ring);
-            ESP_LOGI(TAG, "buffer %u bytes (%lu ms)",
-                     (unsigned)filled,
-                     (unsigned long)(filled * 1000 / (stream_rate * AUDIO_CHANNELS * 2)));
-        }
-    }
-}
-
 
 /* Printed at boot so a log immediately identifies which build produced it --
  * compile time and ELF hash both change on every rebuild. Saves guessing
@@ -322,11 +435,12 @@ void app_main(void)
     wifi_start_sta();
     socket_start();
     i2s_start(44100);
+    tx_rate = 44100;
 
     xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
     xTaskCreate(rx_task, "rx", 4096, NULL, 7, NULL);
     xTaskCreatePinnedToCore(play_task, "play", 4096, NULL, 8, NULL, 1);
-    xTaskCreate(monitor_task, "mon", 3072, NULL, 3, NULL);
+    xTaskCreate(drift_task, "drift", 3072, NULL, 3, NULL);
 
     log_build_stamp(TAG);
     ESP_LOGI(TAG, "satellite up, joining \"%s\"", AP_SSID);

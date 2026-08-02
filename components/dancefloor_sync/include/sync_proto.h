@@ -120,6 +120,20 @@ void sync_est_add(sync_est_t *e, int64_t t1, int64_t t2, int64_t t3, int64_t t4)
  */
 bool sync_est_offset(const sync_est_t *e, int64_t *offset_out);
 
+/*
+ * True once a full window of probes has landed, i.e. the estimate has had a
+ * chance to find a genuinely low-RTT sample rather than the best of three.
+ *
+ * Matters for anchoring playback: `play_at` is consulted once, at stream start,
+ * so an offset error at that instant is permanent. Waiting the extra couple of
+ * seconds costs nothing and removes a whole class of "one speaker is slightly
+ * out" that would be untraceable afterwards.
+ */
+static inline bool sync_est_settled(const sync_est_t *e)
+{
+    return e->count >= SYNC_WINDOW;
+}
+
 /* Master clock -> local clock. */
 static inline int64_t sync_to_local(int64_t master_us, int64_t offset)
 {

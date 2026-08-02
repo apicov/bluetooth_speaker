@@ -12,6 +12,18 @@ menu "Dancefloor satellite"
         int "I2S DATA GPIO"
         default 25
 
+    config DANCEFLOOR_USE_INTERNAL_DAC
+        bool "Play through the ESP32's built-in 8-bit DACs (no hardware needed)"
+        default n
+        help
+            Outputs on GPIO 25 (left) and GPIO 26 (right) using the two DACs
+            built into the ESP32, instead of I2S to an external chip.
+
+            8-bit and noisy -- nothing like the PCM5102A -- but it needs no parts
+            beyond a resistor and a cheap speaker, and it answers the questions
+            that matter before a real DAC arrives: does audio come out, is it the
+            right speed, and is it in sync with the hub?
+
     config DANCEFLOOR_AP_OPEN
         bool "Hub SoftAP has no password (must match the hub)"
         default n
