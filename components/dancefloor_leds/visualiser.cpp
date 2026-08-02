@@ -308,7 +308,7 @@ void visualiser_task(void *arg)
 
 }  // namespace
 
-void visualiser_feed(const uint8_t *pcm, uint32_t len)
+void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
 {
     if (!pcm_stream) {
         return;
@@ -330,15 +330,22 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len)
      * absolute positions in the stream, so they analyse identical windows and
      * reach identical decisions.
      *
-     * Done at feed time, not read time: this runs in the playback task at the
-     * moment the audio is handed to the DAC, so the clock reading refers to the
-     * audio in hand. At read time it would refer to whatever is queued, which is
-     * a varying amount ahead.
+     * The boundary is derived from `due_master_us` -- the instant this audio is
+     * SCHEDULED to be heard, interpolated from the hub's per-packet play_at
+     * stamps -- and not from a clock read here. Every unit gets the same play_at
+     * for the same audio, so every unit computes the same boundary for the same
+     * sample.
+     *
+     * Reading a clock here instead, which an earlier version did, aligns to when
+     * this board reached this line. Two boards reach it a few ms apart, and that
+     * skew lands straight on the block boundaries: 3 ms is 132 samples of 1024,
+     * so roughly one transient in eight is split differently between them. It is
+     * far better than the uniform 0-1023 offset of no alignment at all, which is
+     * why it looked improved but not fixed.
      */
     const uint32_t frame_bytes = CHANNELS * sizeof(int16_t);
-    if (s_align_pending) {
-        const int64_t idx = ((esp_timer_get_time() + master_offset())
-                             * SAMPLE_RATE) / 1000000;
+    if (s_align_pending && due_master_us > 0) {
+        const int64_t idx = (due_master_us * SAMPLE_RATE) / 1000000;
         const int32_t into_block = static_cast<int32_t>(idx % FFT_N);
         s_skip_frames = into_block ? (FFT_N - into_block) : 0;
         s_align_pending = false;

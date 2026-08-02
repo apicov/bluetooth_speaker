@@ -274,10 +274,12 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
  * driven from arrival run that far ahead of the sound. Splice silence goes
  * through here too, and should -- it is genuinely played.
  */
-static void write_audio(const uint8_t *pcm, size_t bytes)
+static void write_audio(const uint8_t *pcm, size_t bytes, int64_t due_master_us)
 {
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-    visualiser_feed(pcm, bytes);
+    visualiser_feed(pcm, bytes, due_master_us);
+#else
+    (void)due_master_us;
 #endif
     dac_write(pcm, bytes);
 }
@@ -611,6 +613,11 @@ static void play_task(void *arg)
          * and zeroing it shifts every marker by the buffer depth.
          */
         int32_t samples_played = 0;
+        /* Last phase point seen, for labelling audio with the instant it is due.
+         * Zero until the first point lands; the visualiser waits rather than
+         * aligning to a guess. */
+        int32_t anchor_pos = 0;
+        int64_t anchor_due = 0;
 
         while (1) {
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -629,6 +636,12 @@ static void play_task(void *arg)
                 int64_t now_master = esp_timer_get_time() + stream_offset;
                 phase_err_us = (int32_t)(now_master - due);
                 phase_valid = true;
+                /* Keep the last point: interpolating from it labels each chunk
+                 * with the instant it is DUE. Every unit gets the same play_at
+                 * for the same audio, so every unit agrees on that label -- which
+                 * is what lets the visualisers cut identical analysis blocks. */
+                anchor_pos = phase_q[phase_tail].pos;
+                anchor_due = due;
                 phase_tail = (phase_tail + 1) % PHASE_Q_LEN;
             }
 
@@ -666,7 +679,7 @@ static void play_task(void *arg)
                     int32_t left = -adj;
                     while (left > 0) {
                         int32_t n = left > (int32_t)AUDIO_FRAMES ? (int32_t)AUDIO_FRAMES : left;
-                        write_audio(quiet, (size_t)n * AUDIO_CHANNELS * sizeof(int16_t));
+                        write_audio(quiet, (size_t)n * AUDIO_CHANNELS * sizeof(int16_t), 0);
                         left -= n;
                     }
                     ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
@@ -684,7 +697,10 @@ static void play_task(void *arg)
             }
             samples_played += AUDIO_FRAMES;
 
-            write_audio(chunk, sizeof(chunk));
+            int64_t due = anchor_due
+                ? anchor_due + (int64_t)(samples_played - anchor_pos) * 1000000 / stream_rate
+                : 0;
+            write_audio(chunk, sizeof(chunk), due);
         }
     }
 }

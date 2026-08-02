@@ -641,6 +641,11 @@ static void local_play_task(void *arg)
          * counters therefore share an origin -- do NOT reset s_samples_in here,
          * it has legitimately been counting the audio buffered during the wait. */
         int32_t samples_played = 0;
+        /* Last phase point seen, for labelling audio with the instant it is due.
+         * Zero until the first point lands; the visualiser waits rather than
+         * aligning to a guess. */
+        int32_t anchor_pos = 0;
+        int64_t anchor_due = 0;
 
         while (1) {
             if (retuning) {
@@ -664,6 +669,12 @@ static void local_play_task(void *arg)
             while (s_phase_tail != s_phase_head && samples_played >= s_phase_q[s_phase_tail].pos) {
                 s_phase_err_us = (int32_t)(esp_timer_get_time() - s_phase_q[s_phase_tail].play_at);
                 s_phase_valid = true;
+                /* Keep the last point: interpolating from it labels each chunk
+                 * with the instant it is DUE, which every unit agrees on because
+                 * they all got the same play_at. The visualiser cuts its
+                 * analysis blocks on that. */
+                anchor_pos = s_phase_q[s_phase_tail].pos;
+                anchor_due = s_phase_q[s_phase_tail].play_at;
                 s_phase_tail = (s_phase_tail + 1) % PHASE_Q_LEN;
             }
 
@@ -718,8 +729,14 @@ static void local_play_task(void *arg)
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
             /* Fed here, at the DAC, and not where the audio arrived: ~200 ms of
              * buffer separates the two, and lights driven from the arrival side
-             * run that far ahead of this unit's own speaker. */
-            visualiser_feed(chunk, sizeof(chunk));
+             * run that far ahead of this unit's own speaker.
+             *
+             * The label is when this chunk is DUE, not the clock now -- see
+             * visualiser.h. On the hub local time is master time, so no offset. */
+            int64_t due = anchor_due
+                ? anchor_due + (int64_t)(samples_played - anchor_pos) * 1000000 / sample_rate
+                : 0;
+            visualiser_feed(chunk, sizeof(chunk), due);
 #endif
             size_t written = 0;
             if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,

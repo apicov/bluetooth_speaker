@@ -65,6 +65,7 @@ typedef struct {
     uint32_t recv_total, epoch;
     /* results */
     int      blocks, misaligned, drops;
+    int64_t  last_block_start;
 } unit_t;
 
 static void unit_init(unit_t *u) {
@@ -72,16 +73,26 @@ static void unit_init(unit_t *u) {
     u->align_pending = 1;
 }
 
-/* One feed call: `nframes` frames starting at absolute index `first`. */
-static void feed(unit_t *u, int64_t first, int nframes) {
+/*
+ * Label mode. LABEL_CLOCK reads this board's clock at the moment of the feed,
+ * which is what the second version of the aligner did; LABEL_DUE uses the
+ * instant the audio is scheduled to be heard, which every unit derives from the
+ * same per-packet play_at and therefore agrees on.
+ */
+#define LABEL_CLOCK 0
+#define LABEL_DUE   1
+
+/* One feed call: `nframes` frames starting at absolute index `first`.
+ * `skew_frames` is how far this board's clock reading sits from the content it
+ * is actually holding -- audio phase error plus task wake jitter. */
+static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_frames) {
     int64_t buf[CHUNK_FRAMES];
     for (int i = 0; i < nframes; i++) buf[i] = first + i;
     int64_t *p = buf;
 
     if (u->align_pending) {
-        /* The real code derives this from the master clock; the frame index of
-         * the audio in hand is the same quantity, exactly. */
-        int into = (int)(first % FFT_N);
+        int64_t label = (mode == LABEL_DUE) ? first : first + skew_frames;
+        int into = (int)(((label % FFT_N) + FFT_N) % FFT_N);
         u->skip_frames = into ? FFT_N - into : 0;
         u->align_pending = 0;
         u->mark_align_point = 1;
@@ -99,6 +110,10 @@ static void feed(unit_t *u, int64_t first, int nframes) {
     int took = fifo_push(&u->fifo, p, nframes);
     u->sent_total += (uint32_t)(took * FRAME_BYTES);
     if (took < nframes) { u->align_pending = 1; u->drops++; }   /* forces re-align */
+}
+
+static void feed(unit_t *u, int64_t first, int nframes) {
+    feed_mode(u, first, nframes, LABEL_DUE, 0);
 }
 
 /* One reader pass. `use_fix` selects the new epoch handling. */
@@ -127,7 +142,8 @@ static void reader(unit_t *u, int use_fix) {
 
     if (u->filled < FFT_N) return;
     u->blocks++;
-    if (u->raw[0] % FFT_N != 0) u->misaligned++;   /* THE property */
+    if (u->raw[0] % FFT_N != 0) u->misaligned++;   /* single-unit property */
+    u->last_block_start = u->raw[0];
     u->filled = 0;
 }
 
@@ -155,10 +171,43 @@ static void run(int use_fix, const char *name) {
            u.misaligned ? "<-- MISALIGNED" : "aligned");
 }
 
+/*
+ * The property that actually matters: TWO units, whose feed calls land a few ms
+ * apart, must cut their analysis blocks at the same CONTENT positions. If they
+ * do not, a transient near a boundary is split on one and centred on the other,
+ * and the marginal onsets are detected by one unit and missed by the other.
+ */
+static void two_units(int mode, const char *name, int skew_ms) {
+    unit_t a, b; unit_init(&a); unit_init(&b);
+    int skew = skew_ms * 44100 / 1000;      /* B's clock reads this far off A's */
+    int64_t pos = 4242;
+    int mismatch = 0, compared = 0;
+
+    for (int step = 0; step < 20000; step++) {
+        feed_mode(&a, pos, CHUNK_FRAMES, mode, 0);
+        feed_mode(&b, pos, CHUNK_FRAMES, mode, skew);
+        pos += CHUNK_FRAMES;
+        reader(&a, 1); reader(&a, 1);
+        reader(&b, 1); reader(&b, 1);
+        if (a.blocks > 2 && a.blocks == b.blocks) {
+            compared++;
+            if (a.last_block_start != b.last_block_start) mismatch++;
+        }
+    }
+    printf("  %-30s skew %2d ms   compared %5d   differing block starts %5d  %s\n",
+           name, skew_ms, compared, mismatch, mismatch ? "<-- DISAGREE" : "identical");
+}
+
 int main(void) {
     printf("block alignment across dropped feeds:\n");
     run(0, "feed-side discard only");
     run(1, "with reader epoch handling");
+
+    printf("\ntwo units, same audio, feed calls a few ms apart:\n");
+    two_units(LABEL_CLOCK, "labelled by local clock", 3);
+    two_units(LABEL_CLOCK, "labelled by local clock", 5);
+    two_units(LABEL_DUE,   "labelled by scheduled time", 3);
+    two_units(LABEL_DUE,   "labelled by scheduled time", 5);
 
     /* Re-run the fixed version and fail the build if it ever misaligns. */
     unit_t u; unit_init(&u); srand(999);
@@ -175,6 +224,24 @@ int main(void) {
            u.blocks, u.drops, u.misaligned);
     if (u.drops < 50)    { printf("FAIL: too few drops to exercise the fix\n"); return 1; }
     if (u.misaligned)    { printf("FAIL\n"); return 1; }
+
+    /* And the cross-unit property, which is the one the LEDs actually show. */
+    {
+        unit_t a, b; unit_init(&a); unit_init(&b);
+        int64_t pos = 4242; int mismatch = 0, compared = 0;
+        for (int step = 0; step < 20000; step++) {
+            feed_mode(&a, pos, CHUNK_FRAMES, LABEL_DUE, 0);
+            feed_mode(&b, pos, CHUNK_FRAMES, LABEL_DUE, 5 * 44100 / 1000);
+            pos += CHUNK_FRAMES;
+            reader(&a, 1); reader(&a, 1); reader(&b, 1); reader(&b, 1);
+            if (a.blocks > 2 && a.blocks == b.blocks) {
+                compared++;
+                if (a.last_block_start != b.last_block_start) mismatch++;
+            }
+        }
+        if (compared < 1000) { printf("FAIL: too few comparisons\n"); return 1; }
+        if (mismatch)        { printf("FAIL: units disagree on block starts\n"); return 1; }
+    }
     printf("\nall tests passed\n");
     return 0;
 }
