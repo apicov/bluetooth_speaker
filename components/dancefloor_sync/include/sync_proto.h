@@ -89,6 +89,20 @@ typedef struct __attribute__((packed)) {
 #define MARKER_EVERY_PKTS 100
 #define MARKER_PULSE_US   200
 
+/*
+ * Smoothed phase error each unit tolerates before retuning its output clock.
+ *
+ * Shared, because it is not a per-unit preference: every unit deadbands around
+ * its own reading of the same timeline, so the worst case between any two of
+ * them is twice this, whatever the servos report individually. Two units at
+ * 7 ms in opposite directions is 14 ms of separation -- audible as a widened
+ * image rather than an echo, and the track-boundary splice removes it.
+ *
+ * The floor is the clock itself: retuning happens in whole Hz, 22.7 ppm at
+ * 44.1 kHz, so this cannot usefully go much below a few ms.
+ */
+#define PHASE_DEADBAND_US 7000
+
 typedef enum {
     AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */
     AUDIO_FMT_SBC = 1,   /* one or more back-to-back SBC frames */

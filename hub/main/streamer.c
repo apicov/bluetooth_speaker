@@ -310,16 +310,22 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_restart_pending = true;      /* and bring the satellites with us */
     }
 
+    /* A timeline start invalidates the position this packet captured, because
+     * the ring it referred to is about to be cleared. */
+    bool started = false;
+
     if (next_play_at == 0) {
         next_play_at = target;
         local_start = target;              /* our own speaker joins the timeline */
         xStreamBufferReset(local_ring);
         s_samples_in = 0;                  /* same origin as the reset ring */
+        s_pending_pos = 0;                 /* and so does anything flagged here */
         s_marker_sample = -1;
         s_phase_head = s_phase_tail = 0;
         s_phase_valid = false;
         s_restart_pos = -1;
         s_restart_pending = false;
+        started = true;
         ESP_LOGI(TAG, "timeline start");
     } else if (llabs(next_play_at - target) > RESYNC_US) {
         static int64_t last_warn;
@@ -347,10 +353,32 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         ESP_LOGW(TAG, "track boundary flagged at seq %" PRIu32, msg.seq);
     }
 
-    /* Position captured before the audio was fed, paired with the time it is
-     * due -- the playback task compares the two when it gets there. */
+    /*
+     * Position captured before the audio was fed, paired with the time it is
+     * due -- the playback task compares the two when it gets there.
+     *
+     * Skipped at a timeline start, and that matters more than it looks.
+     * streamer_begin_packet() snapshots s_samples_in before this packet is
+     * decoded and fed; the branch above then resets s_samples_in to zero and
+     * clears the ring, so the snapshot describes an origin that no longer
+     * exists. On the first start it is legitimately zero, but on an underrun
+     * restart it is every frame fed since the last one -- hours of them.
+     *
+     * Queued, that entry sits at the head of a queue playback reaches only
+     * after playing the same hours of audio. The tail never advances, the queue
+     * fills, no further points are ever recorded, and s_phase_valid stays false
+     * for good: the ring servo stops, anchor_due stays zero, and the visualiser
+     * is fed a due of zero for ever -- hue frozen and no envelope decay, while
+     * every satellite carries on. One local underrun took the hub's strip out
+     * for the rest of the session.
+     *
+     * Nothing is lost by skipping it. This packet's audio went into the ring
+     * before the reset cleared it, so it has no position to record; the next
+     * packet lands at zero in the fresh ring and records itself correctly
+     * against the timeline this call just advanced.
+     */
     uint32_t nq = (s_phase_head + 1) % PHASE_Q_LEN;
-    if (nq != s_phase_tail) {
+    if (!started && nq != s_phase_tail) {
         s_phase_q[s_phase_head].pos = s_pending_pos;
         s_phase_q[s_phase_head].play_at = next_play_at;
         s_phase_head = nq;
@@ -689,11 +717,18 @@ static void local_play_task(void *arg)
                 if (adj < -max_frames) adj = -max_frames;
 
                 if (adj > 0) {
+                    /* Its own buffer, not chunk: chunk holds the audio read at
+                     * the top of this pass and not yet written to the DAC, so
+                     * discarding into it dropped that and played the tail of the
+                     * skipped region instead. Counted correctly either way, so
+                     * nothing drifted -- it just played 5.8 ms of the wrong
+                     * audio at every boundary. Same fix on the satellite. */
+                    static uint8_t discard[AUDIO_CHUNK_BYTES];
                     int32_t left = adj;
                     while (left > 0) {
                         size_t want = (size_t)(left > AUDIO_FRAMES ? AUDIO_FRAMES : left)
                                       * AUDIO_CHANNELS * sizeof(int16_t);
-                        size_t g = xStreamBufferReceive(local_ring, chunk, want, 0);
+                        size_t g = xStreamBufferReceive(local_ring, discard, want, 0);
                         if (g == 0) break;
                         left -= g / (AUDIO_CHANNELS * sizeof(int16_t));
                     }
@@ -706,14 +741,31 @@ static void local_play_task(void *arg)
                     size_t w = 0;
                     while (left > 0) {
                         int32_t n = left > AUDIO_FRAMES ? AUDIO_FRAMES : left;
-                        i2s_channel_write(i2s_tx, quiet,
-                                          (size_t)n * AUDIO_CHANNELS * sizeof(int16_t),
-                                          &w, portMAX_DELAY);
+                        size_t bytes = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+                        /* This silence is genuinely played, so the visualiser
+                         * sees it like everything else that reaches the DAC --
+                         * the satellite already fed its own through write_audio()
+                         * and the two must not differ. No scheduled instant to
+                         * label it with; the realign below supplies one. */
+                        visualiser_feed(quiet, bytes, 0);
+#endif
+                        i2s_channel_write(i2s_tx, quiet, bytes, &w, portMAX_DELAY);
                         left -= n;
                     }
                     ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
                              (long)(-adj * 1000 / (int32_t)sample_rate));
                 }
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+                if (adj != 0) {
+                    /* Samples were added to or taken out of what the visualiser
+                     * counts, so its block boundaries and its due_us stopped
+                     * describing the timeline. Each unit splices by its own
+                     * phase error, so leaving this out is what stepped the
+                     * strips apart at every track change. */
+                    visualiser_realign();
+                }
+#endif
             }
 
             int32_t mark = s_marker_sample;
@@ -825,14 +877,26 @@ static void ring_monitor_task(void *arg)
         }
         uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
 
+        /*
+         * Deadband in phase error, not in rate -- see PHASE_DEADBAND_US and the
+         * note in the satellite's drift task. tx_rate/5000 was documented as
+         * ~8 ms and is really ~20 ms, per unit and in either direction, which is
+         * most of the separation the two speakers were showing between track
+         * boundaries.
+         */
+        int32_t deadband = (int32_t)((int64_t)PHASE_DEADBAND_US * rate_ema / 100000000LL);
+        if (deadband < 1) {
+            deadband = 1;
+        }
+
         /* Wait for the buffer to respond before correcting again -- the hub
          * had no cooldown at all, so it retuned every window and chased its own
          * previous correction. */
         static int cooldown;
         if (cooldown > 0) {
             cooldown--;
-        } else if (desired > tx_rate + tx_rate / 5000 ||
-                   desired < tx_rate - tx_rate / 5000) {
+        } else if (desired > tx_rate + (uint32_t)deadband ||
+                   desired < tx_rate - (uint32_t)deadband) {
             ESP_LOGI(TAG, "servo: phase %+ld us, buffer %+ld ms -> DAC %" PRIu32 " Hz",
                      (long)s_phase_err_us, (long)depth_ms, desired);
             retune_dac(desired);

@@ -77,6 +77,32 @@ int64_t  s_pending_block_index;
 
 std::atomic<uint32_t> s_align_at_byte;      /* byte index where aligned audio starts */
 std::atomic<long long> s_align_block_index; /* block number of that first sample */
+/*
+ * Bumped on every publish, and what the analysis task actually watches.
+ *
+ * It used to watch s_align_at_byte, on the assumption that a new alignment
+ * always carries a new byte index. It does not, and the case where it does not
+ * is the common one: while this task is behind, the buffer is full and feeds are
+ * rejected ENTIRELY, so s_sent_total does not move. Every rejected feed re-arms
+ * the alignment, and each one then publishes the same byte index with a later
+ * block index. The reader took the first and could not see any of the rest --
+ * they compared equal to what it had already adopted -- so it went on labelling
+ * from an origin two or three blocks stale.
+ *
+ * Boundaries survived that, which is why it went unnoticed for so long: the
+ * discard arithmetic still lands on a multiple of FFT_N, so both units cut
+ * identical windows and simply dated them differently. due_us is what carries
+ * the date, and every time-driven pattern is built on it, so the strips ran the
+ * same animation from different points of its cycle -- stepping further apart at
+ * each burst of drops and never recovering. Modelled in test_align.c, where the
+ * byte-index reader mislabels ~53% of blocks over a run and this one mislabels
+ * none.
+ *
+ * The first publish was ignored too, for the duller reason that a byte count of
+ * zero is indistinguishable from the initial value. A generation counter has
+ * neither problem.
+ */
+std::atomic<uint32_t> s_align_gen;
 uint32_t s_sent_total;                      /* feed side only */
 
 /* Statistics, so a disagreement between two units is diagnosable rather than a
@@ -114,7 +140,7 @@ void visualiser_task(void *arg)
     static int16_t raw[FFT_N * CHANNELS];
     size_t   filled = 0;
     uint32_t recv_total = 0;
-    uint32_t epoch = 0;
+    uint32_t seen_gen = 0;
     int64_t  block_index = 0;
     int64_t  last_report_us = esp_timer_get_time();
     bool     starved_shown = false;
@@ -132,14 +158,17 @@ void visualiser_task(void *arg)
          * Dropping only the feed side leaves the boundaries offset by whatever
          * is held here, and the re-alignment silently does nothing.
          */
-        const uint32_t align_at = s_align_at_byte.load(std::memory_order_relaxed);
-        if (align_at != epoch) {
+        /* Acquire, against the release on the publishing side: the byte index
+         * and the block index must both be the ones this generation stored. */
+        const uint32_t gen = s_align_gen.load(std::memory_order_acquire);
+        if (gen != seen_gen) {
+            const uint32_t align_at = s_align_at_byte.load(std::memory_order_relaxed);
             const int32_t ahead = static_cast<int32_t>(recv_total - align_at);
             if (ahead < 0) {
                 filled = 0;             /* still draining pre-alignment audio */
                 continue;
             }
-            epoch = align_at;
+            seen_gen = gen;
             block_index = s_align_block_index.load(std::memory_order_relaxed);
             const size_t keep = static_cast<size_t>(ahead) < filled
                                 ? static_cast<size_t>(ahead) : filled;
@@ -217,10 +246,13 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
         }
     }
 
-    /* Publish where aligned audio begins, and which block that is. */
+    /* Publish where aligned audio begins, and which block that is. The
+     * generation goes last, and with release ordering: it is what the analysis
+     * task watches, so the two values must already be visible when it changes. */
     if (s_mark_align_point) {
         s_align_block_index.store(s_pending_block_index, std::memory_order_relaxed);
         s_align_at_byte.store(s_sent_total, std::memory_order_relaxed);
+        s_align_gen.fetch_add(1, std::memory_order_release);
         s_mark_align_point = false;
     }
 
@@ -234,6 +266,14 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
         bump(s_dropped, len - sent);
         s_align_pending = true;
     }
+}
+
+void visualiser_realign(void)
+{
+    /* Same task as visualiser_feed(), so a plain store is enough -- and it must
+     * be, because this is called from the playback path. The next feed carrying
+     * a scheduled instant re-derives the origin from it. */
+    s_align_pending = true;
 }
 
 void visualiser_set_master_offset(int64_t offset_us)

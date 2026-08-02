@@ -66,7 +66,14 @@ static i2s_chan_handle_t i2s_tx;
 static volatile int64_t stream_start_local;
 static volatile uint32_t stream_rate = 44100;
 static uint32_t tx_rate = 44100;      /* what the output clock is actually set to */
-static int64_t stream_offset;         /* clock offset used when anchoring */
+/*
+ * Local -> master conversion used by playback. Seeded at anchoring and then
+ * slewed towards the live estimate -- see track_offset(). Owned by the playback
+ * task once a stream is running; the receive task only writes it while playback
+ * is parked waiting for one.
+ */
+static int64_t stream_offset;
+static int64_t offset_slew_last;      /* when the slew last moved it */
 /*
  * 32-bit, not 64: these are read by the playback task while the receive task
  * writes them, and a 64-bit load is two instructions on this CPU -- a torn read
@@ -339,6 +346,7 @@ static void handle_audio(const audio_msg_t *msg)
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
         stream_offset = offset;
+        offset_slew_last = 0;                /* re-seed the slew for this stream */
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
         /* Patterns that advance on their own must do so on the shared clock, or
          * two units beat against each other. Re-published on every anchor
@@ -371,9 +379,34 @@ static void handle_audio(const audio_msg_t *msg)
         uint32_t frames_missing = missing * msg->frames;
         ESP_LOGW(TAG, "lost %" PRIu32 " packet(s), inserting %" PRIu32 " frames of silence",
                  missing, frames_missing);
-        while (frames_missing >= 128) {
-            xStreamBufferSend(ring, silence, sizeof(silence), 0);
-            frames_missing -= 128;
+        /*
+         * samples_in must count this silence, and the old loop did not.
+         *
+         * It is the position every marker and every phase point is recorded
+         * against, so audio that goes into the ring uncounted puts all of them
+         * one packet (~20 ms) too early -- permanently, and again on the next
+         * loss. The playback task then measures its phase against the wrong
+         * packet and the servo obediently holds the speaker at that error, so
+         * each lost packet moved this unit ~20 ms away from the hub and it never
+         * came back.
+         *
+         * Nothing showed it: the marker pulse fires off the same skewed count,
+         * so it lands where the hub's does while the sound and the lights slide.
+         *
+         * The tail below 128 frames is now inserted too, for the same reason:
+         * dropping it left up to 2.9 ms uncounted per loss.
+         */
+        while (frames_missing > 0) {
+            uint32_t n = frames_missing > 128 ? 128 : frames_missing;
+            size_t want = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
+            size_t sent = xStreamBufferSend(ring, silence, want, 0);
+            samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
+            if (sent < want) {
+                ESP_LOGW(TAG, "ring full while filling a gap, %" PRIu32 " frames short",
+                         frames_missing - (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t))));
+                break;
+            }
+            frames_missing -= n;
         }
     } else if (have_seq && msg->seq < expect_seq) {
         return;                              /* duplicate or reorder, drop */
@@ -415,10 +448,14 @@ static void handle_audio(const audio_msg_t *msg)
         }
         off += consumed;
         size_t want = samples * sizeof(int16_t);
-        if (xStreamBufferSend(ring, pcm, want, 0) != want) {
+        /* Count what the ring actually took, not what we offered: the same
+         * accounting the gap filler above depends on, and a short send here
+         * would otherwise bias every later position the other way. */
+        size_t sent = xStreamBufferSend(ring, pcm, want, 0);
+        if (sent < want) {
             ESP_LOGW(TAG, "ring full, dropping audio");
         }
-        samples_in += (int32_t)(samples / AUDIO_CHANNELS);
+        samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
     }
 }
 
@@ -559,19 +596,32 @@ static void drift_task(void *arg)
         }
         uint32_t desired = (uint32_t)((int32_t)stream_rate + adj);
         /*
-         * Threshold now applies to the smoothed error, so it can be far tighter:
-         * 0.02% instead of 0.15%. That is ~8 ms of accumulated drift before a
-         * correction, against ~60 ms before -- comfortably inside the ~5 ms that
-         * starts to matter between two speakers, while jitter no longer reaches
-         * it at all.
+         * Deadband, stated in phase error rather than in rate.
+         *
+         * It used to be tx_rate/5000, described as "~8 ms of accumulated drift
+         * before a correction". That reads 0.02% of the sample rate as if it
+         * were milliseconds, and it is not: adj is err_ema scaled by
+         * rate/100000000, so 8 Hz of threshold is 8e8/44100 = ~20 ms of phase
+         * error, not 8. Each unit therefore tolerated ~20 ms before doing
+         * anything, and hub and satellite deadband independently, so the pair
+         * could sit 40 ms apart with both logs reporting a settled servo.
+         *
+         * Derived from the intended figure now, so it stays honest if the rate
+         * changes. Note the floor: the clock is retuned in whole Hz, which is
+         * 22.7 ppm at 44.1 kHz, so corrections finer than that cannot be
+         * expressed however tight this gets.
          */
         if (!phase_valid) {
             continue;                        /* nothing measured yet */
         }
+        int32_t deadband = (int32_t)((int64_t)PHASE_DEADBAND_US * stream_rate / 100000000LL);
+        if (deadband < 1) {
+            deadband = 1;
+        }
         if (cooldown > 0) {
             cooldown--;
-        } else if (desired > tx_rate + tx_rate / 5000 ||
-                   desired < tx_rate - tx_rate / 5000) {
+        } else if (desired > tx_rate + (uint32_t)deadband ||
+                   desired < tx_rate - (uint32_t)deadband) {
             retune_output(desired);
             cooldown = 4;        /* ~20 s, against a 40 s correction time */
         }
@@ -580,6 +630,56 @@ static void drift_task(void *arg)
 }
 
 /* --------------------------------------------------------------- playback */
+
+/*
+ * Keep the local -> master conversion current.
+ *
+ * The offset measured at anchoring goes stale at whatever the two crystals
+ * differ by -- 10.6 ppm on our boards, so 38 ms in an hour (docs/clock-sync.md
+ * §9). The phase measurement below converts local time to master time with it,
+ * so holding it fixed biases that measurement by exactly the drift, and the
+ * servo then faithfully parks the speaker at the growing error instead of
+ * removing it. The drift the servo exists to correct was being fed back in as
+ * its own reference.
+ *
+ * Invisible in the logs, which is why it survived: the marker pulse is derived
+ * from the same conversion, so the cross-unit measurement reads correct while
+ * the sound and the lights slide apart.
+ *
+ * Slewed, never stepped. Minimum-RTT selection moves the raw estimate by a few
+ * ms as one probe replaces another in the window, and handing that straight to
+ * the servo looks exactly like a real position error. The limit below is ~15x
+ * the drift it has to follow, so drift is tracked with room to spare while
+ * estimator noise averages out over tens of seconds.
+ *
+ * Nothing jumps as a result. This moves only where the servo believes it is;
+ * the servo answers in sample rate, over ~100 s, as it always did.
+ */
+#define OFFSET_SLEW_PPM 200
+
+static void track_offset(void)
+{
+    int64_t measured;
+    if (!sync_est_offset(&est, &measured)) {
+        return;
+    }
+
+    const int64_t now = esp_timer_get_time();
+    if (offset_slew_last == 0) {
+        offset_slew_last = now;              /* first look at this stream */
+        return;
+    }
+    const int64_t limit = (now - offset_slew_last) * OFFSET_SLEW_PPM / 1000000;
+    if (limit == 0) {
+        return;                              /* too soon to move; let dt build */
+    }
+    offset_slew_last = now;
+
+    int64_t diff = measured - stream_offset;
+    if (diff >  limit) diff =  limit;
+    if (diff < -limit) diff = -limit;
+    stream_offset += diff;
+}
 
 static void play_task(void *arg)
 {
@@ -629,6 +729,10 @@ static void play_task(void *arg)
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
             }
+            /* Before measuring anything against the master clock, make sure the
+             * conversion still describes it. */
+            track_offset();
+
             /* Has playback reached a recorded packet boundary? If so, compare
              * now against when that sample was due. */
             while (phase_tail != phase_head && samples_played >= phase_q[phase_tail].pos) {
@@ -660,12 +764,21 @@ static void play_task(void *arg)
 
                 if (adj > 0) {
                     /* Late: discard input so playback jumps forward in content.
-                     * samples_played tracks input consumed, so it advances too. */
+                     * samples_played tracks input consumed, so it advances too.
+                     *
+                     * Into its own buffer, not into chunk: chunk is holding the
+                     * audio read at the top of this pass, which has not been
+                     * played yet. Discarding into it threw that away and played
+                     * the tail of the skipped region in its place -- 5.8 ms of
+                     * the wrong audio at every boundary. Nothing drifted, since
+                     * both reads are counted, but it is not what the splice is
+                     * supposed to do. */
+                    static uint8_t discard[AUDIO_CHUNK_BYTES];
                     int32_t left = adj;
                     while (left > 0) {
                         size_t want = (size_t)(left > (int32_t)AUDIO_FRAMES ? AUDIO_FRAMES : left)
                                       * AUDIO_CHANNELS * sizeof(int16_t);
-                        size_t got2 = xStreamBufferReceive(ring, chunk, want, 0);
+                        size_t got2 = xStreamBufferReceive(ring, discard, want, 0);
                         if (got2 == 0) break;
                         left -= got2 / (AUDIO_CHANNELS * sizeof(int16_t));
                     }
@@ -686,6 +799,16 @@ static void play_task(void *arg)
                              (long)(-adj * 1000 / (int32_t)stream_rate));
                     phase_stepped = true;
                 }
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+                if (adj != 0) {
+                    /* The audio stream the visualiser counts just gained or lost
+                     * samples, so its block boundaries and its due_us no longer
+                     * describe this unit's timeline -- and each unit splices by
+                     * its own error, so they no longer describe each other's
+                     * either. Re-derive both from the next scheduled instant. */
+                    visualiser_realign();
+                }
+#endif
             }
 
             int32_t mark = marker_sample;

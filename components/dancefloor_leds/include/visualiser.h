@@ -42,6 +42,27 @@ void visualiser_set_master_offset(int64_t offset_us);
 void visualiser_set_pattern(const char *name);
 
 /*
+ * Tell the visualiser the audio it is about to be fed no longer continues the
+ * audio it was fed before -- samples were skipped or inserted between them.
+ *
+ * Call it from the same task that calls visualiser_feed(), after any splice.
+ *
+ * Block boundaries and due_us are both carried forward by COUNTING what arrives
+ * here, from an origin established once against the scheduled timeline. That is
+ * what lets two units cut identical blocks without exchanging anything. A splice
+ * breaks the count: audio the timeline still accounts for never arrives (a skip)
+ * or audio it does not account for does (an insert), and everything after it is
+ * mislabelled by the length of the splice -- for good, since nothing re-derives
+ * the origin on its own.
+ *
+ * Each unit splices by its own phase error, so the two strips step apart at
+ * every track boundary and never recover. Re-deriving the origin from the next
+ * scheduled instant costs one dropped analysis block and puts them back
+ * together.
+ */
+void visualiser_realign(void);
+
+/*
  * Feed interleaved 16-bit stereo PCM. Non-blocking: never delays audio.
  *
  * Feed this from the PLAYBACK path -- where samples are handed to the DAC -- and
