@@ -17,8 +17,14 @@ menu "Dancefloor LEDs"
 
     config DANCEFLOOR_LED_COUNT
         int "Number of LEDs"
-        default 60
+        default 8
         depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Total pixels on the one data line, so chained 8-LED sticks add up:
+            four of them is 32, not 8.
+
+            8 is the bring-up figure and small enough to run off the devkit's
+            5 V rail. The real strips are 1-2 m and need their own supply.
 
     choice DANCEFLOOR_LED_TYPE
         prompt "Strip model"
