@@ -82,7 +82,19 @@ int64_t master_offset()
  * diagnosable instead of a matter of opinion. All touched only by the feed
  * (audio task) except the counters, which the report reads and clears. */
 bool    s_align_pending = true;
+bool    s_mark_align_point;
 int32_t s_skip_frames;
+
+/*
+ * Where aligned audio starts, as a byte index into the stream that actually
+ * passed through the buffer. Written by the feed, read by the analysis task.
+ *
+ * 32-bit and allowed to wrap: at 176 kB/s that is every 6.8 hours, and every
+ * comparison is a signed difference between two values a fraction of a second
+ * apart, which is wrap-safe.
+ */
+std::atomic<uint32_t> s_align_at_byte;
+uint32_t s_sent_total;          /* feed side only */
 /* Atomic, not volatile: these are incremented by the audio task and read and
  * cleared by the analysis task, and C++20 deprecates compound assignment on a
  * volatile. Relaxed ordering -- they are statistics, not a handshake. */
@@ -203,6 +215,8 @@ void visualiser_task(void *arg)
     size_t filled = 0;
     int64_t last_render_us = esp_timer_get_time();
     int64_t last_report_us = last_render_us;
+    uint32_t recv_total = 0;      /* bytes taken out of the buffer, ever */
+    uint32_t epoch = 0;           /* matches s_align_at_byte's initial value */
 
     while (true) {
         /*
@@ -215,6 +229,31 @@ void visualiser_task(void *arg)
                                                 reinterpret_cast<uint8_t *>(raw) + filled,
                                                 sizeof(raw) - filled, pdMS_TO_TICKS(100));
         filled += got;
+        recv_total += got;
+
+        /*
+         * Has the feed re-aligned? Then everything before its published byte
+         * index is stale and must not contribute to a block, including whatever
+         * partial block is being held here. Dropping only the feed side -- which
+         * is what the first version did -- leaves this partial block in place
+         * and the boundaries offset by its length, so the re-alignment silently
+         * did nothing.
+         */
+        const uint32_t align_at = s_align_at_byte.load(std::memory_order_relaxed);
+        if (align_at != epoch) {
+            const int32_t ahead = static_cast<int32_t>(recv_total - align_at);
+            if (ahead < 0) {
+                filled = 0;             /* still draining pre-alignment audio */
+                continue;
+            }
+            /* Keep only the tail belonging to the new epoch, and start the next
+             * block exactly at the aligned byte. */
+            epoch = align_at;
+            const size_t keep = static_cast<size_t>(ahead) < filled
+                                ? static_cast<size_t>(ahead) : filled;
+            std::memmove(raw, reinterpret_cast<uint8_t *>(raw) + (filled - keep), keep);
+            filled = keep;
+        }
 
         if (filled < sizeof(raw)) {
             if (got == 0) {
@@ -303,6 +342,7 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len)
         const int32_t into_block = static_cast<int32_t>(idx % FFT_N);
         s_skip_frames = into_block ? (FFT_N - into_block) : 0;
         s_align_pending = false;
+        s_mark_align_point = true;
         bump(s_aligns);
     }
     if (s_skip_frames > 0) {
@@ -317,11 +357,32 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len)
         }
     }
 
+    /*
+     * Publish the byte index at which aligned audio begins.
+     *
+     * Discarding here is not on its own enough, and the first version of this
+     * was broken for exactly that reason: the analysis task holds a partially
+     * accumulated block, and completing it with freshly aligned data leaves its
+     * boundaries offset by however much it happened to be holding. The discard
+     * looked like it worked and did nothing. Both units start aligned, and the
+     * first dropped feed on either one un-aligns it permanently.
+     *
+     * So the two sides agree on a position instead. Both count bytes that
+     * actually passed through the buffer -- the count only advances by what the
+     * send accepted, so a drop cannot make them disagree -- and the reader
+     * throws away everything before this index.
+     */
+    if (s_mark_align_point) {
+        s_align_at_byte.store(s_sent_total, std::memory_order_relaxed);
+        s_mark_align_point = false;
+    }
+
     /* 0 ticks: never block the audio task that calls this. A short send means
      * the analysis task fell behind and audio was lost -- which both breaks the
      * block alignment and makes this unit analyse different audio from its
      * neighbours, so count it and re-align rather than losing it silently. */
     const size_t sent = xStreamBufferSend(pcm_stream, pcm, len, 0);
+    s_sent_total += sent;
     if (sent < len) {
         bump(s_dropped, len - sent);
         s_align_pending = true;

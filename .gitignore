@@ -10,6 +10,8 @@ dependencies.lock
 # Host test binaries
 sync_test/test/test_sync_proto
 hub/test/test_beat_detect
+components/dancefloor_leds/test/test_align
+components/dancefloor_leds/test/test_beat
 i2s_loopback/test_*
 
 # Python bytecode from running tools/
