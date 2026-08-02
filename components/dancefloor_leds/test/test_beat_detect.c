@@ -148,6 +148,45 @@ int main(void)
         check("strength stays within 0..1", any && max_s >= 0.0f && max_s <= 1.0f, s);
     }
 
+    /* ---- beat_normalise(): the band scaling the visualiser feeds in ---- */
+
+    {
+        /* The bug this replaced: a hard clamp at 1.0. Flux counts increases, so
+         * once a band pinned, a louder kick produced a rise of exactly zero and
+         * vanished from the detector. Measured against the real FFT and gain,
+         * the bass band clamped above about -11 dBFS -- most mastered music. */
+        bool ok = true;
+        float worst = 1e9f;
+        for (float v = 0.5f; v < 40.0f; v *= 1.3f) {
+            float rise = beat_normalise(v * 1.2f) - beat_normalise(v);
+            if (rise <= 0.0f) ok = false;
+            if (rise < worst) worst = rise;
+        }
+        char m[64]; snprintf(m, sizeof m, "smallest rise=%.5f", worst);
+        check("a 20 pct louder band always rises, however loud", ok, m);
+
+        /* The same case stated as the old code would have failed it. */
+        float clamped_lo = 3.0f > 1.0f ? 1.0f : 3.0f;
+        float clamped_hi = 3.6f > 1.0f ? 1.0f : 3.6f;
+        check("hard clamp would have given zero rise here",
+              clamped_hi - clamped_lo == 0.0f
+              && beat_normalise(3.6f) - beat_normalise(3.0f) > 0.0f, "");
+    }
+    {
+        bool mono = true, bounded = true;
+        float prev = -1.0f;
+        for (float v = 0.0f; v < 100.0f; v += 0.05f) {
+            float n = beat_normalise(v);
+            if (n < prev) mono = false;
+            if (n < 0.0f || n >= 1.0f) bounded = false;
+            prev = n;
+        }
+        check("normalise is monotonic", mono, "");
+        check("normalise stays in [0,1)", bounded, "");
+        check("normalise handles zero and negatives",
+              beat_normalise(0.0f) == 0.0f && beat_normalise(-5.0f) == 0.0f, "");
+    }
+
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");
     return failures != 0;
 }

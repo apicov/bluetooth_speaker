@@ -705,14 +705,16 @@ a listening test rather than a reasoned argument.
 **The beat detector's thresholds have never been tuned against a recording.**
 `BEAT_THRESHOLD_K` (1.8) and `BAND_GAIN` (12.0) were set against synthetic kicks
 in the host test. They fire on real music and the units agree, but nobody has
-checked how many beats are missed or invented. This is what the WAV recording
+measured how many beats are missed or invented. This is what the WAV recording
 exists to fix.
 
-**`bass > pos` is a hard threshold with four steps across 8 LEDs.** A hair's
-difference in band[0] flips whole pixels between full and quarter brightness.
-It has not caused a visible problem since the analysis blocks were aligned, but
-it is the sharpest remaining amplifier of any small numeric difference between
-units, and it is worth softening before the strips get longer.
+It matters less than it did. The band scaling used to end in a hard clamp at
+1.0, and since spectral flux counts only energy *increases*, a pinned band had a
+rise of exactly zero -- measured against this FFT and gain, the bass band clamped
+for any 60 Hz content above about -11 dBFS, so on most mastered music the kick
+contributed nothing at all and detection ran on the higher bands alone.
+`beat_normalise()` is now monotonic over the whole input range, so a wrong gain
+costs sensitivity rather than deleting the signal.
 
 **Nothing has been heard through a real DAC.** M1, M2 and M3 were marked
 complete on log output and on the desktop client's audio. The PCM5102A boards

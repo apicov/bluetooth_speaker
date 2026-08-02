@@ -41,6 +41,25 @@ typedef struct {
     bool primed;          /* first frame has no predecessor to difference against */
 } beat_det_t;
 
+/*
+ * Map a raw band magnitude onto the 0..1 range beat_det_update() expects.
+ *
+ * This used to be a hard clamp in the caller, and the clamp destroyed exactly
+ * the signal the detector runs on. Flux counts energy INCREASES, so a band
+ * pinned at 1.0 has a rise of exactly zero and contributes nothing -- and
+ * measured against this FFT and gain, the bass band clamps for any 60 Hz
+ * content above about -11 dBFS, which is most mastered music. The kick, the
+ * band weighted highest and the one the lights are meant to follow, went
+ * silent on precisely the loud tracks it matters for.
+ *
+ * raw / (1 + raw) is monotonic over the whole input range and never reaches 1,
+ * so an increase always produces a positive rise however loud the input. It
+ * compresses at the top -- the same kick yields less flux when it arrives on a
+ * loud passage -- but the detector's threshold is an adaptive mean plus 1.8
+ * standard deviations over the last 43 frames, so it tracks that.
+ */
+float beat_normalise(float raw);
+
 void beat_det_init(beat_det_t *d);
 
 /*

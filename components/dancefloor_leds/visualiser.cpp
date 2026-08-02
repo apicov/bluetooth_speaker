@@ -55,9 +55,23 @@ constexpr LedStrip::Type STRIP_TYPE = LedStrip::Type::WS2812;
 constexpr std::array<int, BEAT_BANDS> BAND_LO = { 1,  4,  24, 117 };
 constexpr std::array<int, BEAT_BANDS> BAND_HI = { 3, 23, 116, FFT_N / 2 - 1 };
 
-/* Empirical, and tuned against synthetic kicks rather than real music. Expect to
- * revisit this with a recording -- see tools/desktop_satellite.py --record. */
+/* Empirical, and set against synthetic kicks rather than real music. Expect to
+ * revisit this with a recording -- see tools/desktop_satellite.py --record.
+ *
+ * It matters much less than it did: beat_normalise() is monotonic over the whole
+ * input range, so getting this wrong now costs sensitivity rather than deleting
+ * the signal outright. */
 constexpr float BAND_GAIN = 12.0f;
+
+/* Midpoint of the strip in pixel indices. For 8 pixels that is 3.5, so the two
+ * end pixels are equidistant from it and both reach a normalised position of
+ * exactly 1.0. */
+constexpr float CENTRE = (LED_COUNT > 1) ? (LED_COUNT - 1) * 0.5f : 1.0f;
+
+/* Width of the transition in the bass ramp, in band units. Narrow enough to
+ * still read as a moving edge, wide enough that two units disagreeing by a
+ * percent differ by a percent rather than by a factor of four. */
+constexpr float EDGE_WIDTH = 0.15f;
 
 StreamBufferHandle_t pcm_stream;
 std::optional<LedStrip> strip;
@@ -129,7 +143,10 @@ void compute_bands(float band[BEAT_BANDS])
         }
         const float v = (sum / static_cast<float>(BAND_HI[b] - BAND_LO[b] + 1))
                         * BAND_GAIN / static_cast<float>(FFT_N) * 2.0f;
-        band[b] = v > 1.0f ? 1.0f : v;
+        /* Soft, not a hard clamp -- see beat_normalise(). Clamping pinned the
+         * bass band at 1.0 on anything loud, and a pinned band has a rise of
+         * zero, so the kick stopped contributing to flux at all. */
+        band[b] = beat_normalise(v);
     }
 }
 
@@ -176,9 +193,29 @@ void render(float level, float bass, int64_t master_us)
     const Rgb c = hsv2rgb(hue, 1.0f, level * BRIGHTNESS);
 
     for (uint32_t i = 0; i < LED_COUNT; i++) {
-        /* Bass pushes colour outward from the centre of the strip. */
-        const float pos = std::fabs(static_cast<float>(i) / LED_COUNT - 0.5f) * 2.0f;
-        const float k = bass > pos ? 1.0f : 0.25f;
+        /*
+         * Bass pushes colour outward from the centre of the strip.
+         *
+         * Distance is measured from the midpoint BETWEEN the end pixels, so the
+         * figure is symmetric and both ends reach exactly 1.0. Dividing i by
+         * LED_COUNT instead, as this did, puts pixel 0 at 1.0 and the last
+         * pixel at 1 - 2/COUNT: the pattern was lopsided, and since band values
+         * can only reach 1.0 and the test was a strict >, pixel 0 could never
+         * light at all.
+         */
+        const float pos = std::fabs(static_cast<float>(i) - CENTRE) / CENTRE;
+
+        /*
+         * Ramp rather than an on/off test. A hard threshold turns an arbitrarily
+         * small difference in bass between two units into a 4x brightness
+         * difference on whichever pixel sits at the edge -- the sharpest
+         * amplifier in the whole pipeline, on a quantity that is never going to
+         * agree to the last bit. The ramp makes a small disagreement look small.
+         */
+        float t = (bass - pos) / EDGE_WIDTH + 0.5f;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        const float k = 0.25f + 0.75f * t;
+
         strip->set(i, static_cast<uint8_t>(c.r * k),
                       static_cast<uint8_t>(c.g * k),
                       static_cast<uint8_t>(c.b * k));

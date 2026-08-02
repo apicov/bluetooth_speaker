@@ -11,6 +11,14 @@ static const float BAND_WEIGHT[BEAT_BANDS] = { 1.0f, 0.6f, 0.3f, 0.15f };
  * Lower fires on texture, higher misses soft kicks. */
 #define BEAT_THRESHOLD_K 1.8f
 
+float beat_normalise(float raw)
+{
+    if (!(raw > 0.0f)) {        /* also catches NaN */
+        return 0.0f;
+    }
+    return raw / (1.0f + raw);
+}
+
 void beat_det_init(beat_det_t *d)
 {
     memset(d, 0, sizeof(*d));
