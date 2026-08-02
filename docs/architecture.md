@@ -702,9 +702,17 @@ airtime it is not hurting anything measurable, and
 left at 6 because the system was measured working there and the change deserves
 a listening test rather than a reasoned argument.
 
-**The beat detector has never been verified against real music.**
-`BEAT_THRESHOLD_K` (1.8) and `BAND_GAIN` (12.0) were tuned against synthetic
-kicks in the host test. This is what the WAV recording exists to fix.
+**The beat detector's thresholds have never been tuned against a recording.**
+`BEAT_THRESHOLD_K` (1.8) and `BAND_GAIN` (12.0) were set against synthetic kicks
+in the host test. They fire on real music and the units agree, but nobody has
+checked how many beats are missed or invented. This is what the WAV recording
+exists to fix.
+
+**`bass > pos` is a hard threshold with four steps across 8 LEDs.** A hair's
+difference in band[0] flips whole pixels between full and quarter brightness.
+It has not caused a visible problem since the analysis blocks were aligned, but
+it is the sharpest remaining amplifier of any small numeric difference between
+units, and it is worth softening before the strips get longer.
 
 **Nothing has been heard through a real DAC.** M1, M2 and M3 were marked
 complete on log output and on the desktop client's audio. The PCM5102A boards
@@ -715,7 +723,7 @@ are still to be wired.
 | Milestone | State |
 |---|---|
 | M1–M2 Bluetooth speaker + LEDs | Done, on logs and desktop audio |
-| M3 Beat detection driving LEDs | Built on both hub and satellite; **thresholds unverified against real music** |
+| M3 Beat detection driving LEDs | **Working on hardware** — two units pulsing together on real music. Thresholds still never tuned against a recording |
 | M4–M6 Clock sync, streaming, drift | Done and measured |
 | M7 Coexistence | Done — resolved by splitting the chips |
 | M8 Power, enclosure, field test | **Untouched** |
@@ -762,3 +770,19 @@ that was theoretically sound.
 The practical form of that lesson, for anyone extending this: **before
 investigating a symptom, add a counter for the thing you believe is being
 lost.** Everything in this system that works, works because something counts it.
+
+### And a second pattern, from getting the LEDs to agree
+
+That one took three rounds, and each round shipped a test that passed:
+
+| Round | Test written | Why it proved nothing |
+|---|---|---|
+| Block alignment | Producer/consumer with drops | The reader always drained the queue, so no drop was ever exercised |
+| Re-alignment after a drop | Same, with real drops | Correct — it caught the bug, 99.8% of blocks misaligned |
+| Content vs clock labelling | Single unit, blocks correctly spaced | The property is about **two** units. One unit's blocks were correctly spaced the whole time; the two just landed on different content |
+
+The failure mode is not laziness — each test measured a real property, carefully.
+It measured the property that was easy to state rather than the one the hardware
+was showing. The discipline that actually works: **run the new test against the
+broken version first.** If it passes, the test is wrong, and writing it has told
+you nothing about the code.
