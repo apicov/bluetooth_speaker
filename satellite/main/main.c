@@ -104,6 +104,14 @@ static volatile uint32_t phase_head, phase_tail;
 static volatile int32_t phase_err_us;         /* + = playing late */
 static volatile bool phase_valid;
 static volatile int32_t restart_pos = -1;     /* ring position of a track boundary */
+/*
+ * Set after a splice. The phase genuinely steps at that instant, so the running
+ * average from before it describes a situation that no longer exists -- seen as
+ * "phase -2153 us (smoothed +26992 us)", with the servo acting on the stale
+ * figure. Splices are rare, so re-seeding here costs nothing; re-seeding on
+ * every correction, as an earlier version did, destroys the smoothing entirely.
+ */
+static volatile bool phase_stepped;
 
 /* Never splice more than this in one go. A larger error means something is
  * wrong that a splice will not fix, and a 150 ms jump is very audible even at a
@@ -486,6 +494,10 @@ static void drift_task(void *arg)
          * kept only as a safety net against underrun or overflow, which phase
          * control alone would not notice until it was too late. */
         int32_t ph = phase_valid ? phase_err_us : 0;
+        if (phase_stepped) {
+            phase_stepped = false;
+            err_ema_valid = false;       /* history describes a different world */
+        }
         err_ema = err_ema_valid ? (err_ema * 3 + ph) / 4 : ph;
         err_ema_valid = true;
 
@@ -617,6 +629,7 @@ static void play_task(void *arg)
                     samples_played += (adj - left);
                     ESP_LOGW(TAG, "track boundary: skipped %ld ms to null phase",
                              (long)((adj - left) * 1000 / (int32_t)stream_rate));
+                    phase_stepped = true;
                 } else if (adj < 0) {
                     /* Early: emit silence so the timeline catches up with us. */
                     static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
@@ -628,6 +641,7 @@ static void play_task(void *arg)
                     }
                     ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
                              (long)(-adj * 1000 / (int32_t)stream_rate));
+                    phase_stepped = true;
                 }
             }
 
