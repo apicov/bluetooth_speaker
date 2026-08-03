@@ -969,20 +969,29 @@ static void ring_monitor_task(void *arg)
 #endif
 
         /*
-         * Shadow only -- computed, logged, and never acted on.
+         * The servo input, matching the satellite: a 4-sample EMA of the phase,
+         * forgotten after a splice because the average from before it describes
+         * a situation that no longer exists.
          *
-         * The satellite servos on a 4-sample EMA of its phase; this unit servos
-         * on the raw reading. That is a real asymmetry, and it showed once as a
-         * 63 ms / 104 ms splice mismatch at a track boundary after a timeline
-         * resync: the hub had walked the step off and the satellite, filtering,
-         * had not. The raw reading is also visibly noisy -- two reads a
-         * millisecond apart have differed by 1.5 ms.
+         * This unit used to act on the raw reading, and the raw reading is far
+         * noisier than anyone had established. Measured here, two reads of
+         * s_phase_err_us one millisecond apart:
          *
-         * What is NOT known is whether the difference changes any decision, and
-         * that is what wants measuring before either unit is changed. This
-         * mirrors the satellite's filter exactly, including forgetting its
-         * history after a splice, so the log shows what a smoothed hub would
-         * have done beside what the raw hub actually did.
+         *   local ring ... | phase +26786 us (smoothed +8996 us)
+         *   servo: phase +11108 us (smoothed +8996), ...
+         *
+         * 15.7 ms of swing between consecutive samples, with the average
+         * sitting still at +9 ms through it. That is the "hub absolute phase
+         * does not settle" wart in docs/clock-sync.md, quantified: the servo was
+         * substantially triggering on measurement noise. A shadow run put two
+         * of six retunes at the deadband edge, both of which the average would
+         * have held.
+         *
+         * Honest caveat: cross-unit audio measured 0.5 to 2.5 ms with the raw
+         * input, which is already the best this project has recorded, so this
+         * is expected to reduce pointless retunes rather than to move that
+         * number. If it moves it the wrong way, revert this commit -- the raw
+         * value is still computed below and still logged.
          */
         static int32_t s_err_ema;
         static bool    s_err_ema_valid;
@@ -1019,7 +1028,7 @@ static void ring_monitor_task(void *arg)
          * error had gone and overshot to +8 ms. Real drift is ~0.8 ms/minute,
          * far slower than the correction needs to be.
          */
-        int32_t adj = (int32_t)((int64_t)s_phase_err_us * rate_ema / 100000000LL);
+        int32_t adj = (int32_t)((int64_t)s_err_ema * rate_ema / 100000000LL);
         /* The drift correction is small by nature -- real drift is ~14 ppm.
          * Anything larger is a bad phase reading, not a rate error. */
         if (adj >  RATE_TRIM_MAX_HZ) adj =  RATE_TRIM_MAX_HZ;
@@ -1046,37 +1055,37 @@ static void ring_monitor_task(void *arg)
         /* Wait for the buffer to respond before correcting again -- the hub
          * had no cooldown at all, so it retuned every window and chased its own
          * previous correction. */
-        /* What the smoothed input would have asked for, on the same path. */
-        int32_t adj_s = (int32_t)((int64_t)s_err_ema * rate_ema / 100000000LL);
-        if (adj_s >  RATE_TRIM_MAX_HZ) adj_s =  RATE_TRIM_MAX_HZ;
-        if (adj_s < -RATE_TRIM_MAX_HZ) adj_s = -RATE_TRIM_MAX_HZ;
-        const uint32_t desired_s = (uint32_t)((int32_t)rate_ema + adj_s);
+        /* The raw input is the shadow now. Kept so the comparison survives the
+         * change, and so a revert has something to check itself against. */
+        int32_t adj_raw = (int32_t)((int64_t)s_phase_err_us * rate_ema / 100000000LL);
+        if (adj_raw >  RATE_TRIM_MAX_HZ) adj_raw =  RATE_TRIM_MAX_HZ;
+        if (adj_raw < -RATE_TRIM_MAX_HZ) adj_raw = -RATE_TRIM_MAX_HZ;
+        const uint32_t desired_raw = (uint32_t)((int32_t)rate_ema + adj_raw);
 
         static int cooldown;
         if (cooldown > 0) {
             cooldown--;
         } else {
-            const bool raw_would = desired   > tx_rate + (uint32_t)deadband ||
-                                   desired   < tx_rate - (uint32_t)deadband;
-            const bool ema_would = desired_s > tx_rate + (uint32_t)deadband ||
-                                   desired_s < tx_rate - (uint32_t)deadband;
+            const bool ema_would = desired     > tx_rate + (uint32_t)deadband ||
+                                   desired     < tx_rate - (uint32_t)deadband;
+            const bool raw_would = desired_raw > tx_rate + (uint32_t)deadband ||
+                                   desired_raw < tx_rate - (uint32_t)deadband;
             /*
-             * The measurement this exists for: how often the two inputs
-             * disagree about whether to retune at all. Every one of these is a
-             * retune the satellite's filter would have suppressed, or one it
-             * would have made that this unit did not. Count them over a session
-             * and the asymmetry is either worth closing or it is not.
+             * Still logged, with the roles swapped: each of these is now a
+             * retune the raw input would have made and the average declined, or
+             * the reverse. If these become common AND the cross-unit figure
+             * degrades, this commit is the thing to revert.
              */
             if (raw_would != ema_would) {
-                ESP_LOGW(TAG, "SERVO DIVERGES: raw %+ld us -> %" PRIu32 " Hz (%s), "
-                              "smoothed %+ld us -> %" PRIu32 " Hz (%s)",
-                         (long)s_phase_err_us, desired,   raw_would ? "retune" : "hold",
-                         (long)s_err_ema,      desired_s, ema_would ? "retune" : "hold");
+                ESP_LOGW(TAG, "SERVO DIVERGES: smoothed %+ld us -> %" PRIu32 " Hz (%s), "
+                              "raw %+ld us -> %" PRIu32 " Hz (%s)",
+                         (long)s_err_ema,      desired,     ema_would ? "retune" : "hold",
+                         (long)s_phase_err_us, desired_raw, raw_would ? "retune" : "hold");
             }
-            if (raw_would) {
-                ESP_LOGI(TAG, "servo: phase %+ld us (smoothed %+ld), buffer %+ld ms "
+            if (ema_would) {
+                ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
                               "-> DAC %" PRIu32 " Hz",
-                         (long)s_phase_err_us, (long)s_err_ema, (long)depth_ms, desired);
+                         (long)s_err_ema, (long)s_phase_err_us, (long)depth_ms, desired);
                 retune_dac(desired);
                 cooldown = 4;          /* ~20 s against a 100 s correction */
             }
