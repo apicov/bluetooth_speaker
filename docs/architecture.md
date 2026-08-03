@@ -490,18 +490,64 @@ to the DAC: `write_audio()` on the satellite, and immediately before
 from the packet-arrival path in `sbc_in.c` and its lights genuinely did run
 ~200 ms early.
 
-The pulse agrees across units for free, because each is analysing audio that is
-already synchronised. The *hue* does not — it is seeded from each board's own
-boot — which is fine for a pulse and would not be for a chase across units. A
-chase needs its phase seeded from the shared master clock, and is not built.
+#### Agreeing without communicating
+
+The pulse agrees across units for free, because each analyses audio that is
+already synchronised. Everything else has to be *derived from the audio* rather
+than from anything local, and that turns out to be the whole difficulty.
+
+Two things are needed, and both come from the same source.
+
+**Blocks must be cut at the same content positions.** The detector chops the
+stream into fixed 1024-sample blocks, and if two units cut them at different
+offsets a transient near a boundary is split on one board and centred on the
+other — the marginal onsets then fire on one strip and not its neighbour.
+Boundaries are derived from `play_at`, the instant the audio is *scheduled* to be
+heard, which every unit receives identically. Never from a clock read locally:
+units reach that line milliseconds apart, and 3 ms of skew puts them 132 samples
+out of 1024.
+
+**Animation must be a function of shared time, not of local counts.** `due_us`
+comes from the block index, so the same audio carries the same label on every
+unit. A hue that accumulated per render would drift apart, because units do not
+render the same number of times — audio arrives in different-sized lumps and a
+starved unit renders extra frames. Nothing is integrated, so nothing accumulates
+error, and a unit that stalls rejoins in the right place instead of lagging for
+ever.
+
+Both properties depend on the visualiser's count of what has passed through it
+staying true, and three things can break it: a short send when the analysis task
+falls behind, a **splice** at a track boundary, and a **retune**, which discards
+the DMA buffer — audio the playback task has already counted and already fed
+here, that nobody heard. Each calls `visualiser_realign()`, which re-derives the
+origin from the next scheduled instant at the cost of one dropped block. Without
+it the two strips step apart at every one of those events and never recover;
+with it they resynchronise within a block.
+
+`test_align.c` and `test_pattern_sync.cpp` pin both halves mechanically — see
+§15.
 
 #### Where the code lives
 
 `components/dancefloor_leds/` is shared by the hub and every satellite: the same
-FFT, the same detector, the same patterns, one copy. Its `Kconfig` owns the LED
-options for both firmwares — GPIO, count, strip model, and a **brightness cap
-defaulting to 40%**, which is the figure the power budget assumes and which
-dark-adapted eyes cannot distinguish from full outdoors.
+FFT, the same detector, the same patterns, one copy. It is split so that
+everything deciding what the lights *do* has no platform dependencies:
+
+| | |
+|---|---|
+| `analysis.cpp` | FFT, band split, onset detection — audio in, `Frame` out |
+| `patterns.cpp` | `Frame` in, pixels out |
+| `visualiser.cpp` | the parts that cannot be shared: stream buffer, block alignment, task, strip |
+| `fft_host.c` | a radix-2 FFT for the host, where esp-dsp does not exist |
+
+That split exists so `tools/pattern_lab` can run the identical pipeline over a
+WAV on a laptop — same analysis, same patterns, compiled from these files rather
+than copied. Designing a pattern is a taste problem, and taste needs turnaround
+that reflashing two boards cannot give.
+
+Its `Kconfig` owns the LED options for both firmwares — GPIO, count, strip model,
+and a **brightness cap defaulting to 10%**, which is the figure the power budget
+assumes and which dark-adapted eyes cannot distinguish from full outdoors.
 
 The strip itself is driven through `components/led_strip_wrapper/`, an RAII C++
 wrapper vendored from the `esp32c3_neopixel` project:
@@ -710,11 +756,34 @@ matters is that it is **stable**.
 
 ### 16. Known warts
 
-**The hub's absolute phase reading wanders** +6 ms to +24 ms, with steps too
-large to be rate effects. Cause unfound. Both units share whatever causes it, so
-the *difference* between them stays small — which is why cross-unit alignment
-measures 2–4 ms while the absolute figures swing. Treat the cross-unit number as
-the meaningful one.
+**The hub's absolute phase reading wanders**, and it is now quantified: two reads
+of the same variable one millisecond apart differed by **15.7 ms**, with the
+running average sitting still at +9 ms through it. Cause unfound. The satellite's
+readings are quiet by comparison (±5 ms), so this is the hub's own measurement
+rather than something shared. It is filtered rather than understood — both units
+servo on a 4-sample average now — and the practical rule is unchanged: treat the
+cross-unit number as the meaningful one and any single-sample figure derived from
+the hub's phase, including the per-retune costs it prints, as untrustworthy.
+
+**Cross-unit error grows between track boundaries.** A splice nulls phase on both
+units, so the figure resets to ~0.1 ms at every track change and grows to a few
+ms by the end of a long track. That growth is bounded by the deadband — each unit
+tolerates 7 ms of its own error — so the worst case between two of them is twice
+that. Quoting one number for cross-unit sync is misleading; see clock-sync.md §8.
+
+**The retune's discarded DMA buffer is unmeasured.** Disabling the I2S channel
+throws away audio the playback task counted as played and fed to the LEDs. The
+LED half is handled (`visualiser_realign()`); the audio half cannot be seen from
+inside the firmware at all, because every reading derived from `samples_played`
+agrees those frames were played. Only the marker GPIO can measure it, and nobody
+has.
+
+**`beat_det_update()` sums its flux history in array order.** The ring's rotation
+depends on how many frames that unit has pushed, so two units holding identical
+history at different rotations sum the same values in a different order and can
+differ in the last bits of the threshold. An onset flips only within ~1e-7 of it,
+so `test_pattern_sync.cpp` passes — on margin, not on guarantee. Summing from the
+oldest entry would settle it.
 
 **The PHY rate is still pinned interface-wide.**
 `esp_wifi_internal_set_fix_rate()` applies to all AP-interface transmission, not
@@ -749,7 +818,7 @@ are still to be wired.
 |---|---|
 | M1–M2 Bluetooth speaker + LEDs | Done, on logs and desktop audio |
 | M3 Beat detection driving LEDs | **Working on hardware** — two units pulsing together on real music. Thresholds still never tuned against a recording |
-| M4–M6 Clock sync, streaming, drift | Done and measured |
+| M4–M6 Clock sync, streaming, drift | Done and measured. Drift needed a second pass: the satellite was converting with an offset frozen at anchoring, which fed the drift back in as the servo's own reference |
 | M7 Coexistence | Done — resolved by splitting the chips |
 | M8 Power, enclosure, field test | **Untouched** |
 
@@ -811,3 +880,42 @@ It measured the property that was easy to state rather than the one the hardware
 was showing. The discipline that actually works: **run the new test against the
 broken version first.** If it passes, the test is wrong, and writing it has told
 you nothing about the code.
+
+### And a third, from chasing a drift that had already been fixed once
+
+Two habits produced most of the wasted effort in the drift work.
+
+**A fix applied where it was found rather than where it applies.** The hub had
+parked its playback across a retune since "a measured 54 ms correction cost
+177 ms of buffer". The satellite runs the same loop, calls the same blocking
+write, and never got the guard — so for its entire life every retune it
+performed drained its ring at memory speed, costing up to 50 ms each. The
+mirror image was also true: the satellite smoothed its phase and the hub did
+not. Both were one-line differences between two files that are supposed to
+behave identically. **When a fix lands in one unit, the question is not whether
+it works but whether the other unit has the same bug.**
+
+**Diagnoses read off incomparable samples.** Three wrong conclusions in a row,
+each confidently argued:
+
+| Concluded | From | Actually |
+|---|---|---|
+| Frequent retunes were desynchronising the strips | Four phase steps differenced across 5 s log ticks carrying ±5 ms of wander each | The satellite was spinning through its ring during the outage |
+| A restart flag was causing splices | Plausible mechanism, never checked against the log | It had never fired once — there were no underruns |
+| Smoothing the hub's phase made sync worse | Comparing a log window late in a track against one just after a splice | The splice resets cross-unit error, so the two windows were different points of the same cycle |
+
+Each was acted on. Two shipped. The pattern is the same every time: a difference
+was computed between two numbers that were not measuring the same thing.
+
+What broke the cycle was **forcing the event on demand instead of waiting for
+it**. `CONFIG_DANCEFLOOR_RETUNE_BENCH_S` retunes to the rate already set, so the
+rate change and the drift are removed from the experiment and only the cost
+remains; the phase is captured immediately either side of the event rather than
+differenced across log ticks. Twenty samples in ten minutes, against four
+scavenged from a whole session — and the answer contradicted both standing
+theories within one run.
+
+The generalisation: **if a measurement only happens when the system decides to
+do something, add a way to make it happen on demand.** Waiting for the event
+means comparing samples taken under conditions you did not control, and that is
+where confident, wrong answers come from.

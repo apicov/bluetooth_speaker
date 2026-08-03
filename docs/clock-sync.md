@@ -108,6 +108,30 @@ Nothing in the measurement can detect this. The satellite observes `U + D` and
 can never separate the halves. Asymmetry is invisible, and it is the reason the
 target here is 1 ms rather than 10 µs.
 
+### The other weakness: the master's clock can change identity
+
+The window spans 2.5 s and minimum-RTT selection is free to pick any sample in
+it. If the master reboots or is reflashed, its clock restarts from a new origin,
+and for those 2.5 s the window holds samples from **two different clocks**.
+`count` never decreases, so `sync_est_settled()` stays true throughout and a
+satellite will anchor on whichever sample the selection liked — possibly one
+from before the restart, wrong by the master's entire previous uptime.
+
+Measured on hardware: 3595 seconds of it. The satellite scheduled playback for
+an instant that had already passed, every phase reading was an hour out, the
+`int32_t` it was cast into wrapped to −699 s, the smoothing overflowed on top,
+and the servo asked for a 4.29 GHz sample rate. `ESP_ERROR_CHECK` turned that
+into an abort, so the room heard a speaker rebooting in a loop.
+
+`sync_est_add()` now discards the window when consecutive probes disagree by
+more than `SYNC_STEP_US` (1 s). Drift moves the offset by microseconds in a
+quarter second and asymmetry by milliseconds, so nothing legitimate reaches it.
+`count` falls below `SYNC_MIN_SAMPLES`, `sync_est_settled()` goes false, and
+playback holds for 2.5 s until a clean estimate exists — which is what that
+mechanism was already for. The new sample seeds the fresh window, so a single
+corrupt probe costs two samples rather than wedging the estimator. Both are
+pinned in `test_sync_proto.c`.
+
 ---
 
 ## 3. Why we select on minimum RTT
@@ -359,11 +383,28 @@ After convergence, with track-boundary corrections active:
 
 | | Value |
 |---|---|
-| Smoothed phase | within +-1 to 2 ms |
-| Instantaneous phase | within +-5 ms (delivery jitter) |
+| Smoothed phase | +4 to +12 ms standing offset, stable within ~3 ms |
+| Instantaneous phase | +-5 ms (satellite), +-15 ms (hub — see the wart) |
 | Buffer | 165-250 ms around a 200 ms target |
-| Hub-to-satellite audio | 0.2 to 3 ms |
+| Hub-to-satellite audio, just after a splice | **0.1 to 0.5 ms** |
+| Hub-to-satellite audio, late in a track | 2 to 9 ms |
 | Playback start vs schedule | +5 us (hub), +1 us (satellite), same instant |
+
+The cross-unit figure is quoted twice on purpose. A track boundary nulls phase
+on both units, so the error resets to near zero at every track change and grows
+between them — `+99 µs` two seconds after a splice, several ms by the end of a
+long track. Quoting a single number for it invites exactly the mistake of
+comparing two log windows taken at different points of that cycle, which is how
+a regression was diagnosed here that did not exist.
+
+The growth between boundaries is deadband-bound: each unit tolerates
+`PHASE_DEADBAND_US` (7 ms) of its own error before correcting, so the worst case
+between two of them is twice that, and the observed 2-9 ms sits inside it.
+
+The smoothed phase no longer converges to zero, and that is inherent: this is a
+proportional loop with a deadband, so once the rate is right the position error
+accumulated on the way there is inside the deadband and nothing removes it. The
+splice does.
 
 Servo gain matters more than it looks. At a 40 s correction time both units
 converged and then overshot to +10 ms, oscillating rather than settling -- the
@@ -373,13 +414,72 @@ the loop can afford to be far gentler than the disturbance it corrects.
 
 ### Known wart
 
-The hub's absolute phase reading does not settle: it wanders +6 ms to +24 ms with
-steps too large to be rate effects. Both units share whatever causes it, so the
-*difference* between them stays small -- which is why cross-unit alignment
-measures 2-4 ms while the absolute figures swing. The cause has not been found.
+The hub's absolute phase reading does not settle. It is now quantified: two
+reads of the same variable, one millisecond apart, in adjacent log lines.
 
-Treat the cross-unit measurement as the meaningful one, and the absolute phase
-figure as indicative only.
+```
+local ring ... | phase +26786 us (smoothed +8996 us)
+servo: phase +11108 us (smoothed +8996), ...
+```
+
+**15.7 ms of swing between consecutive samples**, with the average sitting still
+at +9 ms through it. Another pair moved 8.7 ms. The satellite's readings are far
+quieter, +-5 ms, so this is the hub's own measurement and not something shared.
+The cause is still not found.
+
+Two consequences worth knowing:
+
+- The servo used to act on that raw number directly, so it was substantially
+  triggering on measurement noise. Both units now servo on a 4-sample EMA (§8),
+  which cut the hub's retunes about fourfold and changed the cross-unit figure
+  not at all — the excursions between splices are the same either way, so they
+  are not a servo-input artefact.
+- Any single-sample figure derived from the hub's phase is untrustworthy,
+  including the per-retune costs it prints. The satellite's are usable; the
+  hub's are only meaningful averaged over many.
+
+Treat the cross-unit measurement as the meaningful one, and the hub's absolute
+phase as indicative only.
+
+### What a retune costs
+
+Retuning the output clock is not free, and until it was measured the cost was
+guessed at twice and wrongly both times.
+
+`CONFIG_DANCEFLOOR_RETUNE_BENCH_S` forces a retune to the rate already set, on a
+timer. Nothing about the audio legitimately changes, so everything it costs is
+the cost of retuning itself, with no rate change and no drift in the way. On the
+satellite, whose phase reading is quiet enough to trust:
+
+| channel down | net phase step |
+|---|---|
+| 2330 us | +2421 us |
+| 5818 us | +6871 us |
+| 2878 us | +1156 us |
+| 1821 us | +3468 us |
+| 5150 us | +1113 us |
+
+Mean net 3.3 ms against a mean outage of 3.1 ms. **The step is the outage**, to
+within the several ms the phase wanders on its own.
+
+It was not always. The same bench before the fix below produced +42, +43 and +50
+ms steps, with 5432 bytes overflowing the visualiser's buffer and nine
+re-alignments in a single window. `i2s_channel_write()` returns *immediately*
+once the channel is disabled — it does not block and does not write — and the
+satellite's `dac_write()` ignored the return value. So for the whole outage the
+playback task pulled chunks from the ring at memory speed, counted every one in
+`samples_played`, fed every one to the visualiser, and threw them at a channel
+that was not running. Milliseconds of outage cost tens of milliseconds of buffer.
+
+The hub had been guarded against this since "a measured 54 ms correction cost
+177 ms of buffer". The satellite never was, and every retune it had ever
+performed paid for it. It holds `retuning` and parks its play task now, exactly
+as the hub does.
+
+The discarded DMA buffer — audio counted as played that never reached the
+speaker — remains unmeasured, and by construction always will be from inside the
+firmware: every reading derived from `samples_played` agrees those frames were
+played. Only the marker GPIO can see it.
 
 ---
 
@@ -402,10 +502,51 @@ So M6 does not correct the clock. It corrects the *playback rate*: dropping or
 inserting a sample occasionally, at a zero crossing, so the slower unit catches
 up inaudibly.
 
+**This is solved now, and the way it stayed broken is the interesting part.**
+The satellite converted local time to master time with the offset it measured
+once, when playback anchored, and then held it. That offset goes stale at
+exactly the crystal difference — so the phase measurement was biased by exactly
+the drift, and the servo faithfully parked the speaker at the growing error
+instead of removing it. The drift the servo existed to correct was being fed
+back in as its own reference.
+
+Nothing in the logs showed it, which is why it survived: the marker pulse is
+derived from the same conversion, so the cross-unit measurement read correct
+while the sound slid. `stream_offset` is now slewed toward the live estimate at
+200 ppm — roughly 15x the drift it has to follow, slow enough that minimum-RTT
+noise is averaged away rather than mistaken for a real position error.
+
+Two other things were quietly feeding the same servo bad numbers:
+
+- Silence inserted for a lost packet went into the ring without being counted in
+  `samples_in`, the position every marker and phase point is recorded against.
+  One lost packet put all of them ~20 ms early, permanently, and again on the
+  next loss. The servo then held the speaker at that error. Invisible for the
+  same reason as above — the marker fires off the same skewed count.
+- The hub queued a phase point captured before a timeline restart reset the
+  ring, so on an underrun recovery it referred to an origin that no longer
+  existed. Playback never reached it, the queue filled, and `s_phase_valid`
+  stayed false for the rest of the session: ring servo stopped, and the
+  visualiser was fed a due of zero forever.
+
 **Asymmetry.** Sustained path asymmetry is invisible to the estimator (§2) and no
 selection strategy removes it. It is the error floor. Test case 5 in
 `test_sync_proto.c` pins the behaviour deliberately: 2 ms up against 200 µs down
 produces exactly 900 µs of error.
+
+**Mid-track divergence.** Cross-unit error resets at every track boundary and
+grows to a few ms by the end of a long track. That growth is deadband-bound, so
+the lever is `PHASE_DEADBAND_US`, and tightening it is now affordable in a way
+it was not: a retune costs a few ms rather than fifty, and no longer drains the
+ring. Untested. Before touching it, put a per-track divergence number in the
+logs — the hub and satellite each print their splice size at a boundary, and the
+difference between those two is how far apart they had drifted, condensed to one
+figure per track. That is the metric to compare builds on; a glance at a log
+window is not, and twice here it produced a confident diagnosis of a regression
+that did not exist.
+
+**The hub's phase noise.** 15.7 ms between consecutive reads, cause unknown. It
+is filtered rather than understood.
 
 ---
 
@@ -433,9 +574,18 @@ radio airtime does not scale with unit count.
 
 ## 11. Verification
 
-**Estimator** — `cd sync_test/test && make check`. Eight cases covering exactness
-on symmetric paths, outlier rejection, the asymmetry floor, window ageing, and
-min-RTT selection.
+**Estimator** — `cd sync_test/test && make check`. Cases covering exactness on
+symmetric paths, outlier rejection, the asymmetry floor, window ageing, min-RTT
+selection, and the master changing clock origin — that last group asserts the
+window is discarded, that no estimate is offered from what survives, that it
+re-settles on the new origin, and that one corrupt probe does not wedge it.
+
+**Retune cost** — set `CONFIG_DANCEFLOOR_RETUNE_BENCH_S` to 30 on **one** unit,
+leaving the other as a reference, and read the `RETUNE COST` lines. It forces a
+retune to the rate already set, so what it reports is the cost of retuning with
+the rate change and the drift removed from the experiment. Set it back to 0
+afterwards; the costs accumulate faster than the servo absorbs them and the
+audio degrades over a long run.
 
 A stable offset in the log means the satellite *believes* it is synced. It does
 not prove the pulse lands where it should — that needs an independent
