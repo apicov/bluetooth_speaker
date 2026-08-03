@@ -102,14 +102,22 @@ typedef struct __attribute__((packed)) {
  *
  * Shared, because it is not a per-unit preference: every unit deadbands around
  * its own reading of the same timeline, so the worst case between any two of
- * them is twice this, whatever the servos report individually. Two units at
- * 7 ms in opposite directions is 14 ms of separation -- audible as a widened
- * image rather than an echo, and the track-boundary splice removes it.
+ * them is twice this, whatever the servos report individually.
  *
- * The floor is the clock itself: retuning happens in whole Hz, 22.7 ppm at
- * 44.1 kHz, so this cannot usefully go much below a few ms.
+ * Set by what a RETUNE costs, not by how well the units could agree. Tightening
+ * it to 7 ms was measured on hardware and made the strips worse: it took the
+ * hub from retuning rarely to retuning every ~25 s, and every retune
+ * disables the I2S channel, discarding whatever is in the DMA buffer -- ~32 ms
+ * of audio that the playback task has already counted as played and already fed
+ * to the visualiser. Rare retunes hide that; frequent ones accumulate it.
+ *
+ * 20000 reproduces the 8 Hz threshold the old `tx_rate / 5000` gave, which is
+ * the behaviour that measured well. Anything tighter needs the retune itself to
+ * stop losing audio first.
+ *
+ * The floor is the clock: retuning happens in whole Hz, 22.7 ppm at 44.1 kHz.
  */
-#define PHASE_DEADBAND_US 7000
+#define PHASE_DEADBAND_US 20000
 
 typedef enum {
     AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */

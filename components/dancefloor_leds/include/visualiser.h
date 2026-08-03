@@ -30,7 +30,10 @@ void visualiser_set_pattern(const char *name);
  * Tell the visualiser the audio it is about to be fed no longer continues the
  * audio it was fed before -- samples were skipped or inserted between them.
  *
- * Call it from the same task that calls visualiser_feed(), after any splice.
+ * Call it after any splice, and after anything else that means audio counted
+ * here was not actually heard -- retuning the output clock does exactly that,
+ * because disabling the I2S channel discards the DMA buffer. Callable from any
+ * task.
  *
  * Block boundaries and due_us are both carried forward by COUNTING what arrives
  * here, from an origin established once against the scheduled timeline. That is

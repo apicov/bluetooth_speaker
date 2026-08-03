@@ -545,6 +545,22 @@ static void retune_output(uint32_t hz)
     }
     ESP_LOGW(TAG, "output clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
     tx_rate = hz;
+
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /*
+     * Disabling the channel discarded whatever was in the DMA buffer -- ~32 ms
+     * that the playback task had already counted as played and already fed to
+     * the visualiser. Its block boundaries and its due_us are carried forward by
+     * counting what arrives, so that audio is now counted and never heard, and
+     * every label after it runs early by the buffer depth.
+     *
+     * Each unit retunes at its own moment and by its own amount, so the strips
+     * separated a little at every retune and only came back at a track boundary.
+     * Measured on hardware, that was most of the difference between a deadband
+     * that retunes rarely and one that retunes every 25 seconds.
+     */
+    visualiser_realign();
+#endif
 }
 #endif
 
@@ -651,18 +667,12 @@ static void drift_task(void *arg)
         /*
          * Deadband, stated in phase error rather than in rate.
          *
-         * It used to be tx_rate/5000, described as "~8 ms of accumulated drift
-         * before a correction". That reads 0.02% of the sample rate as if it
-         * were milliseconds, and it is not: adj is err_ema scaled by
-         * rate/100000000, so 8 Hz of threshold is 8e8/44100 = ~20 ms of phase
-         * error, not 8. Each unit therefore tolerated ~20 ms before doing
-         * anything, and hub and satellite deadband independently, so the pair
-         * could sit 40 ms apart with both logs reporting a settled servo.
-         *
-         * Derived from the intended figure now, so it stays honest if the rate
-         * changes. Note the floor: the clock is retuned in whole Hz, which is
-         * 22.7 ppm at 44.1 kHz, so corrections finer than that cannot be
-         * expressed however tight this gets.
+         * It used to be tx_rate/5000, described in a comment as "~8 ms of
+         * accumulated drift before a correction". That read 0.02% of the sample
+         * rate as if it were milliseconds: 8 Hz of threshold is really 8e8/44100
+         * = ~20 ms of phase. The arithmetic is honest now, but the VALUE is back
+         * where that expression put it, because 20 ms is what measured well --
+         * see PHASE_DEADBAND_US for why tightening it made the strips worse.
          */
         if (!phase_valid) {
             continue;                        /* nothing measured yet */

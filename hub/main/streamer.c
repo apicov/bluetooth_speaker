@@ -699,6 +699,14 @@ static void retune_dac(uint32_t hz)
     }
     ESP_LOGW(TAG, "DAC clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
     tx_rate = hz;
+
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /* The disable above discarded the DMA buffer: ~32 ms that the playback task
+     * counted as played and fed to the visualiser, and that nobody heard. Left
+     * alone, every label after this runs early by that much, on this unit only.
+     * Covers the initial rate match too, which comes through here as well. */
+    visualiser_realign();
+#endif
 }
 
 /*
@@ -955,11 +963,11 @@ static void ring_monitor_task(void *arg)
         uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
 
         /*
-         * Deadband in phase error, not in rate -- see PHASE_DEADBAND_US and the
-         * note in the satellite's drift task. tx_rate/5000 was documented as
-         * ~8 ms and is really ~20 ms, per unit and in either direction, which is
-         * most of the separation the two speakers were showing between track
-         * boundaries.
+         * Deadband in phase error, not in rate -- see PHASE_DEADBAND_US. The
+         * old tx_rate/5000 was documented as ~8 ms and is really ~20 ms; the
+         * arithmetic is honest now and the value is deliberately back at what
+         * that expression gave, because every retune costs a DMA buffer of
+         * audio and rare retunes are worth more than a tight deadband.
          */
         int32_t deadband = (int32_t)((int64_t)PHASE_DEADBAND_US * rate_ema / 100000000LL);
         if (deadband < 1) {

@@ -70,7 +70,13 @@ uint8_t pixels[LED_COUNT * 3];
  * Both sides count bytes that actually passed through the buffer, so a drop
  * cannot make them disagree about position.
  */
-bool     s_align_pending = true;
+/*
+ * Atomic because three tasks raise it: the audio task on a short send, this
+ * component's own task when it starves, and the drift servo after a retune.
+ * Only the audio task lowers it, with an exchange, so a request raised while an
+ * alignment is being computed is not lost.
+ */
+std::atomic<bool> s_align_pending{true};
 bool     s_mark_align_point;
 int32_t  s_skip_frames;
 int64_t  s_pending_block_index;
@@ -185,7 +191,8 @@ void visualiser_task(void *arg)
                 if (pattern) pattern->reset();
                 std::memset(pixels, 0, sizeof(pixels));
                 show(pixels);
-                s_align_pending = true;   /* the stream broke; re-align on return */
+                /* the stream broke; re-align on return */
+                s_align_pending.store(true, std::memory_order_relaxed);
             }
             continue;
         }
@@ -225,12 +232,13 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
         return;
     }
 
-    if (s_align_pending && due_master_us > 0) {
+    /* Exchange rather than test-then-clear: a request raised by another task
+     * while this one is mid-alignment would otherwise be overwritten. */
+    if (due_master_us > 0 && s_align_pending.exchange(false, std::memory_order_relaxed)) {
         const int64_t idx = (due_master_us * RATE) / 1000000;
         const int32_t into_block = static_cast<int32_t>(idx % FFT_N);
         s_skip_frames = into_block ? (FFT_N - into_block) : 0;
         s_pending_block_index = (idx + s_skip_frames) / FFT_N;
-        s_align_pending = false;
         s_mark_align_point = true;
         bump(s_aligns);
     }
@@ -264,16 +272,16 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
     s_sent_total += sent;
     if (sent < len) {
         bump(s_dropped, len - sent);
-        s_align_pending = true;
+        s_align_pending.store(true, std::memory_order_relaxed);
     }
 }
 
 void visualiser_realign(void)
 {
-    /* Same task as visualiser_feed(), so a plain store is enough -- and it must
-     * be, because this is called from the playback path. The next feed carrying
-     * a scheduled instant re-derives the origin from it. */
-    s_align_pending = true;
+    /* Callable from any task: the flag is atomic and the audio task clears it
+     * with an exchange. The next feed carrying a scheduled instant re-derives
+     * the origin from it. */
+    s_align_pending.store(true, std::memory_order_relaxed);
 }
 
 void visualiser_set_pattern(const char *name)
