@@ -37,4 +37,23 @@ menu "Dancefloor satellite"
         bool "Hub SoftAP has no password (must match the hub)"
         default n
 
+    config DANCEFLOOR_RETUNE_BENCH_S
+        int "Bench only: force a same-rate retune every N seconds (0 = off)"
+        default 0
+        help
+            Retunes the output clock to the rate it is ALREADY set to, on a
+            timer. That is a no-op as far as the audio is concerned, so anything
+            it costs in sync is the cost of retuning itself -- the channel being
+            down, and the DMA buffer being discarded -- with no rate change and
+            no drift confusing the measurement.
+
+            Four retunes scraped from an ordinary session put the phase step at
+            somewhere between 5 and 22 ms, which is not a number. This turns it
+            into one.
+
+            Enable it on ONE unit only and watch the hub's AUDIO SYNC line: the
+            marker fires when a sample physically reaches the output, so it sees
+            the discarded DMA buffer, which no measurement inside the firmware
+            can. Leave at 0 for anything you intend to listen to.
+
 endmenu

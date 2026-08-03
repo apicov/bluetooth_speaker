@@ -63,6 +63,18 @@ menu "Dancefloor hub"
             Input. Wire the SATELLITE's marker GPIO here, plus a common ground.
             Must differ from the marker GPIO.
 
+    config DANCEFLOOR_RETUNE_BENCH_S
+        int "Bench only: force a same-rate retune every N seconds (0 = off)"
+        default 0
+        help
+            Retunes the DAC clock to the rate it is ALREADY set to, on a timer.
+            A no-op as far as the audio is concerned, so anything it costs in
+            sync is the cost of retuning itself -- the channel down, the DMA
+            buffer discarded -- with no rate change and no drift in the way.
+
+            Enable it on ONE unit only, so the other stays a reference. Leave at
+            0 for anything you intend to listen to.
+
     comment "LEDs are under 'Dancefloor LEDs' -- shared with the satellite"
 
 endmenu

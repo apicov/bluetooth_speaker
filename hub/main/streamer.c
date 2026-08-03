@@ -663,6 +663,13 @@ static void i2s_start(uint32_t rate)
 #define RATE_SANE_MIN 8000
 #define RATE_SANE_MAX 192000
 
+/* What a retune costs -- see the note on the satellite's copy. The channel down
+ * is measurable here; the discarded DMA buffer is not measurable anywhere in
+ * software, because those frames were counted as played. */
+static volatile int32_t s_retune_phase_before;
+static volatile bool    s_retune_watch;
+static volatile int64_t s_retune_outage_us;
+
 static void retune_dac(uint32_t hz)
 {
     /*
@@ -678,6 +685,9 @@ static void retune_dac(uint32_t hz)
 
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
     retuning = true;
+    /* Timed from here, so the 2 ms park counts: playback is stopped for it just
+     * as surely as for the disable itself. */
+    const int64_t down_at = esp_timer_get_time();
     vTaskDelay(pdMS_TO_TICKS(2));        /* let the play task notice and park */
 
     esp_err_t err = i2s_channel_disable(i2s_tx);
@@ -697,8 +707,13 @@ static void retune_dac(uint32_t hz)
                  hz, esp_err_to_name(err), tx_rate);
         return;
     }
-    ESP_LOGW(TAG, "DAC clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
+    s_retune_outage_us = esp_timer_get_time() - down_at;
+    ESP_LOGW(TAG, "DAC clock retuned %" PRIu32 " -> %" PRIu32 " Hz, channel down %lld us",
+             tx_rate, hz, s_retune_outage_us);
     tx_rate = hz;
+
+    s_retune_phase_before = s_phase_err_us;
+    s_retune_watch = true;
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
     /* The disable above discarded the DMA buffer: ~32 ms that the playback task
@@ -770,6 +785,14 @@ static void local_play_task(void *arg)
             while (s_phase_tail != s_phase_head && samples_played >= s_phase_q[s_phase_tail].pos) {
                 s_phase_err_us = (int32_t)(esp_timer_get_time() - s_phase_q[s_phase_tail].play_at);
                 s_phase_valid = true;
+                if (s_retune_watch) {
+                    s_retune_watch = false;
+                    ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+ld us (net %+ld), "
+                                  "channel was down %lld us",
+                             (long)s_retune_phase_before, (long)s_phase_err_us,
+                             (long)(s_phase_err_us - s_retune_phase_before),
+                             s_retune_outage_us);
+                }
                 /* Keep the last point: interpolating from it labels each chunk
                  * with the instant it is DUE, which every unit agrees on because
                  * they all got the same play_at. The visualiser cuts its
@@ -925,6 +948,18 @@ static void ring_monitor_task(void *arg)
         if (local_start == 0 || rate_ema == 0) {
             continue;
         }
+
+#if CONFIG_DANCEFLOOR_RETUNE_BENCH_S > 0
+        /* Bench: retune to the rate already set, so the RETUNE COST line below
+         * reports the cost of retuning and nothing else. One unit at a time. */
+        static int bench_left;
+        if (--bench_left <= 0) {
+            bench_left = (CONFIG_DANCEFLOOR_RETUNE_BENCH_S + 4) / 5;
+            ESP_LOGW(TAG, "BENCH: forcing a same-rate retune at %" PRIu32 " Hz", tx_rate);
+            retune_dac(tx_rate);
+            continue;
+        }
+#endif
 
         size_t filled = LOCAL_RING_BYTES - xStreamBufferSpacesAvailable(local_ring);
         ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us | tx-fail %" PRIu32 "/5s",

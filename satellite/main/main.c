@@ -504,6 +504,30 @@ static void rx_task(void *arg)
  */
 #define RATE_TRIM_MAX_HZ 100
 
+/*
+ * What a retune costs, which nobody has measured.
+ *
+ * Two effects pull opposite ways and neither is visible to the servo. The
+ * channel is DOWN across disable/reconfig/enable, and real time passes with no
+ * audio playing, so playback returns that far behind the timeline. Against
+ * that, the disable discards the DMA buffer -- audio already counted in
+ * samples_played and already fed to the visualiser -- which skips content and
+ * pushes the other way.
+ *
+ * Software can see the first and, by construction, never the second: those
+ * frames were counted as played, so every reading derived from samples_played
+ * agrees that they were. Only the marker GPIO, which fires when a sample
+ * physically reaches the output, can close that gap.
+ *
+ * These record the first effect directly and the NET at the writer, which is
+ * what the servo has to correct. Four retunes scraped from a session put the
+ * net somewhere between +5 and +22 ms; that is a range, not a number, because
+ * phase wanders by several ms on its own between the 5 s log ticks.
+ */
+static volatile int32_t retune_phase_before;
+static volatile bool    retune_watch;      /* playback reports the next reading */
+static volatile int64_t retune_outage_us;
+
 #if !CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
 static void retune_output(uint32_t hz)
 {
@@ -524,6 +548,8 @@ static void retune_output(uint32_t hz)
     }
 
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
+    const int64_t down_at = esp_timer_get_time();
+
     esp_err_t err = i2s_channel_disable(i2s_tx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "retune: disable failed (%s)", esp_err_to_name(err));
@@ -543,8 +569,16 @@ static void retune_output(uint32_t hz)
         ESP_LOGE(TAG, "retune: enable failed (%s)", esp_err_to_name(err));
         return;
     }
-    ESP_LOGW(TAG, "output clock retuned %" PRIu32 " -> %" PRIu32 " Hz", tx_rate, hz);
+    retune_outage_us = esp_timer_get_time() - down_at;
+    ESP_LOGW(TAG, "output clock retuned %" PRIu32 " -> %" PRIu32 " Hz, channel down %lld us",
+             tx_rate, hz, retune_outage_us);
     tx_rate = hz;
+
+    /* Ask playback to report the first phase it measures after this, so the net
+     * cost is one printed number rather than a difference between two 5 s log
+     * ticks with several ms of wander in each. */
+    retune_phase_before = phase_err_us;
+    retune_watch = true;
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
     /*
@@ -596,6 +630,22 @@ static void drift_task(void *arg)
         if (stream_start_local == 0) {
             continue;
         }
+
+#if CONFIG_DANCEFLOOR_RETUNE_BENCH_S > 0 && !CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+        /*
+         * Bench: retune to the rate we are already at. Nothing about the audio
+         * changes, so whatever the RETUNE COST line then reports is the cost of
+         * retuning alone -- no rate change, no drift, no track boundary in the
+         * way. Run it on one unit and leave the other as the reference.
+         */
+        static int bench_left;
+        if (--bench_left <= 0) {
+            bench_left = (CONFIG_DANCEFLOOR_RETUNE_BENCH_S + 4) / 5;
+            ESP_LOGW(TAG, "BENCH: forcing a same-rate retune at %" PRIu32 " Hz", tx_rate);
+            retune_output(tx_rate);
+            continue;                        /* do not also servo this window */
+        }
+#endif
 
         size_t filled = RING_BYTES - xStreamBufferSpacesAvailable(ring);
         int32_t target = (int32_t)(RING_TARGET_MS *
@@ -825,6 +875,14 @@ static void play_task(void *arg)
                 }
                 phase_err_us = (int32_t)err;
                 phase_valid = true;
+                if (retune_watch) {
+                    retune_watch = false;
+                    ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+ld us (net %+ld), "
+                                  "channel was down %lld us",
+                             (long)retune_phase_before, (long)phase_err_us,
+                             (long)(phase_err_us - retune_phase_before),
+                             retune_outage_us);
+                }
                 /* Keep the last point: interpolating from it labels each chunk
                  * with the instant it is DUE. Every unit gets the same play_at
                  * for the same audio, so every unit agrees on that label -- which
