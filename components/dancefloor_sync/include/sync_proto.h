@@ -104,20 +104,23 @@ typedef struct __attribute__((packed)) {
  * its own reading of the same timeline, so the worst case between any two of
  * them is twice this, whatever the servos report individually.
  *
- * Set by what a RETUNE costs, not by how well the units could agree. Tightening
- * it to 7 ms was measured on hardware and made the strips worse: it took the
- * hub from retuning rarely to retuning every ~25 s, and every retune
- * disables the I2S channel, discarding whatever is in the DMA buffer -- ~32 ms
- * of audio that the playback task has already counted as played and already fed
- * to the visualiser. Rare retunes hide that; frequent ones accumulate it.
+ * Bounded below by what a RETUNE costs, which is now measured rather than
+ * guessed. On the bench, forcing same-rate retunes and reading the phase either
+ * side: the channel is down 1.8 to 5.8 ms and the phase step is 1.1 to 6.9 ms,
+ * mean 3.3 ms against a mean outage of 3.1 ms. The step IS the outage, to
+ * within the several ms the phase wanders on its own.
  *
- * 20000 reproduces the 8 Hz threshold the old `tx_rate / 5000` gave, which is
- * the behaviour that measured well. Anything tighter needs the retune itself to
- * stop losing audio first.
+ * This was briefly raised to 20000 on the theory that frequent retunes were
+ * what made the strips drift. They were not. A retune used to cost up to 50 ms
+ * because the satellite's playback task ran flat out while the channel was down
+ * -- see the `retuning` guard in satellite/main/main.c -- and once that was
+ * fixed the cost fell to the outage. 7000 is what the build that measured well
+ * actually had.
  *
- * The floor is the clock: retuning happens in whole Hz, 22.7 ppm at 44.1 kHz.
+ * The floor is the clock: retuning happens in whole Hz, 22.7 ppm at 44.1 kHz,
+ * so ~2.3 ms of phase is the smallest correction expressible at 44.1 kHz.
  */
-#define PHASE_DEADBAND_US 20000
+#define PHASE_DEADBAND_US 7000
 
 typedef enum {
     AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */

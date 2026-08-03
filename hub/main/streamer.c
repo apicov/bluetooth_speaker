@@ -999,10 +999,10 @@ static void ring_monitor_task(void *arg)
 
         /*
          * Deadband in phase error, not in rate -- see PHASE_DEADBAND_US. The
-         * old tx_rate/5000 was documented as ~8 ms and is really ~20 ms; the
-         * arithmetic is honest now and the value is deliberately back at what
-         * that expression gave, because every retune costs a DMA buffer of
-         * audio and rare retunes are worth more than a tight deadband.
+         * old tx_rate/5000 was documented as ~8 ms and is really ~20 ms. This
+         * unit has always parked its playback across a retune, so its retunes
+         * were never the expensive kind; the satellite's were, until it got the
+         * same guard.
          */
         int32_t deadband = (int32_t)((int64_t)PHASE_DEADBAND_US * rate_ema / 100000000LL);
         if (deadband < 1) {

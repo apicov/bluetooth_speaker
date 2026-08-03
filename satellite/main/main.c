@@ -748,9 +748,11 @@ static void drift_task(void *arg)
          * It used to be tx_rate/5000, described in a comment as "~8 ms of
          * accumulated drift before a correction". That read 0.02% of the sample
          * rate as if it were milliseconds: 8 Hz of threshold is really 8e8/44100
-         * = ~20 ms of phase. The arithmetic is honest now, but the VALUE is back
-         * where that expression put it, because 20 ms is what measured well --
-         * see PHASE_DEADBAND_US for why tightening it made the strips worse.
+         * = ~20 ms of phase, per unit and in either direction.
+         *
+         * Affordable at 7 ms because a retune is cheap now -- measured at 1 to 7
+         * ms, essentially just the channel outage. It was not while this task
+         * spun through the ring during that outage; see PHASE_DEADBAND_US.
          */
         if (!phase_valid) {
             continue;                        /* nothing measured yet */
