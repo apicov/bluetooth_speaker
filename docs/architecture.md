@@ -76,7 +76,9 @@ dies in a field at 2 a.m.
 There is a second profile in play. **AVRCP** — *Audio/Video Remote Control
 Profile* — is the side channel that carries track title, artist and album, and
 notifies when the track changes. That notification turns out to matter for
-synchronisation, not just for display; see §12.
+synchronisation, not just for display: a track change is the one moment a
+splice is inaudible, so it is when every unit nulls its accumulated phase error.
+See §10.
 
 ### 3. Codecs, and what "lossy" costs here
 
@@ -249,11 +251,21 @@ It solved three problems, only one of which was expected:
 they also share one radio and one antenna, and must take turns. Two chips means
 two radios; the contention simply does not arise.
 
-**Burstiness.** This one was a surprise. Bluetooth delivers audio in ~100 ms
-lumps, so on the single-chip master the presentation timeline raced ~50 ms ahead
-during a burst and fell ~50 ms behind while the buffer starved, tripping the
-resync guard on every cycle. The bridge chip absorbs that entirely, and the hub
-receives evenly paced audio.
+**Burstiness.** This one was a surprise, and the original claim here was wrong.
+Bluetooth delivers audio in ~100 ms lumps, so on the single-chip master the
+presentation timeline raced ahead during a burst and fell behind while the buffer
+starved, tripping the resync guard on every cycle. This section used to say the
+bridge chip absorbed that entirely and the hub received evenly paced audio.
+
+It does not. `sbc_in` now measures the longest silence between audio packets in
+every window, and **every** window contains one of 79–112 ms, median 100, against
+a ~43 ms nominal spacing. The burstiness is still there end to end; the bridge
+moved it rather than removing it.
+
+What the split did buy is real — memory, no radio contention, and a decode that
+is not competing with Bluedroid — but the timeline still oscillates by ±130 ms
+with the burst pattern, and `hub/main/streamer.c` had to be taught to slew rather
+than jump because of it. See clock-sync.md §9.
 
 Cost: about $5 and one wire, on the master only.
 
@@ -337,8 +349,16 @@ Each board's `esp_timer_get_time()` counts microseconds since *that board*
 booted, so two boards disagree by however long apart they were switched on
 (measured once: 124 seconds).
 
-The fix is the NTP round trip: the satellite stamps a probe going out, the hub
-stamps arrival and reply, and the satellite stamps the return. Four timestamps
+There are now **two** ways to close that gap, and the round trip described here
+is the fallback. A satellite prefers **802.11 TSF** — the WiFi MAC's own
+microsecond counter, carried in every beacon and timestamped in hardware by the
+receiving MAC — and drops back to the round trip when TSF is unavailable. TSF
+has no network delay in the measurement, so it carries none of the asymmetry
+described below. clock-sync.md §10 has the numbers; the two agreed on rate to
+0.12 ppm over ten minutes before either was trusted.
+
+The round trip, still in use as the fallback: the satellite stamps a probe going
+out, the hub stamps arrival and reply, and the satellite stamps the return. Four timestamps
 around one round trip give both the offset and the round-trip time:
 
 ```
@@ -728,10 +748,15 @@ It decodes via `ffmpeg`, plays through the pipe, and saves one WAV per track
 (skipping Spotify ad breaks, which it recognises by their artist field). Those
 recordings exist to tune the beat detector against real music offline.
 
-#### The three log lines worth knowing
+#### The log lines worth knowing
+
+The periodic lines print every `CONFIG_DANCEFLOOR_LOG_PERIOD_S` (20 s by
+default), not every window. Two of them print *immediately* on a bad window
+regardless, because waiting to hear about a fault is how faults get missed.
 
 ```
-I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 | fed-drop 0 B
+I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 dec 0
+          | fed-drop 0 B | max gap 100189 us
 ```
 
 | Field | Meaning |
@@ -740,19 +765,42 @@ I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 | fed-drop
 | `sync` / `crc` | UART link integrity. Single digits fine, tens are not |
 | `gaps` | Packets the bridge dropped. Visible only because `seq` is assigned at *enqueue*, not at transmit |
 | `fed-drop` | PCM discarded because a buffer was full. **Must be 0** |
+| `max gap` | Longest silence between audio packets. **79–112 ms is normal** — the source is bursty. Past 150 ms the window prints at once |
+
+Every counter but `max gap` describes a packet that *arrived and was wrong*. A
+source that simply stops sending trips none of them, which is why `max gap` had
+to be added: a 118 ms hole was invisible to all of them.
 
 ```
-I stream: phase -412 us (smoothed +1130 us) depth 198 ms rate 44101
+I stream: local ring 33280 bytes (188 ms) | phase +6234 us (smoothed +6431 us)
 ```
 
-Smoothed phase is the number to watch. Depth should sit near 200 ms.
+Smoothed phase is the number to watch; the raw one is noisy on the hub. Depth
+should sit near 200 ms.
 
 ```
-I sync: offset 124270929 us (rtt 7700 us)
+W stream: HEALTH: up 3721 s | heap 59464 (min 52268) | stack play 3036 mon 1864
+          | underruns 0 restarts 1 splices 1 retunes 9 (0 refused) | sta-left 0
+W sat:    HEALTH: ... | gaps 0 wifi-drops 0 | clock TSF (tsf 1/probe 0)
 ```
 
-The absolute offset is just the boot-time difference and means nothing. What
-matters is that it is **stable**.
+Every 60 s, and the line for a long run. **Minimum-ever heap** matters more than
+current — a leak shows as the minimum walking down. Cumulative counters never
+reset, so they answer "has this been happening slowly for an hour", which no
+per-window rate can. `clock TSF (tsf N/probe M)` says which clock source is live
+and how many anchors used each; a rising `probe` means TSF is dropping out.
+
+```
+W stream: TRACK DIVERGENCE (wifi): 192.168.4.2 spliced +8 ms (phase +8231 us),
+          hub spliced +14 ms -> -6 ms apart
+```
+
+One line per track, taken at a track boundary — the one instant that recurs
+identically in every track, so it is comparable across tracks, sessions and
+builds. Cross-unit error resets there and grows until the next one, so a reading
+taken anywhere else depends on where in that cycle you looked. Judging two builds
+by glancing at log windows produced three confident wrong diagnoses in this
+project.
 
 ### 16. Known warts
 
@@ -785,6 +833,21 @@ differ in the last bits of the threshold. An onset flips only within ~1e-7 of it
 so `test_pattern_sync.cpp` passes — on margin, not on guarantee. Summing from the
 oldest entry would settle it.
 
+**The source delivers in ~100 ms bursts, and always has.** Every 5 s window
+contains a silence of 79–112 ms between audio packets against a ~43 ms nominal
+spacing. The consequence is that the hub's presentation timeline does not drift,
+it *oscillates* by ±130 ms with the burst pattern, which is past the 120 ms
+resync threshold — so the mechanism trips on entirely normal delivery about
+seven times a minute. That is survivable because the timeline slews rather than
+jumps, but the threshold cannot simply be raised: `LEAD + RESYNC` bounds what a
+satellite must buffer, 200 + 120 = 320 ms against a 372 ms ring, and the swing
+is 132. Fixing it properly means a smaller lead or a larger ring.
+
+**A ~118 ms delivery pause has been seen with no cause found.** Distinct from the
+routine burstiness above, it landed once mid-track with no track change nearby,
+no CRC error, no sequence gap and no decode error. `max gap` in the `sbc_in`
+line is the instrument for it now.
+
 **The PHY rate is still pinned interface-wide.**
 `esp_wifi_internal_set_fix_rate()` applies to all AP-interface transmission, not
 just multicast, so with multicast gone it fixes *unicast* at 6 Mbps and disables
@@ -794,7 +857,9 @@ airtime it is not hurting anything measurable, and
 left at 6 because the system was measured working there and the change deserves
 a listening test rather than a reasoned argument.
 
-**The beat detector's thresholds have never been tuned against a recording.**
+**The wideband detector's thresholds have never been tuned against a recording.**
+The `boom` detector has: `flux_floor` was set from ten forró tracks (see below).
+`BEAT_THRESHOLD_K` and `BAND_GAIN`, which the `pulse` pattern runs on, have not.
 `BEAT_THRESHOLD_K` (1.8) and `BAND_GAIN` (12.0) were set against synthetic kicks
 in the host test. They fire on real music and the units agree, but nobody has
 measured how many beats are missed or invented. This is what the WAV recording
@@ -817,10 +882,18 @@ are still to be wired.
 | Milestone | State |
 |---|---|
 | M1–M2 Bluetooth speaker + LEDs | Done, on logs and desktop audio |
-| M3 Beat detection driving LEDs | **Working on hardware** — two units pulsing together on real music. Thresholds still never tuned against a recording |
-| M4–M6 Clock sync, streaming, drift | Done and measured. Drift needed a second pass: the satellite was converting with an offset frozen at anchoring, which fed the drift back in as the servo's own reference |
+| M3 Beat detection driving LEDs | **Working on hardware** — two units pulsing together on real music. A `boom` detector follows the zabumba's low band alone, tuned against ten forró recordings; the wideband `pulse` thresholds are still untuned |
+| M4–M6 Clock sync, streaming, drift | Done and measured. Drift needed a second pass: the satellite was converting with an offset frozen at anchoring, which fed the drift back in as the servo's own reference. The clock source is now 802.11 TSF with the probe estimator as fallback |
 | M7 Coexistence | Done — resolved by splitting the chips |
 | M8 Power, enclosure, field test | **Untouched** |
+| Long-run behaviour | **Unknown.** The longest evidenced session is ten minutes against a four-hour target. `HEALTH` exists to answer it and has never been given the chance |
+
+The soak is the cheapest of these and blocks the least: it needs no parts, only
+time. Both units print a `HEALTH` line every 60 s with uptime, current and
+minimum-ever heap, per-task stack headroom, and cumulative counts of underruns,
+re-anchors, splices, retunes, lost-packet gaps and WiFi drops. Over ten minutes
+heap was flat and every counter stayed near zero, which is encouraging and is not
+evidence.
 
 M8 in outline: 12 V LiFePO4, an XL4016-class 5 V/10 A buck (an LM2596 cannot do
 this current), IP65 sleeved strips, cable glands, and a four-hour overnight

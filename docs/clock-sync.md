@@ -9,6 +9,14 @@ multi-speaker system rests on.
 asymmetry plus ~300 µs of scatter, with no accumulating drift. See §7 for how it
 got there and §8 for what remains.
 
+**There are two clock sources, and the one described in §2–§3 is now the
+fallback.** A satellite prefers 802.11 TSF when it has a reading less than a
+second old, and drops back to the probe estimator otherwise — see §10. Almost
+everything below still applies either way: the schedule-the-future design (§4),
+the phase servo (§8) and the splices are all indifferent to where the offset
+came from. What changes with TSF is that the round trip disappears, and with it
+the path asymmetry that §2 identifies as the error floor.
+
 Implemented in `components/dancefloor_sync/` (the estimator and the wire format,
 no ESP-IDF dependencies, host-testable). `sync_test/main/main.c` is the M4
 harness that first exercised it; the hub and satellite use the component
@@ -205,7 +213,7 @@ letting each board independently keep its own appointment.
 
 A useful consequence: nothing passes between the boards at the moment of firing.
 Each one keeps its own appointment independently. The measurement wire described
-in §10 observes the result; it plays no part in producing it.
+in §12 observes the result; it plays no part in producing it.
 
 The cost is latency. Nothing can happen sooner than the lead time, which is why
 M5 budgets 300 ms of audio buffer and accepts ~0.5 s of total delay.
@@ -287,7 +295,7 @@ visible without measuring on real hardware.
 
 ### 3. Making it measurable at all
 
-Wiring the satellite's blink output into an input pin on the master (§10) turned a
+Wiring the satellite's blink output into an input pin on the master (§12) turned a
 milestone that was blocked on test equipment into one verifiable with a jumper
 wire, and produced the data that drove change 2. Worth doing early: a milestone
 you cannot measure is a milestone you cannot finish.
@@ -546,11 +554,98 @@ window is not, and twice here it produced a confident diagnosis of a regression
 that did not exist.
 
 **The hub's phase noise.** 15.7 ms between consecutive reads, cause unknown. It
-is filtered rather than understood.
+is filtered rather than understood. Most of it turned out to be quantisation --
+phase was dated where the playback loop NOTICED a crossing rather than where the
+crossing happened, and samples_played moves 256 frames at a time, so the reading
+was up to 5.8 ms late by an amount uncorrelated between samples. Correcting that
+exactly (the overshoot is known, and writes are paced by the DAC) roughly halved
+the scatter. It did not eliminate it, and the remainder is unexplained.
 
 ---
 
-## 10. Code map
+## 10. The other clock: 802.11 TSF
+
+Everything in §2 and §3 measures the offset with a round trip, and §2 says why
+that has an error floor: the estimator observes `U + D` and can never separate
+the halves, so sustained path asymmetry is invisible and unremovable.
+
+TSF has no round trip in it. The AP maintains a 64-bit microsecond counter,
+every beacon carries it, and each associated station's **MAC hardware**
+timestamps the beacon on arrival and slaves its local copy. That hardware
+timestamp is what real PTP's precision actually rests on, and what a stamp
+either side of a `sendto()` cannot be — everything between "read the clock" and
+"the frame left" lands in the error budget.
+
+Each unit relates its own TSF to its own `esp_timer`, and because both track the
+same AP counter:
+
+```
+offset = (master_local − master_tsf) − (sat_local − sat_tsf)
+```
+
+The master sends its `(tsf, local)` pair on the back of each probe reply
+(`MSG_TSF`, 17 bytes, four times a second per satellite). No network delay
+appears in the result, so no asymmetry can.
+
+### Measured against the estimator
+
+Both were computed side by side for two long runs before either was trusted.
+
+| | |
+|---|---|
+| Offset agreement | ~450 µs, **stable bias**, no trend over 10 min |
+| **Rate agreement** | **0.12 ppm** over 9.7 minutes |
+| Sample-to-sample step, TSF | 1–80 µs |
+| Sample-to-sample step, estimator | 50–200 µs |
+| Playback anchors at | 4.06 s, against 5.8–11 s before |
+
+The rate figure is the one that matters. Two methods built on entirely different
+physics, drifting at −3.55 and −3.43 ppm respectively — that is the hub-satellite
+crystal difference, and they agree on it to a tenth of a ppm. The ~450 µs offset
+bias sits about where §2 puts the estimator's own asymmetry error, so it is as
+likely to be the estimator's as TSF's.
+
+The faster start is not a bonus, it is structural: the 2.5 s settling wait exists
+because minimum-RTT selection needs a full window to find an uncongested round
+trip. TSF is not built from round trips, so there is no congested sample to
+average away and one beacon is as good as ten.
+
+### What it did not buy
+
+**Cross-unit audio was unchanged**, 0.1–10 ms either way. That is the figure a
+listener experiences, and TSF did not move it. What it removed is a class of
+failure — the asymmetry floor, the settling wait, and a master reboot poisoning
+the window — rather than anything audible.
+
+### The fallback, and why it stays
+
+`clock_offset()` in `satellite/main/main.c` prefers TSF while a reading is under
+`TSF_MAX_AGE_US` old and falls back to `sync_est_offset()` otherwise. It has to:
+`esp_wifi_get_tsf_time()` returns 0 before association and before the first
+beacon, and a master that does not send `MSG_TSF` at all would leave a satellite
+with nothing to anchor on.
+
+Everything in §2's "other weakness" therefore stays — `SYNC_STEP_US`, the window
+discard, the settling wait. They guard the fallback path, and TSF resets on
+reassociation, which is exactly the discontinuity the phase-insane re-anchor
+handles.
+
+### Caveats worth carrying
+
+The measurement is not free: `esp_wifi_get_tsf_time()` takes ~65–125 µs, so the
+read pair is bracketed by two TSF reads and the `esp_timer` read is centred
+between them. The span is reported beside every sample.
+
+TSF also steps ±300–600 µs occasionally, always as a jump and an immediate
+return. It is not read skew — the span is 130–240 µs on essentially all of them.
+The likely cause is the beacon-driven correction re-slaving the local counter
+every 102.4 ms. They self-cancel and the servo sees the average.
+
+`git tag probe-estimator-clock` marks the last commit before the switch.
+
+---
+
+## 11. Code map
 
 | File | Responsibility |
 |---|---|
@@ -558,6 +653,7 @@ is filtered rather than understood.
 | `components/dancefloor_sync/sync_proto.c` | Offset maths and min-RTT selection. No ESP-IDF deps |
 | `sync_test/main/main.c` | The M4 harness: SoftAP, UDP sockets, probe/announce/blink tasks |
 | `sync_test/test/` | Host tests — `make check` |
+| `satellite/main/main.c` | `clock_offset()` picks TSF or the estimator; `track_offset()` slews it |
 
 The estimator moved into a component when the hub and satellite came to need it
 too. `sync_test` still builds against it and is still the quickest way to see
@@ -572,7 +668,7 @@ radio airtime does not scale with unit count.
 
 ---
 
-## 11. Verification
+## 12. Verification
 
 **Estimator** — `cd sync_test/test && make check`. Cases covering exactness on
 symmetric paths, outlier rejection, the asymmetry floor, window ageing, min-RTT
