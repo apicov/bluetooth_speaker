@@ -173,6 +173,25 @@ static volatile uint32_t s_feed_dropped;
 static volatile uint32_t s_tx_fail;      /* sendto() rejections */
 
 /*
+ * Cumulative totals for a long run, never reset -- deliberately separate from
+ * the per-window counters above, which are cleared every 5 s.
+ *
+ * A rate tells you what is happening now; a total tells you whether something
+ * has been happening slowly for an hour. Nothing here had one, so the longest
+ * evidenced session was seven minutes and a leak or a slow decay would have
+ * been invisible. This project's own lesson: every real fault was invisible
+ * until something counted it.
+ */
+static volatile uint32_t n_underruns;     /* local playback ran dry */
+static volatile uint32_t n_restarts;      /* timeline restarted */
+static volatile uint32_t n_splices;       /* track-boundary corrections applied */
+static volatile uint32_t n_retunes;       /* DAC clock changes that succeeded */
+static volatile uint32_t n_retunes_bad;   /* refused or failed */
+static volatile uint32_t n_sta_left;      /* satellites disassociating */
+static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
+static volatile uint32_t hw_mon;
+
+/*
  * Satellites are sent audio by UNICAST, not multicast.
  *
  * Group-addressed frames are never acknowledged and never retried, so any
@@ -341,6 +360,7 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_restart_pos = -1;
         s_restart_pending = false;
         started = true;
+        n_restarts++;
         ESP_LOGI(TAG, "timeline start");
     } else if (llabs(next_play_at - target) > RESYNC_US) {
         static int64_t last_warn;
@@ -459,11 +479,28 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 
 /* ------------------------------------------------------------------- wifi */
 
+/*
+ * Only to count them. A satellite dropping off is invisible otherwise -- the
+ * driver logs it, but nothing accumulates it, so a link that flaps once an hour
+ * over an evening looks identical to one that never does. One reason=209
+ * SA-Query disassociation has already been seen.
+ */
+static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)data;
+    if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        n_sta_left++;
+    }
+}
+
 static void wifi_start_ap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                       WIFI_EVENT_AP_STADISCONNECTED,
+                                                       wifi_event, NULL, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -712,6 +749,7 @@ static void retune_dac(uint32_t hz)
      * costs sync, which is recoverable; an abort is not.
      */
     if (hz < RATE_SANE_MIN || hz > RATE_SANE_MAX) {
+        n_retunes_bad++;
         ESP_LOGE(TAG, "refusing a %" PRIu32 " Hz retune -- not a sample rate", hz);
         return;
     }
@@ -736,11 +774,13 @@ static void retune_dac(uint32_t hz)
     retuning = false;
 
     if (err != ESP_OK) {
+        n_retunes_bad++;
         ESP_LOGE(TAG, "retune to %" PRIu32 " Hz failed (%s), staying at %" PRIu32,
                  hz, esp_err_to_name(err), tx_rate);
         return;
     }
     s_retune_outage_us = esp_timer_get_time() - down_at;
+    n_retunes++;
     ESP_LOGW(TAG, "DAC clock retuned %" PRIu32 " -> %" PRIu32 " Hz, channel down %lld us",
              tx_rate, hz, s_retune_outage_us);
     tx_rate = hz;
@@ -803,8 +843,10 @@ static void local_play_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
             }
+            hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
             size_t got = xStreamBufferReceive(local_ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
             if (got == 0) {
+                n_underruns++;
                 ESP_LOGW(TAG, "local underrun, restarting timeline");
                 local_start = 0;
                 s_underrun_recover = true;
@@ -934,6 +976,7 @@ static void local_play_task(void *arg)
                              (long)(-applied * 1000 / (int32_t)sample_rate));
                 }
                 if (adj != 0) {
+                    n_splices++;
                     s_phase_stepped = true;   /* the average before it is stale */
                 }
 
@@ -1088,6 +1131,31 @@ static void ring_monitor_task(void *arg)
     (void)arg;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+
+        /*
+         * Soak line, every 60 s, and deliberately ahead of the streaming check
+         * below: if audio has stopped, that is exactly when the heap and the
+         * counters matter most.
+         *
+         * Totals rather than rates. Everything else here is cleared every
+         * window, which answers "what is happening now" and cannot answer "has
+         * this been happening slowly for an hour" -- and the longest run this
+         * system had ever been given was seven minutes.
+         */
+        static int health_left;
+        if (--health_left <= 0) {
+            health_left = 12;                      /* 12 x 5 s */
+            hw_mon = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ") | "
+                          "stack play %" PRIu32 " mon %" PRIu32 " | underruns %" PRIu32
+                          " restarts %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
+                          " (%" PRIu32 " refused) | sta-left %" PRIu32,
+                     (unsigned long long)(esp_timer_get_time() / 1000000),
+                     esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     hw_play, hw_mon, n_underruns, n_restarts, n_splices,
+                     n_retunes, n_retunes_bad, n_sta_left);
+        }
+
         if (local_start == 0 || rate_ema == 0) {
             continue;
         }

@@ -28,6 +28,7 @@
 #endif
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -148,6 +149,21 @@ static volatile int32_t splice_report_us;
 static volatile int32_t splice_report_phase;
 static volatile bool    splice_report_pending;
 
+/*
+ * Cumulative totals for a long run, never reset. The 5 s lines answer "what is
+ * happening now"; only a total answers "has this been happening slowly for an
+ * hour", and nothing here had one. See the hub's copy.
+ */
+static volatile uint32_t n_underruns;     /* playback ran dry */
+static volatile uint32_t n_reanchors;     /* streams anchored, first included */
+static volatile uint32_t n_splices;       /* track-boundary corrections applied */
+static volatile uint32_t n_retunes;
+static volatile uint32_t n_retunes_bad;
+static volatile uint32_t n_gaps;          /* lost-packet gaps filled with silence */
+static volatile uint32_t n_wifi_drops;    /* disconnects from the hub's AP */
+static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
+static volatile uint32_t hw_drift;
+
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
 #define RING_TARGET_MS 200
@@ -165,6 +181,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = data;
+        n_wifi_drops++;
         ESP_LOGW(TAG, "disconnected from \"%s\" (reason %d), retrying",
                  AP_SSID, d->reason);
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -399,6 +416,7 @@ static void handle_audio(const audio_msg_t *msg)
         expect_seq = msg->seq;
         have_seq = true;
         xStreamBufferReset(ring);
+        n_reanchors++;
         ESP_LOGI(TAG, "stream start: play_at %lld -> local %lld (in %lld ms)",
                  msg->play_at, stream_start_local,
                  (stream_start_local - esp_timer_get_time()) / 1000);
@@ -415,6 +433,7 @@ static void handle_audio(const audio_msg_t *msg)
         uint32_t missing = msg->seq - expect_seq;
         static const int16_t silence[128 * AUDIO_CHANNELS] = {0};
         uint32_t frames_missing = missing * msg->frames;
+        n_gaps++;
         ESP_LOGW(TAG, "lost %" PRIu32 " packet(s), inserting %" PRIu32 " frames of silence",
                  missing, frames_missing);
         /*
@@ -591,6 +610,7 @@ static void retune_output(uint32_t hz)
     const int64_t low  = (int64_t)stream_rate - RATE_TRIM_MAX_HZ;
     const int64_t high = (int64_t)stream_rate + RATE_TRIM_MAX_HZ;
     if ((int64_t)hz < low || (int64_t)hz > high) {
+        n_retunes_bad++;
         ESP_LOGE(TAG, "refusing a %" PRIu32 " Hz retune (nominal %" PRIu32
                       ") -- the servo input is not trustworthy", hz, stream_rate);
         return;
@@ -617,11 +637,13 @@ static void retune_output(uint32_t hz)
     retuning = false;
 
     if (err != ESP_OK) {
+        n_retunes_bad++;
         ESP_LOGE(TAG, "retune to %" PRIu32 " Hz failed (%s), staying at %" PRIu32,
                  hz, esp_err_to_name(err), tx_rate);
         return;
     }
     retune_outage_us = esp_timer_get_time() - down_at;
+    n_retunes++;
     ESP_LOGW(TAG, "output clock retuned %" PRIu32 " -> %" PRIu32 " Hz, channel down %lld us",
              tx_rate, hz, retune_outage_us);
     tx_rate = hz;
@@ -679,6 +701,24 @@ static void drift_task(void *arg)
     int cooldown = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+
+        /* Soak line, every 60 s, ahead of the streaming check below: if audio
+         * has stopped, that is when the heap and the counters matter most.
+         * Totals, not rates -- see the hub's copy. */
+        static int health_left;
+        if (--health_left <= 0) {
+            health_left = 12;                      /* 12 x 5 s */
+            hw_drift = uxTaskGetStackHighWaterMark(NULL);
+            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ") | "
+                          "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
+                          " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
+                          " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32,
+                     (unsigned long long)(esp_timer_get_time() / 1000000),
+                     esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
+                     n_retunes, n_retunes_bad, n_gaps, n_wifi_drops);
+        }
+
         if (stream_start_local == 0) {
             continue;
         }
@@ -893,8 +933,10 @@ static void play_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
             }
+            hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
             if (got == 0) {
+                n_underruns++;
                 ESP_LOGW(TAG, "underrun, waiting for a new stream");
                 stream_start_local = 0;
                 break;
@@ -1046,6 +1088,9 @@ static void play_task(void *arg)
                  * kind of thing that costs a buffer, and this is not urgent --
                  * the hub only wants it to print one line per track.
                  */
+                if (applied != 0) {
+                    n_splices++;
+                }
                 splice_report_us = (int32_t)((int64_t)applied * 1000000 / stream_rate);
                 splice_report_phase = phase_valid ? phase_err_us : 0;
                 splice_report_pending = true;
