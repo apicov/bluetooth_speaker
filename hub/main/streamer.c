@@ -69,10 +69,9 @@ static uint32_t rate_ema;                /* smoothed measured input rate */
 
 static void retune_dac(uint32_t hz);
 
-/* Held across a DAC retune. i2s_channel_write() returns immediately once the
- * channel is disabled, so without this the play task spins through the ring at
- * memory speed -- a measured 54 ms correction cost 177 ms of buffer. */
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
 static volatile int64_t s_marker_at;      /* local time we last pulsed */
+#endif
 
 /*
  * Ring position at which a tagged packet's audio begins, or -1 for none
@@ -126,6 +125,10 @@ static volatile int32_t s_restart_pos = -1;
  * splice will not fix, and 150 ms is audible even at a track change. */
 #define MAX_SPLICE_MS 150
 
+/* Held across a DAC retune, and the play task parks on it.
+ * i2s_channel_write() returns immediately once the channel is disabled, so
+ * without this the play task spins through the ring at memory speed -- a
+ * measured 54 ms correction cost 177 ms of buffer. */
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
 
@@ -558,6 +561,7 @@ static void socket_start(void)
 
 /* ------------------------------------------------------ sync measurement */
 
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
 static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
 
 /*
@@ -642,9 +646,11 @@ static void marker_start(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(CONFIG_DANCEFLOOR_MONITOR_GPIO, monitor_isr, NULL));
     xTaskCreate(monitor_task, "syncmon", 3072, NULL, 9, NULL);
 
-    ESP_LOGI(TAG, "sync markers on GPIO %d, watching GPIO %d",
+    ESP_LOGI(TAG, "sync markers on GPIO %d, watching GPIO %d -- bench instrument, "
+                  "nothing corrects on it",
              CONFIG_DANCEFLOOR_MARKER_GPIO, CONFIG_DANCEFLOOR_MONITOR_GPIO);
 }
+#endif  /* CONFIG_DANCEFLOOR_ENABLE_MARKER */
 
 /* --------------------------------------------------- local delayed playback */
 
@@ -940,10 +946,14 @@ static void local_play_task(void *arg)
 
             int32_t mark = s_marker_sample;
             if (mark >= 0 && samples_played >= mark) {
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
+                /* 200 us of busy-wait in the playback path -- see the Kconfig
+                 * help. Nothing corrects on what it measures. */
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
                 s_marker_at = esp_timer_get_time();
                 esp_rom_delay_us(MARKER_PULSE_US);
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 0);
+#endif
                 s_marker_sample = -1;
             }
             samples_played += AUDIO_FRAMES;
@@ -1197,7 +1207,9 @@ void streamer_start(void)
     wifi_start_ap();
     socket_start();
     i2s_start(sample_rate);
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
     marker_start();
+#endif
 
     ESP_LOGI(TAG, "free heap after WiFi init: %" PRIu32 " bytes", esp_get_free_heap_size());
 

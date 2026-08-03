@@ -47,9 +47,38 @@ menu "Dancefloor hub"
 
     comment "Sync measurement"
 
+    config DANCEFLOOR_ENABLE_MARKER
+        bool "Sync marker GPIO (bench instrument)"
+        default n
+        help
+            Pulses a pin when playback reaches a tagged sample, and watches a
+            satellite's pin doing the same, so the hub can report how far apart
+            the two units' AUDIO actually are -- measured at the speaker rather
+            than inferred from clock estimates. It is the only measurement that
+            sees what happens between samples_played and the sound, so it stays
+            the ground truth while it is attached.
+
+            It needs a wire and a common ground between two boards, so a
+            deployed floor cannot have it: satellites reach the hub over WiFi
+            and nothing else. Off by default for that reason.
+
+            Nothing corrects on it. Every servo and every splice closes through
+            play_at and the phase queue, so enabling or disabling this changes
+            no behaviour -- only whether the measurement exists. A correction
+            loop closed through an instrument that is absent in deployment
+            would be tuned to a configuration nobody ships.
+
+            The cost when enabled is a 200 us busy-wait in the playback task
+            every ~2 s, on each unit. Identical on both, so it cancels for sync
+            purposes, but it buys nothing once the wire is off.
+
+            Track-boundary divergence is reported over WiFi regardless, and
+            covers every satellite rather than the wired one.
+
     config DANCEFLOOR_MARKER_GPIO
         int "GPIO pulsed when playback crosses a marker instant"
         default 4
+        depends on DANCEFLOOR_ENABLE_MARKER
         help
             Every unit pulses this when it plays the sample landing on a
             master-clock marker. Wire a satellite's marker pin to this board's
@@ -59,6 +88,7 @@ menu "Dancefloor hub"
     config DANCEFLOOR_MONITOR_GPIO
         int "GPIO watching a satellite's marker pulse"
         default 21
+        depends on DANCEFLOOR_ENABLE_MARKER
         help
             Input. Wire the SATELLITE's marker GPIO here, plus a common ground.
             Must differ from the marker GPIO.

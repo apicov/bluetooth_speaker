@@ -1044,9 +1044,14 @@ static void play_task(void *arg)
 
             int32_t mark = marker_sample;
             if (mark >= 0 && samples_played >= mark) {
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
+                /* 200 us of busy-wait in the playback path. Worth it while a
+                 * hub is wired to the other end and nothing else can measure
+                 * what reaches the speaker; pure cost once the wire is off. */
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 1);
                 esp_rom_delay_us(MARKER_PULSE_US);
                 gpio_set_level(CONFIG_DANCEFLOOR_MARKER_GPIO, 0);
+#endif
                 marker_sample = -1;
             }
             samples_played += AUDIO_FRAMES;
@@ -1092,12 +1097,15 @@ void app_main(void)
     i2s_start(44100);
     tx_rate = 44100;
 
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
     gpio_config_t marker = {
         .pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_MARKER_GPIO,
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&marker));
-    ESP_LOGI(TAG, "sync marker on GPIO %d", CONFIG_DANCEFLOOR_MARKER_GPIO);
+    ESP_LOGI(TAG, "sync marker on GPIO %d -- bench instrument, nothing corrects on it",
+             CONFIG_DANCEFLOOR_MARKER_GPIO);
+#endif
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
     visualiser_start();

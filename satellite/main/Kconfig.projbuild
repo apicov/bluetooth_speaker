@@ -12,9 +12,32 @@ menu "Dancefloor satellite"
         int "I2S DATA GPIO"
         default 25
 
+    config DANCEFLOOR_ENABLE_MARKER
+        bool "Sync marker GPIO (bench instrument)"
+        default n
+        help
+            Pulses a pin when playback reaches a tagged sample, so a hub wired
+            to it can report how far apart the two units' AUDIO actually is --
+            measured at the speaker rather than inferred from clock estimates,
+            which makes it the only measurement that sees what happens between
+            samples_played and the sound.
+
+            It needs a wire and a common ground to the hub, so a deployed
+            satellite cannot have it: it reaches the hub over WiFi and nothing
+            else. Off by default for that reason.
+
+            Nothing corrects on it. Every servo and every splice closes through
+            play_at and the phase queue, so this changes no behaviour -- only
+            whether the measurement exists.
+
+            Costs a 200 us busy-wait in the playback task every ~2 s while on,
+            which buys nothing once the wire is off. Track-boundary divergence
+            is reported to the hub over WiFi regardless.
+
     config DANCEFLOOR_MARKER_GPIO
         int "GPIO pulsed when playback crosses a marker instant"
         default 4
+        depends on DANCEFLOOR_ENABLE_MARKER
         help
             Wire this to the hub's monitor GPIO, plus a common ground, and the
             hub reports how far this unit's audio is from its own. That is the
