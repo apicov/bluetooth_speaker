@@ -19,6 +19,9 @@
 #include "freertos/stream_buffer.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+#include "driver/gpio.h"
+#endif
 
 #include "analysis.hpp"
 #include "patterns.hpp"
@@ -53,6 +56,34 @@ constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 #define CONFIG_DANCEFLOOR_LOG_PERIOD_S 20
 #endif
 constexpr int64_t LED_LOG_PERIOD_US = CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000LL;
+
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+/*
+ * One flash per second of MASTER-CLOCK time, on every unit at once.
+ *
+ * The second boundary is taken from due_us, which is derived from the scheduled
+ * instant the audio carries -- so every unit crosses the same boundary on the
+ * same block of audio, with nothing sent between them and no local clock read.
+ * That is the same property the strips themselves rely on; this just makes it
+ * visible.
+ *
+ * Watch two boards side by side: if the onboard LEDs flash together the whole
+ * chain agrees, and if one lags it is obvious without a console. The eye
+ * resolves maybe 10-20 ms, so this is a presence check rather than a
+ * measurement -- the numbers live in AUDIO SYNC and TRACK DIVERGENCE.
+ */
+constexpr int64_t LED_MARKER_PERIOD_US = 1000000;
+
+/*
+ * Held for two blocks -- ~46 ms -- rather than delayed for.
+ *
+ * The audio marker can afford a 200 us busy-wait; this cannot. It has to be
+ * long enough to see, and blocking the render task for 40 ms would drop two
+ * analysis frames and break the very alignment being demonstrated. Raising the
+ * pin on one block and lowering it two later costs nothing.
+ */
+constexpr int LED_MARKER_BLOCKS_HIGH = 2;
+#endif
 
 /* Applied to the pattern's output on the way to the strip. A device concern,
  * not a pattern one -- patterns work in full range and this scales it. */
@@ -218,6 +249,28 @@ void visualiser_task(void *arg)
          * is the same value on every unit for this same audio. */
         const int64_t due_us = block_index * FFT_N * 1000000LL / RATE;
         const df::Frame &f = analysis.process(raw, block_index, due_us, 0);
+
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+        /*
+         * Raise when due_us crosses a second, lower two blocks later. Both
+         * edges are handled here, so nothing blocks and nothing needs a timer.
+         *
+         * Which block that lands on is quantised to the 23 ms block period, but
+         * it is the SAME block on every unit, which is the only thing that
+         * matters for comparing two boards.
+         */
+        static int64_t last_sec = -1;
+        static int lower_in = -1;
+        const int64_t sec = due_us / LED_MARKER_PERIOD_US;
+        if (sec != last_sec) {
+            last_sec = sec;
+            lower_in = LED_MARKER_BLOCKS_HIGH;
+            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 1);
+        } else if (lower_in > 0 && --lower_in == 0) {
+            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 0);
+        }
+#endif
+
         block_index++;
 
         bump(s_frames);
@@ -328,6 +381,18 @@ void visualiser_start(void)
      * of bytes at a time is pure overhead now that partial reads accumulate. */
     pcm_stream = xStreamBufferCreate(STREAM_BYTES, FFT_N * CHANNELS * sizeof(int16_t));
     assert(pcm_stream);
+
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+    {
+        gpio_config_t m = {};
+        m.pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_LED_MARKER_GPIO;
+        m.mode = GPIO_MODE_OUTPUT;
+        ESP_ERROR_CHECK(gpio_config(&m));
+        ESP_LOGW(TAG, "LED marker on GPIO %d, one flash per master-clock second "
+                      "-- every unit flashes together; nothing corrects on it",
+                 CONFIG_DANCEFLOOR_LED_MARKER_GPIO);
+    }
+#endif
 
     analysis.init();
 

@@ -60,6 +60,39 @@ menu "Dancefloor LEDs"
             brightest component becomes 25, so hue steps get visibly coarse and
             the dim tail of the beat envelope quantises to black.
 
+    config DANCEFLOOR_ENABLE_LED_MARKER
+        bool "LED sync marker (bench instrument)"
+        default n
+        help
+            Flashes once per second of master-clock time, on every unit at the
+            same instant. Put two boards side by side: if the onboard LEDs blink
+            together the whole chain agrees, and if one lags it is obvious with
+            no console and no wiring.
+
+            It shows something nothing else does. Every existing measurement
+            covers the AUDIO path -- the audio marker, AUDIO SYNC, TRACK
+            DIVERGENCE. Between playback and the pixels sit the analysis stream
+            buffer, the FFT, the detector and the render, and none of that is
+            measured anywhere. The strips could be visibly out of step with the
+            speakers perfectly aligned and nothing would report it.
+
+            The second boundary comes from due_us, which is derived from the
+            scheduled instant the audio carries, so every unit crosses it on the
+            same block with nothing sent between them.
+
+            Same discipline as the audio marker: nothing corrects on it, so this
+            changes no behaviour. It costs one GPIO write per analysis block.
+
+    config DANCEFLOOR_LED_MARKER_GPIO
+        int "GPIO for the LED sync marker"
+        default 2
+        depends on DANCEFLOOR_ENABLE_LED_MARKER
+        help
+            2 is the onboard LED on most ESP32 devkits, so the check needs no
+            wiring at all. The eye resolves maybe 10-20 ms and a 240 fps phone
+            camera about 4 ms, so this answers "are they together" rather than
+            "by how much" -- the numbers are in AUDIO SYNC and TRACK DIVERGENCE.
+
     config DANCEFLOOR_LED_PATTERN
         string "Pattern to start with"
         default "pulse"
