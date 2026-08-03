@@ -13,11 +13,11 @@ synchronised, so they agree for free.
 ## The shape of it
 
 ```
- phone ──A2DP/SBC──▶ bt_bridge ──SBC over UART──▶ hub ──SBC over WiFi──▶ satellites
-                     (chip A)      500 kbaud      (chip B)   unicast      (any number)
-                                                     │                        │
-                                                  speaker                  speaker
-                                                  + strip                  + strip
+phone --A2DP/SBC--> bt_bridge --SBC over UART--> hub --SBC over WiFi--> satellites
+                    (chip A)       500 kbaud     (chip B)    unicast     (any number)
+                                                    |                        |
+                                                 speaker                  speaker
+                                                 + strip                  + strip
 ```
 
 | Directory | What it is |
@@ -61,7 +61,7 @@ cd hub       && idf.py -p /dev/ttyUSB1 flash monitor   # chip B
 cd satellite && idf.py -p /dev/ttyUSB2 flash monitor   # each satellite
 ```
 
-Pins, LED count, brightness and pattern are under `idf.py menuconfig` →
+Pins, LED count, brightness and pattern are under `idf.py menuconfig` ->
 **Dancefloor \***.
 
 ## Tests
