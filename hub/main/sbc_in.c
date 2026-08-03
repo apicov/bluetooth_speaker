@@ -27,6 +27,26 @@ static uint32_t s_packets, s_bad_sync, s_bad_crc, s_gaps, s_decode_err;
 static uint64_t s_pcm_samples;
 
 /*
+ * Longest silence between two audio packets in the window.
+ *
+ * The counters above all describe packets that ARRIVED and were wrong. Nothing
+ * described packets that never came, and a source that simply stops sending
+ * produces no bad sync word, no CRC failure, no sequence gap and no decode
+ * error -- it is invisible to every one of them.
+ *
+ * That blindness cost a real diagnosis: the hub's timeline was seen jumping
+ * -126734 us, and drift accounted for 7% of it. The remaining ~118 ms was a
+ * pause in delivery, and no instrument on this board could see one.
+ *
+ * A2DP packets arrive ~23/s, so ~43 ms apart. Anything past GAP_ALARM_US is
+ * long enough to eat the playback lead and is reported at once.
+ */
+static int64_t s_last_pkt_us;
+static uint32_t s_max_gap_us;
+
+#define GAP_ALARM_US 100000
+
+/*
  * Bulk-read into a local buffer and parse in memory.
  *
  * The first version called uart_read_bytes() one byte at a time to hunt for the
@@ -150,6 +170,19 @@ static void rx_task(void *arg)
             }
             s_packets++;
 
+            /* Time since the previous audio packet. Skipped on the first one,
+             * which has nothing to measure against. */
+            {
+                const int64_t t = esp_timer_get_time();
+                if (s_last_pkt_us) {
+                    const uint32_t gap = (uint32_t)(t - s_last_pkt_us);
+                    if (gap > s_max_gap_us) {
+                        s_max_gap_us = gap;
+                    }
+                }
+                s_last_pkt_us = t;
+            }
+
             /* One A2DP packet holds several SBC frames back to back. Decode for
              * this unit's own speaker, and count frames so the streamer knows
              * how far to advance the timeline for the copy it sends on. */
@@ -222,16 +255,19 @@ static void rx_task(void *arg)
              * hear about a fault is how faults get missed.
              */
             static int quiet_left;
-            const bool bad = s_bad_sync || s_bad_crc || s_gaps || s_decode_err || dropped;
+            const bool bad = s_bad_sync || s_bad_crc || s_gaps || s_decode_err || dropped
+                             || s_max_gap_us > GAP_ALARM_US;
             if (bad || --quiet_left <= 0) {
                 if (!bad) {
                     quiet_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
                 }
                 ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
                               "sync %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32
-                              " dec %" PRIu32 " | fed-drop %" PRIu32 " B",
+                              " dec %" PRIu32 " | fed-drop %" PRIu32 " B | "
+                              "max gap %" PRIu32 " us",
                          s_packets, info.sample_rate, info.channels, eff,
-                         s_bad_sync, s_bad_crc, s_gaps, s_decode_err, dropped);
+                         s_bad_sync, s_bad_crc, s_gaps, s_decode_err, dropped,
+                         s_max_gap_us);
             }
             s_pcm_samples = 0;
             /* Rate the decoder actually produced, which is what the DAC must match. */
@@ -239,6 +275,7 @@ static void rx_task(void *arg)
             /* Per-window, not cumulative: a rising total tells you far less than
              * a rate, and cumulative counters made 500 k look worse than it was. */
             s_packets = s_bad_sync = s_bad_crc = s_gaps = s_decode_err = 0;
+            s_max_gap_us = 0;
             next_report = now + 5000000;
         }
     }

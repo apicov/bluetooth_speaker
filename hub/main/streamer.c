@@ -53,6 +53,22 @@
  */
 #define RESYNC_US 120000
 
+/*
+ * Past this the timeline is not merely off, it is wrong, and no gradual
+ * correction closes it in useful time -- a second at 1 ms/s would take a
+ * quarter of an hour. Jump instead.
+ */
+#define RESYNC_HARD_US 1000000
+
+/*
+ * How far the timeline moves per packet while slewing back to real time.
+ *
+ * At ~50 packets/s this is 1 ms/s. The bound that matters is the servo's: it
+ * trims at most +-100 Hz, which is 2.27 ms/s at 44.1 kHz, so a slew near that
+ * outruns the units it is supposed to be leading.
+ */
+#define TIMELINE_SLEW_US 20
+
 /* Local playback ring. The master delays its own audio by LEAD_US exactly like a
  * satellite, otherwise it would play ahead of every other speaker. Must hold the
  * lead (~21 kB) with headroom; 32 kB is 181 ms. */
@@ -129,6 +145,10 @@ static volatile int32_t s_restart_pos = -1;
  * i2s_channel_write() returns immediately once the channel is disabled, so
  * without this the play task spins through the ring at memory speed -- a
  * measured 54 ms correction cost 177 ms of buffer. */
+/* True while the timeline is being walked back to real time -- see the slew in
+ * streamer_send_sbc(). */
+static bool s_slewing;
+
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
 
@@ -365,16 +385,57 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_phase_valid = false;
         s_restart_pos = -1;
         s_restart_pending = false;
+        s_slewing = false;      /* err is zero by construction; nothing to walk back */
         started = true;
         n_restarts++;
         ESP_LOGI(TAG, "timeline start");
-    } else if (llabs(next_play_at - target) > RESYNC_US) {
-        static int64_t last_warn;
-        int64_t err = next_play_at - target;
-        next_play_at = target;
-        if (now - last_warn > 2000000) {
-            last_warn = now;
-            ESP_LOGW(TAG, "timeline off by %lld us, resyncing", err);
+    } else {
+        /*
+         * Bring the timeline back to real time by SLEWING, not by jumping.
+         *
+         * Jumping is what this used to do, and it stepped every unit's phase by
+         * the whole error at once -- measured at -126734 us, with both boards
+         * then servoing it off over 160 s and drifting 3 to 8 ms apart from
+         * each other while they did. That excursion was most of the sync error
+         * in a ten-minute run, and the servo was being asked to correct a step
+         * with a loop built for 14 ppm of drift.
+         *
+         * A step is also the wrong description of the fault. Drift accounted
+         * for 7% of that -126 ms; the rest arrived as a single ~118 ms pause in
+         * delivery, which reduces the playback lead by exactly its own length.
+         * Rebuilding that lead is real work and the servo has to do it either
+         * way -- but it can do it smoothly if the timeline moves smoothly.
+         *
+         * The rate is bounded by what the servo can follow. It may trim +-100 Hz
+         * at 44.1 kHz, which is 2.27 ms/s, so anything near that leaves the
+         * units unable to keep up and puts the error back. 20 us per packet at
+         * ~50 packets/s is 1 ms/s, well inside it, and closes 118 ms in about
+         * two minutes without the phase ever leaving the servo's linear range.
+         */
+        const int64_t err = next_play_at - target;
+
+        if (llabs(err) > RESYNC_HARD_US) {
+            /* Far beyond anything a slew could close in reasonable time, so
+             * something has gone wrong that gradual correction will not fix.
+             * Jump, and say so -- this is the old behaviour, kept for the case
+             * it was right for. */
+            next_play_at = target;
+            s_slewing = false;
+            ESP_LOGW(TAG, "timeline off by %lld us -- too far to slew, jumping", err);
+        } else if (llabs(err) > RESYNC_US) {
+            if (!s_slewing) {
+                s_slewing = true;
+                ESP_LOGW(TAG, "timeline off by %lld us, slewing back", err);
+            }
+        } else if (s_slewing && llabs(err) < RESYNC_US / 4) {
+            /* Hysteresis, so it does not chatter in and out around the
+             * threshold. */
+            s_slewing = false;
+            ESP_LOGW(TAG, "timeline back within %lld us", err);
+        }
+
+        if (s_slewing) {
+            next_play_at += (err > 0) ? -TIMELINE_SLEW_US : TIMELINE_SLEW_US;
         }
     }
 
