@@ -17,7 +17,8 @@
  *   ./pattern_lab track.wav --csv trace.csv    per-frame numbers for tuning
  *   ./pattern_lab --list                       available patterns
  *
- * Feed it the WAVs that tools/desktop_satellite.py --record writes.
+ * Feed it the WAVs that the desktop client writes -- it lives in its own
+ * repository now, ../dancefloor-tools, and needs nothing from this tree.
  */
 #include <cmath>
 #include <cstdint>

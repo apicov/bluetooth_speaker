@@ -24,6 +24,12 @@ __pycache__/
 # into this one -- a nested repo would go in as an unusable gitlink.
 esp32c3_neopixel/
 
+# The desktop client moved to its own repository (../dancefloor-tools) and is
+# built against nothing here. Ignored in case a checkout is dropped alongside,
+# for the same nested-repo reason as above.
+dancefloor-tools/
+tools/desktop_satellite.py
+
 # Host tool build output
 tools/pattern_lab/pattern_lab
 tools/pattern_lab/*.o

@@ -221,7 +221,7 @@ Four firmware images live in this repository, plus a Python client:
 | `bt_bridge/` | Chip A. Bluetooth only. Receives A2DP, forwards raw SBC over UART |
 | `hub/` | Chip B. WiFi SoftAP, clock master, decoder, DAC, LEDs, streamer |
 | `satellite/` | Every additional speaker. Receives, decodes, plays, lights |
-| `tools/desktop_satellite.py` | A laptop pretending to be a satellite — listens and records WAVs |
+| `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources |
 
 ### 8. Why the master is two chips
 
@@ -728,24 +728,32 @@ cd tools/pattern_lab && make
 
 It compiles `analysis.cpp`, `patterns.cpp` and `beat_detect.c` straight out of
 the component rather than copying them, so it cannot drift from what the strips
-do. Feed it the WAVs `desktop_satellite.py --record` writes.
+do. Feed it the WAVs the desktop client writes (see below).
 
 > The user's shell profile puts the xtensa toolchain on `PATH`, which breaks
 > host `gcc` builds. Both test Makefiles pin `PATH=/usr/bin:/bin` for this
 > reason.
 
-Listen from a laptop without building anything:
+Listen from a laptop without building anything. The desktop client lives in its
+own repository — [`dancefloor-tools`](../../dancefloor-tools) — because it is
+built against nothing here:
 
 ```sh
 nmcli device wifi connect dancefloor password dancefloor
-cd tools
+cd ../dancefloor-tools
 python3 desktop_satellite.py --record ~/dancefloor-tracks \
   | aplay -f S16_LE -r 44100 -c 2 --buffer-time=1000000 -
 ```
 
 It decodes via `ffmpeg`, plays through the pipe, and saves one WAV per track
 (skipping Spotify ad breaks, which it recognises by their artist field). Those
-recordings exist to tune the beat detector against real music offline.
+recordings exist to tune the beat detector against real music offline, which is
+what `tools/pattern_lab` consumes.
+
+One thing that split does not remove: that client carries a hand-maintained copy
+of the wire format from `sync_proto.h`, and nothing checks the two still agree.
+A mismatch shows up as garbled audio or a rising malformed-packet count, never as
+an error. It has caught people out twice.
 
 #### The log lines worth knowing
 
