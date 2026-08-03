@@ -215,8 +215,8 @@ static void rx_task(void *arg)
              *
              * The window stays 5 s -- streamer_set_sample_rate() below feeds the
              * servo's rate estimate and must keep its cadence -- but a healthy
-             * window says the same thing every time, so only every LOG_PERIOD_S
-             * gets printed. Any window with a bad sync word, a CRC failure, a
+             * window says the same thing every time, so only one window per
+             * log period gets printed. Any window with a bad sync word, a CRC failure, a
              * sequence gap, a decode error or a dropped feed prints regardless,
              * because those are the windows worth seeing and waiting 20 s to
              * hear about a fault is how faults get missed.
@@ -225,7 +225,7 @@ static void rx_task(void *arg)
             const bool bad = s_bad_sync || s_bad_crc || s_gaps || s_decode_err || dropped;
             if (bad || --quiet_left <= 0) {
                 if (!bad) {
-                    quiet_left = LOG_PERIOD_S / 5;
+                    quiet_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
                 }
                 ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
                               "sync %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32

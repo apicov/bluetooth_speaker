@@ -180,19 +180,6 @@ typedef struct __attribute__((packed)) {
  */
 #define PHASE_DEADBAND_US 7000
 
-/*
- * How often the periodic status lines print, in seconds.
- *
- * Only the LOGGING. Every servo, every window and every measurement keeps its
- * own cadence -- the 5 s loops still run at 5 s, they simply do not narrate
- * every pass. Changing this cannot change behaviour.
- *
- * At 5 s the two boards emitted a line every 0.8 s between them, most of it
- * identical to the line before, and following anything meant scrolling past
- * the rest. Anything genuinely eventful -- a retune, a splice, a track
- * boundary, an error -- is logged when it happens and is not on this clock.
- */
-#define LOG_PERIOD_S 20
 
 typedef enum {
     AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */

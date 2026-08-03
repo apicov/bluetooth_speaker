@@ -696,7 +696,7 @@ static void rx_task(void *arg)
             if (span > span_max) {
                 span_max = span;
             }
-            if (my_local - last_log_us < (int64_t)LOG_PERIOD_S * 1000000) {
+            if (my_local - last_log_us < (int64_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000) {
                 continue;
             }
             const int64_t tsf_step = last_log_us ? tsf_offset - prev_tsf : 0;
@@ -952,11 +952,11 @@ static void drift_task(void *arg)
         err_ema = err_ema_valid ? (err_ema * 3 + ph) / 4 : ph;
         err_ema_valid = true;
 
-        /* Every LOG_PERIOD_S, not every window. The servo above still runs at
+        /* Once per log period, not every window. The servo above still runs at
          * 5 s and still sees every sample; it just stops narrating. */
         static int status_left;
         if (--status_left <= 0) {
-            status_left = LOG_PERIOD_S / 5;
+            status_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
             ESP_LOGI(TAG, "buffer %lu ms | phase %+ld us (smoothed %+ld us)",
                      (unsigned long)(filled * 1000 / (stream_rate * AUDIO_CHANNELS * 2)),
                      (long)ph, (long)err_ema);

@@ -39,11 +39,20 @@ constexpr uint32_t FRAME_BYTES = CHANNELS * sizeof(int16_t);
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 
-/* Matches LOG_PERIOD_S in sync_proto.h, which this component does not include
- * -- it is deliberately free of the audio protocol. Kept in step by hand; the
- * cost of drifting apart is a console that is noisier than intended, not a
- * fault. */
-constexpr int64_t LED_LOG_PERIOD_US = 20 * 1000000LL;
+/*
+ * One definition, in components/dancefloor_sync/Kconfig. Kconfig symbols are
+ * global in ESP-IDF, so this reads it without including the audio protocol or
+ * depending on that component -- which matters, because everything here has to
+ * stay buildable on its own.
+ *
+ * The fallback keeps that true: if this component is ever built in a project
+ * that has no dancefloor_sync, it compiles rather than failing on a missing
+ * symbol.
+ */
+#ifndef CONFIG_DANCEFLOOR_LOG_PERIOD_S
+#define CONFIG_DANCEFLOOR_LOG_PERIOD_S 20
+#endif
+constexpr int64_t LED_LOG_PERIOD_US = CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000LL;
 
 /* Applied to the pattern's output on the way to the strip. A device concern,
  * not a pattern one -- patterns work in full range and this scales it. */

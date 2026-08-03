@@ -696,7 +696,7 @@ static void monitor_task(void *arg)
         /* Every ~2 s is more than anyone reads. The value is kept for the
          * track-boundary summary regardless of whether this prints. */
         static int64_t last_sync_log;
-        if (s_sync_at - last_sync_log >= (int64_t)LOG_PERIOD_S * 1000000) {
+        if (s_sync_at - last_sync_log >= (int64_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000) {
             last_sync_log = s_sync_at;
             ESP_LOGW(TAG, "AUDIO SYNC: satellite %+lld us (%s)", err,
                      err >= 0 ? "late" : "early");
@@ -1283,11 +1283,11 @@ static void ring_monitor_task(void *arg)
         s_err_ema_valid = true;
 
         size_t filled = LOCAL_RING_BYTES - xStreamBufferSpacesAvailable(local_ring);
-        /* Printed every LOG_PERIOD_S, not every window. tx-fail accumulates
+        /* Printed once per log period, not every window. tx-fail accumulates
          * across the quiet windows so nothing is lost by not printing it. */
         static int status_left;
         if (--status_left <= 0) {
-            status_left = LOG_PERIOD_S / 5;
+            status_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
             ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
                           "tx-fail %" PRIu32,
                      (unsigned)filled,

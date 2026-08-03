@@ -1,0 +1,28 @@
+menu "Dancefloor diagnostics"
+
+    config DANCEFLOOR_LOG_PERIOD_S
+        int "Seconds between periodic status lines"
+        default 20
+        range 5 300
+        help
+            How often the recurring status lines print: the hub's ring/phase
+            line, the satellite's buffer/phase line, the SBC link summary, the
+            visualiser's frame counts, and the TSF comparison.
+
+            Logging only. Every servo, window and estimator keeps its own
+            cadence -- the 5 s loops still run at 5 s and still see every
+            sample, they simply do not narrate each pass -- so changing this
+            cannot change behaviour.
+
+            At 5 s the two boards emitted a line every 0.8 s between them, most
+            of it identical to the line before. Anything eventful -- a retune, a
+            splice, a track boundary, a decode error, dropped audio -- is logged
+            when it happens and is not on this clock. Two of the lines above
+            also print immediately on a bad window regardless of this setting,
+            because waiting to hear about a fault is how faults get missed.
+
+            Lives here because both firmwares require this component, and
+            because Kconfig symbols are global in ESP-IDF: the LED component
+            reads it without needing to depend on the sync protocol.
+
+endmenu
