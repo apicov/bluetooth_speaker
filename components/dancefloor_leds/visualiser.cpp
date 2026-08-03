@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <optional>
 
@@ -244,6 +245,23 @@ std::atomic<uint32_t> s_dropped;
 std::atomic<uint32_t> s_aligns;
 std::atomic<uint32_t> s_onsets;
 std::atomic<uint32_t> s_frames;
+/*
+ * The boom detector's own counts, because `onsets` is the wideband detector and
+ * BoomPattern does not use it -- so on a floor running "boom" the log described
+ * a decision nobody could see and said nothing about the one on the strip.
+ *
+ * `marginal` is the reason this is here rather than just `booms`. Two units
+ * analyse audio a few ms apart, so their blocks overlap ~91% and their flux
+ * values are close but never equal. Any block whose flux sits near its own
+ * threshold can therefore fall either way, and that population -- not the
+ * timeline -- is what puts one strip lit and the other dark. Counting it needs
+ * one unit rather than two boards and two log windows lined up by hand.
+ *
+ * Within 10% of threshold is a proxy, not a derivation: the real width is the
+ * flux difference between the units, which no unit can see on its own.
+ */
+std::atomic<uint32_t> s_booms;
+std::atomic<uint32_t> s_marginal;
 /* Re-alignments nobody asked for -- see ALIGN_DRIFT_US. Reported separately
  * from s_aligns because they mean something different: an align is an event
  * being handled, a drift is an event that was never reported at all. */
@@ -396,6 +414,11 @@ void visualiser_task(void *arg)
 
         bump(s_frames);
         if (f.onset) bump(s_onsets);
+        if (f.boom) bump(s_booms);
+        if (f.boom_threshold > 0.0f &&
+            std::fabs(f.boom_flux - f.boom_threshold) < 0.1f * f.boom_threshold) {
+            bump(s_marginal);
+        }
 
         if (pattern) {
             pattern->render(f, pixels, LED_COUNT);
@@ -420,9 +443,11 @@ void visualiser_task(void *arg)
          * fault in here that used to be permanent and invisible. */
         if (dropped || drifts || aligns > 1 || now - last_report_us >= LED_LOG_PERIOD_US) {
             ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
+                          " | booms %" PRIu32 " (marginal %" PRIu32 ")"
                           " | drop %" PRIu32 " B | aligns %" PRIu32
                           " | drift %" PRIu32 " (last %+ld us) | %s",
-                     take(s_frames), take(s_onsets), take(s_dropped), take(s_aligns),
+                     take(s_frames), take(s_onsets), take(s_booms), take(s_marginal),
+                     take(s_dropped), take(s_aligns),
                      take(s_drifts), (long)s_last_drift_us.load(std::memory_order_relaxed),
                      pattern ? pattern->name() : "no pattern");
             last_report_us = now;
