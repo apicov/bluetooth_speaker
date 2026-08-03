@@ -47,6 +47,13 @@ void visualiser_set_pattern(const char *name);
  * every track boundary and never recover. Re-deriving the origin from the next
  * scheduled instant costs one dropped analysis block and puts them back
  * together.
+ *
+ * Calling this is no longer the only defence. visualiser_feed() compares the
+ * count against the `due_master_us` it is handed and re-derives on its own if
+ * they have come apart -- see ALIGN_DRIFT_US in visualiser.cpp, and the two
+ * silent breakages that motivated it. Still call this: it corrects at the
+ * instant of the event rather than once the error has grown to 10 ms, and a
+ * caller that knows exactly what it did should say so.
  */
 void visualiser_realign(void);
 

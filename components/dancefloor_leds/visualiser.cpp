@@ -157,6 +157,72 @@ std::atomic<long long> s_align_block_index; /* block number of that first sample
 std::atomic<uint32_t> s_align_gen;
 uint32_t s_sent_total;                      /* feed side only */
 
+/*
+ * The safety net: the origin this file is counting from, kept beside the
+ * scheduled instant it was derived from, so the two can be compared.
+ *
+ * Everything above depends on the count of what has passed through here staying
+ * true, and the only defence was that each caller REMEMBERS to report the events
+ * that break it. Three do (a short send below, a splice, a retune). The list is
+ * not closed, and the ones nobody thought of fail silently and for good:
+ *
+ *   - content dropped before it ever reaches the playback path, so the audio
+ *     the timeline accounts for never arrives here (the hub's local ring and
+ *     the satellite's receive ring both drop when full, and both only count it)
+ *   - a short read from the playback ring, zero-filled to a whole chunk: audio
+ *     the timeline does NOT account for, invented and fed here as though it were
+ *     real
+ *
+ * Each leaves the count and the timeline permanently offset, on one unit only.
+ * Measured on the host over forro-shaped material, that is not subtle: two units
+ * offset by 2.9 ms already render 15% of their frames visibly differently, and
+ * one packet's worth -- 42 ms -- puts 3.4% of frames in the state where one
+ * strip is lit and the other is dark. It never recovers on its own.
+ *
+ * So stop relying on the callers being exhaustive. `due_master_us` arrives on
+ * every feed and says where the timeline thinks this audio is; the count says
+ * where this file thinks it is. If they disagree, the count is wrong, whatever
+ * caused it, and the next scheduled instant re-derives it.
+ */
+int64_t  s_ref_due;                         /* scheduled instant of the aligned frame */
+uint32_t s_ref_byte;                        /* ... and its byte index */
+bool     s_ref_valid;
+
+/*
+ * How far the two may disagree before the origin is re-derived.
+ *
+ * This is a BOUND on how far the count may be from the timeline, so it is also
+ * the bound on how far two units can be from each other -- and smaller is better
+ * on both counts, which is the opposite of what it first looks like.
+ *
+ * The scheduled timeline is not exactly the content rate. The hub slews it by up
+ * to 1 ms/s to walk it back to real time, and `next_play_at += frames * 1000000
+ * / rate` truncates, which alone runs it ~20 ppm slow. Neither is a fault and
+ * neither is worth correcting: every unit is handed the same play_at values and
+ * counts the same audio, so both errors are common to all of them and cost
+ * nothing at all while they stay common.
+ *
+ * They stop being common the moment one unit re-derives and another has not.
+ * That is why the threshold wants to be small: two units differ by at most what
+ * one of them has accumulated since its own last alignment, and that is bounded
+ * by exactly this number. Where their origins agree -- the usual case, since a
+ * track boundary re-derives every unit at once -- the trigger is a function of
+ * data every unit shares, so they cross it on the same audio and stay identical
+ * however often it fires.
+ *
+ * The cost of firing is one dropped analysis block, ~23 ms of the strip holding
+ * its previous frame. At 20 ppm this crosses about once every 100 s on its own.
+ * That is affordable, so this is set by what is NOT drift: the per-packet slew
+ * step is ~20 us and the interpolation rounds to the microsecond, so 2 ms is two
+ * orders of magnitude above the noise and still under one chunk of audio.
+ *
+ * Measured for reference, on the host over forro-shaped material: two units
+ * whose audio is offset by 2.9 ms render 15% of frames visibly differently, and
+ * at 42 ms -- one packet, which is what a single unreported drop used to cost
+ * for good -- 3.4% of frames have one strip lit and the other dark.
+ */
+constexpr int64_t ALIGN_DRIFT_US = 2000;
+
 /* Statistics, so a disagreement between two units is diagnosable rather than a
  * matter of opinion. Atomic: incremented by the audio task, read and cleared by
  * the analysis task. */
@@ -164,6 +230,11 @@ std::atomic<uint32_t> s_dropped;
 std::atomic<uint32_t> s_aligns;
 std::atomic<uint32_t> s_onsets;
 std::atomic<uint32_t> s_frames;
+/* Re-alignments nobody asked for -- see ALIGN_DRIFT_US. Reported separately
+ * from s_aligns because they mean something different: an align is an event
+ * being handled, a drift is an event that was never reported at all. */
+std::atomic<uint32_t> s_drifts;
+std::atomic<int32_t>  s_last_drift_us;
 
 uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
 void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
@@ -311,10 +382,16 @@ void visualiser_task(void *arg)
         const int64_t now = esp_timer_get_time();
         const uint32_t dropped = s_dropped.load(std::memory_order_relaxed);
         const uint32_t aligns  = s_aligns.load(std::memory_order_relaxed);
-        if (dropped || aligns > 1 || now - last_report_us >= LED_LOG_PERIOD_US) {
+        const uint32_t drifts  = s_drifts.load(std::memory_order_relaxed);
+        /* A drift is always worth seeing at once: it means audio was gained or
+         * lost somewhere that does not know it has to say so, which is the one
+         * fault in here that used to be permanent and invisible. */
+        if (dropped || drifts || aligns > 1 || now - last_report_us >= LED_LOG_PERIOD_US) {
             ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
-                          " | drop %" PRIu32 " B | aligns %" PRIu32 " | %s",
+                          " | drop %" PRIu32 " B | aligns %" PRIu32
+                          " | drift %" PRIu32 " (last %+ld us) | %s",
                      take(s_frames), take(s_onsets), take(s_dropped), take(s_aligns),
+                     take(s_drifts), (long)s_last_drift_us.load(std::memory_order_relaxed),
                      pattern ? pattern->name() : "no pattern");
             last_report_us = now;
         }
@@ -327,6 +404,33 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
 {
     if (!pcm_stream) {
         return;
+    }
+
+    /*
+     * Is the count still describing the timeline?
+     *
+     * Cheap, because both halves are already here: `due_master_us` is where the
+     * timeline says this audio is, and the byte count since the last alignment
+     * is where this file believes it is. Nothing else has to be told anything.
+     *
+     * Checked before the exchange below so a drift found here is served by the
+     * same alignment path as an explicitly requested one, in this same call.
+     *
+     * Not while one is already in flight: an alignment that is still discarding
+     * frames has not published its new origin yet, so this would measure the
+     * same drift against the old one and re-arm on every feed until the discard
+     * finished -- harmless, since the grid it recomputes is absolute, but it
+     * would make the counter report four events where there was one.
+     */
+    if (due_master_us > 0 && s_ref_valid && s_skip_frames <= 0 && !s_mark_align_point &&
+        !s_align_pending.load(std::memory_order_relaxed)) {
+        const int64_t frames = static_cast<int64_t>(s_sent_total - s_ref_byte) / FRAME_BYTES;
+        const int64_t drift = due_master_us - (s_ref_due + frames * 1000000LL / RATE);
+        if (drift > ALIGN_DRIFT_US || drift < -ALIGN_DRIFT_US) {
+            s_last_drift_us.store(static_cast<int32_t>(drift), std::memory_order_relaxed);
+            bump(s_drifts);
+            s_align_pending.store(true, std::memory_order_relaxed);
+        }
     }
 
     /* Exchange rather than test-then-clear: a request raised by another task
@@ -358,6 +462,13 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
         s_align_block_index.store(s_pending_block_index, std::memory_order_relaxed);
         s_align_at_byte.store(s_sent_total, std::memory_order_relaxed);
         s_align_gen.fetch_add(1, std::memory_order_release);
+        /* The same origin the reader is about to adopt, in the units the drift
+         * check needs: the scheduled instant of the first aligned frame, beside
+         * the byte it starts at. Plain stores -- the feed task is the only
+         * reader of these. */
+        s_ref_due = s_pending_block_index * FFT_N * 1000000LL / RATE;
+        s_ref_byte = s_sent_total;
+        s_ref_valid = true;
         s_mark_align_point = false;
     }
 

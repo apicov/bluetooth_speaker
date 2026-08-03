@@ -276,7 +276,7 @@ int main(void)
               std::to_string(onsets) + " onsets in " + std::to_string(BLOCKS) + " blocks");
     }
 
-    std::printf("\npulse -- the shipped pattern, must agree exactly:\n");
+    std::printf("\npulse -- must agree exactly:\n");
     {
         df::PulsePattern a, b;
         check("  same blocks, two instances", replay(pcm, &a, &b) == 0, "");
@@ -295,6 +295,54 @@ int main(void)
     }
     {
         df::PulsePattern a, b;
+        const int d = gap(pcm, &a, &b, 300, 40);
+        check("  one unit loses 40 blocks mid-stream", d == 0,
+              d ? std::to_string(d) + " blocks differ after convergence" : "converged");
+    }
+
+    /*
+     * The same scenarios against boom, which is what the firmware is actually
+     * configured to run (CONFIG_DANCEFLOOR_LED_PATTERN) and which had no
+     * coverage here at all -- every check above ran pulse.
+     *
+     * It is also the pattern where a disagreement is worst to look at. Pulse
+     * ramps its pixels, so two units differing slightly differ slightly; boom
+     * writes full brightness inside `reach` and 15% outside it, so the same
+     * disagreement is one strip lit and the other dark.
+     */
+    std::printf("\nboom -- the pattern the firmware ships, must agree exactly:\n");
+    {
+        Unit u;
+        df::BoomPattern p;
+        u.init(&p);
+        int booms = 0;
+        for (int i = 0; i < BLOCKS; i++) {
+            const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
+            if (u.an.process(blk, i, (int64_t)i * df::FFT_N * 1000000LL / df::RATE, 0).boom) {
+                booms++;
+            }
+        }
+        check("  the test signal produces booms", booms >= 10,
+              std::to_string(booms) + " booms in " + std::to_string(BLOCKS) + " blocks");
+    }
+    {
+        df::BoomPattern a, b;
+        check("  same blocks, two instances", replay(pcm, &a, &b) == 0, "");
+    }
+    {
+        df::BoomPattern a, b;
+        const int d = late_join(pcm, &a, &b, 100);
+        check("  one unit joins at block 100", d == 0,
+              d ? std::to_string(d) + " blocks differ after convergence" : "converged");
+    }
+    {
+        df::BoomPattern a, b;
+        const int d = double_render(pcm, &a, &b);
+        check("  one unit renders every block twice", d == 0,
+              d ? std::to_string(d) + " blocks differ" : "identical");
+    }
+    {
+        df::BoomPattern a, b;
         const int d = gap(pcm, &a, &b, 300, 40);
         check("  one unit loses 40 blocks mid-stream", d == 0,
               d ? std::to_string(d) + " blocks differ after convergence" : "converged");

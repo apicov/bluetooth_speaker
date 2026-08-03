@@ -535,13 +535,37 @@ error, and a unit that stalls rejoins in the right place instead of lagging for
 ever.
 
 Both properties depend on the visualiser's count of what has passed through it
-staying true, and three things can break it: a short send when the analysis task
+staying true. Three things break it loudly: a short send when the analysis task
 falls behind, a **splice** at a track boundary, and a **retune**, which discards
 the DMA buffer — audio the playback task has already counted and already fed
 here, that nobody heard. Each calls `visualiser_realign()`, which re-derives the
 origin from the next scheduled instant at the cost of one dropped block. Without
 it the two strips step apart at every one of those events and never recover;
 with it they resynchronise within a block.
+
+That list was presented here as complete. It never was, and the ones outside it
+break the count in exactly the same way while calling nothing at all:
+
+- audio **dropped before it reaches the playback path**, so content the timeline
+  still accounts for never arrives at the visualiser — the hub's local ring and
+  the satellite's receive ring both drop when full, and both only count it
+- a **short read** from the playback ring, zero-filled to a whole chunk: audio
+  the timeline does *not* account for, invented and fed here as if it were real
+
+Neither knows it is doing anything to the LEDs, so neither reports it, and the
+result is a permanent offset on one unit. Measured on the host over forró-shaped
+material: two units whose audio is offset by 2.9 ms render **15% of frames
+visibly differently**, and at one packet — 42 ms, what a single unreported drop
+used to cost for good — **3.4% of frames have one strip lit and the other dark**.
+That is what "they look synchronised but sometimes one is lit and the other
+isn't" was.
+
+So the count no longer depends on callers being exhaustive. `visualiser_feed()`
+is handed `due_master_us` on every call, which is where the timeline says this
+audio is, and it knows where its own count says it is; if the two part company by
+more than `ALIGN_DRIFT_US` it re-derives the origin itself, whatever caused it.
+Still call `visualiser_realign()` — it corrects at the instant of the event
+rather than once the error has grown — but forgetting to is no longer permanent.
 
 `test_align.c` and `test_pattern_sync.cpp` pin both halves mechanically — see
 §15.
@@ -832,6 +856,14 @@ LED half is handled (`visualiser_realign()`); the audio half cannot be seen from
 inside the firmware at all, because every reading derived from `samples_played`
 agrees those frames were played. Only the marker GPIO can measure it, and nobody
 has.
+
+**The LED drift check bounds the error, it does not remove it.** `ALIGN_DRIFT_US`
+is 2 ms, so holes smaller than that accumulate until they add up to something
+that trips it, and two units can sit up to that far apart in the meantime — worth
+roughly 15% of frames rendering visibly differently, per the figures in §12. The
+bound is the guarantee; zero is not. Lower the constant if strips are seen
+disagreeing between track boundaries, and read `drift` in the `vis` log line to
+see whether it is firing at all.
 
 **`beat_det_update()` sums its flux history in array order.** The ring's rotation
 depends on how many frames that unit has pushed, so two units holding identical
