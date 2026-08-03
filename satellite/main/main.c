@@ -280,7 +280,12 @@ static void i2s_start(uint32_t rate)
 static void dac_write(const uint8_t *pcm, size_t bytes)
 {
     size_t written = 0;
-    i2s_channel_write(i2s_tx, pcm, bytes, &written, portMAX_DELAY);
+    /* Second line of defence behind the `retuning` park: a failed write does
+     * NOT block, so ignoring it lets this task spin through the ring at memory
+     * speed. That is what a retune used to cost. */
+    if (i2s_channel_write(i2s_tx, pcm, bytes, &written, portMAX_DELAY) != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
 }
 #endif
 
@@ -528,6 +533,26 @@ static volatile int32_t retune_phase_before;
 static volatile bool    retune_watch;      /* playback reports the next reading */
 static volatile int64_t retune_outage_us;
 
+/*
+ * Held across a retune, and the playback task parks on it.
+ *
+ * i2s_channel_write() returns IMMEDIATELY once the channel is disabled -- it
+ * does not block, and dac_write() did not look at the return value -- so for
+ * the whole outage the play task ran flat out: pulling chunks from the ring,
+ * counting them in samples_played, feeding them to the visualiser, and throwing
+ * them at a channel that was not running. Milliseconds of outage cost tens of
+ * milliseconds of buffer.
+ *
+ * Measured on hardware: a 7.7 ms outage produced a +42 ms phase step, 5432
+ * bytes overflowed the visualiser's buffer, and it re-aligned nine times in one
+ * window. The short outages, where the task had less time to spin, cost +4 ms.
+ *
+ * The hub has had this since "a measured 54 ms correction cost 177 ms of
+ * buffer". It was never ported here, and every satellite retune has been paying
+ * for it since.
+ */
+static volatile bool retuning;
+
 #if !CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
 static void retune_output(uint32_t hz)
 {
@@ -550,23 +575,26 @@ static void retune_output(uint32_t hz)
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
     const int64_t down_at = esp_timer_get_time();
 
+    /* Park playback before taking the channel down, and count the park as part
+     * of the outage -- audio is stopped for it just as surely. */
+    retuning = true;
+    vTaskDelay(pdMS_TO_TICKS(2));
+
     esp_err_t err = i2s_channel_disable(i2s_tx);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "retune: disable failed (%s)", esp_err_to_name(err));
-        return;
+    if (err == ESP_OK) {
+        err = i2s_channel_reconfig_std_clock(i2s_tx, &clk);
+        /* Re-enable whatever happened: leaving the channel down stalls playback
+         * silently, which reads as a dead board rather than a failed trim. */
+        const esp_err_t on = i2s_channel_enable(i2s_tx);
+        if (err == ESP_OK) {
+            err = on;
+        }
     }
-    err = i2s_channel_reconfig_std_clock(i2s_tx, &clk);
+    retuning = false;
+
     if (err != ESP_OK) {
-        /* Put the channel back at the rate it had rather than leaving it down,
-         * which would stall playback silently. */
         ESP_LOGE(TAG, "retune to %" PRIu32 " Hz failed (%s), staying at %" PRIu32,
                  hz, esp_err_to_name(err), tx_rate);
-        i2s_channel_enable(i2s_tx);
-        return;
-    }
-    err = i2s_channel_enable(i2s_tx);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "retune: enable failed (%s)", esp_err_to_name(err));
         return;
     }
     retune_outage_us = esp_timer_get_time() - down_at;
@@ -833,6 +861,12 @@ static void play_task(void *arg)
         int64_t anchor_due = 0;
 
         while (1) {
+            if (retuning) {
+                /* Do not pull from the ring while the channel is down -- the
+                 * writes would return instantly and drain it. */
+                vTaskDelay(pdMS_TO_TICKS(2));
+                continue;
+            }
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
             if (got == 0) {
                 ESP_LOGW(TAG, "underrun, waiting for a new stream");
