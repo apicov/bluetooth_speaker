@@ -398,7 +398,25 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 
     if (next_play_at == 0) {
         next_play_at = target;
-        local_start = target;              /* our own speaker joins the timeline */
+        /*
+         * local_start is assigned at the END of this call, not here.
+         *
+         * It has to be the stamp of the audio that will actually be at position
+         * zero of the ring, and that is NOT this packet: sbc_in decodes and
+         * feeds before calling us, so this packet's PCM went into the ring a
+         * moment ago and the reset below is about to throw it away. Position
+         * zero belongs to the NEXT packet, one packet's worth of audio later.
+         *
+         * Setting it to `target` here -- which is what this did -- started this
+         * speaker on the next packet's audio at the previous packet's instant,
+         * so the hub played ~20-45 ms ahead of the timeline it was publishing,
+         * on the first start and again after every underrun recovery. The phase
+         * servo then read that as a real error and spent ~100 s walking it out,
+         * with every satellite that far behind this speaker while it did.
+         *
+         * The queue entry below already dates position zero correctly, so the
+         * two disagreed with each other; this is the half that was wrong.
+         */
         xStreamBufferReset(local_ring);
         s_samples_in = 0;                  /* same origin as the reset ring */
         s_pending_pos = 0;                 /* and so does anything flagged here */
@@ -580,6 +598,17 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     /* The timeline advances by the audio actually sent, not by wall clock --
      * stamping "now + lead" each time would fold task jitter into playback. */
     next_play_at += (int64_t)frames * 1000000LL / (int64_t)sample_rate;
+
+    /*
+     * Our own speaker joins the timeline, on the audio that will be at position
+     * zero of the freshly reset ring -- the next packet, whose stamp is the one
+     * this call has just left behind. Written here rather than in the branch
+     * above so that it is the same expression as the timeline itself, and cannot
+     * drift from it again.
+     */
+    if (started) {
+        local_start = next_play_at;
+    }
 }
 
 /* ------------------------------------------------------------------- wifi */
