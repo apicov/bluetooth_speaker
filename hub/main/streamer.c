@@ -560,6 +560,19 @@ static void socket_start(void)
 
 static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
 
+/*
+ * Last cross-unit measurement, for the per-track summary below.
+ *
+ * A track boundary nulls phase on every unit, so cross-unit error resets there
+ * and grows until the next one. That makes the reading taken just BEFORE a
+ * boundary the one worth keeping: it is how far apart the speakers had drifted
+ * over a whole track, which is the number to compare sessions and builds on.
+ * Any other sample depends on where in the track cycle it was taken, and
+ * comparing two of those produced three confident wrong diagnoses in a row.
+ */
+static volatile int64_t s_sync_err_us;
+static volatile int64_t s_sync_at;        /* 0 = never measured */
+
 static void IRAM_ATTR monitor_isr(void *arg)
 {
     (void)arg;
@@ -592,6 +605,11 @@ static void monitor_task(void *arg)
         if (err > 500000 || err < -500000) {
             continue;
         }
+        /* Kept for the track-boundary summary, which wants the last reading
+         * before the splice rather than a scroll of them. */
+        s_sync_err_us = err;
+        s_sync_at = esp_timer_get_time();
+
         ESP_LOGW(TAG, "AUDIO SYNC: satellite %+lld us (%s)", err,
                  err >= 0 ? "late" : "early");
     }
@@ -823,6 +841,7 @@ static void local_play_task(void *arg)
                     ? (int32_t)((int64_t)s_phase_err_us * sample_rate / 1000000) : 0;
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
+                int32_t applied = 0;      /* what the splice actually moved */
 
                 if (adj > 0) {
                     /* Its own buffer, not chunk: chunk holds the audio read at
@@ -841,8 +860,9 @@ static void local_play_task(void *arg)
                         left -= g / (AUDIO_CHANNELS * sizeof(int16_t));
                     }
                     samples_played += (adj - left);
+                    applied = adj - left;
                     ESP_LOGW(TAG, "track boundary: skipped %ld ms to null phase",
-                             (long)((adj - left) * 1000 / (int32_t)sample_rate));
+                             (long)(applied * 1000 / (int32_t)sample_rate));
                 } else if (adj < 0) {
                     static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
                     int32_t left = -adj;
@@ -861,11 +881,39 @@ static void local_play_task(void *arg)
                         i2s_channel_write(i2s_tx, quiet, bytes, &w, portMAX_DELAY);
                         left -= n;
                     }
+                    applied = adj;
                     ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
-                             (long)(-adj * 1000 / (int32_t)sample_rate));
+                             (long)(-applied * 1000 / (int32_t)sample_rate));
                 }
                 if (adj != 0) {
                     s_phase_stepped = true;   /* the average before it is stale */
+                }
+
+                /*
+                 * One line per track for how far apart the speakers had drifted
+                 * by the end of it -- the figure to compare sessions and builds
+                 * on, because it is taken at the same point of every track
+                 * cycle rather than wherever a log window happened to fall.
+                 *
+                 * The satellite figure is the marker: a physical measurement of
+                 * when a sample reached the output, so it sees things no
+                 * software reading can. The hub's splice is how much of its own
+                 * error it had accumulated. They answer different questions and
+                 * both belong here.
+                 */
+                if (s_sync_at) {
+                    ESP_LOGW(TAG, "TRACK DIVERGENCE: satellite %+lld us "
+                                  "(measured %lld ms before this boundary) | "
+                                  "hub spliced %+ld ms | hub phase %+ld us",
+                             s_sync_err_us,
+                             (esp_timer_get_time() - s_sync_at) / 1000,
+                             (long)(applied * 1000 / (int32_t)sample_rate),
+                             (long)s_phase_err_us);
+                } else {
+                    ESP_LOGW(TAG, "TRACK DIVERGENCE: no marker reading yet | "
+                                  "hub spliced %+ld ms | hub phase %+ld us",
+                             (long)(applied * 1000 / (int32_t)sample_rate),
+                             (long)s_phase_err_us);
                 }
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
                 if (adj != 0) {
