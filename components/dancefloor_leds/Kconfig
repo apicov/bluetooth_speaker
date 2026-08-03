@@ -60,4 +60,23 @@ menu "Dancefloor LEDs"
             brightest component becomes 25, so hue steps get visibly coarse and
             the dim tail of the beat envelope quantises to black.
 
+    config DANCEFLOOR_LED_PATTERN
+        string "Pattern to start with"
+        default "pulse"
+        help
+            Which pattern the strip runs from boot. Must match a name from
+            pattern_by_name() -- run `tools/pattern_lab --list` to see them.
+            An unknown name logs a warning and leaves the first pattern
+            running, so a typo costs a line in the log rather than a dark floor.
+
+            "pulse" follows onsets across all four bands, which suits music
+            whose transients are broadband.
+
+            "boom" follows the lowest band alone, 43-129 Hz, and is meant for
+            forró: the mallet stroke on the zabumba's big head, with the
+            triangle and the accordion deliberately not wanted. Try both against
+            a recording in pattern_lab before deciding -- where the two disagree
+            on the same track, one of them is wrong about the music, and which
+            one depends entirely on what is playing.
+
 endmenu

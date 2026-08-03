@@ -304,7 +304,16 @@ void visualiser_start(void)
     assert(pcm_stream);
 
     analysis.init();
+
+    /* Configured name if it resolves, first pattern otherwise. A typo should
+     * cost a line in the log, not a dark floor. */
     pattern = df::pattern_at(0);
+    if (df::Pattern *p = df::pattern_by_name(CONFIG_DANCEFLOOR_LED_PATTERN)) {
+        pattern = p;
+    } else {
+        ESP_LOGW(TAG, "no pattern named \"%s\" -- falling back to \"%s\"",
+                 CONFIG_DANCEFLOOR_LED_PATTERN, pattern ? pattern->name() : "none");
+    }
 
     /*
      * SPI + DMA, not bit-banging and not RMT.
