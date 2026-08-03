@@ -40,9 +40,41 @@
 namespace df {
 
 constexpr int FFT_N    = 1024;          /* 43 Hz bins at 44.1 kHz */
-constexpr int RATE     = 44100;
+constexpr int RATE     = 44100;         /* what the tuning was measured at */
 constexpr int BINS     = FFT_N / 2;
 constexpr int CHANNELS = 2;
+
+/*
+ * Band edges in Hz, and the bins they land on at whatever rate the stream is.
+ *
+ * These used to be bin numbers -- { 1, 4, 24, 117 } -- with a comment giving the
+ * frequencies they meant at 44.1 kHz. That is the same assumption that made the
+ * rest of this file wrong at any other rate: the source picks the sample rate,
+ * the bridge advertises 16/32/44.1/48 kHz, and nothing checks which one arrives.
+ *
+ * The frequencies are the ones the bins were, not the round numbers the old
+ * comment quoted: bin 24 begins at 1033.6 Hz and bin 117 at 5038.8 Hz. That
+ * distinction is not pedantry. The boom detector's flux floor of 0.02 was swept
+ * against these exact bins over ten recordings, so a band that moves by one bin
+ * at 44.1 kHz silently invalidates a measurement -- which is why the
+ * static_assert below exists rather than a comment asking someone to be careful.
+ */
+constexpr int BAND_EDGE_HZ[] = { 43, 172, 1034, 5039 };
+constexpr int BEAT_BANDS_N = (int)(sizeof(BAND_EDGE_HZ) / sizeof(BAND_EDGE_HZ[0]));
+static_assert(BEAT_BANDS_N == BEAT_BANDS, "one edge per band");
+
+/* Nearest bin to `hz`. Integer throughout so it is usable in a static_assert. */
+constexpr int band_bin(int hz, int rate)
+{
+    return (hz * FFT_N + rate / 2) / rate;
+}
+
+/* The bins this reproduces at 44.1 kHz are the ones every tuning figure in
+ * analysis.cpp was measured against. Changing them is a retune, not a refactor. */
+static_assert(band_bin(BAND_EDGE_HZ[0], RATE) == 1,   "band 0 moved");
+static_assert(band_bin(BAND_EDGE_HZ[1], RATE) == 4,   "band 1 moved");
+static_assert(band_bin(BAND_EDGE_HZ[2], RATE) == 24,  "band 2 moved");
+static_assert(band_bin(BAND_EDGE_HZ[3], RATE) == 117, "band 3 moved");
 
 /* One analysis frame: ~23 ms of audio, reduced. */
 struct Frame {
@@ -92,7 +124,14 @@ public:
 /* Audio in, Frame out. Owns the FFT, the band split and the onset detector. */
 class Analysis {
 public:
-    void init();
+    /*
+     * `sample_rate` is the rate of the audio that will be fed, and it must be
+     * the same rate the caller uses to derive due_us -- the two are the forward
+     * and reverse of one conversion, and if they disagree the count and the
+     * timeline separate at their difference. Pass df::RATE only if that is
+     * genuinely what the stream is.
+     */
+    void init(int sample_rate);
 
     /* Override the boom detector's tuning after init(). Exists for pattern_lab
      * to sweep these against a recording rather than rebuild per value; the
@@ -109,6 +148,8 @@ private:
     float      win_[FFT_N];
     float      mag_[BINS];
     float      band_[BEAT_BANDS];
+    int        band_lo_[BEAT_BANDS];     /* derived from BAND_EDGE_HZ and the rate */
+    int        band_hi_[BEAT_BANDS];
     beat_det_t beat_;
     beat_det_t boom_;        /* the low band alone -- see Frame::boom */
     Frame      frame_;

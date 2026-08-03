@@ -111,7 +111,7 @@ struct Unit {
 
     void init(df::Pattern *p)
     {
-        an.init();
+        an.init(df::RATE);
         pat = p;
         pat->reset();
         rgb.assign(LEDS * 3, 0);

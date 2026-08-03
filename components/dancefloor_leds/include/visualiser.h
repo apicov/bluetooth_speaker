@@ -27,6 +27,26 @@ void visualiser_start(void);
 void visualiser_set_pattern(const char *name);
 
 /*
+ * Tell the visualiser what rate the audio is at.
+ *
+ * It must be the SAME rate this unit uses to derive the due_us it passes to
+ * visualiser_feed() -- `sample_rate` on the hub, `stream_rate` on the satellite.
+ * The two are the forward and reverse of one conversion between an instant and a
+ * sample position, so if they disagree the count and the timeline separate at
+ * exactly their difference: 8.8% for a 48 kHz source against the 44.1 kHz this
+ * used to assume, which is 88 ms of divergence per second of audio.
+ *
+ * Not a preference and not a tuning knob. The source chooses the rate -- the
+ * bridge advertises 16, 32, 44.1 and 48 kHz to the phone and takes what it is
+ * given -- so this is the firmware finding out, not deciding.
+ *
+ * Safe from any task, and cheap when the rate has not changed. A change re-cuts
+ * the analysis bands, drops the detector history built at the old rate, and
+ * re-derives the block origin.
+ */
+void visualiser_set_rate(uint32_t hz);
+
+/*
  * Tell the visualiser the audio it is about to be fed no longer continues the
  * audio it was fed before -- samples were skipped or inserted between them.
  *

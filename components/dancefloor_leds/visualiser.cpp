@@ -100,6 +100,20 @@ constexpr LedStrip::Type STRIP_TYPE = LedStrip::Type::WS2812;
 StreamBufferHandle_t pcm_stream;
 std::optional<LedStrip> strip;
 df::Analysis analysis;
+
+/*
+ * The rate of the audio being fed, which is whatever the source chose.
+ *
+ * Atomic because two tasks read it: the playback task converts due_us to a
+ * sample position in visualiser_feed(), and the analysis task converts a block
+ * index back to due_us. They are the two halves of one conversion and must use
+ * the same number, so there is exactly one of it.
+ *
+ * Starts at the rate the tuning was measured at, which is also what a source
+ * almost always picks, so a unit that is never told anything behaves as it
+ * always did.
+ */
+std::atomic<uint32_t> s_rate{df::RATE};
 df::Pattern *pattern = nullptr;
 uint8_t pixels[LED_COUNT * 3];
 
@@ -267,8 +281,24 @@ void visualiser_task(void *arg)
     int64_t  block_index = 0;
     int64_t  last_report_us = esp_timer_get_time();
     bool     starved_shown = false;
+    uint32_t seen_rate = s_rate.load(std::memory_order_relaxed);
 
     while (true) {
+        /*
+         * A rate change re-cuts the analysis bands, so every flux figure in the
+         * detector's history was measured against different frequencies and has
+         * to go. Handled here rather than in the setter because this task owns
+         * `analysis` and the setter can be called from anywhere.
+         */
+        const uint32_t rate = s_rate.load(std::memory_order_relaxed);
+        if (rate != seen_rate) {
+            seen_rate = rate;
+            analysis.init(static_cast<int>(rate));
+            if (pattern) pattern->reset();
+            filled = 0;
+            ESP_LOGW(TAG, "analysing at %" PRIu32 " Hz", rate);
+        }
+
         const size_t got = xStreamBufferReceive(pcm_stream,
                                                 reinterpret_cast<uint8_t *>(raw) + filled,
                                                 sizeof(raw) - filled, pdMS_TO_TICKS(100));
@@ -317,8 +347,10 @@ void visualiser_task(void *arg)
         starved_shown = false;
 
         /* due_us is derived from the block index, not read from a clock, so it
-         * is the same value on every unit for this same audio. */
-        const int64_t due_us = block_index * FFT_N * 1000000LL / RATE;
+         * is the same value on every unit for this same audio -- at the rate
+         * this unit was told the audio is, which is the same rate its playback
+         * used to date the audio in the first place. */
+        const int64_t due_us = block_index * FFT_N * 1000000LL / rate;
         const df::Frame &f = analysis.process(raw, block_index, due_us, 0);
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
@@ -422,10 +454,12 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
      * finished -- harmless, since the grid it recomputes is absolute, but it
      * would make the counter report four events where there was one.
      */
+    const int64_t rate = s_rate.load(std::memory_order_relaxed);
+
     if (due_master_us > 0 && s_ref_valid && s_skip_frames <= 0 && !s_mark_align_point &&
         !s_align_pending.load(std::memory_order_relaxed)) {
         const int64_t frames = static_cast<int64_t>(s_sent_total - s_ref_byte) / FRAME_BYTES;
-        const int64_t drift = due_master_us - (s_ref_due + frames * 1000000LL / RATE);
+        const int64_t drift = due_master_us - (s_ref_due + frames * 1000000LL / rate);
         if (drift > ALIGN_DRIFT_US || drift < -ALIGN_DRIFT_US) {
             s_last_drift_us.store(static_cast<int32_t>(drift), std::memory_order_relaxed);
             bump(s_drifts);
@@ -436,7 +470,7 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
     /* Exchange rather than test-then-clear: a request raised by another task
      * while this one is mid-alignment would otherwise be overwritten. */
     if (due_master_us > 0 && s_align_pending.exchange(false, std::memory_order_relaxed)) {
-        const int64_t idx = (due_master_us * RATE) / 1000000;
+        const int64_t idx = (due_master_us * rate) / 1000000;
         const int32_t into_block = static_cast<int32_t>(idx % FFT_N);
         s_skip_frames = into_block ? (FFT_N - into_block) : 0;
         s_pending_block_index = (idx + s_skip_frames) / FFT_N;
@@ -466,7 +500,7 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
          * check needs: the scheduled instant of the first aligned frame, beside
          * the byte it starts at. Plain stores -- the feed task is the only
          * reader of these. */
-        s_ref_due = s_pending_block_index * FFT_N * 1000000LL / RATE;
+        s_ref_due = s_pending_block_index * FFT_N * 1000000LL / rate;
         s_ref_byte = s_sent_total;
         s_ref_valid = true;
         s_mark_align_point = false;
@@ -490,6 +524,30 @@ void visualiser_realign(void)
      * with an exchange. The next feed carrying a scheduled instant re-derives
      * the origin from it. */
     s_align_pending.store(true, std::memory_order_relaxed);
+}
+
+void visualiser_set_rate(uint32_t hz)
+{
+    /* Nothing computed from a stream field may divide the conversions below.
+     * Same guard as retune_dac(): a rate outside this is a broken number,
+     * whoever sent it, and using it would be worse than ignoring it. */
+    if (hz < 8000 || hz > 192000) {
+        ESP_LOGE(TAG, "ignoring a stream rate of %" PRIu32 " Hz -- not a sample rate", hz);
+        return;
+    }
+    /* Called from wherever each unit learns the rate, which is often and mostly
+     * says the same thing. */
+    if (s_rate.exchange(hz, std::memory_order_relaxed) == hz) {
+        return;
+    }
+    /*
+     * The conversion between an instant and a sample position has just changed,
+     * so the origin derived under the old one describes nothing. The analysis
+     * task re-cuts its bands when it sees the new value; this side only has to
+     * ask for a fresh origin.
+     */
+    s_align_pending.store(true, std::memory_order_relaxed);
+    ESP_LOGW(TAG, "stream rate is %" PRIu32 " Hz", hz);
 }
 
 void visualiser_set_pattern(const char *name)
@@ -523,7 +581,10 @@ void visualiser_start(void)
     }
 #endif
 
-    analysis.init();
+    /* Whatever has been set by now, which is the default unless the stream was
+     * already running when this was called. Either way the task re-inits if it
+     * changes. */
+    analysis.init(static_cast<int>(s_rate.load(std::memory_order_relaxed)));
 
     /* Configured name if it resolves, first pattern otherwise. A typo should
      * cost a line in the log, not a dark floor. */

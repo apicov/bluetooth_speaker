@@ -17,15 +17,15 @@ namespace df {
 namespace {
 
 /*
- * Band edges in FFT bins at 44.1 kHz / 1024 (43.07 Hz per bin):
- *   0: 43-129 Hz    kick
- *   1: 172-990 Hz   low-mid / snare body
- *   2: 1.0-5.0 kHz  presence
- *   3: 5.0-22 kHz   air / hats
- * Bin 0 is DC and deliberately excluded.
+ * The bands, in the order the detector weights them:
+ *   0: kick            1: low-mid / snare body
+ *   2: presence        3: air / hats
+ *
+ * The edges are in Hz now and the bins come from the stream's rate -- see
+ * BAND_EDGE_HZ in analysis.hpp. At 44.1 kHz they are { 1, 4, 24, 117 }, which is
+ * what they have always been. Bin 0 is DC and deliberately excluded, which is
+ * why band 0 starts at 43 Hz rather than at zero.
  */
-constexpr int BAND_LO[BEAT_BANDS] = { 1,  4,  24, 117 };
-constexpr int BAND_HI[BEAT_BANDS] = { 3, 23, 116, BINS - 1 };
 
 /*
  * Scales raw magnitudes towards the 0..1 the detector wants. Empirical, and set
@@ -58,8 +58,33 @@ void fft_run(float *buf)
 
 }  // namespace
 
-void Analysis::init()
+void Analysis::init(int sample_rate)
 {
+    /*
+     * Bands from the rate the audio is actually at.
+     *
+     * Contiguous by construction: each band runs to the bin below the next one's
+     * start, so no bin is counted twice or missed, and the top band runs to
+     * Nyquist. A rate low enough to push an edge past Nyquist would fold the
+     * bands into each other, so they are clamped -- at 16 kHz, the lowest the
+     * bridge advertises, the top edge is bin 323 of 512 and nothing collapses.
+     */
+    if (sample_rate <= 0) {
+        sample_rate = RATE;
+    }
+    for (int b = 0; b < BEAT_BANDS; b++) {
+        int lo = band_bin(BAND_EDGE_HZ[b], sample_rate);
+        if (lo < 1) lo = 1;                          /* never DC */
+        if (lo > BINS - 1) lo = BINS - 1;
+        band_lo_[b] = lo;
+    }
+    for (int b = 0; b < BEAT_BANDS; b++) {
+        band_hi_[b] = (b + 1 < BEAT_BANDS) ? band_lo_[b + 1] - 1 : BINS - 1;
+        if (band_hi_[b] < band_lo_[b]) {
+            band_hi_[b] = band_lo_[b];               /* a band is never empty */
+        }
+    }
+
     /* Exactly esp-dsp's dsps_wind_hann_f32, so the host and the board window
      * identically -- symmetric Hann, not the periodic variant. */
     const float m = 1.0f / static_cast<float>(FFT_N - 1);
@@ -156,10 +181,13 @@ const Frame &Analysis::process(const int16_t *stereo, int64_t index,
 
     for (int b = 0; b < BEAT_BANDS; b++) {
         float sum = 0.0f;
-        for (int k = BAND_LO[b]; k <= BAND_HI[b]; k++) {
+        for (int k = band_lo_[b]; k <= band_hi_[b]; k++) {
             sum += mag_[k];
         }
-        const float v = (sum / static_cast<float>(BAND_HI[b] - BAND_LO[b] + 1))
+        /* Averaged over the bins in the band, not summed, so a band that holds
+         * a different number of bins at a different rate still lands in the
+         * same range -- the gain below stays a property of the music. */
+        const float v = (sum / static_cast<float>(band_hi_[b] - band_lo_[b] + 1))
                         * BAND_GAIN / static_cast<float>(FFT_N) * 2.0f;
         /* Soft, never a hard clamp: flux counts only increases, so a band
          * pinned at 1.0 has a rise of exactly zero and stops contributing. */

@@ -180,6 +180,13 @@ void streamer_set_sample_rate(uint32_t hz)
         return;
     }
     sample_rate = hz;
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /* The LEDs convert between the timeline and a sample position, and this is
+     * the rate the other half of that conversion uses: `sample_rate` is what
+     * stamps every packet and what the playback task interpolates due_us with.
+     * They have to be the same number. */
+    visualiser_set_rate(hz);
+#endif
     /* Smooth it: single windows carry ~0.3% noise, and every retune glitches
      * audio. The servo below wants a stable baseline, not the latest sample. */
     rate_ema = rate_ema ? (rate_ema * 3 + hz) / 4 : hz;

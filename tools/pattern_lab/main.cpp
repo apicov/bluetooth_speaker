@@ -108,11 +108,13 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "%s: %s\n", wav_path.c_str(), err.c_str());
         return 1;
     }
+    /* The pipeline follows the file now rather than assuming 44.1 kHz, so this
+     * is a note about what the tuning was measured against, not a warning that
+     * the numbers below are wrong. */
     if (wav.rate != df::RATE) {
         std::fprintf(stderr,
-            "note: %s is %d Hz, the pipeline assumes %d -- timings will be off by %.1f%%\n",
-            wav_path.c_str(), wav.rate, df::RATE,
-            100.0 * (double(wav.rate) / df::RATE - 1.0));
+            "note: %s is %d Hz -- analysed at that rate; the tuning defaults were "
+            "measured at %d\n", wav_path.c_str(), wav.rate, df::RATE);
     }
 
     const size_t frames = wav.samples.size() / df::CHANNELS;
@@ -122,7 +124,7 @@ int main(int argc, char **argv)
     if (blocks == 0) { std::fprintf(stderr, "too short to analyse\n"); return 1; }
 
     df::Analysis analysis;
-    analysis.init();
+    analysis.init(wav.rate);
     if (boom_floor >= 0 || boom_k >= 0 || boom_refr >= 0) {
         analysis.set_boom_tuning(boom_k    >= 0 ? float(boom_k)    : 1.4f,
                                  boom_floor >= 0 ? float(boom_floor) : 0.15f,
@@ -150,7 +152,10 @@ int main(int argc, char **argv)
 
     for (size_t b = 0; b < blocks; b++) {
         const int16_t *chunk = &wav.samples[b * df::FFT_N * df::CHANNELS];
-        const int64_t due_us = int64_t(b) * df::FFT_N * 1000000LL / df::RATE;
+        /* From the file's rate, exactly as the firmware derives it from the
+         * stream's -- otherwise every time-based pattern runs at the wrong
+         * speed here and looks right on the boards. */
+        const int64_t due_us = int64_t(b) * df::FFT_N * 1000000LL / wav.rate;
         const df::Frame &f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
         if (f.onset) onsets++;
         if (f.boom)  booms++;

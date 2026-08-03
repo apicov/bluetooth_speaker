@@ -468,6 +468,13 @@ static void handle_audio(const audio_msg_t *msg)
             return;
         }
         stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+        /* Same number the playback task dates its audio with below. The LEDs
+         * convert that back to a sample position, so a different rate there
+         * would separate the count from the timeline at the difference -- 8.8%
+         * for a 48 kHz source against the 44.1 kHz this used to assume. */
+        visualiser_set_rate(stream_rate);
+#endif
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
         stream_offset = offset;
