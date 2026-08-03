@@ -911,7 +911,26 @@ static void play_task(void *arg)
             bool timeline_changed = false;
             while (phase_tail != phase_head && samples_played >= phase_q[phase_tail].pos) {
                 int64_t due = phase_q[phase_tail].play_at;
-                int64_t now_master = esp_timer_get_time() + stream_offset;
+                /*
+                 * Dated by where the crossing HAPPENED, not where the loop
+                 * noticed it. samples_played moves AUDIO_FRAMES at a time --
+                 * 5.8 ms at 44.1 kHz -- so the crossing is up to a chunk in the
+                 * past by an amount that depends on where pos falls on the
+                 * chunk grid, which is uncorrelated noise straight into the
+                 * servo's only input. The overshoot is known, and writes are
+                 * paced by the DAC, so the correction is exact rather than a
+                 * filter. See the hub's copy for what this cost there.
+                 */
+                int32_t overshoot = samples_played - phase_q[phase_tail].pos;
+                /* Capped at one chunk: a splice steps samples_played by up to
+                 * MAX_SPLICE_MS at once and those frames were skipped rather
+                 * than played, so anything the jump carried us past cannot be
+                 * dated this way. Same guard as the hub. */
+                if (overshoot > (int32_t)AUDIO_FRAMES) {
+                    overshoot = (int32_t)AUDIO_FRAMES;
+                }
+                int64_t now_master = esp_timer_get_time() + stream_offset
+                                   - (int64_t)overshoot * 1000000 / stream_rate;
                 int64_t err = now_master - due;
                 /*
                  * Seconds of error is not drift and not jitter. It means the

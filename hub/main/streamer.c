@@ -816,7 +816,44 @@ static void local_play_task(void *arg)
             /* Local time IS master time here, so this is a direct read of how
              * far playback has slipped from the published timeline. */
             while (s_phase_tail != s_phase_head && samples_played >= s_phase_q[s_phase_tail].pos) {
-                s_phase_err_us = (int32_t)(esp_timer_get_time() - s_phase_q[s_phase_tail].play_at);
+                /*
+                 * Correct for WHERE the crossing was noticed versus where it
+                 * happened, which is most of this unit's phase noise.
+                 *
+                 * samples_played advances by AUDIO_FRAMES per iteration -- 5.8
+                 * ms at 44.1 kHz -- so by the time the loop sees it has passed
+                 * `pos`, it passed it up to a chunk ago, by an amount that
+                 * depends on where pos falls on the chunk grid and is therefore
+                 * uncorrelated sample to sample. Reading the clock here dates
+                 * the crossing at "when I noticed", and the difference is pure
+                 * quantisation noise on the servo's only input.
+                 *
+                 * Measured before this: two reads of s_phase_err_us in adjacent
+                 * log lines, a millisecond apart, differing by 15.7 ms. That
+                 * noise made the hub's own retune bench unmeasurable (scatter
+                 * 2.9x the effect), produced a false 23 ms alarm, and is the
+                 * "hub absolute phase does not settle" wart in clock-sync.md.
+                 *
+                 * The overshoot is known exactly, so this is arithmetic rather
+                 * than a filter: writes are paced by the DAC, so the instant
+                 * samples_played was `pos` is `overshoot / rate` ago.
+                 */
+                int32_t overshoot = samples_played - s_phase_q[s_phase_tail].pos;
+                /*
+                 * Capped at one chunk, because beyond that the pacing
+                 * assumption is false. A splice advances samples_played by up
+                 * to MAX_SPLICE_MS in a single step and those frames were
+                 * discarded rather than played over time, so any point the jump
+                 * carried us past cannot be dated this way. Capping leaves
+                 * those readings no worse than they were before this
+                 * correction existed.
+                 */
+                if (overshoot > AUDIO_FRAMES) {
+                    overshoot = AUDIO_FRAMES;
+                }
+                const int64_t crossed_at = esp_timer_get_time()
+                                         - (int64_t)overshoot * 1000000 / sample_rate;
+                s_phase_err_us = (int32_t)(crossed_at - s_phase_q[s_phase_tail].play_at);
                 s_phase_valid = true;
                 if (s_retune_watch) {
                     s_retune_watch = false;
