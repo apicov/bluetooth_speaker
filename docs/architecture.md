@@ -222,7 +222,6 @@ Four firmware images live in this repository, plus a Python client:
 | `hub/` | Chip B. WiFi SoftAP, clock master, decoder, DAC, LEDs, streamer |
 | `satellite/` | Every additional speaker. Receives, decodes, plays, lights |
 | `tools/desktop_satellite.py` | A laptop pretending to be a satellite — listens and records WAVs |
-| `sync_test/`, `i2s_loopback/` | Measurement harnesses, kept because they earned their place |
 
 ### 8. Why the master is two chips
 
@@ -704,7 +703,7 @@ cd satellite && idf.py -p /dev/ttyUSB2 flash monitor   # each satellite
 Host-side unit tests need no hardware:
 
 ```sh
-cd sync_test/test                && make check   # 8 cases on the clock estimator
+cd components/dancefloor_sync/test && make check # the clock estimator
 cd components/dancefloor_leds/test && make check # FFT, beat detection, patterns,
                                                  # block alignment, cross-unit
                                                  # determinism
@@ -914,7 +913,6 @@ budget.
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
 | `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
 | `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |
-| `sync_test/`, `i2s_loopback/` | Measurement harnesses |
 
 ---
 

@@ -18,9 +18,10 @@ came from. What changes with TSF is that the round trip disappears, and with it
 the path asymmetry that §2 identifies as the error floor.
 
 Implemented in `components/dancefloor_sync/` (the estimator and the wire format,
-no ESP-IDF dependencies, host-testable). `sync_test/main/main.c` is the M4
-harness that first exercised it; the hub and satellite use the component
-directly.
+no ESP-IDF dependencies, host-testable). The hub and satellite use the component
+directly. The M4 blink harness that first exercised it has been deleted now that
+the audio path is the thing under test; its host tests moved into the component
+alongside the code they cover.
 
 ---
 
@@ -651,13 +652,13 @@ every 102.4 ms. They self-cancel and the servo sees the average.
 |---|---|
 | `components/dancefloor_sync/include/sync_proto.h` | Wire format, estimator state, `sync_to_local()` |
 | `components/dancefloor_sync/sync_proto.c` | Offset maths and min-RTT selection. No ESP-IDF deps |
-| `sync_test/main/main.c` | The M4 harness: SoftAP, UDP sockets, probe/announce/blink tasks |
-| `sync_test/test/` | Host tests — `make check` |
+| `components/dancefloor_sync/test/` | Host tests — `make check` |
 | `satellite/main/main.c` | `clock_offset()` picks TSF or the estimator; `track_offset()` slews it |
 
 The estimator moved into a component when the hub and satellite came to need it
-too. `sync_test` still builds against it and is still the quickest way to see
-the clock alone, without audio in the way.
+too, and its tests moved in alongside it when the M4 blink harness that used to
+host them was deleted — the same shape as `components/dancefloor_leds/test/`,
+where every suite sits next to the code it exercises.
 
 The estimator is deliberately free of platform dependencies. It is the part most
 likely to be subtly wrong, and hardware bring-up is a bad place to discover that.
@@ -670,7 +671,7 @@ radio airtime does not scale with unit count.
 
 ## 12. Verification
 
-**Estimator** — `cd sync_test/test && make check`. Cases covering exactness on
+**Estimator** — `cd components/dancefloor_sync/test && make check`. Cases covering exactness on
 symmetric paths, outlier rejection, the asymmetry floor, window ageing, min-RTT
 selection, and the master changing clock origin — that last group asserts the
 window is discarded, that no estimate is offered from what survives, that it

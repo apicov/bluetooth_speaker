@@ -14,10 +14,6 @@
 
 #define SYNC_PORT        5001
 
-/* Used only by the M4 harness in sync_test/, which still multicasts its blink
- * announcements. The audio path unicasts to registered listeners and touches
- * neither this nor MSG_BLINK -- see hub/main/streamer.c. */
-#define SYNC_MCAST_ADDR  "239.12.34.56"
 #define SYNC_WINDOW      10      /* probes retained for the median */
 #define SYNC_MIN_SAMPLES 3       /* below this the estimate is not trusted */
 
@@ -32,7 +28,10 @@
 typedef enum {
     MSG_TIME_REQ = 1,   /* satellite -> master */
     MSG_TIME_RSP = 2,   /* master -> satellite, unicast */
-    MSG_BLINK    = 3,   /* sync_test harness only, multicast */
+    /* 3 was MSG_BLINK, for the M4 blink harness. The number is deliberately
+     * not reused: an old board still flashed with that firmware would be
+     * talking a protocol this one no longer speaks, and a silently
+     * reinterpreted type is worse than an unknown one. */
     MSG_AUDIO    = 4,   /* master -> listeners */
     MSG_META     = 5,   /* master -> listeners, track metadata */
     MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
@@ -59,11 +58,6 @@ typedef struct __attribute__((packed)) {
     int64_t t2;   /* master receive,    master clock    */
     int64_t t3;   /* master transmit,   master clock    */
 } time_msg_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t type;
-    int64_t play_at;  /* master clock, microseconds */
-} blink_msg_t;
 
 /*
  * The master's 802.11 TSF against its own clock. MEASUREMENT ONLY -- nothing
