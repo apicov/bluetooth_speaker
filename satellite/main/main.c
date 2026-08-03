@@ -150,6 +150,27 @@ static volatile int32_t splice_report_phase;
 static volatile bool    splice_report_pending;
 
 /*
+ * The TSF-derived clock offset, and when it was last updated.
+ *
+ * Written by the receive task, read by playback. Zero `at` means no usable TSF
+ * message has arrived, in which case everything falls back to the probe
+ * estimator exactly as before -- both units may have TSF unavailable, the
+ * satellite may not have associated yet, or the hub may be an older build that
+ * does not send MSG_TSF at all.
+ */
+static volatile int64_t tsf_offset_us;
+static volatile int64_t tsf_offset_at;
+static volatile uint32_t n_tsf_used;      /* anchors that used TSF */
+static volatile uint32_t n_tsf_fallback;  /* anchors that fell back */
+
+/*
+ * How stale a TSF offset may be and still be preferred over the estimator.
+ * Messages arrive with every probe reply, 4/s, so a second means several have
+ * been missed and the link is not healthy enough to trust the last one.
+ */
+#define TSF_MAX_AGE_US 1000000
+
+/*
  * Cumulative totals for a long run, never reset. The 5 s lines answer "what is
  * happening now"; only a total answers "has this been happening slowly for an
  * hour", and nothing here had one. See the hub's copy.
@@ -382,6 +403,31 @@ static void probe_task(void *arg)
     }
 }
 
+/*
+ * Which clock offset to believe.
+ *
+ * TSF when it is fresh, the probe estimator otherwise. TSF has no round trip in
+ * it, so it carries none of the path asymmetry that is the estimator's error
+ * floor -- measured on this hardware the two agree within ~450 us with a stable
+ * bias, and TSF's sample-to-sample step is 1-80 us against the estimator's
+ * 50-200 us.
+ *
+ * The estimator stays as the fallback rather than being removed. It works when
+ * TSF reads 0 (not associated, no beacon yet, or a hub that does not send
+ * MSG_TSF), and losing both at once would leave nothing to anchor on.
+ */
+static bool clock_offset(int64_t *out, bool *used_tsf)
+{
+    const int64_t at = tsf_offset_at;
+    if (at && esp_timer_get_time() - at < TSF_MAX_AGE_US) {
+        *out = tsf_offset_us;
+        if (used_tsf) *used_tsf = true;
+        return true;
+    }
+    if (used_tsf) *used_tsf = false;
+    return sync_est_offset(&est, out);
+}
+
 static void handle_audio(const audio_msg_t *msg)
 {
     static uint32_t expect_seq;
@@ -389,7 +435,8 @@ static void handle_audio(const audio_msg_t *msg)
     static int16_t pcm[SBC_MAX_PCM_SAMPLES];
 
     int64_t offset;
-    if (!sync_est_offset(&est, &offset)) {
+    bool by_tsf = false;
+    if (!clock_offset(&offset, &by_tsf)) {
         return;                              /* clock not trusted yet, discard */
     }
     if (msg->format != AUDIO_FMT_SBC) {
@@ -401,12 +448,17 @@ static void handle_audio(const audio_msg_t *msg)
     if (!have_seq || stream_start_local == 0) {
         /*
          * First chunk of a stream: the only moment playback timing is decided,
-         * so it must use a settled clock estimate. Three probes are enough to
-         * produce *an* offset but not a good one -- minimum-RTT selection needs
-         * a full window to find a genuinely uncongested round trip, and any
-         * error here is baked in for the life of the stream.
+         * so it must use a clock that can be trusted. Any error here is baked
+         * in for the life of the stream.
+         *
+         * The settling wait applies to the ESTIMATOR only. Three probes produce
+         * an offset but not a good one -- minimum-RTT selection needs a full
+         * window to find a genuinely uncongested round trip, which costs 2.5 s
+         * of silence at every stream start. TSF needs no such wait: it is not
+         * built from round trips, so there is no congested sample to average
+         * away, and one beacon is as good as ten.
          */
-        if (!sync_est_settled(&est)) {
+        if (!by_tsf && !sync_est_settled(&est)) {
             static bool told;
             if (!told) {
                 told = true;
@@ -432,9 +484,11 @@ static void handle_audio(const audio_msg_t *msg)
         have_seq = true;
         xStreamBufferReset(ring);
         n_reanchors++;
-        ESP_LOGI(TAG, "stream start: play_at %lld -> local %lld (in %lld ms)",
+        if (by_tsf) n_tsf_used++; else n_tsf_fallback++;
+        ESP_LOGI(TAG, "stream start: play_at %lld -> local %lld (in %lld ms) [%s]",
                  msg->play_at, stream_start_local,
-                 (stream_start_local - esp_timer_get_time()) / 1000);
+                 (stream_start_local - esp_timer_get_time()) / 1000,
+                 by_tsf ? "TSF" : "probe estimator");
     }
 
     /*
@@ -614,6 +668,12 @@ static void rx_task(void *arg)
             }
 
             const int64_t tsf_offset = (m.local - m.tsf) - (my_local - my_tsf);
+
+            /* Published for anchoring and for the slew. This is the promotion
+             * from measurement to source; everything else about the comparison
+             * below stays, because it is what would show a regression. */
+            tsf_offset_us = tsf_offset;
+            tsf_offset_at = my_local;
 
             /*
              * Rate-limited, and the rate limit comes FIRST so that this line
@@ -830,11 +890,15 @@ static void drift_task(void *arg)
             ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ") | "
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
-                          " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32,
+                          " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32
+                          " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
-                     n_retunes, n_retunes_bad, n_gaps, n_wifi_drops);
+                     n_retunes, n_retunes_bad, n_gaps, n_wifi_drops,
+                     (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
+                         ? "TSF" : "probe",
+                     n_tsf_used, n_tsf_fallback);
         }
 
         if (stream_start_local == 0) {
@@ -985,7 +1049,7 @@ static void drift_task(void *arg)
 static void track_offset(void)
 {
     int64_t measured;
-    if (!sync_est_offset(&est, &measured)) {
+    if (!clock_offset(&measured, NULL)) {
         return;
     }
 
