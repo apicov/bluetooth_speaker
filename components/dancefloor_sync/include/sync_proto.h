@@ -35,6 +35,7 @@ typedef enum {
     MSG_BLINK    = 3,   /* sync_test harness only, multicast */
     MSG_AUDIO    = 4,   /* master -> listeners */
     MSG_META     = 5,   /* master -> listeners, track metadata */
+    MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
 } msg_type_t;
 
 /*
@@ -62,6 +63,32 @@ typedef struct __attribute__((packed)) {
     uint8_t type;
     int64_t play_at;  /* master clock, microseconds */
 } blink_msg_t;
+
+/*
+ * What a satellite corrected at a track boundary, reported so the master can
+ * print how far apart the units had drifted.
+ *
+ * Every unit splices by its OWN phase error against the same published
+ * timeline, so the difference between two units' corrections is how far apart
+ * they had come to be. Both are measured at the boundary, which is the one
+ * instant that recurs identically in every track -- unlike a reading taken
+ * wherever a log window happened to fall, which depends on how long since the
+ * last boundary reset it.
+ *
+ * The marker GPIO answers the same question physically, and better, because it
+ * sees things no software reading can. It is a bench instrument: two boards, a
+ * wire and a common ground. This works over the WiFi that is there anyway, for
+ * every satellite rather than the one that happens to be wired.
+ *
+ * Sent from the probe task, not from playback: a sendto() in the audio path is
+ * exactly the kind of thing that costs a buffer. Up to PROBE_PERIOD_MS late,
+ * which against track-length intervals is nothing.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t type;         /* MSG_SPLICE */
+    int32_t applied_us;   /* + = skipped content (was late), - = inserted silence */
+    int32_t phase_us;     /* the phase error it was correcting */
+} splice_msg_t;
 
 /*
  * Audio alignment measurement.

@@ -573,6 +573,11 @@ static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
 static volatile int64_t s_sync_err_us;
 static volatile int64_t s_sync_at;        /* 0 = never measured */
 
+/* This unit's own last boundary correction, for satellites to be compared
+ * against when they report theirs. */
+static volatile int32_t s_hub_splice_us;
+static volatile int64_t s_hub_splice_at;  /* 0 = no boundary yet */
+
 static void IRAM_ATTR monitor_isr(void *arg)
 {
     (void)arg;
@@ -901,18 +906,24 @@ static void local_play_task(void *arg)
                  * error it had accumulated. They answer different questions and
                  * both belong here.
                  */
+                s_hub_splice_us = (int32_t)((int64_t)applied * 1000000 / sample_rate);
+                s_hub_splice_at = esp_timer_get_time();
+
                 if (s_sync_at) {
                     ESP_LOGW(TAG, "TRACK DIVERGENCE: satellite %+lld us "
-                                  "(measured %lld ms before this boundary) | "
+                                  "(marker, %lld ms before this boundary) | "
                                   "hub spliced %+ld ms | hub phase %+ld us",
                              s_sync_err_us,
-                             (esp_timer_get_time() - s_sync_at) / 1000,
-                             (long)(applied * 1000 / (int32_t)sample_rate),
+                             (s_hub_splice_at - s_sync_at) / 1000,
+                             (long)(s_hub_splice_us / 1000),
                              (long)s_phase_err_us);
                 } else {
-                    ESP_LOGW(TAG, "TRACK DIVERGENCE: no marker reading yet | "
-                                  "hub spliced %+ld ms | hub phase %+ld us",
-                             (long)(applied * 1000 / (int32_t)sample_rate),
+                    /* No marker wire -- the normal deployed case, since it is a
+                     * bench instrument. Satellites report over WiFi instead, and
+                     * their line arrives within PROBE_PERIOD_MS of this one. */
+                    ESP_LOGW(TAG, "TRACK BOUNDARY: hub spliced %+ld ms | "
+                                  "hub phase %+ld us | no marker fitted",
+                             (long)(s_hub_splice_us / 1000),
                              (long)s_phase_err_us);
                 }
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
@@ -972,6 +983,36 @@ static void probe_task(void *arg)
         socklen_t from_len = sizeof(from);
         int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
         int64_t t2 = esp_timer_get_time();          /* stamp on arrival */
+
+        /*
+         * A satellite reporting what it corrected at a track boundary. Both
+         * units splice by their own error against the same published timeline,
+         * so the DIFFERENCE between the two corrections is how far apart they
+         * had drifted over that track -- the same question the marker GPIO
+         * answers physically, over the WiFi that is there anyway.
+         */
+        if (n >= (int)sizeof(splice_msg_t) && buf[0] == MSG_SPLICE) {
+            splice_msg_t s;
+            memcpy(&s, buf, sizeof(s));
+            client_seen(&from);
+            const int64_t age = s_hub_splice_at ? (t2 - s_hub_splice_at) / 1000 : -1;
+            const char *who = inet_ntoa(from.sin_addr);
+            if (age >= 0 && age < 10000) {
+                ESP_LOGW(TAG, "TRACK DIVERGENCE (wifi): %s spliced %+ld ms "
+                              "(phase %+ld us), hub spliced %+ld ms -> %+ld ms apart",
+                         who, (long)(s.applied_us / 1000), (long)s.phase_us,
+                         (long)(s_hub_splice_us / 1000),
+                         (long)((s.applied_us - s_hub_splice_us) / 1000));
+            } else {
+                /* No boundary of our own to compare against -- the hub's phase
+                 * was invalid, or this arrived nowhere near one. */
+                ESP_LOGW(TAG, "satellite %s spliced %+ld ms (phase %+ld us), "
+                              "no hub boundary to compare",
+                         who, (long)(s.applied_us / 1000), (long)s.phase_us);
+            }
+            continue;
+        }
+
         if (n < (int)sizeof(time_msg_t) || buf[0] != MSG_TIME_REQ) {
             continue;
         }

@@ -138,6 +138,16 @@ static volatile bool phase_stepped;
  */
 #define PHASE_INSANE_US 1000000
 
+/*
+ * A track-boundary correction waiting to be reported to the hub, so it can
+ * print how far apart the units had drifted -- see splice_msg_t. Written by
+ * playback, sent by the probe task, because a sendto() in the audio path is
+ * exactly the kind of thing that costs a buffer.
+ */
+static volatile int32_t splice_report_us;
+static volatile int32_t splice_report_phase;
+static volatile bool    splice_report_pending;
+
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
 #define RING_TARGET_MS 200
@@ -322,6 +332,20 @@ static void probe_task(void *arg)
     while (1) {
         time_msg_t msg = { .type = MSG_TIME_REQ, .seq = seq++, .t1 = esp_timer_get_time() };
         sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&dest, sizeof(dest));
+
+        /* Piggyback any track-boundary correction on the same socket. Cleared
+         * before sending, so a report landing while this runs is kept rather
+         * than overwritten by the clear. */
+        if (splice_report_pending) {
+            splice_report_pending = false;
+            splice_msg_t s = {
+                .type = MSG_SPLICE,
+                .applied_us = splice_report_us,
+                .phase_us = splice_report_phase,
+            };
+            sendto(sock, &s, sizeof(s), 0, (struct sockaddr *)&dest, sizeof(dest));
+        }
+
         vTaskDelay(pdMS_TO_TICKS(PROBE_PERIOD_MS));
     }
 }
@@ -955,6 +979,7 @@ static void play_task(void *arg)
                     ? (int32_t)((int64_t)phase_err_us * stream_rate / 1000000) : 0;
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
+                int32_t applied = 0;      /* what the splice actually moved */
 
                 if (adj > 0) {
                     /* Late: discard input so playback jumps forward in content.
@@ -977,8 +1002,9 @@ static void play_task(void *arg)
                         left -= got2 / (AUDIO_CHANNELS * sizeof(int16_t));
                     }
                     samples_played += (adj - left);
+                    applied = adj - left;
                     ESP_LOGW(TAG, "track boundary: skipped %ld ms to null phase",
-                             (long)((adj - left) * 1000 / (int32_t)stream_rate));
+                             (long)(applied * 1000 / (int32_t)stream_rate));
                     phase_stepped = true;
                 } else if (adj < 0) {
                     /* Early: emit silence so the timeline catches up with us. */
@@ -989,10 +1015,21 @@ static void play_task(void *arg)
                         write_audio(quiet, (size_t)n * AUDIO_CHANNELS * sizeof(int16_t), 0);
                         left -= n;
                     }
+                    applied = adj;
                     ESP_LOGW(TAG, "track boundary: inserted %ld ms to null phase",
-                             (long)(-adj * 1000 / (int32_t)stream_rate));
+                             (long)(-applied * 1000 / (int32_t)stream_rate));
                     phase_stepped = true;
                 }
+
+                /*
+                 * Hand the correction to the probe task to report. Not sent
+                 * from here: a sendto() in the playback path is exactly the
+                 * kind of thing that costs a buffer, and this is not urgent --
+                 * the hub only wants it to print one line per track.
+                 */
+                splice_report_us = (int32_t)((int64_t)applied * 1000000 / stream_rate);
+                splice_report_phase = phase_valid ? phase_err_us : 0;
+                splice_report_pending = true;
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
                 if (adj != 0) {
                     /* The audio stream the visualiser counts just gained or lost
