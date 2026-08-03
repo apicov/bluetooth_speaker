@@ -12,6 +12,7 @@
 #include "freertos/stream_buffer.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -1319,12 +1320,14 @@ static void ring_monitor_task(void *arg)
         if (--health_left <= 0) {
             health_left = 12;                      /* 12 x 5 s */
             hw_mon = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ") | "
+            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ", "
+                          "largest %u) | "
                           "stack play %" PRIu32 " mon %" PRIu32 " | underruns %" PRIu32
                           " restarts %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | sta-left %" PRIu32,
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_mon, n_underruns, n_restarts, n_splices,
                      n_retunes, n_retunes_bad, n_sta_left);
         }

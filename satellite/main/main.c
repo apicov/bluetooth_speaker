@@ -28,6 +28,7 @@
 #endif
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -887,13 +888,15 @@ static void drift_task(void *arg)
         if (--health_left <= 0) {
             health_left = 12;                      /* 12 x 5 s */
             hw_drift = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ") | "
+            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ", "
+                          "largest %u) | "
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32
                           " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
                      n_retunes, n_retunes_bad, n_gaps, n_wifi_drops,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
