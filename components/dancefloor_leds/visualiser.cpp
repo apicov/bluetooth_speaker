@@ -266,6 +266,24 @@ void visualiser_task(void *arg)
             last_sec = sec;
             lower_in = LED_MARKER_BLOCKS_HIGH;
             gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 1);
+            /*
+             * Say so for the first few, then go quiet.
+             *
+             * Without this, "the LED is not blinking" is three different faults
+             * wearing the same face: the code never runs (no audio, so no
+             * complete block ever reaches here), the code runs but the pin is
+             * not wired to an LED on this board, or the option was not built
+             * in. Those need completely different fixes and the console could
+             * not tell them apart. If these lines appear, the firmware is doing
+             * its job and the question is the pin.
+             */
+            static int told;
+            if (told < 3) {
+                told++;
+                ESP_LOGW(TAG, "LED marker fired on GPIO %d (%d of 3) -- if the "
+                              "LED is dark, this board's LED is not on that pin",
+                         CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
+            }
         } else if (lower_in > 0 && --lower_in == 0) {
             gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 0);
         }
