@@ -94,6 +94,11 @@ class Analysis {
 public:
     void init();
 
+    /* Override the boom detector's tuning after init(). Exists for pattern_lab
+     * to sweep these against a recording rather than rebuild per value; the
+     * firmware uses whatever init() sets. */
+    void set_boom_tuning(float k, float flux_floor, int64_t refractory_us);
+
     /* `stereo` is exactly FFT_N interleaved 16-bit frames. The returned
      * reference is valid until the next call. */
     const Frame &process(const int16_t *stereo, int64_t index,

@@ -188,20 +188,18 @@ int main(void)
     }
 
     /*
-     * The flux floor is what separates a bass-drum detector from a detector
-     * that follows whatever leaked into the bass.
+     * flux_floor is per-instance, and this pins that it does what it claims.
      *
-     * A sharp transient anywhere leaks into the low bins -- a windowed FFT
-     * cannot prevent it -- so accordion stabs and the like raise the low band a
-     * little even with no drum in the music at all. Measured on synthetic
-     * forró: a real zabumba produced a low-band flux of 0.17 to 0.49, and the
-     * leakage with the drum removed entirely produced 0.02 to 0.11. Everything
-     * hangs on the detector telling those apart, and the only thing that does
-     * is the floor beneath the adaptive threshold.
+     * Note what it is NOT: the zabumba detector ships with the same floor as
+     * the wideband one, 0.02. A raised floor was tried first, on synthetic
+     * material where a drum swung the low band from silence -- and measured
+     * against ten real forró recordings it was an order of magnitude too high
+     * and left the strip dark. Real music has continuous bass, so a stroke
+     * rises from ~0.03 rather than from nothing.
      *
-     * Both cases run here, so the test states the difference rather than
-     * asserting the new behaviour: the default floor CANNOT reject the leakage,
-     * whatever else is tuned.
+     * The field still earns its place: the boom detector overrides k and the
+     * refractory through the same mechanism, and a future detector may well
+     * want a different floor. This checks the knob turns.
      */
     {
         beat_det_t leaky, floored;
@@ -223,8 +221,8 @@ int main(void)
         char d[80];
         snprintf(d, sizeof d, "default floor fired %d, raised floor fired %d",
                  leaky_hits, floored_hits);
-        check("leakage-sized rises get through the default floor", leaky_hits > 5, d);
-        check("a raised flux floor rejects them", floored_hits == 0, d);
+        check("small rises pass the default floor", leaky_hits > 5, d);
+        check("raising the floor rejects them", floored_hits == 0, d);
     }
     {
         /* And it must not reject a real drum: the same detector, fed rises the
@@ -245,7 +243,7 @@ int main(void)
         }
         char d[64];
         snprintf(d, sizeof d, "found %d of %d strokes", hits, strokes);
-        check("the raised floor still finds a real drum", hits >= strokes - 2, d);
+        check("a raised floor still finds large rises", hits >= strokes - 2, d);
     }
 
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");

@@ -90,28 +90,51 @@ void Analysis::init()
     boom_.refractory_us = 200000;
 
     /*
-     * A much higher flux floor than the wideband detector's 0.02, and this is
-     * the constant that makes the difference between finding the drum and
-     * following whatever else is happening.
+     * The flux floor, measured against ten forró recordings.
      *
-     * A sharp transient anywhere leaks into the low bins -- a windowed FFT
-     * cannot prevent it -- so accordion stabs raise band 0 slightly even with no
-     * drum present. The floor exists to stop the adaptive threshold collapsing
-     * onto that when there is no real bass, and 0.02 was chosen for a weighted
-     * sum of four bands, not for one band on its own.
+     * It was 0.15 on the strength of synthetic material, and that was wrong by
+     * an order of magnitude and in the wrong direction -- on real tracks it
+     * fired 0 to 30 times a minute, three of them exactly zero, and a floor
+     * left the strip dark.
      *
-     * Measured on synthetic forró: with a zabumba, booms fire at a flux of
-     * 0.169 to 0.488; with the drum removed entirely and only accordion and
-     * triangle left, the leakage fires at 0.022 to 0.114. 0.15 sits in the gap.
+     * The synthetic signal had the drum going from silence to a stroke, so band
+     * 0 swung the whole way and the flux was huge. Real forró has continuous
+     * bass under everything -- baixo, accordion left hand, the drum itself
+     * ringing -- so band 0 sits around 0.03 and a stroke RISES from there.
+     * beat_normalise() compresses what is already loud, so the rise is smaller
+     * still. Measured across the recordings: median low-band flux 0.0000, p90
+     * 0.016 to 0.019, p99 0.038 to 0.131. A floor of 0.15 is above nearly every
+     * stroke in the material.
      *
-     * That gap is real but its POSITION depends on how loud the material is,
-     * since flux scales with BAND_GAIN and the mix. It is a synthetic number
-     * until it has been checked against a recording, and it is the first thing
-     * to move if the lights miss quiet drums or fire during quiet passages.
+     * Swept over the ten tracks, booms per minute against floor:
+     *
+     *   0.15   0-16      dark, the bug
+     *   0.06   0-80      still clipping most tracks
+     *   0.03   50-114
+     *   0.02   68-134    plateau begins; the adaptive threshold takes over
+     *   0.012  82-139    ~10% more, and 3/min on a drumless passage
+     *
+     * 0.02 is the conservative end of that plateau: every track lands in a rate
+     * consistent with one stroke per beat at forró tempo, and a synthetic
+     * passage of dither, quiet accordion and triangle with no drum at all
+     * produces exactly zero. It is also, coincidentally, the wideband
+     * detector's own floor -- so the thing that makes this detector selective
+     * is not the floor at all. It is the single-band input and the adaptive
+     * threshold above it.
+     *
+     * Lower it toward 0.012 if the lights miss strokes; that costs occasional
+     * firing where there is no drum.
      */
-    boom_.flux_floor = 0.15f;
+    boom_.flux_floor = 0.02f;
 
     std::memset(&frame_, 0, sizeof(frame_));
+}
+
+void Analysis::set_boom_tuning(float k, float flux_floor, int64_t refractory_us)
+{
+    boom_.threshold_k   = k;
+    boom_.flux_floor    = flux_floor;
+    boom_.refractory_us = refractory_us;
 }
 
 const Frame &Analysis::process(const int16_t *stereo, int64_t index,

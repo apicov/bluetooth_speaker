@@ -46,7 +46,10 @@ void usage()
         "  --csv FILE       write per-frame bands, flux, threshold and onsets\n"
         "  --no-tty         skip the live terminal render\n"
         "  --speed X        terminal playback rate (default 1.0, 0 = as fast as possible)\n"
-        "  --unit N         value of Frame::unit, for cross-unit effects (default 0)\n");
+        "  --unit N         value of Frame::unit, for cross-unit effects (default 0)\n"
+        "  --boom-floor X   boom detector flux floor (default: the firmware's)\n"
+        "  --boom-k X       boom detector threshold, in std devs\n"
+        "  --boom-refr MS   boom detector refractory period\n");
 }
 
 }  // namespace
@@ -57,6 +60,7 @@ int main(int argc, char **argv)
     int  leds = 8, unit = 0, brightness = 10;
     bool tty = true, list = false;
     double speed = 1.0;
+    double boom_floor = -1, boom_k = -1, boom_refr = -1;   /* <0 = leave alone */
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -73,6 +77,9 @@ int main(int argc, char **argv)
         else if (a == "--no-tty")     tty = false;
         else if (a == "--speed")      speed = std::stod(next("--speed"));
         else if (a == "--unit")       unit = std::stoi(next("--unit"));
+        else if (a == "--boom-floor") boom_floor = std::stod(next("--boom-floor"));
+        else if (a == "--boom-k")     boom_k = std::stod(next("--boom-k"));
+        else if (a == "--boom-refr")  boom_refr = std::stod(next("--boom-refr"));
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a.rfind("--", 0) == 0) { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
         else wav_path = a;
@@ -115,6 +122,11 @@ int main(int argc, char **argv)
 
     df::Analysis analysis;
     analysis.init();
+    if (boom_floor >= 0 || boom_k >= 0 || boom_refr >= 0) {
+        analysis.set_boom_tuning(boom_k    >= 0 ? float(boom_k)    : 1.4f,
+                                 boom_floor >= 0 ? float(boom_floor) : 0.15f,
+                                 boom_refr  >= 0 ? int64_t(boom_refr * 1000) : 200000);
+    }
     pattern->reset();
 
     std::vector<uint8_t> rgb(size_t(leds) * 3);
