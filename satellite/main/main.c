@@ -140,6 +140,17 @@ static volatile bool phase_stepped;
 #define PHASE_INSANE_US 1000000
 
 /*
+ * Longest a TSF/esp_timer read pair may take and still be trusted.
+ *
+ * The reads are not atomic, so a preemption between them is indistinguishable
+ * from the clocks disagreeing. Bracketing the timer read between two TSF reads
+ * gives the pair its own error bar; anything wider than this is thrown away
+ * rather than reported as jitter. 60 us is generous against a pair that
+ * normally completes in single-digit microseconds.
+ */
+#define TSF_READ_SPAN_MAX_US 60
+
+/*
  * A track-boundary correction waiting to be reported to the hub, so it can
  * print how far apart the units had drifted -- see splice_msg_t. Written by
  * playback, sent by the probe task, because a sendto() in the audio path is
@@ -566,8 +577,23 @@ static void rx_task(void *arg)
             tsf_msg_t m;
             memcpy(&m, buf, sizeof(m));
 
-            const int64_t my_tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
+            /*
+             * Bracket the esp_timer read between two TSF reads, so the pair
+             * carries its own error bar.
+             *
+             * The two reads are not atomic, and anything that preempts between
+             * them lands directly in the delta. The first run showed it: the
+             * steps sat at 1 to 80 us and then jumped +333, -296, +360, -355,
+             * +521, -515 -- always a jump and an immediate return, which is one
+             * bad sample rather than a clock moving. `span` is how long the
+             * pair actually took, so a preempted sample can be discarded
+             * instead of being read as TSF instability.
+             */
+            const int64_t tsf_a = esp_wifi_get_tsf_time(WIFI_IF_STA);
             const int64_t my_local = esp_timer_get_time();
+            const int64_t tsf_b = esp_wifi_get_tsf_time(WIFI_IF_STA);
+            const int64_t span = tsf_b - tsf_a;
+            const int64_t my_tsf = (tsf_a + tsf_b) / 2;   /* centred on the timer read */
 
             /*
              * Say what the first one looked like, whatever it looked like.
@@ -598,6 +624,14 @@ static void rx_task(void *arg)
                 continue;           /* estimator not ready yet; it will be */
             }
 
+            /* Preempted mid-read: the delta is wrong by however long we were
+             * away, so it says nothing about TSF. Counted, not hidden. */
+            static uint32_t skipped;
+            if (span > TSF_READ_SPAN_MAX_US) {
+                skipped++;
+                continue;
+            }
+
             const int64_t tsf_offset = (m.local - m.tsf) - (my_local - my_tsf);
 
             /* Rate-limited: probes arrive 4/s and the interesting quantity is
@@ -618,9 +652,10 @@ static void rx_task(void *arg)
              * microseconds -- beacons are 102.4 ms apart and the local counter
              * free-runs at ~14 ppm between them, so ~1.4 us of drift. */
             ESP_LOGW(TAG, "TSF: est %+lld us | tsf %+lld us | diff %+lld us | "
-                          "steps tsf %+lld us, est %+lld us",
+                          "steps tsf %+lld us, est %+lld us | span %lld us, "
+                          "skipped %" PRIu32,
                      est_offset, tsf_offset, tsf_offset - est_offset,
-                     tsf_step, est_step);
+                     tsf_step, est_step, span, skipped);
         } else if (buf[0] == MSG_AUDIO && n >= (int)AUDIO_MSG_BYTES(0)) {
             handle_audio((const audio_msg_t *)buf);
         }
