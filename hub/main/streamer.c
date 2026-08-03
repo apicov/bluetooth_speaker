@@ -532,6 +532,37 @@ static void wifi_start_ap(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
+
+#if CONFIG_DANCEFLOOR_DISABLE_PMF
+    /*
+     * Turn off Protected Management Frames, because its Secure Association
+     * teardown is disconnecting our own satellite.
+     *
+     * Observed: the AP starts an SA Query, the satellite does not answer six
+     * attempts, and the AP disassociates it with reason 209 -- 1.7 s off the
+     * network, twice in the first 65 seconds of a run. The satellite never
+     * noticed: it counted zero disconnects while this unit counted two, which
+     * is why sta-left exists at all.
+     *
+     * pmf_cfg.capable is deprecated in IDF 6 ("set to true internally"), so it
+     * cannot be used to opt out. esp_wifi_disable_pmf_config() is the supported
+     * way, and it must come after esp_wifi_set_config() and before
+     * esp_wifi_start(). It fails on a WPA3 or WPA2/WPA3-mixed SoftAP; this one
+     * is WPA2-PSK, so it applies.
+     *
+     * What is given up is protection of management frames -- spoofed
+     * deauth/disassoc. Data stays encrypted under WPA2-PSK and the password is
+     * unchanged. For a closed floor with two boards that is a poor trade
+     * against losing a speaker every half minute.
+     *
+     * Not asserted, because it is the fix for a fault and not a requirement:
+     * if a future IDF refuses it, the log says so and the link works as it
+     * does today.
+     */
+    const esp_err_t pmf = esp_wifi_disable_pmf_config(WIFI_IF_AP);
+    ESP_LOGW(TAG, "PMF disabled on the AP: %s", esp_err_to_name(pmf));
+#endif
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
     /* Power save would park the radio between beacons and add tens of ms to

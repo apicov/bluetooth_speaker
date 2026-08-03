@@ -216,6 +216,21 @@ static void wifi_start_sta(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+
+#if CONFIG_DANCEFLOOR_DISABLE_PMF
+    /*
+     * Both ends, so neither advertises the capability -- see the hub's copy for
+     * what PMF was doing to this link. This unit is the one that was failing to
+     * answer the SA Query and being thrown off for it, and it is also the one
+     * that never noticed: the hub counted two disassociations while this
+     * counted zero.
+     *
+     * Must sit between esp_wifi_set_config() and esp_wifi_start().
+     */
+    const esp_err_t pmf = esp_wifi_disable_pmf_config(WIFI_IF_STA);
+    ESP_LOGW(TAG, "PMF disabled on the station: %s", esp_err_to_name(pmf));
+#endif
+
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     /* STA_START triggers the first connect; disconnects retry from the handler. */
