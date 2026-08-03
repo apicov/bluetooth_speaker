@@ -163,7 +163,13 @@ void streamer_set_sample_rate(uint32_t hz)
     if (i2s_tx && (hz > tx_rate + tx_rate / 100 || hz < tx_rate - tx_rate / 100)) {
         retune_dac(hz);
     } else {
-        ESP_LOGI(TAG, "sample rate %" PRIu32 " Hz", hz);
+        /* Only when it moves. This ran every 5 s and printed the same 44100
+         * every time -- a twelfth of the console spent saying nothing changed. */
+        static uint32_t told_hz;
+        if (hz != told_hz) {
+            told_hz = hz;
+            ESP_LOGI(TAG, "sample rate %" PRIu32 " Hz", hz);
+        }
     }
 }
 
@@ -687,8 +693,14 @@ static void monitor_task(void *arg)
         s_sync_err_us = err;
         s_sync_at = esp_timer_get_time();
 
-        ESP_LOGW(TAG, "AUDIO SYNC: satellite %+lld us (%s)", err,
-                 err >= 0 ? "late" : "early");
+        /* Every ~2 s is more than anyone reads. The value is kept for the
+         * track-boundary summary regardless of whether this prints. */
+        static int64_t last_sync_log;
+        if (s_sync_at - last_sync_log >= (int64_t)LOG_PERIOD_S * 1000000) {
+            last_sync_log = s_sync_at;
+            ESP_LOGW(TAG, "AUDIO SYNC: satellite %+lld us (%s)", err,
+                     err >= 0 ? "late" : "early");
+        }
     }
 }
 
@@ -1271,12 +1283,18 @@ static void ring_monitor_task(void *arg)
         s_err_ema_valid = true;
 
         size_t filled = LOCAL_RING_BYTES - xStreamBufferSpacesAvailable(local_ring);
-        ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
-                      "tx-fail %" PRIu32 "/5s",
-                 (unsigned)filled,
-                 (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
-                 (long)s_phase_err_us, (long)s_err_ema, s_tx_fail);
-        s_tx_fail = 0;
+        /* Printed every LOG_PERIOD_S, not every window. tx-fail accumulates
+         * across the quiet windows so nothing is lost by not printing it. */
+        static int status_left;
+        if (--status_left <= 0) {
+            status_left = LOG_PERIOD_S / 5;
+            ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
+                          "tx-fail %" PRIu32,
+                     (unsigned)filled,
+                     (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
+                     (long)s_phase_err_us, (long)s_err_ema, s_tx_fail);
+            s_tx_fail = 0;
+        }
 
         const int32_t target = (int32_t)(LEAD_US / 1000) *
                                (int32_t)(rate_ema * AUDIO_CHANNELS * 2 / 1000);

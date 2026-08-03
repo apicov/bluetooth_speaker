@@ -208,12 +208,31 @@ static void rx_task(void *arg)
              */
             uint32_t eff = (uint32_t)(s_pcm_samples * 1000000ULL /
                                       (uint64_t)(now - (next_report - 5000000)) / 2);
-            ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
-                          "sync %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32
-                          " dec %" PRIu32 " | fed-drop %" PRIu32 " B",
-                     s_packets, info.sample_rate, info.channels, eff,
-                     s_bad_sync, s_bad_crc, s_gaps, s_decode_err,
-                     streamer_take_dropped());
+            const uint32_t dropped = streamer_take_dropped();
+
+            /*
+             * Quiet when the link is clean, immediate when it is not.
+             *
+             * The window stays 5 s -- streamer_set_sample_rate() below feeds the
+             * servo's rate estimate and must keep its cadence -- but a healthy
+             * window says the same thing every time, so only every LOG_PERIOD_S
+             * gets printed. Any window with a bad sync word, a CRC failure, a
+             * sequence gap, a decode error or a dropped feed prints regardless,
+             * because those are the windows worth seeing and waiting 20 s to
+             * hear about a fault is how faults get missed.
+             */
+            static int quiet_left;
+            const bool bad = s_bad_sync || s_bad_crc || s_gaps || s_decode_err || dropped;
+            if (bad || --quiet_left <= 0) {
+                if (!bad) {
+                    quiet_left = LOG_PERIOD_S / 5;
+                }
+                ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
+                              "sync %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32
+                              " dec %" PRIu32 " | fed-drop %" PRIu32 " B",
+                         s_packets, info.sample_rate, info.channels, eff,
+                         s_bad_sync, s_bad_crc, s_gaps, s_decode_err, dropped);
+            }
             s_pcm_samples = 0;
             /* Rate the decoder actually produced, which is what the DAC must match. */
             streamer_set_sample_rate(info.sample_rate ? info.sample_rate : 44100);

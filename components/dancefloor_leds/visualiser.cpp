@@ -39,6 +39,12 @@ constexpr uint32_t FRAME_BYTES = CHANNELS * sizeof(int16_t);
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 
+/* Matches LOG_PERIOD_S in sync_proto.h, which this component does not include
+ * -- it is deliberately free of the audio protocol. Kept in step by hand; the
+ * cost of drifting apart is a console that is noisier than intended, not a
+ * fault. */
+constexpr int64_t LED_LOG_PERIOD_US = 20 * 1000000LL;
+
 /* Applied to the pattern's output on the way to the strip. A device concern,
  * not a pattern one -- patterns work in full range and this scales it. */
 constexpr float BRIGHTNESS = CONFIG_DANCEFLOOR_LED_BRIGHTNESS / 100.0f;
@@ -213,8 +219,19 @@ void visualiser_task(void *arg)
             show(pixels);
         }
 
+        /*
+         * Quiet when nothing is wrong, immediate when something is.
+         *
+         * A healthy window reports the same ~215 frames and 0 dropped bytes
+         * every time, and two units doing that every 5 s is most of a console.
+         * A window that dropped audio, or re-aligned more than the one time a
+         * splice or retune explains, is worth seeing at once -- those are the
+         * two things that put the strips out of step with each other.
+         */
         const int64_t now = esp_timer_get_time();
-        if (now - last_report_us >= 5000000) {
+        const uint32_t dropped = s_dropped.load(std::memory_order_relaxed);
+        const uint32_t aligns  = s_aligns.load(std::memory_order_relaxed);
+        if (dropped || aligns > 1 || now - last_report_us >= LED_LOG_PERIOD_US) {
             ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
                           " | drop %" PRIu32 " B | aligns %" PRIu32 " | %s",
                      take(s_frames), take(s_onsets), take(s_dropped), take(s_aligns),
