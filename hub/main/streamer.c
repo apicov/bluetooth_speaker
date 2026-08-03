@@ -37,9 +37,28 @@
 #define LEAD_US   200000
 
 /*
- * How far the presentation timeline may wander from real time before restarting.
+ * How far the presentation timeline may wander from real time before the slew
+ * starts walking it back.
  *
- * 120 ms, because SBC over UART is bursty. A2DP packets arrive ~23/s, each
+ * Now measured rather than estimated. sbc_in tracks the longest silence between
+ * audio packets and every 5 s window contains one of 79 to 112 ms, median 100 --
+ * so `next_play_at - target` does not drift, it OSCILLATES: a burst arrives and
+ * the timeline races ahead of real time, a gap follows and it falls behind. The
+ * trough reaches -132 ms, which is past this threshold, so it trips on entirely
+ * normal delivery about seven times a minute and recovers on its own within a
+ * second or two.
+ *
+ * That is survivable now and was not before. The old code JUMPED to `target` on
+ * crossing this line, writing a transient trough permanently into the timeline
+ * and stepping every unit's phase by the whole amount; the slew moves 1 ms/s,
+ * so a trip that lasts a second costs 1 ms and the burst refill does the rest.
+ *
+ * Raising it above the swing would stop the tripping, but the headroom is not
+ * there: LEAD + RESYNC bounds how much a satellite must buffer, 200 + 120 = 320
+ * against a 372 ms ring, and the swing is 132. Left as is, with the reporting
+ * filtered to episodes that persist.
+ *
+ * The original note, still true: SBC over UART is bursty. A2DP packets arrive ~23/s, each
  * carrying ~43 ms of audio that decodes in one go, so the timeline legitimately
  * races ahead while a burst is consumed and falls behind while waiting for the
  * next -- measured swings of +-75 ms. The old 50 ms threshold fired several
@@ -148,6 +167,8 @@ static volatile int32_t s_restart_pos = -1;
 /* True while the timeline is being walked back to real time -- see the slew in
  * streamer_send_sbc(). */
 static bool s_slewing;
+static bool s_slew_told;          /* whether this episode has been announced */
+static int64_t s_slew_since;      /* when it started, for the 5 s filter */
 
 static volatile bool retuning;
 static volatile int64_t local_start;   /* master-clock instant local playback begins */
@@ -386,6 +407,7 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_restart_pos = -1;
         s_restart_pending = false;
         s_slewing = false;      /* err is zero by construction; nothing to walk back */
+        s_slew_told = false;
         started = true;
         n_restarts++;
         ESP_LOGI(TAG, "timeline start");
@@ -425,13 +447,28 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         } else if (llabs(err) > RESYNC_US) {
             if (!s_slewing) {
                 s_slewing = true;
-                ESP_LOGW(TAG, "timeline off by %lld us, slewing back", err);
+                s_slew_since = now;
+            }
+            /*
+             * Only worth reporting if it PERSISTS. err oscillates with the
+             * burst pattern -- the source leaves a ~100 ms gap in every window,
+             * so the trough routinely reaches -132 ms against a 120 ms
+             * threshold and recovers with the next burst about a second later.
+             * Announcing each of those was seven alarms in ninety seconds for
+             * something entirely normal.
+             */
+            if (!s_slew_told && now - s_slew_since > 5000000) {
+                s_slew_told = true;
+                ESP_LOGW(TAG, "timeline off by %lld us for 5 s, slewing back", err);
             }
         } else if (s_slewing && llabs(err) < RESYNC_US / 4) {
             /* Hysteresis, so it does not chatter in and out around the
              * threshold. */
             s_slewing = false;
-            ESP_LOGW(TAG, "timeline back within %lld us", err);
+            if (s_slew_told) {
+                s_slew_told = false;
+                ESP_LOGW(TAG, "timeline back within %lld us", err);
+            }
         }
 
         if (s_slewing) {

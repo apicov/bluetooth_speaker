@@ -38,13 +38,18 @@ static uint64_t s_pcm_samples;
  * -126734 us, and drift accounted for 7% of it. The remaining ~118 ms was a
  * pause in delivery, and no instrument on this board could see one.
  *
- * A2DP packets arrive ~23/s, so ~43 ms apart. Anything past GAP_ALARM_US is
- * long enough to eat the playback lead and is reported at once.
+ * A2DP packets arrive ~23/s, so ~43 ms apart -- but that is the AVERAGE, and
+ * the first run with this counter showed the truth: every 5 s window contains a
+ * gap of 79 to 112 ms, median 100. The source has always delivered in bursts,
+ * and nothing here could see it.
+ *
+ * GAP_ALARM_US therefore sits above that, not at it. 100 ms was the first guess
+ * and it alarmed on every window, which is no alarm at all.
  */
 static int64_t s_last_pkt_us;
 static uint32_t s_max_gap_us;
 
-#define GAP_ALARM_US 100000
+#define GAP_ALARM_US 150000
 
 /*
  * Bulk-read into a local buffer and parse in memory.
