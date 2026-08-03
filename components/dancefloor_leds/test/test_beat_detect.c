@@ -187,6 +187,67 @@ int main(void)
               beat_normalise(0.0f) == 0.0f && beat_normalise(-5.0f) == 0.0f, "");
     }
 
+    /*
+     * The flux floor is what separates a bass-drum detector from a detector
+     * that follows whatever leaked into the bass.
+     *
+     * A sharp transient anywhere leaks into the low bins -- a windowed FFT
+     * cannot prevent it -- so accordion stabs and the like raise the low band a
+     * little even with no drum in the music at all. Measured on synthetic
+     * forró: a real zabumba produced a low-band flux of 0.17 to 0.49, and the
+     * leakage with the drum removed entirely produced 0.02 to 0.11. Everything
+     * hangs on the detector telling those apart, and the only thing that does
+     * is the floor beneath the adaptive threshold.
+     *
+     * Both cases run here, so the test states the difference rather than
+     * asserting the new behaviour: the default floor CANNOT reject the leakage,
+     * whatever else is tuned.
+     */
+    {
+        beat_det_t leaky, floored;
+        beat_det_init(&leaky);                  /* default floor, 0.02 */
+        beat_det_init(&floored);
+        floored.flux_floor = 0.15f;             /* what the boom detector uses */
+
+        int leaky_hits = 0, floored_hits = 0;
+        float band[BEAT_BANDS] = {0};
+        for (int i = 0; i < 600; i++) {
+            /* Low band twitching at the level pure leakage produces: a rise of
+             * ~0.09, well above the default floor and well below a drum. */
+            band[0] = (i % 12 == 0) ? 0.09f + noise(0.004f) : noise(0.004f);
+            int64_t t = (int64_t)i * 23220;     /* one analysis frame at 44.1 kHz */
+            float s;
+            if (beat_det_update(&leaky, band, t, &s))   leaky_hits++;
+            if (beat_det_update(&floored, band, t, &s)) floored_hits++;
+        }
+        char d[80];
+        snprintf(d, sizeof d, "default floor fired %d, raised floor fired %d",
+                 leaky_hits, floored_hits);
+        check("leakage-sized rises get through the default floor", leaky_hits > 5, d);
+        check("a raised flux floor rejects them", floored_hits == 0, d);
+    }
+    {
+        /* And it must not reject a real drum: the same detector, fed rises the
+         * size a zabumba actually produced, still fires on every one. */
+        beat_det_t floored;
+        beat_det_init(&floored);
+        floored.flux_floor = 0.15f;
+
+        int hits = 0, strokes = 0;
+        float band[BEAT_BANDS] = {0};
+        for (int i = 0; i < 600; i++) {
+            const bool hit = (i % 20 == 0);
+            if (hit) strokes++;
+            band[0] = hit ? 0.45f + noise(0.01f) : noise(0.01f);
+            int64_t t = (int64_t)i * 23220;
+            float s;
+            if (beat_det_update(&floored, band, t, &s)) hits++;
+        }
+        char d[64];
+        snprintf(d, sizeof d, "found %d of %d strokes", hits, strokes);
+        check("the raised floor still finds a real drum", hits >= strokes - 2, d);
+    }
+
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");
     return failures != 0;
 }

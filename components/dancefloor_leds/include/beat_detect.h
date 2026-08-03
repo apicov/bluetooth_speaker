@@ -41,6 +41,17 @@ typedef struct {
     int hist_next;
     int64_t last_onset_us;
     bool primed;          /* first frame has no predecessor to difference against */
+
+    /*
+     * Per-instance, so one detector can be looking for something different from
+     * another. beat_det_init() sets the defaults below and callers may override
+     * them afterwards -- which is what the zabumba detector does, since a drum
+     * you want on the pulse wants a longer refractory than one you want every
+     * stroke of.
+     */
+    float   threshold_k;      /* default BEAT_THRESHOLD_K */
+    int64_t refractory_us;    /* default BEAT_REFRACTORY_US */
+    float   flux_floor;       /* default BEAT_FLUX_FLOOR */
 } beat_det_t;
 
 /*

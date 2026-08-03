@@ -125,20 +125,22 @@ int main(int argc, char **argv)
     if (!csv_path.empty()) {
         csv = std::fopen(csv_path.c_str(), "w");
         if (!csv) { std::perror(csv_path.c_str()); return 1; }
-        std::fprintf(csv, "block,time_s,band0,band1,band2,band3,flux,threshold,onset,strength\n");
+        std::fprintf(csv, "block,time_s,band0,band1,band2,band3,flux,threshold,onset,strength,"
+                             "boom_flux,boom_threshold,boom,boom_strength\n");
     }
 
     TtyRender tty_render;
     if (tty) tty_render.begin(leds, pattern->name());
 
     const float scale = brightness / 100.0f;
-    size_t onsets = 0;
+    size_t onsets = 0, booms = 0;
 
     for (size_t b = 0; b < blocks; b++) {
         const int16_t *chunk = &wav.samples[b * df::FFT_N * df::CHANNELS];
         const int64_t due_us = int64_t(b) * df::FFT_N * 1000000LL / df::RATE;
         const df::Frame &f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
         if (f.onset) onsets++;
+        if (f.boom)  booms++;
 
         pattern->render(f, rgb.data(), uint32_t(leds));
 
@@ -150,9 +152,11 @@ int main(int argc, char **argv)
             image.insert(image.end(), rgb.begin(), rgb.end());
         }
         if (csv) {
-            std::fprintf(csv, "%zu,%.3f,%.4f,%.4f,%.4f,%.4f,%.5f,%.5f,%d,%.3f\n",
+            std::fprintf(csv, "%zu,%.3f,%.4f,%.4f,%.4f,%.4f,%.5f,%.5f,%d,%.3f,"
+                              "%.5f,%.5f,%d,%.3f\n",
                          b, due_us / 1e6, f.band[0], f.band[1], f.band[2], f.band[3],
-                         f.flux, f.threshold, f.onset ? 1 : 0, f.strength);
+                         f.flux, f.threshold, f.onset ? 1 : 0, f.strength,
+                         f.boom_flux, f.boom_threshold, f.boom ? 1 : 0, f.boom_strength);
         }
         if (tty) tty_render.frame(rgb.data(), leds, f, speed);
     }
@@ -172,5 +176,7 @@ int main(int argc, char **argv)
     const double secs = double(frames) / wav.rate;
     std::fprintf(stderr, "%zu onsets in %.1f s = %.1f per minute\n",
                  onsets, secs, onsets * 60.0 / secs);
+    std::fprintf(stderr, "%zu booms  in %.1f s = %.1f per minute (low band only)\n",
+                 booms, secs, booms * 60.0 / secs);
     return 0;
 }

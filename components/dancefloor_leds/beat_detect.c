@@ -23,6 +23,9 @@ void beat_det_init(beat_det_t *d)
 {
     memset(d, 0, sizeof(*d));
     d->last_onset_us = INT64_MIN / 2;   /* halved: leaves room to subtract without overflow */
+    d->threshold_k   = BEAT_THRESHOLD_K;
+    d->refractory_us = BEAT_REFRACTORY_US;
+    d->flux_floor    = BEAT_FLUX_FLOOR;
 }
 
 static void hist_push(beat_det_t *d, float flux)
@@ -73,9 +76,9 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
         }
         var /= d->hist_n;
     }
-    float threshold = mean + BEAT_THRESHOLD_K * sqrtf(var);
-    if (threshold < BEAT_FLUX_FLOOR) {
-        threshold = BEAT_FLUX_FLOOR;
+    float threshold = mean + d->threshold_k * sqrtf(var);
+    if (threshold < d->flux_floor) {
+        threshold = d->flux_floor;
     }
     d->last_flux = flux;
     d->last_threshold = threshold;
@@ -89,7 +92,7 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
     if (flux <= threshold) {
         return false;
     }
-    if (now_us - d->last_onset_us < BEAT_REFRACTORY_US) {
+    if (now_us - d->last_onset_us < d->refractory_us) {
         return false;
     }
 

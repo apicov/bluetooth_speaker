@@ -55,6 +55,25 @@ struct Frame {
     bool         onset;
     float        strength;   /* 0..1 on an onset, else 0 */
     uint8_t      unit;       /* which speaker; 0 is the hub */
+
+    /*
+     * The zabumba's boom, detected separately from everything else.
+     *
+     * `onset` above is a weighted sum across all four bands, which is right for
+     * music where the transients are broadband. Forró is not that: the triangle
+     * plays continuous eighths or sixteenths at 4-8 kHz and contributes flux on
+     * every subdivision, so a wideband detector follows the triangle and the
+     * lights flicker with it instead of moving with the drum.
+     *
+     * This looks at the lowest band alone -- 43-129 Hz, where the mallet stroke
+     * on the zabumba's big head lives, and where in a pe-de-serra trio there is
+     * no bass guitar to compete. The stick stroke on the underside head is a mid
+     * transient and is deliberately not wanted here.
+     */
+    bool         boom;
+    float        boom_strength;
+    float        boom_flux;      /* for tuning: what the low band actually did */
+    float        boom_threshold;
 };
 
 /* Implement this to make a new pattern. See the rule at the top of the file. */
@@ -86,6 +105,7 @@ private:
     float      mag_[BINS];
     float      band_[BEAT_BANDS];
     beat_det_t beat_;
+    beat_det_t boom_;        /* the low band alone -- see Frame::boom */
     Frame      frame_;
 };
 

@@ -30,6 +30,27 @@ private:
     int64_t last_due_us_ = 0;
 };
 
+/*
+ * Follows the zabumba's boom and nothing else -- see Frame::boom.
+ *
+ * Deliberately plain: a flash on the drum, decaying on shared time, with the
+ * bass level setting how much of the strip lights. Its job is to make it
+ * obvious whether the detector is finding the drum, so anything decorative
+ * would get in the way of reading it. Run it against `pulse` on the same track
+ * in pattern_lab -- if the two disagree, the wideband detector is following the
+ * triangle.
+ */
+class BoomPattern : public Pattern {
+public:
+    const char *name() const override { return "boom"; }
+    void render(const Frame &f, uint8_t *rgb, uint32_t count) override;
+    void reset() override;
+
+private:
+    float   level_ = 0.0f;
+    int64_t last_due_us_ = 0;
+};
+
 /* Number of built-in patterns, and lookup by name or index. Returns nullptr if
  * there is no such pattern. */
 int         pattern_count();
