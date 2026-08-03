@@ -568,9 +568,34 @@ static void rx_task(void *arg)
 
             const int64_t my_tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
             const int64_t my_local = esp_timer_get_time();
+
+            /*
+             * Say what the first one looked like, whatever it looked like.
+             * These used to skip silently on every failure path, so a run with
+             * no TSF line could not distinguish "the messages never arrived"
+             * from "both counters read zero" from "the estimator was not ready"
+             * -- and a measurement that fails invisibly is worse than none.
+             */
+            static bool announced;
+            if (!announced) {
+                announced = true;
+                ESP_LOGW(TAG, "TSF first message: hub %lld us, ours %lld us%s",
+                         m.tsf, my_tsf,
+                         (m.tsf && my_tsf) ? "" : "  <-- zero means not available");
+            }
+
             int64_t est_offset;
-            if (m.tsf == 0 || my_tsf == 0 || !sync_est_offset(&est, &est_offset)) {
-                continue;           /* not associated, no beacon yet, or no estimate */
+            if (m.tsf == 0 || my_tsf == 0) {
+                static bool told_zero;
+                if (!told_zero) {
+                    told_zero = true;
+                    ESP_LOGW(TAG, "TSF unavailable (hub %lld, ours %lld) -- "
+                                  "no comparison possible", m.tsf, my_tsf);
+                }
+                continue;
+            }
+            if (!sync_est_offset(&est, &est_offset)) {
+                continue;           /* estimator not ready yet; it will be */
             }
 
             const int64_t tsf_offset = (m.local - m.tsf) - (my_local - my_tsf);

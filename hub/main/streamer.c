@@ -1157,14 +1157,22 @@ static void probe_task(void *arg)
          */
         const int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_AP);
         const int64_t now = esp_timer_get_time();
-        if (tsf == 0) {
-            /* A persistent zero here IS the result: SoftAP-side TSF is not
-             * exposed on this target and the experiment stops. Said once. */
-            static bool told;
-            if (!told) {
-                told = true;
+        /* Say which way it went, once, either way. Silence here would leave a
+         * run with no TSF output ambiguous between "not supported" and "this
+         * board is not running the branch". */
+        static bool told;
+        if (!told) {
+            told = true;
+            if (tsf == 0) {
+                /* A persistent zero here IS the result: SoftAP-side TSF is not
+                 * exposed on this target and the experiment stops. */
                 ESP_LOGW(TAG, "TSF reads 0 on the AP interface -- nothing to compare");
+            } else {
+                ESP_LOGW(TAG, "TSF on the AP interface reads %lld us, sending to "
+                              "satellites", tsf);
             }
+        }
+        if (tsf == 0) {
             continue;
         }
         tsf_msg_t tm = { .type = MSG_TSF, .tsf = tsf, .local = now };
