@@ -190,6 +190,21 @@ static volatile uint32_t hw_drift;
  * that much should be sitting here waiting. */
 #define RING_TARGET_MS 200
 
+/*
+ * TEMPORARY: does i2s_channel_disable() discard the DMA descriptors or drain
+ * them? The depth is already on the OUTPUT line at boot; only this is unknown,
+ * and the two answers predict opposite signs for the phase step a retune
+ * causes. A discard leaves the descriptors empty, so writes return without
+ * blocking until they refill; a drain leaves nothing to refill. Count the
+ * frames that go in before the first write that blocks.
+ *
+ * Play task only -- it arms and clears these, so no volatile. Delete once the
+ * question is settled.
+ */
+#define REFILL_FAST_US 1000     /* below this, the write did not block */
+static bool    s_refill_active;
+static int32_t s_refill_frames;
+
 /* ------------------------------------------------------------------- wifi */
 
 /*
@@ -321,6 +336,11 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
 static void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* One descriptor per chunk, so a write never spans two and the disable
+     * waits at most one descriptor period for it. See the hub's copy for the
+     * mechanism; both units must carry it, because this also sets the output
+     * pipeline latency the servo absorbs at startup. */
+    chan_cfg.dma_frame_num = AUDIO_FRAMES;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -344,11 +364,22 @@ static void i2s_start(uint32_t rate)
 static void dac_write(const uint8_t *pcm, size_t bytes)
 {
     size_t written = 0;
+    const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
     /* Second line of defence behind the `retuning` park: a failed write does
      * NOT block, so ignoring it lets this task spin through the ring at memory
      * speed. That is what a retune used to cost. */
     if (i2s_channel_write(i2s_tx, pcm, bytes, &written, portMAX_DELAY) != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    if (s_refill_active) {
+        if (esp_timer_get_time() - w0 < REFILL_FAST_US) {
+            s_refill_frames += (int32_t)(written / (AUDIO_CHANNELS * sizeof(int16_t)));
+        } else {
+            s_refill_active = false;
+            ESP_LOGW(TAG, "REFILL: %ld frames (%ld ms) before a write blocked",
+                     (long)s_refill_frames,
+                     (long)(s_refill_frames * 1000 / (int32_t)stream_rate));
+        }
     }
 }
 #endif
@@ -1123,13 +1154,25 @@ static void play_task(void *arg)
          * aligning to a guess. */
         int32_t anchor_pos = 0;
         int64_t anchor_due = 0;
+        /* When the DAC last accepted a chunk -- what the phase reading is dated
+         * against. See the hub's copy for why it is not a clock read taken in
+         * the phase loop. Seeded so the first pass has a sane value. */
+        int64_t wrote_at = esp_timer_get_time();
+
+        bool was_retuning = false;
 
         while (1) {
             if (retuning) {
                 /* Do not pull from the ring while the channel is down -- the
                  * writes would return instantly and drain it. */
+                was_retuning = true;
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
+            }
+            if (was_retuning) {         /* TEMPORARY: see REFILL_FAST_US */
+                was_retuning = false;
+                s_refill_active = true;
+                s_refill_frames = 0;
             }
             hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -1169,7 +1212,11 @@ static void play_task(void *arg)
                 if (overshoot > (int32_t)AUDIO_FRAMES) {
                     overshoot = (int32_t)AUDIO_FRAMES;
                 }
-                int64_t now_master = esp_timer_get_time() + stream_offset
+                /* Dated from when the DAC last took a chunk, not from a clock
+                 * read here -- the write is the only DAC-paced event in this
+                 * loop, and everything between it and this line is unpaced.
+                 * See the hub's copy, which is where that mattered. */
+                int64_t now_master = wrote_at + stream_offset
                                    - (int64_t)overshoot * 1000000 / stream_rate;
                 int64_t err = now_master - due;
                 /*
@@ -1192,15 +1239,19 @@ static void play_task(void *arg)
                     timeline_changed = true;
                     break;
                 }
-                phase_err_us = (int32_t)err;
-                phase_valid = true;
+                /* The first reading after a retune is a transient -- logged,
+                 * then thrown away rather than handed to the servo. See the
+                 * hub's copy for what the outage figure actually covers and
+                 * for the bench numbers that came off this unit. */
                 if (retune_watch) {
                     retune_watch = false;
-                    ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+ld us (net %+ld), "
-                                  "channel was down %lld us",
-                             (long)retune_phase_before, (long)phase_err_us,
-                             (long)(phase_err_us - retune_phase_before),
+                    ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+lld us (net %+lld), "
+                                  "channel was down %lld us -- withheld from the servo",
+                             (long)retune_phase_before, err, err - retune_phase_before,
                              retune_outage_us);
+                } else {
+                    phase_err_us = (int32_t)err;
+                    phase_valid = true;
                 }
                 /* Keep the last point: interpolating from it labels each chunk
                  * with the instant it is DUE. Every unit gets the same play_at
@@ -1322,6 +1373,9 @@ static void play_task(void *arg)
                 ? anchor_due + (int64_t)(samples_played - anchor_pos) * 1000000 / stream_rate
                 : 0;
             write_audio(chunk, sizeof(chunk), due);
+            /* Immediately: it is the instant the next pass dates its phase
+             * reading from. */
+            wrote_at = esp_timer_get_time();
         }
     }
 }

@@ -874,6 +874,21 @@ static void marker_start(void)
 static void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    /*
+     * One descriptor per chunk, so a write never spans two.
+     *
+     * i2s_channel_disable() waits for the in-flight write to release the DMA
+     * queue, and a write that needs a second descriptor waits a second
+     * descriptor period for it. At the default 240 against AUDIO_FRAMES of 256
+     * every single write needed two, which is most of why this unit's retunes
+     * were down 2-18 ms against the satellite's 2-6. Matching them makes the
+     * worst case one period.
+     *
+     * Both units must carry this: it also sets the output pipeline latency the
+     * servo absorbs at startup, and unequal depths park them at different
+     * standing offsets.
+     */
+    chan_cfg.dma_frame_num = AUDIO_FRAMES;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -1013,6 +1028,13 @@ static void local_play_task(void *arg)
          * aligning to a guess. */
         int32_t anchor_pos = 0;
         int64_t anchor_due = 0;
+        /*
+         * When the DAC last accepted a chunk -- the reference the phase reading
+         * is dated against. See the note in the phase loop for why it is not a
+         * clock read taken there. Seeded here so the first pass, before any
+         * write has happened, has a sane value rather than zero.
+         */
+        int64_t wrote_at = esp_timer_get_time();
 
         while (1) {
             if (retuning) {
@@ -1071,17 +1093,66 @@ static void local_play_task(void *arg)
                 if (overshoot > AUDIO_FRAMES) {
                     overshoot = AUDIO_FRAMES;
                 }
-                const int64_t crossed_at = esp_timer_get_time()
+                /*
+                 * Dated from when the DAC last took a chunk, not from a clock
+                 * read here.
+                 *
+                 * samples_played describes audio handed to the DAC by the write
+                 * at the END of the previous pass, and that write is the only
+                 * DAC-paced event in this loop -- the same pacing the overshoot
+                 * correction above already rests on. Everything between it and
+                 * this line is not paced by anything: the ring receive, and
+                 * whatever preemption a board also running Bluetooth, a SoftAP,
+                 * SBC decode and the bridge UART hands out. Reading the clock
+                 * here folds all of it into the measurement, uncorrelated pass
+                 * to pass, which is the shape of the +-20 ms scatter
+                 * docs/clock-sync.md §9 lists as unexplained -- two reads of
+                 * s_phase_err_us a millisecond apart differing by 15.7 ms.
+                 *
+                 * The satellite carries the same change for symmetry, but it is
+                 * not where the problem was: its load is a fraction of this
+                 * one's and its readings were always the quiet ones.
+                 */
+                const int64_t crossed_at = wrote_at
                                          - (int64_t)overshoot * 1000000 / sample_rate;
-                s_phase_err_us = (int32_t)(crossed_at - s_phase_q[s_phase_tail].play_at);
-                s_phase_valid = true;
+                const int32_t err = (int32_t)(crossed_at - s_phase_q[s_phase_tail].play_at);
+                /*
+                 * The first reading after a retune is a transient, so it is
+                 * logged and thrown away rather than handed to the servo.
+                 *
+                 * What a retune actually costs is not what the outage figure
+                 * suggests. i2s_channel_disable() sets the channel state, then
+                 * blocks on the same binary semaphore i2s_channel_write() holds
+                 * across a portMAX_DELAY wait for a DMA descriptor -- and only
+                 * calls handle->stop() after that. So the audio keeps playing
+                 * for most of the reported outage. What stops is this task:
+                 * samples_played freezes while the DMA drains and real time
+                 * advances, and the next crossing reads that gap as position
+                 * error. It is not one. The buffer refills over the following
+                 * few writes and the position comes back on its own.
+                 *
+                 * Measured on the satellite bench, 19 same-rate retunes: net
+                 * +4.4 ms against a 3.6 ms outage, every one positive, and the
+                 * crossing landing 1-22 ms after the retune -- inside the
+                 * refill every time. The servo took each of those as a real
+                 * error and trimmed the rate for it, so every retune injected
+                 * the disturbance the next one would correct. That is what
+                 * pinned the trim at RATE_TRIM_MAX_HZ and ran phase to +500 ms.
+                 *
+                 * Only the first crossing is withheld. If the transient turns
+                 * out to outlast it, the REFILL line says so -- a reading taken
+                 * before the refill completes is the one to distrust.
+                 */
                 if (s_retune_watch) {
                     s_retune_watch = false;
                     ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+ld us (net %+ld), "
-                                  "channel was down %lld us",
-                             (long)s_retune_phase_before, (long)s_phase_err_us,
-                             (long)(s_phase_err_us - s_retune_phase_before),
+                                  "channel was down %lld us -- withheld from the servo",
+                             (long)s_retune_phase_before, (long)err,
+                             (long)(err - s_retune_phase_before),
                              s_retune_outage_us);
+                } else {
+                    s_phase_err_us = err;
+                    s_phase_valid = true;
                 }
                 /* Keep the last point: interpolating from it labels each chunk
                  * with the instant it is DUE, which every unit agrees on because
@@ -1233,6 +1304,9 @@ static void local_play_task(void *arg)
                                   portMAX_DELAY) != ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
+            /* Immediately, and before anything else can delay this task: it is
+             * the instant the next pass dates its phase reading from. */
+            wrote_at = esp_timer_get_time();
         }
     }
 }
