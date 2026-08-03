@@ -1145,6 +1145,30 @@ static void probe_task(void *arg)
         msg.t2 = t2;
         msg.t3 = esp_timer_get_time();              /* stamp immediately before send */
         sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&from, from_len);
+
+        /*
+         * Measurement only -- see tsf_msg_t. Sent on the back of the probe
+         * reply because that already runs once per satellite per probe and
+         * needs no task, no client snapshot and no timer of its own. 17 bytes
+         * four times a second against ~42 kB/s of audio.
+         *
+         * The pair is read as close together as it can be: the gap between them
+         * is skew that lands directly in the comparison.
+         */
+        const int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_AP);
+        const int64_t now = esp_timer_get_time();
+        if (tsf == 0) {
+            /* A persistent zero here IS the result: SoftAP-side TSF is not
+             * exposed on this target and the experiment stops. Said once. */
+            static bool told;
+            if (!told) {
+                told = true;
+                ESP_LOGW(TAG, "TSF reads 0 on the AP interface -- nothing to compare");
+            }
+            continue;
+        }
+        tsf_msg_t tm = { .type = MSG_TSF, .tsf = tsf, .local = now };
+        sendto(sock, &tm, sizeof(tm), 0, (struct sockaddr *)&from, from_len);
     }
 }
 

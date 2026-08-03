@@ -36,6 +36,7 @@ typedef enum {
     MSG_AUDIO    = 4,   /* master -> listeners */
     MSG_META     = 5,   /* master -> listeners, track metadata */
     MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
+    MSG_TSF      = 7,   /* master -> satellite, measurement only, see tsf_msg_t */
 } msg_type_t;
 
 /*
@@ -63,6 +64,36 @@ typedef struct __attribute__((packed)) {
     uint8_t type;
     int64_t play_at;  /* master clock, microseconds */
 } blink_msg_t;
+
+/*
+ * The master's 802.11 TSF against its own clock. MEASUREMENT ONLY -- nothing
+ * reads it but a log line, and the probe estimator continues to drive every
+ * anchor, offset and splice.
+ *
+ * TSF is the WiFi MAC's own microsecond counter. The AP maintains it, every
+ * beacon carries it, and each associated station's MAC hardware timestamps the
+ * beacon on arrival and slaves its local copy to it. That hardware timestamp is
+ * what real PTP relies on and what a software stamp either side of a sendto()
+ * cannot provide -- everything between "read the clock" and "the frame left"
+ * lands in the error budget, and that path asymmetry is the estimator's floor
+ * (see docs/clock-sync.md §2).
+ *
+ * With TSF there is no round trip to be asymmetric. Each unit relates its OWN
+ * TSF to its OWN esp_timer, and since both TSFs track the same AP counter:
+ *
+ *     offset = (master_local - master_tsf) - (sat_local - sat_tsf)
+ *
+ * The two reads on each side are not atomic, so a few microseconds of skew is
+ * inherent. That is far below what this is trying to distinguish.
+ *
+ * Zero means the interface is not associated or has not yet seen a beacon; the
+ * sender skips it and the receiver ignores it.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t type;      /* MSG_TSF */
+    int64_t tsf;       /* esp_wifi_get_tsf_time(WIFI_IF_AP) */
+    int64_t local;     /* esp_timer_get_time(), read adjacently */
+} tsf_msg_t;
 
 /*
  * What a satellite corrected at a track boundary, reported so the master can

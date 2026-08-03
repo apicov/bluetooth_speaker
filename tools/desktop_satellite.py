@@ -57,6 +57,10 @@ MSG_TIME_REQ = 1
 MSG_TIME_RSP = 2
 MSG_AUDIO = 4
 MSG_META = 5
+# Master's 802.11 TSF against its own clock, sent to anything that probes.
+# Measurement traffic for the ESP32 satellites; nothing here wants it, and it is
+# named only so it does not land in the malformed-packet count.
+MSG_TSF = 7
 AUDIO_FMT_PCM = 0
 AUDIO_FMT_SBC = 1
 
@@ -333,6 +337,9 @@ def main():
             desc = " - ".join(x for x in (artist, title) if x) or "(no metadata yet)"
             log(f"    {desc}" + (f"  [{album}]" if album else ""))
             continue
+
+        if data and data[0] == MSG_TSF:
+            continue                    # not ours; see MSG_TSF above
 
         if len(data) < HDR.size or data[0] != MSG_AUDIO:
             bad += 1

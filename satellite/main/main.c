@@ -552,6 +552,50 @@ static void rx_task(void *arg)
             const link_meta_t *m = (const link_meta_t *)((const meta_msg_t *)buf)->payload;
             ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
                      m->track_id, m->title, m->artist, m->album);
+        } else if (buf[0] == MSG_TSF && n >= (int)sizeof(tsf_msg_t)) {
+            /*
+             * Measurement only. Nothing below feeds anchoring, stream_offset,
+             * track_offset() or any splice -- the probe estimator still drives
+             * all of it. If TSF turns out to be garbage, audio is unaffected.
+             *
+             * The comparison: both units relate their own TSF to their own
+             * esp_timer, and because both TSFs track the same AP counter the
+             * difference of those two deltas is the clock offset -- with no
+             * round trip in it, so no path asymmetry (see tsf_msg_t).
+             */
+            tsf_msg_t m;
+            memcpy(&m, buf, sizeof(m));
+
+            const int64_t my_tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
+            const int64_t my_local = esp_timer_get_time();
+            int64_t est_offset;
+            if (m.tsf == 0 || my_tsf == 0 || !sync_est_offset(&est, &est_offset)) {
+                continue;           /* not associated, no beacon yet, or no estimate */
+            }
+
+            const int64_t tsf_offset = (m.local - m.tsf) - (my_local - my_tsf);
+
+            /* Rate-limited: probes arrive 4/s and the interesting quantity is
+             * how much each method MOVES, not its value at 4 Hz. */
+            static int64_t last_log_us;
+            static int64_t prev_tsf, prev_est;
+            if (my_local - last_log_us < 2000000) {
+                continue;
+            }
+            const int64_t tsf_step = last_log_us ? tsf_offset - prev_tsf : 0;
+            const int64_t est_step = last_log_us ? est_offset - prev_est : 0;
+            last_log_us = my_local;
+            prev_tsf = tsf_offset;
+            prev_est = est_offset;
+
+            /* The steps are the point. The estimator swings several ms sample
+             * to sample; if TSF has a hardware advantage its step should be
+             * microseconds -- beacons are 102.4 ms apart and the local counter
+             * free-runs at ~14 ppm between them, so ~1.4 us of drift. */
+            ESP_LOGW(TAG, "TSF: est %+lld us | tsf %+lld us | diff %+lld us | "
+                          "steps tsf %+lld us, est %+lld us",
+                     est_offset, tsf_offset, tsf_offset - est_offset,
+                     tsf_step, est_step);
         } else if (buf[0] == MSG_AUDIO && n >= (int)AUDIO_MSG_BYTES(0)) {
             handle_audio((const audio_msg_t *)buf);
         }
