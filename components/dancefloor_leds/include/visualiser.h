@@ -17,6 +17,70 @@
 extern "C" {
 #endif
 
+/* Mirrors df::BEAT_BANDS and df::SPEC_BINS, which are C++ and cannot be seen
+ * from here. visualiser.cpp static_asserts that they still agree. */
+#define VIS_BANDS      4
+#define VIS_SPEC_BINS 64
+
+/*
+ * One analysis frame, in the form that can leave the unit that computed it.
+ *
+ * This is df::Frame minus the one field that cannot travel -- `mag`, 512 floats
+ * pointing into an Analysis -- and with the spectrum in its reduced form. 123
+ * bytes, so a stream of these at 43 Hz is ~5 kB/s against the 30-40 the audio
+ * already uses on the same radio.
+ *
+ * Deliberately declared here and not in sync_proto.h. This component does not
+ * depend on the audio protocol and must stay buildable on its own; the unit
+ * that transports a frame is the one that knows how, and copies these bytes
+ * into whatever message it sends. Packed for the same reason -- the two ends
+ * may not be the same build.
+ *
+ * A unit fed these instead of computing them cannot tell the difference from a
+ * pattern's point of view, which is the whole purpose: the algorithm runs in
+ * one place, so no algorithm has to be proved deterministic across units to
+ * stay in sync.
+ */
+typedef struct __attribute__((packed)) {
+    int64_t due_us;         /* master-clock instant this frame describes */
+    int64_t index;          /* block number, from an origin all units share */
+    float   band[VIS_BANDS];
+    float   flux;
+    float   threshold;
+    float   strength;
+    float   boom_strength;
+    float   boom_flux;
+    float   boom_threshold;
+    uint8_t onset;
+    uint8_t boom;
+    uint8_t unit;           /* which speaker computed it; 0 is the hub */
+    uint8_t spec[VIS_SPEC_BINS];
+} vis_frame_t;
+
+/*
+ * Called with every frame this unit computes, if set.
+ *
+ * For a unit that sends its frames to others. Runs on the analysis task, so it
+ * must not block -- hand the bytes to a queue or a socket and return.
+ * Registering nothing, which is the default, simply publishes nothing.
+ */
+void visualiser_set_publish(void (*publish)(const vis_frame_t *f));
+
+/*
+ * Hand this unit a frame computed somewhere else.
+ *
+ * Goes into the same queue local analysis fills and is drawn at the instant it
+ * names, so the two sources are interchangeable by construction. Safe from any
+ * task. Ignored unless this unit is built to take frames from elsewhere -- see
+ * CONFIG_DANCEFLOOR_LED_SOURCE -- because a unit doing its own analysis and
+ * also accepting somebody else's would draw two timelines at once.
+ */
+void visualiser_submit_frame(const vis_frame_t *f);
+
+/* Whether this unit computes its own frames or is given them. Reportable, so a
+ * mixed floor is a fact in the log rather than a puzzle. */
+const char *visualiser_source_name(void);
+
 /* Brings up the strip and starts the analysis and render tasks. Call once. */
 void visualiser_start(void);
 

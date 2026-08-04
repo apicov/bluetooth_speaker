@@ -336,6 +336,83 @@ std::atomic<uint32_t> s_render_sum, s_render_max, s_render_n;
  */
 std::atomic<int64_t (*)(int64_t)> s_to_local{nullptr};
 
+/* Set on a unit that sends its frames onward. Null publishes nothing. */
+std::atomic<void (*)(const vis_frame_t *)> s_publish{nullptr};
+
+/* BEAT_BANDS is a macro from beat_detect.h, not a df:: member. */
+static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
+static_assert(VIS_SPEC_BINS == df::SPEC_BINS, "wire frame and spectrum disagree");
+
+/* df::Frame -> the form that can leave this unit. mag is the only field with
+ * nowhere to go; everything else is a copy. */
+void to_wire(const df::Frame &f, vis_frame_t *w)
+{
+    w->due_us = f.due_us;
+    w->index  = f.index;
+    std::memcpy(w->band, f.band, sizeof(w->band));
+    std::memcpy(w->spec, f.spec, sizeof(w->spec));
+    w->flux           = f.flux;
+    w->threshold      = f.threshold;
+    w->strength       = f.strength;
+    w->boom_strength  = f.boom_strength;
+    w->boom_flux      = f.boom_flux;
+    w->boom_threshold = f.boom_threshold;
+    w->onset = f.onset ? 1 : 0;
+    w->boom  = f.boom ? 1 : 0;
+    w->unit  = f.unit;
+}
+
+/* ... and back. mag stays null: it did not travel and a Pattern cannot read it
+ * on a locally analysed frame either, since rendering is deferred.
+ *
+ * Only compiled where frames are taken from elsewhere -- a unit doing its own
+ * analysis never converts one back. */
+#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+void from_wire(const vis_frame_t *w, df::Frame &f)
+{
+    f.due_us = w->due_us;
+    f.index  = w->index;
+    std::memcpy(f.band, w->band, sizeof(f.band));
+    std::memcpy(f.spec, w->spec, sizeof(f.spec));
+    f.mag            = nullptr;
+    f.flux           = w->flux;
+    f.threshold      = w->threshold;
+    f.strength       = w->strength;
+    f.boom_strength  = w->boom_strength;
+    f.boom_flux      = w->boom_flux;
+    f.boom_threshold = w->boom_threshold;
+    f.onset = w->onset != 0;
+    f.boom  = w->boom != 0;
+    f.unit  = w->unit;
+}
+#endif
+
+/*
+ * Put a frame in the queue for the instant it names.
+ *
+ * One path for both sources, so a frame taken from the radio and a frame
+ * computed here are treated identically from this point on -- which is what
+ * makes them interchangeable rather than merely similar.
+ *
+ * Dropping the newest when full is deliberate. Evicting the oldest would
+ * discard a frame about to be due in order to keep one that is not, so a strip
+ * already behind skips forward instead of catching up.
+ */
+bool enqueue(const df::Frame &f)
+{
+    const uint32_t head = s_fq_head.load(std::memory_order_relaxed);
+    const uint32_t tail = s_fq_tail.load(std::memory_order_acquire);
+    if (head - tail >= FRAME_RING) {
+        bump(s_overrun);
+        return false;
+    }
+    s_fq[head % FRAME_RING] = f;
+    /* Release, against the acquire on the reader: the frame must be fully
+     * written before the index that publishes it moves. */
+    s_fq_head.store(head + 1, std::memory_order_release);
+    return true;
+}
+
 /*
  * How early is close enough to draw now rather than sleep again.
  *
@@ -498,17 +575,18 @@ void visualiser_task(void *arg)
          * not keeping pace, and the honest response is to stop adding to its
          * backlog.
          */
-        {
-            const uint32_t head = s_fq_head.load(std::memory_order_relaxed);
-            const uint32_t tail = s_fq_tail.load(std::memory_order_acquire);
-            if (head - tail >= FRAME_RING) {
-                bump(s_overrun);
-            } else {
-                s_fq[head % FRAME_RING] = f;
-                /* Release, against the acquire on the reader: the frame must be
-                 * fully written before the index that publishes it moves. */
-                s_fq_head.store(head + 1, std::memory_order_release);
-            }
+        enqueue(f);
+
+        /*
+         * Onward, if anything is listening. After the local queue, so this
+         * unit's own strip never waits on a radio, and outside it, so a send
+         * that fails costs a neighbour a frame rather than costing this unit
+         * one too.
+         */
+        if (const auto publish = s_publish.load(std::memory_order_relaxed)) {
+            vis_frame_t w;
+            to_wire(f, &w);
+            publish(&w);
         }
         {
             const int64_t a = t_analysed - t_in;
@@ -707,6 +785,43 @@ void visualiser_set_clock(int64_t (*master_to_local)(int64_t))
     s_to_local.store(master_to_local, std::memory_order_relaxed);
 }
 
+void visualiser_set_publish(void (*publish)(const vis_frame_t *))
+{
+    s_publish.store(publish, std::memory_order_relaxed);
+}
+
+void visualiser_submit_frame(const vis_frame_t *f)
+{
+#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+    if (!f) {
+        return;
+    }
+    df::Frame local;
+    from_wire(f, local);
+    if (enqueue(local)) {
+        bump(s_frames);
+        if (local.onset) bump(s_onsets);
+        if (local.boom) bump(s_booms);
+    }
+#else
+    /*
+     * Ignored, and silently, because it is configuration rather than a fault: a
+     * unit doing its own analysis has a complete timeline already, and drawing
+     * somebody else's alongside it would interleave two.
+     */
+    (void)f;
+#endif
+}
+
+const char *visualiser_source_name(void)
+{
+#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+    return "remote";
+#else
+    return "local";
+#endif
+}
+
 void visualiser_flush(void)
 {
     /* Release, so everything the caller did to establish the new timeline is
@@ -716,6 +831,13 @@ void visualiser_flush(void)
 
 void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
 {
+    /*
+     * Null on a unit built to take frames from elsewhere -- no stream buffer is
+     * created and no analysis task runs, so audio handed here has nothing to be
+     * handed to. Callers are not conditionalised on the source: the audio path
+     * should not have to know, and the check was already here for the case
+     * where the visualiser is disabled entirely.
+     */
     if (!pcm_stream) {
         return;
     }
@@ -846,10 +968,12 @@ void visualiser_set_pattern(const char *name)
 
 void visualiser_start(void)
 {
+#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
     /* Trigger level is one full analysis frame: waking the task for a handful
      * of bytes at a time is pure overhead now that partial reads accumulate. */
     pcm_stream = xStreamBufferCreate(STREAM_BYTES, FFT_N * CHANNELS * sizeof(int16_t));
     assert(pcm_stream);
+#endif
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
     {
@@ -902,9 +1026,14 @@ void visualiser_start(void)
      * busy, a frame drawn on time from slightly stale analysis beats a frame
      * drawn late from fresh analysis, and only one of the two is visible.
      */
+#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
     xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1);
+#endif
     xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1);
-    ESP_LOGI(TAG, "started: %lu LEDs on GPIO %d at %d%% brightness, pattern %s",
+    /* The source is on this line because an unintended mismatch across a floor
+     * is the expensive bug, and two consoles side by side should settle it. */
+    ESP_LOGW(TAG, "started: %lu LEDs on GPIO %d at %d%% brightness, pattern %s, "
+                  "frames %s",
              LED_COUNT, CONFIG_DANCEFLOOR_LED_GPIO, CONFIG_DANCEFLOOR_LED_BRIGHTNESS,
-             pattern ? pattern->name() : "none");
+             pattern ? pattern->name() : "none", visualiser_source_name());
 }
