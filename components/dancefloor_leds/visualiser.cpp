@@ -167,7 +167,24 @@ constexpr LedStrip::Type STRIP_TYPE = LedStrip::Type::WS2812;
 
 StreamBufferHandle_t pcm_stream;
 std::optional<LedStrip> strip;
+/*
+ * Not built where nothing analyses.
+ *
+ * process() is only ever called from visualiser_task, which such a unit does not
+ * run -- so no FFT and no detector has ever executed there. What did happen is
+ * that the object was defined anyway, reserving the whole window-sized state in
+ * .bss for the entire uptime: buf_ 8 kB, win_ 4 kB, mag_ 2 kB, plus the band and
+ * spectrum tables, two detectors and a Frame. init() then filled a Hann window
+ * and derived band edges at boot for something that would never be asked
+ * anything.
+ *
+ * Guarded on the capability rather than on the source option, so it stays right
+ * for a unit that is given a spectrum and runs its own detector on it: that unit
+ * needs the detectors and still has no use for any of this.
+ */
+#if DF_ANALYSES_AUDIO
 df::Analysis analysis;
+#endif
 
 /*
  * The rate of the audio being fed, which is whatever the source chose.
@@ -1213,10 +1230,12 @@ void visualiser_start(void)
     }
 #endif
 
+#if DF_ANALYSES_AUDIO
     /* Whatever has been set by now, which is the default unless the stream was
      * already running when this was called. Either way the task re-inits if it
      * changes. */
     analysis.init(static_cast<int>(s_rate.load(std::memory_order_relaxed)));
+#endif
 
     /* Configured name if it resolves, first pattern otherwise. A typo should
      * cost a line in the log, not a dark floor. */
