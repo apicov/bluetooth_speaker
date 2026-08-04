@@ -45,11 +45,16 @@ CONFIG_DANCEFLOOR_LED_HOP_512=y
 # None of the classic hub's numbers carry over except the marker. 23 and 25 do
 # not exist on this part; 26 and 27 do, but are wired to the SPI flash.
 #
-# On the Sense variant the camera, PDM microphone and SD slot hang off the B2B
-# connector on GPIOs that are not broken out, so they take nothing from this
-# list -- but they also give nothing to it. Every one of them is dead weight for
-# a hub, which analyses the synchronised stream and deliberately never listens
-# to a room (architecture.md S12).
+# On the Sense variant the camera and PDM microphone hang off the B2B connector
+# on GPIOs that are not broken out (the mic is 42/41), so they take nothing from
+# this list. The SD slot may: it is reportedly on the same D8/D9/D10 SPI pads
+# the I2S output uses below, with GPIO 21 for CS. Unverified against the
+# schematic, and irrelevant unless you want the card -- but do not assume the
+# two coexist without checking.
+#
+# None of it gives anything either. Every one of them is dead weight for a hub,
+# which analyses the synchronised stream and deliberately never listens to a
+# room (architecture.md S12).
 
 # I2S to the PCM5102A, on the three SPI-labelled pads so the DAC is one ribbon
 # off the end of the header. This chip is the I2S master.
@@ -76,11 +81,19 @@ CONFIG_DANCEFLOOR_LED_GPIO=1
 #
 # The marker stays at 4 (D3), which is the one number that survived the move.
 # The monitor default is 5 (D4), set in main/Kconfig.projbuild where it cannot
-# be dropped. Same trap applies to DANCEFLOOR_LED_MARKER_GPIO, which lives in
-# the shared components/dancefloor_leds/Kconfig and is left alone: if you turn
-# the LED marker on, set its pin to 21 by hand, and expect it to read INVERTED
-# against every other unit, because the onboard LED here is active low and the
-# driver does not know that.
+# be dropped.
+#
+# DANCEFLOOR_LED_MARKER_GPIO lives in the shared components/dancefloor_leds/
+# Kconfig and needs nothing here either. Its default is 2, which on this board
+# is pad D1 -- free, not a strapping pin, and in range. Wire an LED and a 330 R
+# resistor to ground there.
+#
+# Do NOT point it at 21. That is documented as the onboard user LED and this
+# file used to recommend it; it has since been seen not to light at all. Two
+# candidate reasons, neither confirmed: the LED may not be on 21 on every board
+# revision, and 21 is also the pin the Sense's SD slot reportedly uses for CS.
+# It is active low as well, so even working it would read inverted against every
+# other unit. An external LED on D1 avoids all three questions.
 
 # ---------------------------------------------------------------------------
 # Carried over, but NOT carried over on evidence

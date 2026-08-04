@@ -102,10 +102,15 @@ menu "Dancefloor LEDs"
               GPIO 22  some Heltec boards. This used to say 22 was the hub's
                        SBC UART TX and so satellite-only; it is not any more.
                        The link is one-way and the hub names no TX pin.
-              GPIO 21  XIAO ESP32-S3 -- but it is ACTIVE LOW there and this
-                       driver does not know that, so it reads inverted against
-                       every other unit: one gap per second, not one flash.
               none     official Espressif ESP32-DevKitC has only a power LED
+              none     XIAO ESP32-S3 in practice. Its onboard LED is documented
+                       as GPIO 21 and did not light when pointed at. Unresolved,
+                       and there are three candidate reasons: the pin may differ
+                       by board revision, the Sense's SD slot reportedly uses 21
+                       for CS, and it is active low anyway -- so even working it
+                       would read inverted against every other unit, one gap per
+                       second rather than one flash. Wire an external LED to pad
+                       D1, which is GPIO 2 and so already this default.
 
             With no usable onboard LED, wire one to any free pin through a
             resistor, or point this at a pin you can watch on a scope. Taken

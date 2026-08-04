@@ -99,6 +99,48 @@ I sbc_in:  pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 dec 0
 Nothing arrives at all until a phone connects and plays, so `pkts 0` before that
 is expected rather than a fault.
 
+### The PCM5102A DAC
+
+Every unit drives its own DAC — the hub is a full speaker, not a base station —
+and in every case **the ESP32 is the I2S master**, generating the clocks the DAC
+follows.
+
+| PCM5102A | classic hub | classic satellite | S3 hub (`hub_s3/`) |
+|---|---|---|---|
+| BCK | GPIO 26 | GPIO 26 | **GPIO 7**, pad `D8` |
+| LRCK | GPIO 27 | GPIO 27 | **GPIO 8**, pad `D9` |
+| DIN | GPIO 25 | GPIO 25 | **GPIO 9**, pad `D10` |
+| VIN | 3V3 | 3V3 | 3V3 |
+| GND | GND | GND | GND |
+| SCK | GND | GND | GND |
+
+There is no S3 satellite build. If you make one, the pins above are what it
+would take — `hub_s3/` and `satellite/` read the same three Kconfig symbols.
+
+Four things that are not obvious from the table:
+
+- **`XSMT` must be high or the DAC stays silently muted.** No error, no log line,
+  no sound. This is the first thing to check.
+- **`SCK` goes to ground.** The PCM5102A derives its own internal clock, and the
+  firmware sets `mclk = I2S_GPIO_UNUSED` to match. It is not a pin you wire.
+- **GPIO 25 is also the bridge's UART TX**, and that is not a conflict — those
+  are different chips. It only looks alarming when both pin maps are on one page.
+- **The S3's pads are not fixed.** S3 I2S routes through the GPIO matrix, so any
+  of the eleven work; all three are `menuconfig` values under *Dancefloor hub*.
+  They sit on the SPI-labelled pads so the DAC is one ribbon off the end of the
+  header.
+
+A satellite can run with **no DAC at all** for bring-up:
+`DANCEFLOOR_USE_INTERNAL_DAC` plays through the ESP32's built-in converters on
+GPIO 25 (left) and 26 (right). They are 8-bit — 48 dB of dynamic range against
+96 — so quiet passages sit in obvious hiss, and it is a way to test a board with
+nothing wired rather than a way to listen. It is also **classic-ESP32 only**:
+the S3 has no internal DAC hardware, so an S3 unit needs the PCM5102A.
+
+> Nothing in this project has been heard through a real PCM5102A yet. M1–M3 were
+> marked complete on log output and on the desktop client's audio; the boards are
+> still to be wired. See `docs/architecture.md` §16.
+
 ### The NeoPixel strip
 
 Every unit drives its own strip — the hub is a full speaker, not a base station
@@ -164,7 +206,7 @@ audio, one measures light, and GPIO 21 swaps roles between the two hub builds:
 |---|---|---|---|
 | Audio marker | out | GPIO 4 | GPIO 4, pad `D3` |
 | Audio monitor | in | GPIO 21 | GPIO 5, pad `D4` |
-| LED marker | out | GPIO 2 | GPIO 21 |
+| LED marker | out | GPIO 2 | GPIO 2, pad `D1` |
 
 **The audio marker pair** (`DANCEFLOOR_ENABLE_MARKER`, under *Dancefloor hub*)
 measures how far apart two units' *audio* really is, at the speaker rather than
@@ -191,19 +233,28 @@ pin that is varies by board and cannot be detected:
 |---|---|
 | DOIT ESP32 DEVKIT V1, NodeMCU-32S, most WROOM-32 clones | GPIO 2 |
 | WEMOS/LOLIN D32, some TTGO | GPIO 5 |
-| XIAO ESP32-S3 | GPIO 21, **active low** |
 | Official Espressif ESP32-DevKitC | none — power LED only |
+| XIAO ESP32-S3 | none that works — see below |
 
 If the log says the marker fired and nothing lit, this is the setting to change.
 With no usable onboard LED, wire one to any free pin through a resistor, or
 point it at something you can watch on a scope.
 
-Two cautions. On the XIAO the onboard LED is **active low** and the driver does
-not know that, so it reads inverted against every other unit — one gap per
-second rather than one flash, which is still perfectly usable for "are they
-together" but will look wrong beside a classic board. And the setting's range
-stops at GPIO 33, so on the XIAO the free pads `D1`/`D2`/`D5` (GPIO 2/3/6) can
-take it but `D6` (GPIO 43) cannot.
+**On the XIAO, wire an external one.** Its onboard LED is documented as GPIO 21
+and does not light when pointed at, cause unresolved — the pin may differ by
+board revision, the Sense's SD slot reportedly uses 21 for CS, and it is active
+low regardless, so even working it would read inverted against every other unit.
+Pad `D1` is free and is GPIO 2, which is already this setting's default, so
+nothing needs configuring:
+
+```
+  GPIO 2 (D1) ──[330 Ω]──▶ LED ──▶ GND
+```
+
+The other free pads are `D2` (GPIO 3, a strapping pin — JTAG source select),
+`D5` (GPIO 6) and `D6` (GPIO 43, the ROM UART0 TX, which can glitch at boot).
+`D6` cannot take this setting anyway: the range stops at GPIO 33, since 34–39 on
+a classic ESP32 are input-only and cannot drive anything.
 
 The eye resolves maybe 10–20 ms and a 240 fps phone camera about 4 ms, so this
 answers "are they together", not "by how much". The numbers live in `AUDIO SYNC`

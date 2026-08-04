@@ -78,11 +78,16 @@ because a polarity flag in shared code wants a better reason than one board.
 
 ## What the Sense part contributes
 
-Nothing. The camera, PDM microphone and SD slot hang off the B2B connector on
-GPIOs that are not broken out, so they take nothing from the map above — but a
-hub analyses the synchronised stream and deliberately never listens to a room
-(§12), so there is no use here for a microphone. The plain XIAO ESP32-S3 is the
-same board for this purpose.
+Nothing. The camera and PDM microphone hang off the B2B connector on GPIOs that
+are not broken out (the mic is 42/41), so they take nothing from the map above.
+The **SD slot may be a different matter** — it is reportedly wired to the same
+`D8`/`D9`/`D10` SPI pads the I2S output uses here, plus GPIO 21 for CS. That is
+unverified against the schematic and costs nothing unless you want the card, but
+check it before assuming the two can coexist.
+
+Either way there is no use here for a microphone: a hub analyses the
+synchronised stream and deliberately never listens to a room (§12). The plain
+XIAO ESP32-S3 is the same board for this purpose.
 
 The one piece of the board that *is* worth something: the u.FL connector and
 external antenna, on the unit that is the SoftAP in a field.
