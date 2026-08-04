@@ -82,7 +82,9 @@ constexpr int KICK_EVERY = df::RATE / 2;        /* 120 BPM */
  * the margin is wide, not because the arithmetic is rotation-independent.
  * Summing from the oldest entry rather than from index 0 would make it so.
  */
-constexpr int CONVERGE = 80;                    /* > BEAT_HIST (43) with room */
+/* Derived, not 80: BEAT_HIST is swept by `make HIST=...` and a fixed allowance
+ * would stop covering the history it exists to outlast. */
+constexpr int CONVERGE = BEAT_HIST * 2;
 
 uint32_t rng = 0x1234abcdu;
 float noise()

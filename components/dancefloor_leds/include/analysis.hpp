@@ -241,6 +241,20 @@ public:
     void set_boom_tuning(float k, float flux_floor, int64_t refractory_us);
 
     /*
+     * The same, for the wideband detector, and deliberately narrower: only the
+     * floor.
+     *
+     * BEAT_THRESHOLD_K is a macro private to beat_detect.c, so there is no value
+     * a caller could pass as the "leave it alone" fallback -- and it needs none,
+     * being provably invariant under a hop change: scaling flux scales the mean
+     * and the standard deviation with it. BEAT_HIST is an array length and is
+     * swept by rebuilding (`make HIST=`). The floor is the one of the three that
+     * is per-instance state and genuinely needs measuring, so it is the one with
+     * a setter.
+     */
+    void set_beat_floor(float flux_floor);
+
+    /*
      * `stereo` is exactly FFT_N interleaved 16-bit frames. The returned
      * reference is valid until the next call.
      *

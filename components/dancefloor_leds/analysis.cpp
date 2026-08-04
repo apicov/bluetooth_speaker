@@ -188,6 +188,11 @@ void Analysis::set_boom_tuning(float k, float flux_floor, int64_t refractory_us)
     boom_.refractory_us = refractory_us;
 }
 
+void Analysis::set_beat_floor(float flux_floor)
+{
+    beat_.flux_floor = flux_floor;
+}
+
 const Frame &Analysis::process(const int16_t *stereo, int64_t index,
                                int64_t due_us, uint8_t unit)
 {

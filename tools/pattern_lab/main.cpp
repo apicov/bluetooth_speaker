@@ -51,7 +51,9 @@ void usage()
         "  --boom-floor X   boom detector flux floor\n"
         "  --boom-k X       boom detector threshold, in std devs\n"
         "  --boom-refr MS   boom detector refractory period\n"
-        "                   any --boom-* left unset keeps the firmware's value\n");
+        "                   any --boom-* left unset keeps the firmware's value\n"
+        "  --beat-floor X   wideband detector flux floor (its k and history are\n"
+        "                   compile-time -- see BEAT_THRESHOLD_K and `make HIST=`)\n");
 }
 
 }  // namespace
@@ -63,6 +65,7 @@ int main(int argc, char **argv)
     bool tty = true, list = false;
     double speed = 1.0;
     double boom_floor = -1, boom_k = -1, boom_refr = -1;   /* <0 = leave alone */
+    double beat_floor = -1;
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -82,6 +85,7 @@ int main(int argc, char **argv)
         else if (a == "--boom-floor") boom_floor = std::stod(next("--boom-floor"));
         else if (a == "--boom-k")     boom_k = std::stod(next("--boom-k"));
         else if (a == "--boom-refr")  boom_refr = std::stod(next("--boom-refr"));
+        else if (a == "--beat-floor") beat_floor = std::stod(next("--beat-floor"));
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else if (a.rfind("--", 0) == 0) { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
         else wav_path = a;
@@ -139,6 +143,11 @@ int main(int argc, char **argv)
             boom_k     >= 0 ? float(boom_k)             : df::BOOM_THRESHOLD_K,
             boom_floor >= 0 ? float(boom_floor)         : df::BOOM_FLUX_FLOOR,
             boom_refr  >= 0 ? int64_t(boom_refr * 1000) : df::BOOM_REFRACTORY_US);
+    }
+    /* Nothing to fall back to here -- set_beat_floor touches only the floor, so
+     * an unset flag simply leaves init()'s BEAT_FLUX_FLOOR in place. */
+    if (beat_floor >= 0) {
+        analysis.set_beat_floor(float(beat_floor));
     }
     pattern->reset();
 

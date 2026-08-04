@@ -76,8 +76,16 @@ extern "C" {
  * Note the second axis above before deciding: this also sets how long a unit
  * that missed frames takes to agree with its neighbours again, so "adapts
  * faster" is a sync argument for the shorter window and not only a taste one.
+ *
+ * A command-line -DBEAT_HIST wins, which is what lets the host harness sweep it
+ * -- `make HIST=86` in tools/pattern_lab or components/dancefloor_leds/test.
+ * Unlike the flux floors this cannot be a runtime knob: it is the length of
+ * beat_det_t::hist below, and that struct is on the firmware's per-frame path
+ * and must be identical on every unit that runs a detector.
  */
-#define BEAT_HIST  43
+#ifndef BEAT_HIST
+#  define BEAT_HIST  43
+#endif
 
 /* Below this, flux is treated as silence rather than signal. Without it the
  * adaptive threshold collapses toward zero during quiet passages and fires on

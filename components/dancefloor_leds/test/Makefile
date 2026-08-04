@@ -16,6 +16,16 @@ CFLAGS   += -DDF_HOP_N=$(HOP)
 CXXFLAGS += -DDF_HOP_N=$(HOP)
 endif
 
+# The detector's flux history, for `make HIST=86 check`. Same both-flag rule as
+# the hop, and for a sharper reason: BEAT_HIST is the length of an array inside
+# beat_det_t, so a value that differed between the C and C++ halves would link
+# two disagreeing definitions of the same struct.
+HIST ?=
+ifneq ($(HIST),)
+CFLAGS   += -DBEAT_HIST=$(HIST)
+CXXFLAGS += -DBEAT_HIST=$(HIST)
+endif
+
 BINS := test_align test_pattern test_beat_detect test_fft test_pattern_sync
 
 test_align: test_align.c

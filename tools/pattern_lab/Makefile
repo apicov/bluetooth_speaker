@@ -25,6 +25,16 @@ ifneq ($(HOP),)
 CFLAGS   += -DDF_HOP_N=$(HOP)
 CXXFLAGS += -DDF_HOP_N=$(HOP)
 endif
+
+# The detector's flux history: `make clean && make HIST=86`. A rebuild rather
+# than a flag because BEAT_HIST is the length of an array inside beat_det_t --
+# the flux floors, which are per-instance fields, are --boom-floor/--beat-floor
+# instead. Both flag sets, or the C and C++ halves link disagreeing structs.
+HIST ?=
+ifneq ($(HIST),)
+CFLAGS   += -DBEAT_HIST=$(HIST)
+CXXFLAGS += -DBEAT_HIST=$(HIST)
+endif
 LDLIBS   := -lz -lm
 
 SRCS := main.cpp wav.cpp out_png.cpp out_tty.cpp $(LEDS)/analysis.cpp $(LEDS)/patterns.cpp
