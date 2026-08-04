@@ -134,7 +134,6 @@ menu "Dancefloor LEDs"
             on the same track, one of them is wrong about the music, and which
             one depends entirely on what is playing.
 
-endmenu
 
     choice DANCEFLOOR_LED_SOURCE
         prompt "Where this unit's analysis frames come from"
@@ -143,29 +142,26 @@ endmenu
             Frames are drawn at the instant they name, so a unit can be given
             them by another unit instead of computing its own and still stay in
             step with it.
-
             Mixing the two across a floor is intended, not a hazard: a unit on
             LOCAL runs its own analysis and can therefore run a different
             algorithm or react to something else entirely. What is guaranteed is
             narrower than "every strip agrees" -- it is that units taking frames
             from the same source render identically.
-
             An UNINTENDED mismatch is still the expensive bug, so the live
             source is printed at startup and carried in the HEALTH line.
-
     config DANCEFLOOR_LED_SOURCE_LOCAL
         bool "Local -- this unit analyses the audio it holds"
         help
             What every unit did before frames could travel. Costs an FFT and
             two detectors per frame, and gives the pattern the full spectrum.
-
     config DANCEFLOOR_LED_SOURCE_REMOTE
         bool "Remote -- this unit is given frames by the hub"
         help
             No FFT and no detectors run here; the analysis task is not even
             started. The strip follows the sending unit exactly, whatever
             algorithm it runs, because there is only one copy of the decision.
-
             Frame::mag is not available under this option -- it is 512 floats
             and does not travel. Patterns using spec[] work either way.
     endchoice
+
+endmenu

@@ -288,7 +288,7 @@ std::atomic<uint32_t> s_marginal;
 std::atomic<uint32_t> s_drifts;
 std::atomic<int32_t>  s_last_drift_us;
 
-uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
+[[maybe_unused]] [[maybe_unused]] uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
 void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
 
 /*
@@ -346,7 +346,11 @@ static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
 static_assert(VIS_SPEC_BINS == df::SPEC_BINS, "wire frame and spectrum disagree");
 
 /* df::Frame -> the form that can leave this unit. mag is the only field with
- * nowhere to go; everything else is a copy. */
+ * nowhere to go; everything else is a copy.
+ *
+ * Only compiled where frames are produced here -- a unit that is given them
+ * never converts one out. */
+#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
 void to_wire(const df::Frame &f, vis_frame_t *w)
 {
     w->due_us = f.due_us;
@@ -363,6 +367,7 @@ void to_wire(const df::Frame &f, vis_frame_t *w)
     w->boom  = f.boom ? 1 : 0;
     w->unit  = f.unit;
 }
+#endif
 
 /* ... and back. mag stays null: it did not travel and a Pattern cannot read it
  * on a locally analysed frame either, since rendering is deferred.
@@ -471,6 +476,9 @@ void show(const uint8_t *rgb)
     }
 }
 
+/* Not built at all on a unit that is given its frames: there is no audio to
+ * analyse there, and the FFT and detectors would be pure cost. */
+#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
 void visualiser_task(void *arg)
 {
     (void)arg;
@@ -668,6 +676,8 @@ void visualiser_task(void *arg)
     }
 }
 
+#endif  /* !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE */
+
 /*
  * Draw each frame at the instant it names.
  *
@@ -681,6 +691,9 @@ void render_task(void *arg)
     (void)arg;
     uint32_t seen_flush = s_fq_flush.load(std::memory_order_relaxed);
     int64_t  drawn_at = 0;      /* when the strip last showed something */
+#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+    int64_t  last_report_us = esp_timer_get_time();
+#endif
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
     int64_t last_sec = -1;
     int     lower_in = -1;
@@ -709,6 +722,35 @@ void render_task(void *arg)
             show(pixels);
         }
 
+#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+        /*
+         * The periodic line lives in the analysis task, which is not built on a
+         * unit that is given its frames -- so without this such a unit reports
+         * nothing at all, and the numbers that say whether frames are arriving
+         * are exactly the ones missing.
+         *
+         * Same cadence, and only the fields that mean anything here: no audio
+         * is being dropped, there is no block grid to re-align, and there is no
+         * analysis to time.
+         */
+        {
+            const int64_t now_us = esp_timer_get_time();
+            if (now_us - last_report_us >= LED_LOG_PERIOD_US) {
+                last_report_us = now_us;
+                const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
+                ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
+                              " | booms %" PRIu32 " | render %" PRIu32 "/%" PRIu32
+                              " us | queued %" PRIu32 " | late %" PRIu32
+                              " | overrun %" PRIu32 " | dark %" PRIu32 " | %s",
+                         take(s_frames), take(s_onsets), take(s_booms),
+                         rn ? rsum / rn : 0, take(s_render_max),
+                         s_fq_head.load(std::memory_order_relaxed) -
+                             s_fq_tail.load(std::memory_order_relaxed),
+                         take(s_late), take(s_overrun), take(s_idle_dark),
+                         pattern ? pattern->name() : "no pattern");
+            }
+        }
+#endif
         const uint32_t tail = s_fq_tail.load(std::memory_order_relaxed);
         const uint32_t head = s_fq_head.load(std::memory_order_acquire);
         if (head == tail) {
