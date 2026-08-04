@@ -317,12 +317,20 @@ static volatile uint32_t alloc_fail_caps;
  * a glitch. The event handler below is what makes a clean disassociation instant
  * regardless; this bound is for the satellite that vanishes without saying so.
  *
- * What remains after both is 3 to 5 failed allocations per disconnect, and that
- * is the floor rather than a leftover to chase. Those are frames handed to the
- * WiFi driver before client_gone() ran -- about 20 buffers outstanding by the
- * same heap arithmetic that gave the 124 above -- and nothing above the driver
- * can reach a buffer it has already taken. Audio is unaffected: underruns stay
- * 0 across it. A run showing 3-5 here is this working, not regressing.
+ * What remains after both is 3 to 5 failed allocations per disconnect taken MID-
+ * TRACK, and that is the floor rather than a leftover to chase. Those are frames
+ * handed to the WiFi driver before client_gone() ran -- about 20 buffers
+ * outstanding by the same heap arithmetic that gave the 124 above -- and nothing
+ * above the driver can reach a buffer it has already taken. Audio is unaffected:
+ * underruns stay 0 across it. A run showing 3-5 here is this working, not
+ * regressing.
+ *
+ * Mid-track is load-bearing in that sentence. A satellite that leaves while
+ * nothing is playing costs zero, because the residual IS the in-flight sends and
+ * there are none: a disassociation observed 110 s before the first audio came
+ * through reported alloc-fail 0, with the heap window never below 25 kB against
+ * the 1748 B the exhaustion left. Zero here is an idle disconnect, not a better
+ * floor, and reading it as one would hide the case that matters.
  */
 #define CLIENT_TIMEOUT_US 2000000
 
