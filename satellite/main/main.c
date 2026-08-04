@@ -188,6 +188,41 @@ static volatile uint32_t n_frames_bad;    /* ... and rejected, wrong size */
 static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
 static volatile uint32_t hw_drift;
 
+/*
+ * Heap, dated, and allocation failures made audible. The hub's copy carries the
+ * reasoning; this is the same instrument on the other unit.
+ *
+ * It is here despite no pressure ever having been observed on a satellite --
+ * 52 kB free analysing locally, 118 kB being given its frames, against a hub
+ * that reached 2040 bytes. Which is the point: the value of a windowed minimum
+ * is that it says nothing, every minute, until the minute it does. A counter
+ * that only exists on the unit already known to be sick cannot tell you the
+ * other one just got sick too, and these two units do not have the same job or
+ * the same failure.
+ */
+static volatile uint32_t heap_min_window = UINT32_MAX;
+static volatile uint32_t n_alloc_fail;
+static volatile uint32_t alloc_fail_size;   /* the largest request that failed */
+static volatile uint32_t alloc_fail_caps;
+
+/*
+ * Records only, and in IRAM. IDF marks heap_caps_alloc_failed() HEAP_IRAM_ATTR
+ * because the heap is usable with the flash cache disabled, so a hook in flash
+ * would fault when reached from an ISR or during a flash write -- a diagnostic
+ * for running out of memory that crashes under the one condition it exists to
+ * observe. It also runs inside the allocator, and ESP_LOGx allocates, so
+ * drift_task does the talking within 5 s.
+ */
+static IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *function_name)
+{
+    (void)function_name;
+    n_alloc_fail++;
+    if ((uint32_t)size > alloc_fail_size) {
+        alloc_fail_size = (uint32_t)size;
+        alloc_fail_caps = caps;
+    }
+}
+
 /* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
  * that much should be sitting here waiting. */
 #define RING_TARGET_MS 200
@@ -995,6 +1030,23 @@ static void drift_task(void *arg)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
 
+        const uint32_t heap_now = esp_get_free_heap_size();
+        if (heap_now < heap_min_window) {
+            heap_min_window = heap_now;
+        }
+
+        /* Said once, and within 5 s of the fact rather than at the next soak
+         * line -- see the hub's copy. */
+        static uint32_t alloc_fail_told;
+        if (n_alloc_fail != alloc_fail_told) {
+            alloc_fail_told = n_alloc_fail;
+            ESP_LOGE(TAG, "ALLOCATION FAILED %" PRIu32 " time(s): largest request %"
+                          PRIu32 " B (caps 0x%" PRIx32 "), heap %" PRIu32
+                          " free, largest block %u",
+                     n_alloc_fail, alloc_fail_size, alloc_fail_caps, heap_now,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        }
+
         /* Soak line, every 60 s, ahead of the streaming check below: if audio
          * has stopped, that is when the heap and the counters matter most.
          * Totals, not rates -- see the hub's copy. */
@@ -1002,18 +1054,25 @@ static void drift_task(void *arg)
         if (--health_left <= 0) {
             health_left = 12;                      /* 12 x 5 s */
             hw_drift = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ", "
-                          "largest %u) | "
+            /* `window` is the lowest this minute, `min` the lowest since boot.
+             * The pair dates a dip to this line, which the watermark alone
+             * never could. Taken and cleared, like every windowed counter. */
+            const uint32_t heap_win = heap_min_window;
+            heap_min_window = UINT32_MAX;
+            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32
+                          ", window %" PRIu32 ", largest %u) | "
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32
+                          " | alloc-fail %" PRIu32
                           " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
                      " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
-                     n_retunes, n_retunes_bad, n_gaps, n_wifi_drops,
+                     n_retunes, n_retunes_bad, n_gaps, n_wifi_drops, n_alloc_fail,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",
                      n_tsf_used, n_tsf_fallback,
@@ -1462,6 +1521,10 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    /* Before anything else allocates, so a failure during WiFi or socket setup
+     * is caught too -- that is the phase with the largest single requests. */
+    ESP_ERROR_CHECK(heap_caps_register_failed_alloc_callback(on_alloc_failed));
 
     sync_est_init(&est);
     /* Link check only for now -- the SBC receive path lands in the next stage. */
