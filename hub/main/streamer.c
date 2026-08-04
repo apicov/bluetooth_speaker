@@ -247,6 +247,40 @@ static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
 static volatile uint32_t hw_mon;
 
 /*
+ * Heap, with a timestamp -- because the all-time figure could not provide one.
+ *
+ * esp_get_minimum_free_heap_size() is a watermark since boot. A run that ended
+ * at 2040 bytes free, against 21892 on two clean runs before it, said only that
+ * the hub had nearly died at some point in five minutes: not when, not during
+ * what, and not whether it was the same moment as the underrun on the same line.
+ * The heap is one large block plus scraps -- `largest` reads 26624 in every log
+ * ever captured here -- so reaching 2040 means that block went in one piece, and
+ * the only thing on this unit that takes that much on demand is WiFi's 32
+ * dynamic TX and 32 dynamic RX buffers. Attributing it needs a window, not a
+ * watermark.
+ *
+ * Sampled every 5 s and cleared by each HEALTH line, so a dip lands in a named
+ * minute beside sta-left, restarts and underruns. A dip shorter than the sample
+ * interval is still missed; that is what the allocation hook below is for.
+ */
+static volatile uint32_t heap_min_window = UINT32_MAX;
+
+/*
+ * Allocation failures, which until now were silent.
+ *
+ * At 2040 bytes free something very likely failed to allocate, and nothing said
+ * so -- it surfaced as an underrun, which names the symptom and not the cause.
+ * CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS would panic instead, which is too
+ * violent for a dance floor; this counts and reports.
+ *
+ * The hook records and does not log; see the constraints where it is defined.
+ * ring_monitor_task notices within 5 s from a context where logging is safe.
+ */
+static volatile uint32_t n_alloc_fail;
+static volatile uint32_t alloc_fail_size;   /* the largest request that failed */
+static volatile uint32_t alloc_fail_caps;
+
+/*
  * Satellites are sent audio by UNICAST, not multicast.
  *
  * Group-addressed frames are never acknowledged and never retried, so any
@@ -1462,11 +1496,54 @@ static void probe_task(void *arg)
  * accumulated error rather than the instantaneous one. Correction is spread over
  * ~40 s, well below the ~1% pitch shift a listener would notice.
  */
+/*
+ * Records only, and lives in IRAM. Both are load-bearing.
+ *
+ * IDF marks heap_caps_alloc_failed() HEAP_IRAM_ATTR precisely because the heap
+ * is usable with the flash cache disabled, so this can be reached from an ISR
+ * or from a task running while a flash write is in progress. A hook in flash
+ * would fault there -- a diagnostic for running out of memory that crashes
+ * under the one condition it exists to observe. Hence IRAM_ATTR, no string
+ * literals, and nothing called that is not itself in IRAM.
+ *
+ * And no logging even where it would be reachable: this runs inside the
+ * allocator, and ESP_LOGx allocates. ring_monitor_task says it within 5 s from
+ * a context where saying things is safe.
+ */
+static IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *function_name)
+{
+    (void)function_name;
+    n_alloc_fail++;
+    if ((uint32_t)size > alloc_fail_size) {
+        alloc_fail_size = (uint32_t)size;
+        alloc_fail_caps = caps;
+    }
+}
+
 static void ring_monitor_task(void *arg)
 {
     (void)arg;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+
+        const uint32_t heap_now = esp_get_free_heap_size();
+        if (heap_now < heap_min_window) {
+            heap_min_window = heap_now;
+        }
+
+        /* Said once, and within 5 s of the fact rather than at the next soak
+         * line -- an allocation failure is the thing you want to see next to
+         * whatever else the console was saying at the time. The running count
+         * stays on HEALTH. */
+        static uint32_t alloc_fail_told;
+        if (n_alloc_fail != alloc_fail_told) {
+            alloc_fail_told = n_alloc_fail;
+            ESP_LOGE(TAG, "ALLOCATION FAILED %" PRIu32 " time(s): largest request %"
+                          PRIu32 " B (caps 0x%" PRIx32 "), heap %" PRIu32
+                          " free, largest block %u",
+                     n_alloc_fail, alloc_fail_size, alloc_fail_caps, heap_now,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        }
 
         /*
          * Soak line, every 60 s, and deliberately ahead of the streaming check
@@ -1482,16 +1559,24 @@ static void ring_monitor_task(void *arg)
         if (--health_left <= 0) {
             health_left = 12;                      /* 12 x 5 s */
             hw_mon = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32 ", "
-                          "largest %u) | "
+            /* `window` is the lowest this minute, `min` the lowest since boot.
+             * The pair is the point: a window far below the current free figure
+             * dates the dip to this line, which the watermark alone never
+             * could. Taken and cleared, like every other windowed counter. */
+            const uint32_t heap_win = heap_min_window;
+            heap_min_window = UINT32_MAX;
+            ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32
+                          ", window %" PRIu32 ", largest %u) | "
                           "stack play %" PRIu32 " mon %" PRIu32 " | underruns %" PRIu32
                           " restarts %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
-                          " (%" PRIu32 " refused) | sta-left %" PRIu32,
+                          " (%" PRIu32 " refused) | sta-left %" PRIu32
+                          " | alloc-fail %" PRIu32,
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
+                     heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_mon, n_underruns, n_restarts, n_splices,
-                     n_retunes, n_retunes_bad, n_sta_left);
+                     n_retunes, n_retunes_bad, n_sta_left, n_alloc_fail);
         }
 
         if (local_start == 0 || rate_ema == 0) {
@@ -1649,6 +1734,10 @@ void streamer_start(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+
+    /* Before anything else allocates, so a failure during WiFi or socket setup
+     * is caught too -- that is the phase with the largest single requests. */
+    ESP_ERROR_CHECK(heap_caps_register_failed_alloc_callback(on_alloc_failed));
 
     local_ring = xStreamBufferCreate(LOCAL_RING_BYTES, AUDIO_CHUNK_BYTES);
     assert(local_ring);
