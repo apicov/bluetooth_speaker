@@ -814,14 +814,33 @@ W stream: HEALTH: up 3721 s | heap 59464 (min 52268, window 58120, largest 55296
           | stack play 3036 mon 1864 | underruns 0 restarts 1 splices 1
           | retunes 9 (0 refused) | sta-left 0 (dropped 0, no-lease 0)
           | sta-timeout 0 | alloc-fail 0
-W sat:    HEALTH: ... | gaps 0 wifi-drops 0 | clock TSF (tsf 1/probe 0)
+W sat:    HEALTH: ... | gaps 0 wifi-drops 0 | alloc-fail 0
+          | clock TSF (tsf 1/probe 0) | leds remote hop 512 (rx 31558, bad 0)
 ```
 
-Every 60 s, and the line for a long run. **Minimum-ever heap** matters more than
-current — a leak shows as the minimum walking down. Cumulative counters never
-reset, so they answer "has this been happening slowly for an hour", which no
-per-window rate can. `clock TSF (tsf N/probe M)` says which clock source is live
-and how many anchors used each; a rising `probe` means TSF is dropping out.
+Every 60 s, and the line for a long run. Cumulative counters never reset, so they
+answer "has this been happening slowly for an hour", which no per-window rate can.
+
+The four heap terms are four different questions. `min` is the all-time watermark
+and **cannot be dated** — one bad moment an hour ago pins it for the rest of the
+run, which is why `window` exists: the lowest seen this minute, sampled every 5 s
+and cleared by each line, so a dip can be placed in time. `largest` is the largest
+free block, and it fails before `heap` does — the WiFi driver wants 1152 B
+contiguous, so a fragmented heap refuses that while the free total still looks
+comfortable. `alloc-fail` counts allocations that actually failed; it records
+rather than logs, and lives in IRAM, because a hook in flash would fault in the
+one condition it exists to observe.
+
+`sta-left N (dropped M, no-lease K) | sta-timeout T` is how a satellite left.
+`dropped` is a clean disassociation, resolved to an IP through the DHCP lease
+table, ~11 ms after the event. `no-lease` is the event arriving when the lease had
+already gone. `sta-timeout` is the ungraceful case — power cut, out of range —
+where no event fires at all and the 2 s timeout does the work, since the AP
+notices inactivity far later than that. Without it, a run where a satellite
+vanished mid-track and a run where nothing happened print the same line.
+
+`clock TSF (tsf N/probe M)` says which clock source is live and how many anchors
+used each; a rising `probe` means TSF is dropping out.
 
 ```
 W stream: TRACK DIVERGENCE (wifi): 192.168.4.2 spliced +8 ms (phase +8231 us),
