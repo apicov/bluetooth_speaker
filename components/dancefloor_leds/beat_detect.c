@@ -64,14 +64,32 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
 
     /* Threshold is computed from history *excluding* this frame, so a large
      * onset cannot raise the bar it is being judged against. */
+    /*
+     * Summed oldest first, not in array order.
+     *
+     * Float addition is not associative, so the same history summed from a
+     * different starting index gives a slightly different total. Two units
+     * holding identical flux can sit at different rotations of the ring -- they
+     * start analysing at whatever grid point their own alignment landed on -- so
+     * array order made the threshold depend on something the units do not share.
+     * Iterating from hist_next makes the sum a function of the history alone.
+     *
+     * The difference is in the last bits, and test_pattern_sync passes today
+     * because the margin between flux and threshold is wide compared to it. That
+     * is passing on margin rather than on the arithmetic being right, which the
+     * test's own comment admits. Overlapping windows shrink the margin from both
+     * sides -- flux gets smaller and there are twice as many near-threshold
+     * frames -- so this stops being free before it stops being invisible.
+     */
     float mean = 0.0f, var = 0.0f;
     if (d->hist_n > 0) {
-        for (int i = 0; i < d->hist_n; i++) {
-            mean += d->hist[i];
+        const int base = (d->hist_n < BEAT_HIST) ? 0 : d->hist_next;
+        for (int j = 0; j < d->hist_n; j++) {
+            mean += d->hist[(base + j) % d->hist_n];
         }
         mean /= d->hist_n;
-        for (int i = 0; i < d->hist_n; i++) {
-            float dv = d->hist[i] - mean;
+        for (int j = 0; j < d->hist_n; j++) {
+            float dv = d->hist[(base + j) % d->hist_n] - mean;
             var += dv * dv;
         }
         var /= d->hist_n;
