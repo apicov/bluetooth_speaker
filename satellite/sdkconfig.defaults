@@ -1,3 +1,13 @@
 # Playback start is scheduled to sub-millisecond precision; the default 100 Hz
 # tick makes vTaskDelay granularity 10 ms.
 CONFIG_FREERTOS_HZ=1000
+
+# 50% overlap between analysis windows. The window stays 1024; this is only how
+# far the analysis advances between them, so it doubles the frame rate to 86 Hz
+# without changing the FFT's resolution.
+#
+# Stated here as well as being the Kconfig default because the two flux floors
+# were swept at hop 1024 and are not yet re-measured -- a floor running this is
+# running a detector that is over-sensitive until they are, and that should be
+# visible in the tracked config rather than only in a component default.
+CONFIG_DANCEFLOOR_LED_HOP_512=y

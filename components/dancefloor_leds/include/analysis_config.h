@@ -43,20 +43,26 @@
 /*
  * The hop: how many samples the analysis advances between windows.
  *
- * DF_HOP_N == DF_FFT_N reproduces the behaviour that shipped, exactly. Anything
- * smaller overlaps the windows and raises the frame rate by the same factor.
+ * 512 is 50% overlap, which is what ordinary onset-detection algorithms assume
+ * and what this pipeline now runs. DF_HOP_N == DF_FFT_N reproduces the
+ * behaviour that shipped before overlap existed.
  *
- * A command-line -DDF_HOP_N wins over the Kconfig choice, which is what lets
- * `make check-hops` sweep the host tests over every supported value without
- * touching a config anywhere.
+ * This fallback must equal the Kconfig default below it, and that is not a
+ * tidiness point. It is what the host harness gets -- pattern_lab and the unit
+ * tests compile with no sdkconfig.h at all -- so if the two disagreed, every
+ * figure measured on the host would describe a pipeline the boards do not run.
+ * That is the whole reason the hop is not a Kconfig symbol alone.
+ *
+ * A command-line -DDF_HOP_N beats both, which is what lets `make check-hops`
+ * sweep the host tests over every supported value without touching a config.
  */
 #ifndef DF_HOP_N
-#  if defined(CONFIG_DANCEFLOOR_LED_HOP_256)
-#    define DF_HOP_N 256
-#  elif defined(CONFIG_DANCEFLOOR_LED_HOP_512)
-#    define DF_HOP_N 512
-#  else
+#  if defined(CONFIG_DANCEFLOOR_LED_HOP_1024)
 #    define DF_HOP_N DF_FFT_N
+#  elif defined(CONFIG_DANCEFLOOR_LED_HOP_256)
+#    define DF_HOP_N 256
+#  else
+#    define DF_HOP_N 512
 #  endif
 #endif
 

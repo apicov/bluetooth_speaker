@@ -4,3 +4,13 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 # esp_wifi_internal_set_fix_rate() returns ESP_ERR_NOT_SUPPORTED while TX AMPDU
 # is enabled, and pinning the multicast rate is required for throughput.
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+
+# 50% overlap between analysis windows. The window stays 1024; this is only how
+# far the analysis advances between them, so it doubles the frame rate to 86 Hz
+# without changing the FFT's resolution.
+#
+# Stated here as well as being the Kconfig default because the two flux floors
+# were swept at hop 1024 and are not yet re-measured -- a floor running this is
+# running a detector that is over-sensitive until they are, and that should be
+# visible in the tracked config rather than only in a component default.
+CONFIG_DANCEFLOOR_LED_HOP_512=y
