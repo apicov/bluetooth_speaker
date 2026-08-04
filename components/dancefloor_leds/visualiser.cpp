@@ -68,10 +68,10 @@ using df::CHANNELS;
 constexpr int STREAM_BYTES = FFT_N * CHANNELS * (int)sizeof(int16_t) * 8;
 constexpr uint32_t FRAME_BYTES = CHANNELS * sizeof(int16_t);
 
-/* The window and the hop in bytes, which is the unit the accumulator works in. */
-constexpr size_t WINDOW_BYTES = (size_t)FFT_N * CHANNELS * sizeof(int16_t);
-constexpr size_t HOP_BYTES    = (size_t)HOP_N * CHANNELS * sizeof(int16_t);
-constexpr size_t TAIL_BYTES   = (size_t)TAIL_N * CHANNELS * sizeof(int16_t);
+/* The hop and the carried-over tail in bytes, which is the unit the accumulator
+ * works in. */
+constexpr size_t HOP_BYTES  = (size_t)HOP_N * CHANNELS * sizeof(int16_t);
+constexpr size_t TAIL_BYTES = (size_t)TAIL_N * CHANNELS * sizeof(int16_t);
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 
@@ -113,9 +113,17 @@ constexpr int64_t LED_MARKER_PERIOD_US = 1000000;
  * The audio marker can afford a 200 us busy-wait; this cannot. It has to be
  * long enough to see, and blocking the render task for 40 ms would drop two
  * analysis frames and break the very alignment being demonstrated. Raising the
- * pin on one block and lowering it two later costs nothing.
+ * pin on one frame and lowering it a few later costs nothing.
+ *
+ * Derived from a DURATION rather than a frame count, because "two frames" is
+ * 46 ms at hop 1024 and 12 ms at hop 256 -- and a marker that exists to be seen
+ * by eye must not quietly shrink below what an eye resolves when the frame rate
+ * changes. Rounded up, so this is still exactly 2 at hop 1024.
  */
-constexpr int LED_MARKER_BLOCKS_HIGH = 2;
+constexpr int64_t LED_MARKER_HIGH_US = 40000;
+constexpr int64_t LED_MARKER_HOP_US  = (int64_t)HOP_N * 1000000 / RATE;
+constexpr int LED_MARKER_BLOCKS_HIGH =
+    (int)((LED_MARKER_HIGH_US + LED_MARKER_HOP_US - 1) / LED_MARKER_HOP_US);
 #endif
 
 /* Applied to the pattern's output on the way to the strip. A device concern,
@@ -262,7 +270,8 @@ bool     s_ref_valid;
  * data every unit shares, so they cross it on the same audio and stay identical
  * however often it fires.
  *
- * The cost of firing is one dropped analysis block, ~23 ms of the strip holding
+ * The cost of firing is one dropped analysis frame, one hop -- ~23 ms at hop
+ * 1024 -- of the strip holding
  * its previous frame. At 20 ppm this crosses about once every 100 s on its own.
  * That is affordable, so this is set by what is NOT drift: the per-packet slew
  * step is ~20 us and the interpolation rounds to the microsecond, so 2 ms is two
@@ -329,11 +338,25 @@ void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory
  * the indices need no locking. They are free-running counts, not wrapped
  * positions: the difference is the depth and stays right across a uint32 wrap.
  *
- * 32 frames is ~740 ms at the current hop, comfortably more than the 200 ms of
- * lead the audio carries, so the queue is sized by the audio buffer rather than
- * the other way round.
+ * Sized in TIME, not in frames, which is the whole point of the expression.
+ *
+ * 32 slots is ~740 ms at hop 1024 and comfortably more than the 200 ms of lead
+ * the audio carries -- but at hop 256 the same 32 slots are 186 ms, which is
+ * LESS than that lead. The analysis runs as far ahead as it has audio for, so
+ * the queue would fill, overrun, and drop frames that the strip then never
+ * draws. Scaling with FFT_N / HOP_N holds ~740 ms whatever the hop and leaves
+ * hop 1024 exactly as it was.
+ *
+ * The cost is RAM, and it is not nothing: df::Frame is ~136 bytes, so this is
+ * 4.4 kB at hop 1024, 8.7 kB at 512 and 17.4 kB at 256.
+ *
+ * Must stay a power of two. head and tail are free-running uint32 counters and
+ * `% FRAME_RING` is only continuous across their wrap because 2^32 is a whole
+ * number of rings.
  */
-constexpr uint32_t FRAME_RING = 32;
+constexpr uint32_t FRAME_RING = 32 * (FFT_N / HOP_N);
+static_assert((FRAME_RING & (FRAME_RING - 1)) == 0,
+              "FRAME_RING must be a power of two -- the uint32 wrap depends on it");
 df::Frame s_fq[FRAME_RING];
 std::atomic<uint32_t> s_fq_head;    /* analysis task writes */
 std::atomic<uint32_t> s_fq_tail;    /* render task writes */
@@ -465,7 +488,7 @@ constexpr int64_t RENDER_LATE_US = 20000;
  * its last frame indefinitely -- a lit strip that looks like it is working
  * while the thing driving it has gone.
  *
- * Half a second is well past any gap normal delivery produces at 43 frames a
+ * Half a second is well past any gap normal delivery produces at 43 or more frames a
  * second, and short enough that a stopped floor reads as stopped.
  *
  * Going dark rather than falling back to local analysis is the deliberate
@@ -912,6 +935,51 @@ void visualiser_submit_frame(const vis_frame_t *f)
     if (!f) {
         return;
     }
+    /*
+     * Is the sender cutting the same grid this unit is built for?
+     *
+     * Nothing here analyses audio, so the hop is not a setting this unit obeys
+     * -- it is a statement about the unit SENDING the frames. It still has to be
+     * right, because FRAME_RING is sized from it: a hub at hop 256 feeding a
+     * satellite left at 1024 gives that satellite 186 ms of queue against
+     * ~200 ms of audio lead, so it silently overruns and drops frames it should
+     * have drawn.
+     *
+     * No protocol change is needed to check it. Consecutive frames are one hop
+     * apart by construction, so the difference of their due_us IS the sender's
+     * hop. The index test skips the first frame and any gap or flush, where the
+     * difference would be several hops and mean nothing.
+     *
+     * An eighth is a deliberately loose band. The sender's due_us comes from an
+     * integer division, so successive differences alternate by a microsecond,
+     * while the supported hops are a factor of two apart -- rounding cannot trip
+     * this and a real mismatch cannot hide under it.
+     *
+     * Said once, and not acted on: the sizes are compiled in, so the honest
+     * response is to name the fault rather than half-absorb it.
+     */
+    {
+        static int64_t prev_index = -1, prev_due = 0;
+        const int64_t want = (int64_t)HOP_N * 1000000 /
+                             s_rate.load(std::memory_order_relaxed);
+        if (f->index == prev_index + 1 && want > 0) {
+            const int64_t got = f->due_us - prev_due;
+            const int64_t err = got > want ? got - want : want - got;
+            if (err > want / 8) {
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    ESP_LOGE(TAG, "sender's hop is %lld us, this build expects %lld us "
+                                  "(hop %d) -- frames will be queued for the wrong "
+                                  "depth; set DANCEFLOOR_LED_HOP to match the hub",
+                             (long long)got, (long long)want, HOP_N);
+                }
+            }
+        }
+        prev_index = f->index;
+        prev_due   = f->due_us;
+    }
+
     df::Frame local;
     from_wire(f, local);
     if (enqueue(local)) {
@@ -927,6 +995,19 @@ void visualiser_submit_frame(const vis_frame_t *f)
      */
     (void)f;
 #endif
+}
+
+int visualiser_hop(void)
+{
+    /*
+     * Reported rather than merely compiled in, because two units on different
+     * hops cut different windows and reach different decisions -- and on the
+     * LOCAL path nothing crosses between the boards, so no unit can detect that
+     * for itself. Making it printable is the most that path can offer, and it
+     * is enough: it is the same way the audio's own agreement is checked, by
+     * putting two consoles side by side.
+     */
+    return HOP_N;
 }
 
 const char *visualiser_source_name(void)
@@ -1148,10 +1229,15 @@ void visualiser_start(void)
     xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1);
 #endif
     xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1);
-    /* The source is on this line because an unintended mismatch across a floor
-     * is the expensive bug, and two consoles side by side should settle it. */
+    /* The source and the hop are on this line because an unintended mismatch
+     * across a floor is the expensive bug, and two consoles side by side should
+     * settle it. The frame rate is spelled out rather than left to be divided,
+     * since it is the number that actually changed. */
     ESP_LOGW(TAG, "started: %lu LEDs on GPIO %d at %d%% brightness, pattern %s, "
-                  "frames %s",
+                  "frames %s | window %d, hop %d (%.1f frames/s at %" PRIu32 " Hz)",
              LED_COUNT, CONFIG_DANCEFLOOR_LED_GPIO, CONFIG_DANCEFLOOR_LED_BRIGHTNESS,
-             pattern ? pattern->name() : "none", visualiser_source_name());
+             pattern ? pattern->name() : "none", visualiser_source_name(),
+             FFT_N, HOP_N,
+             (double)s_rate.load(std::memory_order_relaxed) / HOP_N,
+             s_rate.load(std::memory_order_relaxed));
 }

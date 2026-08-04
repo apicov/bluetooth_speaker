@@ -81,6 +81,17 @@ void visualiser_submit_frame(const vis_frame_t *f);
  * mixed floor is a fact in the log rather than a puzzle. */
 const char *visualiser_source_name(void);
 
+/*
+ * The analysis hop this unit was built for, in samples.
+ *
+ * The other half of the same question. Units on different hops cut different
+ * windows and so reach different decisions, and a unit doing its own analysis
+ * cannot detect that -- nothing crosses between locally analysing units, which
+ * is exactly the property that makes them stay in step. So it is reported, and
+ * two consoles settle it.
+ */
+int visualiser_hop(void);
+
 /* Brings up the strip and starts the analysis and render tasks. Call once. */
 void visualiser_start(void);
 

@@ -5,6 +5,17 @@ CXX      := /usr/bin/g++
 CFLAGS   := -std=c11 -Wall -Wextra -O2 -I../include
 CXXFLAGS := -std=gnu++20 -Wall -Wextra -O2 -I../include
 
+# The analysis hop, for `make HOP=512 check` and the sweep below. Empty means
+# whatever analysis_config.h defaults to, which is what the firmware gets when
+# no Kconfig choice is made. It must reach BOTH sets of flags: beat_detect.c and
+# fft_host.c are compiled as C and linked into the C++ tests, and a hop that
+# differed between the two halves would be a link that silently disagrees.
+HOP ?=
+ifneq ($(HOP),)
+CFLAGS   += -DDF_HOP_N=$(HOP)
+CXXFLAGS += -DDF_HOP_N=$(HOP)
+endif
+
 BINS := test_align test_pattern test_beat_detect test_fft test_pattern_sync
 
 test_align: test_align.c
@@ -33,7 +44,23 @@ test_pattern_sync: test_pattern_sync.cpp ../analysis.cpp ../patterns.cpp \
 	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) test_pattern_sync.cpp \
 		../analysis.cpp ../patterns.cpp fft_host.o beat_detect.o -o $@ -lm
 
-.PHONY: check clean
+.PHONY: check check-hops clean
+
+# Every supported hop, because the alignment arithmetic and the window slide are
+# what a hop change actually touches and they are only exercised by running them.
+# The window-contiguity check in test_align is the one that has teeth here: at
+# HOP == FFT_N the tail slide compiles to nothing, so 1024 alone proves little
+# about it.
+check-hops:
+	@for h in 1024 512 256; do \
+	    echo "=== hop $$h ==="; \
+	    $(MAKE) --no-print-directory clean >/dev/null; \
+	    $(MAKE) --no-print-directory HOP=$$h check || exit 1; \
+	    echo; \
+	done
+	@$(MAKE) --no-print-directory clean >/dev/null
+	@echo "all hops green"
+
 check: $(BINS)
 	@./test_align
 	@echo

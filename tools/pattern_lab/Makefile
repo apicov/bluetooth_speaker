@@ -14,6 +14,17 @@ CC       := /usr/bin/gcc
 CXX      := /usr/bin/g++
 CFLAGS   := -std=c11     -Wall -Wextra -O2 -I$(LEDS)/include
 CXXFLAGS := -std=gnu++20 -Wall -Wextra -O2 -I$(LEDS)/include
+
+# The analysis hop, for sweeping a recording at more than one: `make clean &&
+# make HOP=512`. Empty means whatever analysis_config.h defaults to. Both sets of
+# flags, since beat_detect.c and fft_host.c are compiled as C and linked in. The
+# hop a run used is written into the --csv header, so a sweep cannot be misread
+# afterwards.
+HOP ?=
+ifneq ($(HOP),)
+CFLAGS   += -DDF_HOP_N=$(HOP)
+CXXFLAGS += -DDF_HOP_N=$(HOP)
+endif
 LDLIBS   := -lz -lm
 
 SRCS := main.cpp wav.cpp out_png.cpp out_tty.cpp $(LEDS)/analysis.cpp $(LEDS)/patterns.cpp

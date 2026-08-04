@@ -116,9 +116,10 @@ static_assert(band_bin(BAND_EDGE_HZ[3], RATE) == 117, "band 3 moved");
  *
  * `mag` is 512 floats and cannot outlive the Analysis that made it, so nothing
  * that renders later can read it -- and if one unit is ever to compute frames
- * for another, 2 KB at 43 Hz is 88 KB/s against audio already using 30-40 on the
- * same radio. Neither limit is about precision: an LED strip cannot show 512
- * bands or 24 bits of one.
+ * for another, 2 KB at 43 frames a second (hop 1024) is 88 KB/s against audio
+ * already using 30-40 on the same radio -- and a shorter hop multiplies that.
+ * Neither limit is about precision: an LED strip cannot show 512 bands or 24
+ * bits of one.
  *
  * So the spectrum every consumer sees is this reduction, and it is filled the
  * same way whoever produced the frame -- computed here, or received already
@@ -140,7 +141,9 @@ constexpr float   BOOM_THRESHOLD_K  = 1.4f;
 constexpr float   BOOM_FLUX_FLOOR   = 0.02f;
 constexpr int64_t BOOM_REFRACTORY_US = 200000;
 
-/* One analysis frame: ~23 ms of audio, reduced. */
+/* One analysis frame: the FFT_N window, ~23 ms of audio, reduced. One is
+ * produced every HOP_N samples, so at hop 1024 that is every 23 ms and at hop
+ * 512 every 12 -- the window each frame describes does not change with it. */
 struct Frame {
     int64_t      index;      /* block number, from an origin all units share */
     int64_t      due_us;     /* master-clock instant this audio is heard */
@@ -202,7 +205,8 @@ public:
     virtual ~Pattern() = default;
     virtual const char *name() const = 0;
 
-    /* Write `count` RGB triples. Called once per analysis frame, ~43 Hz. */
+    /* Write `count` RGB triples. Called once per analysis frame -- ~43 Hz at
+     * hop 1024, and twice that at hop 512. */
     virtual void render(const Frame &f, uint8_t *rgb, uint32_t count) = 0;
 
     /* Drop any accumulated state. Called when the stream restarts. */

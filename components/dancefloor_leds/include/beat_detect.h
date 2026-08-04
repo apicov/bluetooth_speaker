@@ -21,7 +21,21 @@ extern "C" {
 #endif
 
 #define BEAT_BANDS 4      /* roughly: kick, low-mid, presence, air */
-#define BEAT_HIST  43     /* ~0.5 s of history at a 512-sample hop / 44.1 kHz */
+/*
+ * How many frames of flux the adaptive threshold is measured over.
+ *
+ * A FRAME COUNT, so the span of wall-clock it covers is set by the analysis hop
+ * and moves when that does: 1.0 s at hop 1024, 0.5 s at 512, 0.25 s at 256. The
+ * comment here used to claim 0.5 s "at a 512-sample hop", which described a hop
+ * this code has never actually run at.
+ *
+ * Whether it should stay a frame count or be scaled to hold the span constant is
+ * a tuning question and not a mechanical one, and it is open: a shorter window
+ * of history adapts faster but is a noisier estimate of the mean and standard
+ * deviation. It wants measuring against the corpus rather than reasoning about,
+ * which is why nothing here scales it yet.
+ */
+#define BEAT_HIST  43
 
 /* Below this, flux is treated as silence rather than signal. Without it the
  * adaptive threshold collapses toward zero during quiet passages and fires on

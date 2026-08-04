@@ -1008,7 +1008,7 @@ static void drift_task(void *arg)
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32
                           " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
-                     " | leds %s (rx %" PRIu32 ", bad %" PRIu32 ")",
+                     " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
@@ -1017,7 +1017,8 @@ static void drift_task(void *arg)
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",
                      n_tsf_used, n_tsf_fallback,
-                     visualiser_source_name(), n_frames_rx, n_frames_bad);
+                     visualiser_source_name(), visualiser_hop(),
+                     n_frames_rx, n_frames_bad);
         }
 
         if (stream_start_local == 0) {

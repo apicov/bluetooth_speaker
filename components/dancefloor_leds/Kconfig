@@ -135,6 +135,51 @@ menu "Dancefloor LEDs"
             one depends entirely on what is playing.
 
 
+    choice DANCEFLOOR_LED_HOP
+        prompt "Analysis hop (samples advanced between windows)"
+        default DANCEFLOOR_LED_HOP_1024
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            How far the analysis advances between one window and the next. The
+            WINDOW stays 1024 samples whatever this is set to -- that is what
+            fixes the 43 Hz bin width and the band edges, and changing it would
+            be a retune. This sets only how often a window is taken, and so how
+            often a frame is produced.
+
+            1024 is no overlap: each window begins where the last one ended,
+            which is what shipped and what every tuning figure in analysis.cpp
+            was measured against. Smaller values overlap the windows and raise
+            the frame rate by the same factor -- 512 gives 86 frames a second
+            instead of 43.
+
+            Overlap is what ordinary onset-detection algorithms assume, so this
+            exists to make them possible. Be aware that the detector is NOT
+            retuned for it: flux is a frame-to-frame difference, so overlapping
+            windows make it smaller and make adjacent samples correlated, and
+            both flux floors were swept at 1024. The refractory periods and both
+            threshold_k values are unaffected -- scaling flux scales the mean and
+            the standard deviation with it. Sweep against a recording in
+            tools/pattern_lab before running anything but 1024 on a floor.
+
+            A choice rather than a number because the hop must divide the window
+            and be a power of two. Anything else fails the build in
+            analysis_config.h; this way it cannot be selected at all.
+
+            On LED_SOURCE_REMOTE this configures no analysis -- such a unit runs
+            none. It DECLARES what the unit sending it frames is doing, and it
+            has to match, because it sizes the frame queue. A mismatch is
+            detected and logged at runtime.
+
+        config DANCEFLOOR_LED_HOP_1024
+            bool "1024 -- no overlap, as measured"
+
+        config DANCEFLOOR_LED_HOP_512
+            bool "512 -- 50% overlap, 86 frames/s"
+
+        config DANCEFLOOR_LED_HOP_256
+            bool "256 -- 75% overlap, 172 frames/s"
+    endchoice
+
     choice DANCEFLOOR_LED_SOURCE
         prompt "Where this unit's analysis frames come from"
         default DANCEFLOOR_LED_SOURCE_LOCAL

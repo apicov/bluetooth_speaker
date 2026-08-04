@@ -150,6 +150,10 @@ int main(int argc, char **argv)
     if (!csv_path.empty()) {
         csv = std::fopen(csv_path.c_str(), "w");
         if (!csv) { std::perror(csv_path.c_str()); return 1; }
+        /* What this run was cut by, so two CSVs can never be compared across
+         * hops by accident -- the row count and every flux figure change with
+         * it, and nothing else in the file would say why. */
+        std::fprintf(csv, "# window=%d hop=%d rate=%d\n", df::FFT_N, df::HOP_N, wav.rate);
         std::fprintf(csv, "block,time_s,band0,band1,band2,band3,flux,threshold,onset,strength,"
                              "boom_flux,boom_threshold,boom,boom_strength\n");
     }

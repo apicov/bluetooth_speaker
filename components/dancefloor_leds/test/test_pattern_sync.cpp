@@ -50,7 +50,18 @@ void check(const char *name, bool cond, const std::string &detail)
 }
 
 constexpr int LEDS   = 30;
-constexpr int BLOCKS = 900;                     /* ~21 s at 44.1 kHz */
+/*
+ * A fixed amount of AUDIO, not a fixed number of frames.
+ *
+ * 900 frames is ~21 s at hop 1024 but only ~10 s at hop 512, and the signal
+ * below is kicks at a fixed rate -- so holding the frame count fixed would quietly
+ * halve the number of kicks the detector is shown every time the hop halved, and
+ * the "signal actually produces onsets" guard would fail for a reason that has
+ * nothing to do with what it is guarding. Scaling by FFT_N / HOP_N keeps every
+ * hop looking at the same ~21 s of the same music, which is also the only way a
+ * result at one hop can be compared with a result at another.
+ */
+constexpr int BLOCKS = 900 * (df::FFT_N / df::HOP_N);   /* ~21 s at 44.1 kHz */
 constexpr int KICK_EVERY = df::RATE / 2;        /* 120 BPM */
 
 /*

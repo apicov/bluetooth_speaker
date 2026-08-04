@@ -51,7 +51,13 @@
  * touching a config anywhere.
  */
 #ifndef DF_HOP_N
-#  define DF_HOP_N DF_FFT_N
+#  if defined(CONFIG_DANCEFLOOR_LED_HOP_256)
+#    define DF_HOP_N 256
+#  elif defined(CONFIG_DANCEFLOOR_LED_HOP_512)
+#    define DF_HOP_N 512
+#  else
+#    define DF_HOP_N DF_FFT_N
+#  endif
 #endif
 
 /* What is carried over from one window to the next. Zero when they do not
