@@ -33,3 +33,5 @@ tools/desktop_satellite.py
 # Host tool build output
 tools/pattern_lab/pattern_lab
 tools/pattern_lab/*.o
+tools/tuning/converge
+tools/tuning/*.o
