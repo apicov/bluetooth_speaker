@@ -9,20 +9,27 @@
  * un-aligned it permanently -- visible as one strip firing on a beat while the
  * other stayed dark.
  *
- * The property under test is the one that matters on hardware: every block a
- * unit analyses must start at a stream position that is a multiple of FFT_N in
+ * The property under test is the one that matters on hardware: every window a
+ * unit analyses must start at a stream position that is a multiple of HOP_N in
  * master-clock samples, because that is what makes two units analyse identical
  * windows and therefore reach identical onset decisions.
  *
  * Both the old and new logic are here, so the test demonstrates the difference
  * rather than merely asserting the new one is fine.
+ *
+ * The lengths come from the shared header rather than being restated, so that
+ * `make check-hops` sweeps this model and the firmware from one -DDF_HOP_N.
  */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 
-#define FFT_N        1024
+#include "analysis_config.h"
+
+#define FFT_N        DF_FFT_N
+#define HOP_N        DF_HOP_N
+#define TAIL_N       DF_TAIL_N
 #define CHANNELS     2
 #define FRAME_BYTES  (CHANNELS * (int)sizeof(int16_t))
 #define BLOCK_BYTES  (FFT_N * FRAME_BYTES)
@@ -82,7 +89,7 @@ typedef struct {
     uint32_t recv_total, epoch, seen_gen;
     int64_t  block_index;
     /* results */
-    int      blocks, misaligned, mislabelled, drops;
+    int      blocks, misaligned, mislabelled, drops, discontiguous;
     int64_t  last_block_start, last_block_index;
     /* Worst label error seen, in frames. A count of mislabelled blocks says how
      * OFTEN the origin was wrong; this says by how MUCH, which is the number
@@ -133,9 +140,9 @@ static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_
     }
 
     if (u->align_pending) {
-        int into = (int)(((label % FFT_N) + FFT_N) % FFT_N);
-        u->skip_frames = into ? FFT_N - into : 0;
-        u->pending_block_index = (label + u->skip_frames) / FFT_N;
+        int into = (int)(((label % HOP_N) + HOP_N) % HOP_N);
+        u->skip_frames = into ? HOP_N - into : 0;
+        u->pending_block_index = (label + u->skip_frames) / HOP_N;
         u->align_pending = 0;
         u->mark_align_point = 1;
     }
@@ -149,7 +156,7 @@ static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_
         u->align_at = u->sent_total;
         u->align_block_index = u->pending_block_index;
         u->align_gen++;
-        u->ref_frame = u->pending_block_index * FFT_N;
+        u->ref_frame = u->pending_block_index * HOP_N;
         u->ref_byte = u->sent_total;
         u->ref_valid = 1;
         u->mark_align_point = 0;
@@ -217,24 +224,43 @@ static void reader(unit_t *u, int variant) {
 
     if (u->filled < FFT_N) return;
     u->blocks++;
-    if (u->raw[0] % FFT_N != 0) u->misaligned++;   /* single-unit property */
+    if (u->raw[0] % HOP_N != 0) u->misaligned++;   /* single-unit property */
     /*
      * The label, which is the half the boundary check cannot see. due_us is
-     * block_index * FFT_N / RATE, so the index must be the block number of the
-     * content in the block -- otherwise two units cutting identical windows
+     * block_index * HOP_N / RATE, so the index must be the hop number of the
+     * content in the window -- otherwise two units cutting identical windows
      * still date them differently, and every animation keyed to due_us runs at
      * a different point of its cycle on each strip.
      */
-    if (u->raw[0] != u->block_index * FFT_N) u->mislabelled++;
+    if (u->raw[0] != u->block_index * HOP_N) u->mislabelled++;
     {
-        int64_t e = u->raw[0] - u->block_index * FFT_N;
+        int64_t e = u->raw[0] - u->block_index * HOP_N;
         if (e < 0) e = -e;
         if (e > u->worst_err) u->worst_err = e;
+    }
+    /*
+     * What is IN the window, not just where it claims to start.
+     *
+     * Every other check here reads raw[0] alone, which was sufficient while the
+     * window was discarded whole: there was no way to have the right first
+     * sample and the wrong rest. Once a hop is shorter than the window the tail
+     * is slid down and re-used, and sliding it the wrong way -- keeping the
+     * oldest TAIL_N instead of the newest, which is the natural mistake --
+     * leaves raw[0] correct, the label correct, both units agreeing, and the
+     * audio being analysed wrong. Nothing above would notice.
+     */
+    for (int j = 0; j < FFT_N; j++) {
+        if (u->raw[j] != u->raw[0] + j) { u->discontiguous++; break; }
     }
     u->last_block_start = u->raw[0];
     u->last_block_index = u->block_index;
     u->block_index++;
-    u->filled = 0;
+    /* Advance by one hop, keeping the newest TAIL_N -- the reader half of the
+     * memmove in visualiser.cpp's analysis task. */
+    if (TAIL_N > 0) {
+        memmove(u->raw, u->raw + HOP_N, (size_t)TAIL_N * sizeof(u->raw[0]));
+    }
+    u->filled = TAIL_N;
 }
 
 static void run(int variant, const char *name) {
@@ -256,9 +282,11 @@ static void run(int variant, const char *name) {
             if ((rand() % 400) == 0) stall_left = 20 + rand() % 20;
         }
     }
-    printf("  %-28s blocks %6d  drops %5d  misaligned %6d  mislabelled %6d  %s\n",
-           name, u.blocks, u.drops, u.misaligned, u.mislabelled,
-           (u.misaligned || u.mislabelled) ? "<-- BROKEN" : "aligned and labelled");
+    printf("  %-28s blocks %6d  drops %5d  misaligned %6d  mislabelled %6d  "
+           "torn %6d  %s\n",
+           name, u.blocks, u.drops, u.misaligned, u.mislabelled, u.discontiguous,
+           (u.misaligned || u.mislabelled || u.discontiguous)
+               ? "<-- BROKEN" : "aligned and labelled");
 }
 
 /*
@@ -289,9 +317,11 @@ static void splice_case(int realign, int check, const char *name) {
         reader(&u, READER_GEN); reader(&u, READER_GEN);
     }
     g_drift_check = 1;
-    printf("  %-28s splices %d  blocks %6d  misaligned %6d  mislabelled %6d  %s\n",
-           name, splices, u.blocks, u.misaligned, u.mislabelled,
-           (u.misaligned || u.mislabelled) ? "<-- BROKEN" : "aligned and labelled");
+    printf("  %-28s splices %d  blocks %6d  misaligned %6d  mislabelled %6d  "
+           "torn %6d  %s\n",
+           name, splices, u.blocks, u.misaligned, u.mislabelled, u.discontiguous,
+           (u.misaligned || u.mislabelled || u.discontiguous)
+               ? "<-- BROKEN" : "aligned and labelled");
 }
 
 /*
@@ -405,10 +435,12 @@ int main(void) {
         }
     }
     printf("\nsecond seed, fixed:          blocks %6d  drops %5d  misaligned %6d  "
-           "mislabelled %6d\n", u.blocks, u.drops, u.misaligned, u.mislabelled);
+           "mislabelled %6d  torn %6d\n",
+           u.blocks, u.drops, u.misaligned, u.mislabelled, u.discontiguous);
     if (u.drops < 50)    { printf("FAIL: too few drops to exercise the fix\n"); return 1; }
     if (u.misaligned)    { printf("FAIL: blocks cut at the wrong positions\n"); return 1; }
     if (u.mislabelled)   { printf("FAIL: blocks carry the wrong index\n"); return 1; }
+    if (u.discontiguous) { printf("FAIL: window content is not contiguous audio\n"); return 1; }
 
     /* A splice must not leave the reader labelling audio against an origin the
      * splice invalidated. */
@@ -424,6 +456,7 @@ int main(void) {
         if (s.blocks < 1000) { printf("FAIL: too few blocks after splices\n"); return 1; }
         if (s.misaligned)    { printf("FAIL: splice left the boundaries offset\n"); return 1; }
         if (s.mislabelled)   { printf("FAIL: splice left the labels offset\n"); return 1; }
+        if (s.discontiguous) { printf("FAIL: splice tore the window content\n"); return 1; }
     }
 
     /*
@@ -447,6 +480,7 @@ int main(void) {
         if (h.drifts < holes)  { printf("FAIL: %d holes, only %d found\n", holes, h.drifts); return 1; }
         if (h.misaligned)      { printf("FAIL: unreported hole left the boundaries offset\n"); return 1; }
         if (h.mislabelled)     { printf("FAIL: unreported hole left the labels offset\n"); return 1; }
+        if (h.discontiguous)   { printf("FAIL: unreported hole tore the window content\n"); return 1; }
     }
 
     /*

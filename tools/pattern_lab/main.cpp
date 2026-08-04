@@ -119,7 +119,12 @@ int main(int argc, char **argv)
     }
 
     const size_t frames = wav.samples.size() / df::CHANNELS;
-    const size_t blocks = frames / df::FFT_N;
+    /* Windows start every HOP_N and are FFT_N long, so the last one that fits
+     * begins FFT_N from the end -- not frames/FFT_N, which only happened to be
+     * right while the two were the same number. */
+    const size_t blocks = frames < size_t(df::FFT_N)
+                          ? 0
+                          : (frames - df::FFT_N) / df::HOP_N + 1;
     std::fprintf(stderr, "%s: %.1f s, %zu analysis blocks, pattern \"%s\", %d LEDs\n",
                  wav_path.c_str(), double(frames) / wav.rate, blocks, pattern->name(), leds);
     if (blocks == 0) { std::fprintf(stderr, "too short to analyse\n"); return 1; }
@@ -156,11 +161,11 @@ int main(int argc, char **argv)
     size_t onsets = 0, booms = 0;
 
     for (size_t b = 0; b < blocks; b++) {
-        const int16_t *chunk = &wav.samples[b * df::FFT_N * df::CHANNELS];
+        const int16_t *chunk = &wav.samples[b * df::HOP_N * df::CHANNELS];
         /* From the file's rate, exactly as the firmware derives it from the
          * stream's -- otherwise every time-based pattern runs at the wrong
          * speed here and looks right on the boards. */
-        const int64_t due_us = int64_t(b) * df::FFT_N * 1000000LL / wav.rate;
+        const int64_t due_us = int64_t(b) * df::HOP_N * 1000000LL / wav.rate;
         const df::Frame &f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
         if (f.onset) onsets++;
         if (f.boom)  booms++;

@@ -33,6 +33,8 @@ namespace {
 constexpr const char *TAG = "vis";
 
 using df::FFT_N;
+using df::HOP_N;
+using df::TAIL_N;
 using df::RATE;
 using df::CHANNELS;
 
@@ -54,12 +56,22 @@ using df::CHANNELS;
  * re-derives its origin and drops a block, and it does that on one unit and not
  * the other -- which is the exact divergence this whole path exists to avoid.
  *
- * Eight frames is 186 ms, comfortably past the worst gap observed and about the
+ * Eight windows is 186 ms, comfortably past the worst gap observed and about the
  * lead the audio itself carries. The cost is 16 kB more of a 16 kB buffer, on a
  * unit with ~50 kB free.
+ *
+ * Sized in windows rather than hops on purpose: this covers how audio ARRIVES,
+ * which is a number of bytes per burst, and bytes do not care how often they are
+ * analysed. Overlapping the windows raises the frame rate without changing what
+ * has to be held.
  */
 constexpr int STREAM_BYTES = FFT_N * CHANNELS * (int)sizeof(int16_t) * 8;
 constexpr uint32_t FRAME_BYTES = CHANNELS * sizeof(int16_t);
+
+/* The window and the hop in bytes, which is the unit the accumulator works in. */
+constexpr size_t WINDOW_BYTES = (size_t)FFT_N * CHANNELS * sizeof(int16_t);
+constexpr size_t HOP_BYTES    = (size_t)HOP_N * CHANNELS * sizeof(int16_t);
+constexpr size_t TAIL_BYTES   = (size_t)TAIL_N * CHANNELS * sizeof(int16_t);
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 
@@ -141,12 +153,17 @@ uint8_t pixels[LED_COUNT * 3];
 /*
  * Block alignment.
  *
- * The detector chops the stream into fixed FFT_N blocks, and every unit must cut
- * them at the same positions or a transient near a boundary is split on one
- * board and centred on another -- the marginal onsets then fire on one strip and
- * not the other. Boundaries are derived from the instant audio is SCHEDULED to
- * be heard, which all units agree on, and never from a clock read here, which
- * they do not: they reach this code milliseconds apart.
+ * The detector cuts a window of FFT_N every HOP_N samples, and every unit must
+ * cut at the same positions or a transient near a boundary is split on one board
+ * and centred on another -- the marginal onsets then fire on one strip and not
+ * the other. Boundaries are derived from the instant audio is SCHEDULED to be
+ * heard, which all units agree on, and never from a clock read here, which they
+ * do not: they reach this code milliseconds apart.
+ *
+ * The grid is the HOP, not the window. Windows may overlap; what every unit has
+ * to agree on is where one is allowed to START, and that is a multiple of HOP_N.
+ * Since FFT_N is a whole number of hops, the old window grid is a subset of this
+ * one -- a finer hop refines the positions rather than moving them.
  *
  * Both sides count bytes that actually passed through the buffer, so a drop
  * cannot make them disagree about position.
@@ -177,7 +194,7 @@ std::atomic<long long> s_align_block_index; /* block number of that first sample
  * from an origin two or three blocks stale.
  *
  * Boundaries survived that, which is why it went unnoticed for so long: the
- * discard arithmetic still lands on a multiple of FFT_N, so both units cut
+ * discard arithmetic still lands on a multiple of HOP_N, so both units cut
  * identical windows and simply dated them differently. due_us is what carries
  * the date, and every time-driven pattern is built on it, so the strips ran the
  * same animation from different points of its cycle -- stepping further apart at
@@ -572,17 +589,43 @@ void visualiser_task(void *arg)
             }
             continue;
         }
-        filled = 0;
         starved_shown = false;
 
-        /* due_us is derived from the block index, not read from a clock, so it
+        /* due_us is derived from the hop index, not read from a clock, so it
          * is the same value on every unit for this same audio -- at the rate
          * this unit was told the audio is, which is the same rate its playback
-         * used to date the audio in the first place. */
-        const int64_t due_us = block_index * FFT_N * 1000000LL / rate;
+         * used to date the audio in the first place. It names the START of the
+         * window, which is what the grid is counted in. */
+        const int64_t due_us = block_index * HOP_N * 1000000LL / rate;
         const int64_t t_in = esp_timer_get_time();
         const df::Frame &f = analysis.process(raw, block_index, due_us, 0);
         const int64_t t_analysed = esp_timer_get_time();
+
+        /*
+         * Advance by one HOP, keeping the newest TAIL_BYTES.
+         *
+         * This was `filled = 0`, and it sat ABOVE process() -- which was safe
+         * only because the window and the hop were the same thing, so resetting
+         * the counter discarded the whole window and moved nothing. A hop that
+         * is shorter than the window has to physically slide the tail down, so
+         * it has to happen after the window has been read, not before.
+         *
+         * The newest bytes, not the oldest. `raw` must remain a contiguous
+         * SUFFIX of what has been received, because that is the invariant the
+         * realign path above depends on -- it trims `raw` by a byte count
+         * measured from the far end. Keeping the oldest would leave the right
+         * number of bytes holding the wrong audio, and every check here looks at
+         * where a window starts rather than what is in it, so nothing on the
+         * board would report it. test_align.c grew a window-contiguity check for
+         * exactly that reason.
+         *
+         * `if constexpr` so that at TAIL_N == 0 this is absent rather than a
+         * zero-length memmove off the end of the buffer.
+         */
+        if constexpr (TAIL_BYTES > 0) {
+            std::memmove(raw, reinterpret_cast<uint8_t *>(raw) + HOP_BYTES, TAIL_BYTES);
+        }
+        filled = TAIL_BYTES;
 
         block_index++;
 
@@ -948,9 +991,9 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
      * while this one is mid-alignment would otherwise be overwritten. */
     if (due_master_us > 0 && s_align_pending.exchange(false, std::memory_order_relaxed)) {
         const int64_t idx = (due_master_us * rate) / 1000000;
-        const int32_t into_block = static_cast<int32_t>(idx % FFT_N);
-        s_skip_frames = into_block ? (FFT_N - into_block) : 0;
-        s_pending_block_index = (idx + s_skip_frames) / FFT_N;
+        const int32_t into_hop = static_cast<int32_t>(idx % HOP_N);
+        s_skip_frames = into_hop ? (HOP_N - into_hop) : 0;
+        s_pending_block_index = (idx + s_skip_frames) / HOP_N;
         s_mark_align_point = true;
         bump(s_aligns);
     }
@@ -977,7 +1020,7 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
          * check needs: the scheduled instant of the first aligned frame, beside
          * the byte it starts at. Plain stores -- the feed task is the only
          * reader of these. */
-        s_ref_due = s_pending_block_index * FFT_N * 1000000LL / rate;
+        s_ref_due = s_pending_block_index * HOP_N * 1000000LL / rate;
         s_ref_byte = s_sent_total;
         s_ref_valid = true;
         s_mark_align_point = false;
@@ -1042,9 +1085,11 @@ void visualiser_set_pattern(const char *name)
 void visualiser_start(void)
 {
 #if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
-    /* Trigger level is one full analysis frame: waking the task for a handful
-     * of bytes at a time is pure overhead now that partial reads accumulate. */
-    pcm_stream = xStreamBufferCreate(STREAM_BYTES, FFT_N * CHANNELS * sizeof(int16_t));
+    /* Trigger level is one HOP: waking the task for a handful of bytes at a time
+     * is pure overhead now that partial reads accumulate, and once the first
+     * window is held a frame needs only a hop of fresh audio to produce the
+     * next one. */
+    pcm_stream = xStreamBufferCreate(STREAM_BYTES, HOP_BYTES);
     assert(pcm_stream);
 #endif
 

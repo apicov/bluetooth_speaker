@@ -35,11 +35,29 @@
 
 #include <stdint.h>
 
+#include "analysis_config.h"
 #include "beat_detect.h"
 
 namespace df {
 
-constexpr int FFT_N    = 1024;          /* 43 Hz bins at 44.1 kHz */
+/*
+ * The window and the hop, which used to be the same number. See
+ * analysis_config.h for where they are set and why they are not Kconfig-only.
+ *
+ * FFT_N is WINDOW-ONLY. It sets BINS, band_bin() and the four band
+ * static_asserts below, the Hann table and the magnitude normalisation in
+ * analysis.cpp, and fft_host.c. None of those care how often a window is taken.
+ *
+ * HOP_N is GRID-ONLY. It sets how often a frame is produced, and therefore the
+ * block grid the units align to and the derivation of due_us from an index.
+ * Nothing in the transform reads it.
+ *
+ * TAIL_N is what one window carries over into the next -- zero when they do not
+ * overlap.
+ */
+constexpr int FFT_N    = DF_FFT_N;      /* 43 Hz bins at 44.1 kHz */
+constexpr int HOP_N    = DF_HOP_N;
+constexpr int TAIL_N   = DF_TAIL_N;
 constexpr int RATE     = 44100;         /* what the tuning was measured at */
 constexpr int BINS     = FFT_N / 2;
 constexpr int CHANNELS = 2;
@@ -208,8 +226,16 @@ public:
      * firmware uses whatever init() sets. */
     void set_boom_tuning(float k, float flux_floor, int64_t refractory_us);
 
-    /* `stereo` is exactly FFT_N interleaved 16-bit frames. The returned
-     * reference is valid until the next call. */
+    /*
+     * `stereo` is exactly FFT_N interleaved 16-bit frames. The returned
+     * reference is valid until the next call.
+     *
+     * Hop-agnostic, and deliberately so: this transforms whatever window it is
+     * handed and never asks where the previous one started. All the hop
+     * knowledge lives in the callers, which is why overlapping the windows is a
+     * change to them and not to this. `index` and `due_us` are the caller's
+     * statement of where on the shared grid this window sits.
+     */
     const Frame &process(const int16_t *stereo, int64_t index,
                          int64_t due_us, uint8_t unit);
 

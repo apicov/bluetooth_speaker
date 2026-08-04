@@ -84,10 +84,14 @@ float noise()
  * keeps the bands from sitting at zero where flux is trivially zero too. */
 std::vector<int16_t> make_audio()
 {
-    std::vector<int16_t> pcm((size_t)BLOCKS * df::FFT_N * df::CHANNELS);
+    /* BLOCKS windows starting every HOP_N, so the last one runs FFT_N past its
+     * own start -- not BLOCKS * FFT_N, which is only the same while the windows
+     * do not overlap. */
+    const int SAMPLES = (BLOCKS - 1) * df::HOP_N + df::FFT_N;
+    std::vector<int16_t> pcm((size_t)SAMPLES * df::CHANNELS);
     int last_kick = -KICK_EVERY;
 
-    for (int i = 0; i < BLOCKS * df::FFT_N; i++) {
+    for (int i = 0; i < SAMPLES; i++) {
         if (i % KICK_EVERY == 0) {
             last_kick = i;
         }
@@ -121,7 +125,7 @@ struct Unit {
      * the same frame more than once, which must make no difference. */
     void block(const int16_t *audio, int64_t index, int renders = 1)
     {
-        const int64_t due = index * df::FFT_N * 1000000LL / df::RATE;
+        const int64_t due = index * df::HOP_N * 1000000LL / df::RATE;
         const df::Frame &f = an.process(audio, index, due, 0);
         for (int i = 0; i < renders; i++) {
             pat->render(f, rgb.data(), LEDS);
@@ -175,7 +179,7 @@ int replay(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb)
     int differ = 0;
 
     for (int i = 0; i < BLOCKS; i++) {
-        const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
+        const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
         a.block(blk, i);
         b.block(blk, i);
         if (!same(a, b)) {
@@ -195,7 +199,7 @@ int late_join(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
     int differ = 0;
 
     for (int i = 0; i < BLOCKS; i++) {
-        const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
+        const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
         a.block(blk, i);
         if (i < join) {
             continue;
@@ -218,7 +222,7 @@ int double_render(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern 
     int differ = 0;
 
     for (int i = 0; i < BLOCKS; i++) {
-        const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
+        const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
         a.block(blk, i, 1);
         b.block(blk, i, 2);
         if (!same(a, b)) {
@@ -239,7 +243,7 @@ int gap(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
     int differ = 0;
 
     for (int i = 0; i < BLOCKS; i++) {
-        const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
+        const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
         a.block(blk, i);
         if (i >= from && i < from + len) {
             continue;                       /* B never sees these */
@@ -266,8 +270,8 @@ int main(void)
         u.init(&p);
         int onsets = 0;
         for (int i = 0; i < BLOCKS; i++) {
-            const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
-            const int64_t due = (int64_t)i * df::FFT_N * 1000000LL / df::RATE;
+            const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
+            const int64_t due = (int64_t)i * df::HOP_N * 1000000LL / df::RATE;
             if (u.an.process(blk, i, due, 0).onset) {
                 onsets++;
             }
@@ -317,8 +321,8 @@ int main(void)
         u.init(&p);
         int booms = 0;
         for (int i = 0; i < BLOCKS; i++) {
-            const int16_t *blk = &pcm[(size_t)i * df::FFT_N * df::CHANNELS];
-            if (u.an.process(blk, i, (int64_t)i * df::FFT_N * 1000000LL / df::RATE, 0).boom) {
+            const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
+            if (u.an.process(blk, i, (int64_t)i * df::HOP_N * 1000000LL / df::RATE, 0).boom) {
                 booms++;
             }
         }
