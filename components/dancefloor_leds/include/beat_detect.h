@@ -21,6 +21,44 @@ extern "C" {
 #endif
 
 #define BEAT_BANDS 4      /* roughly: kick, low-mid, presence, air */
+
+/*
+ * ---------------------------------------------------------------------------
+ * These constants are on their way to becoming a cross-unit agreement
+ * ---------------------------------------------------------------------------
+ *
+ * Today every value below is a local quality knob: exactly one unit runs this
+ * detector for any given frame. A unit doing its own analysis decides for
+ * itself, and a unit given frames by the hub is handed decisions already made,
+ * so two units cannot disagree about a threshold they do not both apply.
+ *
+ * A third source mode is intended -- the hub does the FFT, and each satellite
+ * runs its own detector on the band energies it is sent, sitting between
+ * "analyse everything locally" and "be told everything". See DF_ANALYSES_AUDIO
+ * and DF_TAKES_REMOTE_FRAMES in visualiser.cpp, which name the two capabilities
+ * separately for exactly that reason. Frame::band is already what such a unit
+ * would consume: four floats, full precision, and it already travels.
+ *
+ * Under that mode these stop being local. Every unit runs beat_det_update() on
+ * the same received bands, so identical decisions require identical constants
+ * AND identical state -- and the state is BEAT_HIST frames of flux history plus
+ * a refractory instant. Two consequences worth knowing before touching anything
+ * here:
+ *
+ *   - a value changed on one unit and not another becomes a sync fault rather
+ *     than a taste difference, and it will present as strips that mostly agree
+ *     and disagree on the marginal onsets, which is expensive to diagnose
+ *   - BEAT_HIST sets how long a unit that missed frames takes to converge back
+ *     onto its neighbours' threshold, so it is a sync parameter as well as a
+ *     tuning one
+ *
+ * Frame::spec is NOT a substitute for band here, and that matters if the input
+ * is ever reconsidered: it is quantised to 8 bits through x/(1+x), and flux is
+ * a frame-to-frame difference, so the quantisation lands directly on the signal
+ * the detector runs on. BOOM_FLUX_FLOOR is 0.02 on a 0..1 scale, about five
+ * counts of 255, and near-threshold differences are smaller than that.
+ */
+
 /*
  * How many frames of flux the adaptive threshold is measured over.
  *
@@ -34,6 +72,10 @@ extern "C" {
  * of history adapts faster but is a noisier estimate of the mean and standard
  * deviation. It wants measuring against the corpus rather than reasoning about,
  * which is why nothing here scales it yet.
+ *
+ * Note the second axis above before deciding: this also sets how long a unit
+ * that missed frames takes to agree with its neighbours again, so "adapts
+ * faster" is a sync argument for the shorter window and not only a taste one.
  */
 #define BEAT_HIST  43
 

@@ -137,6 +137,16 @@ constexpr int   SPEC_BINS   = 64;
 constexpr float SPEC_LO_HZ  = 40.0f;
 constexpr float SPEC_HI_HZ  = 16000.0f;
 
+/*
+ * The boom detector's three, applied by Analysis::init() and swept by
+ * pattern_lab. The reasoning behind each value is with the code that explains
+ * it, in Analysis::init().
+ *
+ * Same caveat as the wideband detector's constants: see the note at the top of
+ * beat_detect.h about these becoming a cross-unit agreement rather than a local
+ * preference once a satellite can be sent bands and run its own detector on
+ * them. Frame::band carries what such a unit needs; Frame::spec does not.
+ */
 constexpr float   BOOM_THRESHOLD_K  = 1.4f;
 constexpr float   BOOM_FLUX_FLOOR   = 0.02f;
 constexpr int64_t BOOM_REFRACTORY_US = 200000;
