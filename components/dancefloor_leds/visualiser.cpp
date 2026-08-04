@@ -327,6 +327,8 @@ std::atomic<uint32_t> s_overrun;    /* frames dropped because the queue was full
  * scale with different things -- see the note where they are logged -- and are
  * only useful next to each other. */
 std::atomic<uint32_t> s_render_sum, s_render_max, s_render_n;
+/* Times the strip went dark because nothing arrived -- see RENDER_IDLE_US. */
+std::atomic<uint32_t> s_idle_dark;
 
 /*
  * Master -> local, or null on a unit where they are the same thing.
@@ -431,6 +433,25 @@ constexpr int64_t RENDER_NAP_MS = 20;
 /* Past this, the frame was not merely a little late -- something stalled. Drawn
  * anyway, because a stale frame is better than a gap, but counted. */
 constexpr int64_t RENDER_LATE_US = 20000;
+
+/*
+ * How long the queue may stay empty before the strip goes dark.
+ *
+ * Only reachable on a unit that is GIVEN its frames: one doing its own analysis
+ * notices a stopped stream itself and flushes, which blanks. A unit fed from
+ * elsewhere has no analysis task to notice anything, so without this it holds
+ * its last frame indefinitely -- a lit strip that looks like it is working
+ * while the thing driving it has gone.
+ *
+ * Half a second is well past any gap normal delivery produces at 43 frames a
+ * second, and short enough that a stopped floor reads as stopped.
+ *
+ * Going dark rather than falling back to local analysis is the deliberate
+ * choice: a unit told to follow another should stop when it cannot, not start
+ * improvising. Improvising is what a locally analysing unit is for, and that is
+ * a build-time decision.
+ */
+constexpr int64_t RENDER_IDLE_US = 500000;
 
 void show(const uint8_t *rgb)
 {
@@ -631,13 +652,14 @@ void visualiser_task(void *arg)
             const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
             ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %" PRIu32
                           "/%" PRIu32 " us | queued %" PRIu32 " | late %" PRIu32
-                          " | overrun %" PRIu32 " | n %" PRIu32 "/%" PRIu32
+                          " | overrun %" PRIu32 " | dark %" PRIu32
+                          " | n %" PRIu32 "/%" PRIu32
                           " | stack free %" PRIu32,
                      cost_analysis / cost_n, cost_analysis_max,
                      rn ? rsum / rn : 0, take(s_render_max),
                      s_fq_head.load(std::memory_order_relaxed) -
                          s_fq_tail.load(std::memory_order_relaxed),
-                     take(s_late), take(s_overrun), cost_n, rn,
+                     take(s_late), take(s_overrun), take(s_idle_dark), cost_n, rn,
                      uxTaskGetStackHighWaterMark(nullptr));
             cost_analysis = cost_analysis_max = 0;
             cost_n = 0;
@@ -658,6 +680,7 @@ void render_task(void *arg)
 {
     (void)arg;
     uint32_t seen_flush = s_fq_flush.load(std::memory_order_relaxed);
+    int64_t  drawn_at = 0;      /* when the strip last showed something */
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
     int64_t last_sec = -1;
     int     lower_in = -1;
@@ -689,6 +712,13 @@ void render_task(void *arg)
         const uint32_t tail = s_fq_tail.load(std::memory_order_relaxed);
         const uint32_t head = s_fq_head.load(std::memory_order_acquire);
         if (head == tail) {
+            if (drawn_at && esp_timer_get_time() - drawn_at > RENDER_IDLE_US) {
+                drawn_at = 0;                /* once, not every nap */
+                if (pattern) pattern->reset();
+                std::memset(pixels, 0, sizeof(pixels));
+                show(pixels);
+                bump(s_idle_dark);
+            }
             vTaskDelay(pdMS_TO_TICKS(RENDER_NAP_MS));
             continue;
         }
@@ -768,7 +798,8 @@ void render_task(void *arg)
             show(pixels);
         }
 
-        const uint32_t took = static_cast<uint32_t>(esp_timer_get_time() - t0);
+        drawn_at = esp_timer_get_time();
+        const uint32_t took = static_cast<uint32_t>(drawn_at - t0);
         s_render_sum.fetch_add(took, std::memory_order_relaxed);
         bump(s_render_n);
         uint32_t prev = s_render_max.load(std::memory_order_relaxed);

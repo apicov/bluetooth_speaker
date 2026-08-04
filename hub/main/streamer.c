@@ -388,6 +388,48 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
     }
 }
 
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+/*
+ * Send one analysis frame to every listener.
+ *
+ * Registered as the visualiser's publisher, so it runs on the analysis task --
+ * which means it must not block. sendto() on a UDP socket does not.
+ *
+ * Unicast, like the audio and for the same reason: group-addressed frames are
+ * never acknowledged and so never retried, measured at ~20% loss here, and a
+ * fifth of the frames missing is a visibly broken strip. ~5 kB/s per listener
+ * against the 30-40 the audio already costs.
+ *
+ * A failed send costs a satellite one frame out of 43 a second. It is counted
+ * with the audio's own failures rather than separately -- the interesting
+ * question is whether the link is dropping things, not which kind.
+ */
+static void publish_frame(const vis_frame_t *f)
+{
+    if (sizeof(*f) > FRAME_PAYLOAD_MAX) {
+        return;                              /* refuse rather than truncate */
+    }
+    frame_msg_t msg = { .type = MSG_FRAME, .len = (uint8_t)sizeof(*f) };
+    memcpy(msg.payload, f, sizeof(*f));
+    const size_t bytes = FRAME_MSG_BYTES(sizeof(*f));
+
+    portENTER_CRITICAL(&s_clients_lock);
+    client_t snapshot[MAX_CLIENTS];
+    memcpy(snapshot, s_clients, sizeof(snapshot));
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!snapshot[i].last_seen) {
+            continue;
+        }
+        if (sendto(sock, &msg, bytes, 0,
+                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
+            s_tx_fail++;
+        }
+    }
+}
+#endif
+
 void streamer_begin_packet(void)
 {
     s_pending_pos = s_samples_in;
@@ -1623,5 +1665,16 @@ void streamer_start(void)
     xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
     xTaskCreatePinnedToCore(local_play_task, "play", 4096, NULL, 8, NULL, 1);
     xTaskCreate(ring_monitor_task, "ringmon", 3072, NULL, 3, NULL);
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /*
+     * Safe before visualiser_start(): this only stores a pointer the analysis
+     * task reads, and that task does not exist yet.
+     *
+     * Registered unconditionally. A satellite built to do its own analysis
+     * ignores what arrives, so whether frames are worth sending is the
+     * receiver's decision, not this one's -- and a floor may hold some of each.
+     */
+    visualiser_set_publish(publish_frame);
+#endif
     ESP_LOGI(TAG, "streaming on port %d, unicast to registered listeners", SYNC_PORT);
 }

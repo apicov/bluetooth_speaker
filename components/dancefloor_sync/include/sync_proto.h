@@ -36,6 +36,7 @@ typedef enum {
     MSG_META     = 5,   /* master -> listeners, track metadata */
     MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
     MSG_TSF      = 7,   /* master -> satellite, measurement only, see tsf_msg_t */
+    MSG_FRAME    = 8,   /* master -> listeners, one analysis frame */
 } msg_type_t;
 
 /*
@@ -224,6 +225,33 @@ typedef struct __attribute__((packed)) {
 
 /* Track metadata forwarded from the bridge. Carries link_meta_t verbatim, so
  * there is exactly one definition of the fields (see sbc_link.h). */
+/*
+ * One analysis frame, for units that draw what another unit decided.
+ *
+ * The payload is a vis_frame_t from components/dancefloor_leds -- copied in as
+ * bytes rather than declared here, because that component does not depend on
+ * this one and must stay buildable alone. `len` is carried so the two ends can
+ * disagree about the frame's size and say so, instead of reading past it: a hub
+ * and a satellite on different builds is the failure this protocol is most
+ * likely to meet, and a silently reinterpreted frame would be worse than a
+ * refused one.
+ *
+ * Unicast to each listener like the audio, NOT multicast. Group-addressed
+ * frames are never acknowledged and so never retried -- measured at ~20% loss
+ * at every PHY rate tried -- and 20% of frames missing is a visibly broken
+ * strip. ~5 kB/s per listener at 43 Hz, against the 30-40 the audio already
+ * costs, so paying for retries here is cheap.
+ */
+#define FRAME_PAYLOAD_MAX 160
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;           /* MSG_FRAME */
+    uint8_t len;            /* bytes of payload that follow */
+    uint8_t payload[FRAME_PAYLOAD_MAX];
+} frame_msg_t;
+
+#define FRAME_MSG_BYTES(n) (sizeof(frame_msg_t) - FRAME_PAYLOAD_MAX + (n))
+
 typedef struct __attribute__((packed)) {
     uint8_t type;           /* MSG_META */
     uint8_t payload[196];   /* sizeof(link_meta_t) */

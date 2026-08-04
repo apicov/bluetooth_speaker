@@ -183,6 +183,8 @@ static volatile uint32_t n_retunes;
 static volatile uint32_t n_retunes_bad;
 static volatile uint32_t n_gaps;          /* lost-packet gaps filled with silence */
 static volatile uint32_t n_wifi_drops;    /* disconnects from the hub's AP */
+static volatile uint32_t n_frames_rx;     /* analysis frames taken from the hub */
+static volatile uint32_t n_frames_bad;    /* ... and rejected, wrong size */
 static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
 static volatile uint32_t hw_drift;
 
@@ -689,6 +691,40 @@ static void rx_task(void *arg)
             const link_meta_t *m = (const link_meta_t *)((const meta_msg_t *)buf)->payload;
             ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
                      m->track_id, m->title, m->artist, m->album);
+        } else if (buf[0] == MSG_FRAME && n >= (int)FRAME_MSG_BYTES(0)) {
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+            /*
+             * An analysis frame the hub computed. Drawn at the instant it
+             * names, exactly like one this unit computed itself, so the two
+             * sources are interchangeable -- which is what lets the hub run any
+             * algorithm at all without it having to be deterministic across
+             * units.
+             *
+             * The length is checked rather than assumed. A hub and a satellite
+             * on different builds is the mismatch this protocol is most likely
+             * to meet, and reinterpreting a frame of the wrong shape would put
+             * garbage on the strip rather than nothing. Said once: it is a
+             * property of the pair of builds, so it will not stop happening,
+             * and 43 complaints a second would bury everything else.
+             */
+            const frame_msg_t *fm = (const frame_msg_t *)buf;
+            if (fm->len == sizeof(vis_frame_t) &&
+                n >= (int)FRAME_MSG_BYTES(fm->len)) {
+                vis_frame_t f;
+                memcpy(&f, fm->payload, sizeof(f));
+                visualiser_submit_frame(&f);
+                n_frames_rx++;
+            } else {
+                static bool told;
+                if (!told) {
+                    told = true;
+                    ESP_LOGE(TAG, "frame of %u bytes, expected %u -- hub and "
+                                  "satellite are not the same build",
+                             fm->len, (unsigned)sizeof(vis_frame_t));
+                }
+                n_frames_bad++;
+            }
+#endif
         } else if (buf[0] == MSG_TSF && n >= (int)sizeof(tsf_msg_t)) {
             /*
              * Measurement only. Nothing below feeds anchoring, stream_offset,
@@ -971,7 +1007,8 @@ static void drift_task(void *arg)
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32
-                          " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")",
+                          " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
+                     " | leds %s (rx %" PRIu32 ", bad %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
@@ -979,7 +1016,8 @@ static void drift_task(void *arg)
                      n_retunes, n_retunes_bad, n_gaps, n_wifi_drops,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",
-                     n_tsf_used, n_tsf_fallback);
+                     n_tsf_used, n_tsf_fallback,
+                     visualiser_source_name(), n_frames_rx, n_frames_bad);
         }
 
         if (stream_start_local == 0) {
