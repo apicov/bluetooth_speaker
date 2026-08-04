@@ -13,6 +13,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -295,7 +296,26 @@ static volatile uint32_t alloc_fail_caps;
  * anything that has probed recently is listening.
  */
 #define MAX_CLIENTS 8
-#define CLIENT_TIMEOUT_US 10000000   /* forget a satellite that stops probing */
+/*
+ * How long a satellite that has stopped probing stays on the send list.
+ *
+ * Was 10 s, which is 40 probes at PROBE_PERIOD_MS -- far more tolerance than
+ * losing probes needs, and the window during which this unit keeps unicasting
+ * audio and 86 analysis frames a second at a station that is not there. Each of
+ * those sends takes a 1152-byte DMA buffer the driver cannot deliver and will
+ * not free until it gives up, and the pool is finite: pulling a satellite mid-
+ * track produced 124 failed allocations over exactly ten seconds, free heap down
+ * to 4580 bytes and the largest block from 26624 to 1216, recovering the instant
+ * this timeout expired. An earlier instance of the same thing cost an underrun.
+ *
+ * 2 s is 8 consecutive probes, which is still generous against a link measured
+ * essentially clean, and cuts that window five-fold. Not shorter: a satellite
+ * forgotten in error gets no audio until its next probe re-registers it, and at
+ * ~150 ms of ring against a 250 ms probe period that is an underrun rather than
+ * a glitch. The event handler below is what makes a clean disassociation instant
+ * regardless; this bound is for the satellite that vanishes without saying so.
+ */
+#define CLIENT_TIMEOUT_US 2000000
 
 typedef struct {
     struct sockaddr_in addr;
@@ -304,6 +324,8 @@ typedef struct {
 
 static client_t s_clients[MAX_CLIENTS];
 static portMUX_TYPE s_clients_lock = portMUX_INITIALIZER_UNLOCKED;
+static esp_netif_t *s_ap_netif;           /* for the MAC -> IP lookup below */
+static volatile uint32_t n_sta_dropped;   /* forgotten on the event, not the timeout */
 
 static void client_seen(const struct sockaddr_in *from)
 {
@@ -326,6 +348,54 @@ static void client_seen(const struct sockaddr_in *from)
         s_clients[free_slot].last_seen = now;
     }
     portEXIT_CRITICAL(&s_clients_lock);
+}
+
+/*
+ * Forget a satellite the instant it disassociates, rather than when it stops
+ * probing.
+ *
+ * The send list is keyed by IP and the WiFi event carries a MAC, so the DHCP
+ * server's lease table bridges them -- the API takes the MAC in and writes the
+ * IP out. If the lookup fails, or the lease is already gone, this does nothing
+ * and CLIENT_TIMEOUT_US still applies: the effect is only ever to forget sooner,
+ * never to forget something else, because the MAC is authoritative.
+ *
+ * Worth having on top of a shorter timeout because it removes the window
+ * entirely for the case that actually happens -- a satellite being reflashed or
+ * restarted, which disassociates cleanly. The timeout covers the case this
+ * cannot see at all: a unit that loses power or walks out of range.
+ */
+static void client_gone(const uint8_t mac[6])
+{
+    if (!s_ap_netif) {
+        return;
+    }
+    /* Outside the critical section: this walks the lease table and takes its own
+     * locks, neither of which belongs inside a spinlock held by the send path. */
+    esp_netif_pair_mac_ip_t pair;
+    memcpy(pair.mac, mac, sizeof(pair.mac));
+    pair.ip.addr = 0;
+    if (esp_netif_dhcps_get_clients_by_mac(s_ap_netif, 1, &pair) != ESP_OK || !pair.ip.addr) {
+        return;
+    }
+
+    bool found = false;
+    portENTER_CRITICAL(&s_clients_lock);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (s_clients[i].last_seen &&
+            s_clients[i].addr.sin_addr.s_addr == pair.ip.addr) {
+            s_clients[i].last_seen = 0;
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    if (found) {
+        n_sta_dropped++;
+        ESP_LOGW(TAG, "satellite " IPSTR " disassociated -- dropped from the send list",
+                 IP2STR(&pair.ip));
+    }
 }
 
 uint32_t streamer_take_dropped(void)
@@ -741,16 +811,27 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 /* ------------------------------------------------------------------- wifi */
 
 /*
- * Only to count them. A satellite dropping off is invisible otherwise -- the
- * driver logs it, but nothing accumulates it, so a link that flaps once an hour
- * over an evening looks identical to one that never does. One reason=209
- * SA-Query disassociation has already been seen.
+ * Count them, and stop sending to them.
+ *
+ * Counting was the original reason: a satellite dropping off is invisible
+ * otherwise -- the driver logs it, but nothing accumulates it, so a link that
+ * flaps once an hour over an evening looks identical to one that never does. One
+ * reason=209 SA-Query disassociation has already been seen.
+ *
+ * Dropping it from the send list is the other half, and it was missing. The
+ * counter alone left this unit unicasting audio and analysis frames at a station
+ * that had gone, for a whole CLIENT_TIMEOUT_US, exhausting the WiFi driver's
+ * buffer pool -- see the note there.
  */
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)data;
+    (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
         n_sta_left++;
+        const wifi_event_ap_stadisconnected_t *ev = data;
+        if (ev) {
+            client_gone(ev->mac);
+        }
     }
 }
 
@@ -758,7 +839,9 @@ static void wifi_start_ap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    /* Kept, because client_gone() needs it to turn a disassociating station's
+     * MAC into the IP the send list is keyed by. */
+    s_ap_netif = esp_netif_create_default_wifi_ap();
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                        WIFI_EVENT_AP_STADISCONNECTED,
                                                        wifi_event, NULL, NULL));
@@ -1570,13 +1653,13 @@ static void ring_monitor_task(void *arg)
                           "stack play %" PRIu32 " mon %" PRIu32 " | underruns %" PRIu32
                           " restarts %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | sta-left %" PRIu32
-                          " | alloc-fail %" PRIu32,
+                          " (dropped %" PRIu32 ") | alloc-fail %" PRIu32,
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_mon, n_underruns, n_restarts, n_splices,
-                     n_retunes, n_retunes_bad, n_sta_left, n_alloc_fail);
+                     n_retunes, n_retunes_bad, n_sta_left, n_sta_dropped, n_alloc_fail);
         }
 
         if (local_start == 0 || rate_ema == 0) {
