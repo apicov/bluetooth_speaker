@@ -36,9 +36,29 @@ using df::FFT_N;
 using df::RATE;
 using df::CHANNELS;
 
-/* Four analysis frames of headroom. A short send loses audio AND breaks the
- * block alignment, so the buffer is sized to make that rare. */
-constexpr int STREAM_BYTES = FFT_N * CHANNELS * (int)sizeof(int16_t) * 4;
+/*
+ * Sized by how bursty the audio ARRIVES, which is not how smoothly it plays.
+ *
+ * This was four analysis frames -- 93 ms -- and that was right while the feed
+ * came from the DAC, where audio turns up one chunk per playback pass and the
+ * buffer only had to cover the analysis task being descheduled.
+ *
+ * Fed from the arrival side it has to cover the source's delivery pattern
+ * instead, and the hub's own sbc_in line reports what that is: bursts with
+ * gaps of 77 to 115 ms between them. A burst after a 105 ms gap is ~18.5 kB
+ * against a 16 kB buffer, so it overflowed by about the 512 B seen dropped in
+ * nearly every window on the hub and none on the satellite -- which never sees
+ * it, because the hub re-sends packets paced.
+ *
+ * A short send is not just lost audio. It sets s_align_pending, so the unit
+ * re-derives its origin and drops a block, and it does that on one unit and not
+ * the other -- which is the exact divergence this whole path exists to avoid.
+ *
+ * Eight frames is 186 ms, comfortably past the worst gap observed and about the
+ * lead the audio itself carries. The cost is 16 kB more of a 16 kB buffer, on a
+ * unit with ~50 kB free.
+ */
+constexpr int STREAM_BYTES = FFT_N * CHANNELS * (int)sizeof(int16_t) * 8;
 constexpr uint32_t FRAME_BYTES = CHANNELS * sizeof(int16_t);
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
