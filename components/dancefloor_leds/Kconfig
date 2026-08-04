@@ -99,17 +99,23 @@ menu "Dancefloor LEDs"
               GPIO 2   DOIT ESP32 DEVKIT V1, NodeMCU-32S, most WROOM-32 clones
               GPIO 5   WEMOS/LOLIN D32, some TTGO
               GPIO 16  a few ESP32-CAM style boards
-              GPIO 22  some Heltec boards -- but 22 is the SBC UART TX on the
-                       hub, so only usable on a satellite
+              GPIO 22  some Heltec boards. This used to say 22 was the hub's
+                       SBC UART TX and so satellite-only; it is not any more.
+                       The link is one-way and the hub names no TX pin.
+              GPIO 21  XIAO ESP32-S3 -- but it is ACTIVE LOW there and this
+                       driver does not know that, so it reads inverted against
+                       every other unit: one gap per second, not one flash.
               none     official Espressif ESP32-DevKitC has only a power LED
 
             With no usable onboard LED, wire one to any free pin through a
             resistor, or point this at a pin you can watch on a scope. Taken
             here: I2S (25, 26, 27), the strip (18), the markers (4, 21), and on
-            the hub the SBC UART (22, 23).
+            the hub the SBC UART RX (23).
 
             The range stops at 33 because GPIO 34-39 on the ESP32 are
-            input-only and cannot drive anything.
+            input-only and cannot drive anything. That bound is an ESP32 fact
+            and not an S3 one, where it costs the XIAO's D6 (GPIO 43) -- but
+            D1, D2 and D5 are 2, 3 and 6, so something is always reachable.
 
             The eye resolves maybe 10-20 ms and a 240 fps phone camera about
             4 ms, so this answers "are they together" rather than "by how much"

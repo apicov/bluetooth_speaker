@@ -1,0 +1,129 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+CONFIG_FREERTOS_HZ=1000
+
+# The XIAO ESP32-S3 carries 8 MB of flash, against the classic hub's 4.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# There is no USB-UART bridge on this board -- the S3's USB peripheral is wired
+# straight to the connector. Without this the console goes nowhere and the board
+# looks dead on arrival.
+#
+# Worth knowing before the first long run: the port disappears on every reboot,
+# because it IS the chip. `idf.py monitor` reconnects, but a panic during
+# enumeration can lose its own backtrace, which on a project whose whole method
+# is "everything that works, works because something counts it" is a real cost.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# esp_wifi_internal_set_fix_rate() returns ESP_ERR_NOT_SUPPORTED while TX AMPDU
+# is enabled, and DANCEFLOOR_WIFI_PHY_RATE_MBPS is still 6. Unchanged from the
+# classic hub, and unchanged for the same reason.
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+
+# 50% overlap between analysis windows. The window stays 1024; this is only how
+# far the analysis advances between them.
+#
+# Pinned here for the reason it is pinned on the classic hub and on the
+# satellite: a hop mismatch across a floor is the expensive bug, and this build
+# makes one MORE likely rather than less, because it is the first unit on the
+# floor whose config is not a copy of the others'. Both flux floors and the beat
+# history were swept against 206 recordings at 512 -- see docs/tuning-corpus.md.
+CONFIG_DANCEFLOOR_LED_HOP_512=y
+
+# ---------------------------------------------------------------------------
+# Pin map: Seeed Studio XIAO ESP32-S3 (Sense)
+# ---------------------------------------------------------------------------
+#
+# The board breaks out eleven GPIOs, D0-D10, and nothing else:
+#
+#   D0=1  D1=2  D2=3  D3=4  D4=5  D5=6  D6=43(TX)  D7=44(RX)
+#   D8=7(SCK)  D9=8(MISO)  D10=9(MOSI)
+#
+# The hub wants seven of them, so the map below is not one arrangement among
+# many -- it is close to the only one. What is left over is D1, D2, D5 and D6.
+#
+# None of the classic hub's numbers carry over except the marker. 23 and 25 do
+# not exist on this part; 26 and 27 do, but are wired to the SPI flash.
+#
+# On the Sense variant the camera, PDM microphone and SD slot hang off the B2B
+# connector on GPIOs that are not broken out, so they take nothing from this
+# list -- but they also give nothing to it. Every one of them is dead weight for
+# a hub, which analyses the synchronised stream and deliberately never listens
+# to a room (architecture.md S12).
+
+# I2S to the PCM5102A, on the three SPI-labelled pads so the DAC is one ribbon
+# off the end of the header. This chip is the I2S master.
+CONFIG_DANCEFLOOR_I2S_BCK_PIN=7
+CONFIG_DANCEFLOOR_I2S_LRCK_PIN=8
+CONFIG_DANCEFLOOR_I2S_DATA_PIN=9
+
+# One wire in from the bridge chip. D7, the pad silkscreened RX.
+CONFIG_DANCEFLOOR_SBC_UART_RX_PIN=44
+
+# WS2812 data, still via the 74AHCT125 -- the S3 drives 3.3 V exactly as the
+# classic ESP32 does, so the level shifter is no less necessary here. Driven
+# through SPI2_HOST and the GPIO matrix, which is fine at the ~2.4 MHz the
+# WS2812 encoding needs. Never RMT: see architecture.md S12.
+CONFIG_DANCEFLOOR_LED_GPIO=1
+
+# The bench marker pins are NOT set here, on purpose.
+#
+# DANCEFLOOR_MARKER_GPIO and DANCEFLOOR_MONITOR_GPIO both depend on
+# DANCEFLOOR_ENABLE_MARKER, which is off, so they are invisible when this file
+# is applied and any value given for them here is silently discarded. Enabling
+# the marker later would then fall back to the Kconfig defaults -- and the
+# classic hub's monitor pin, 21, is this board's onboard LED rather than a pad.
+#
+# The marker stays at 4 (D3), which is the one number that survived the move.
+# The monitor default is 5 (D4), set in main/Kconfig.projbuild where it cannot
+# be dropped. Same trap applies to DANCEFLOOR_LED_MARKER_GPIO, which lives in
+# the shared components/dancefloor_leds/Kconfig and is left alone: if you turn
+# the LED marker on, set its pin to 21 by hand, and expect it to read INVERTED
+# against every other unit, because the onboard LED here is active low and the
+# driver does not know that.
+
+# ---------------------------------------------------------------------------
+# Carried over, but NOT carried over on evidence
+# ---------------------------------------------------------------------------
+#
+# Keep the lwIP tcpip thread off the core the LED tasks run on.
+#
+# On the classic hub this was the whole fix for render starvation: wake overshoot
+# mean 2057 -> 634 us, pattern arithmetic max 23226 -> 5254 us, late frames
+# 10 -> 0. Both parts of that reasoning still hold in principle -- the thread
+# still runs at priority 18, above every task this firmware creates, core locking
+# is still off so every sendto() blocks in that thread rather than in the caller,
+# and this unit still drives ~30x the priority-18 work a satellite does.
+#
+# What does NOT carry over is the measurement. Those numbers were taken on a
+# 240 MHz LX6 with esp-dsp's generic FFT; this is an LX7 with the SIMD path, and
+# the starvation may be smaller, absent, or differently shaped. It is set here
+# because it was right there and is unlikely to hurt, which is exactly the
+# standard architecture.md's postscript says produced most of the wasted effort
+# in this project.
+#
+# Before trusting it, run it both ways and read the vis log line. That is a
+# measurement nobody has made on this part.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
+# ---------------------------------------------------------------------------
+# Deliberately NOT set
+# ---------------------------------------------------------------------------
+#
+# PSRAM. The board has 8 MB of octal PSRAM and this build leaves it off.
+#
+# It is tempting, because architecture.md S16 ends the burstiness wart at
+# "fixing it properly means a smaller lead or a larger ring", and LEAD + RESYNC
+# is 320 ms against a 372 ms ring. But the S3 already has 512 kB of internal
+# SRAM against the classic part's 320, so a larger ring does not need PSRAM --
+# and PSRAM is the wrong memory for it regardless, since the ring is touched
+# from the playback path and cache misses there are the one thing that loop
+# cannot absorb.
+#
+# Enabling it also costs: the octal interface eats GPIO 33-37 (not broken out,
+# so no loss) and adds cache-miss jitter to every task, including the ones being
+# measured. Turn it on only with a specific allocation in mind.
+#
+#   CONFIG_SPIRAM=y
+#   CONFIG_SPIRAM_MODE_OCT=y
+#   CONFIG_SPIRAM_SPEED_80M=y

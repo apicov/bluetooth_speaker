@@ -4,19 +4,18 @@ menu "Dancefloor hub"
 
     config DANCEFLOOR_SBC_UART_RX_PIN
         int "UART RX GPIO, listening to the bridge"
-        default 23
+        default 44
         help
             One wire and a common ground, 500 kbaud, one way. There is no TX
             half -- the bridge talks and this chip only listens.
 
-            23 reuses the wire the old three-wire I2S link used for DATA, from
-            before the bridge link became a UART. See docs/sbc-link.md.
+            44 is D7 on the XIAO ESP32-S3, the pad silkscreened RX. The
+            classic-ESP32 hub uses 23, which does not exist on this part: the
+            S3's GPIOs are 0-21 and 26-48, so 22 to 25 are simply absent. 26-32
+            exist but are wired to the SPI flash, and 33-37 to the octal PSRAM,
+            so of the classic hub's pin map only the marker pin survives.
 
-            Configurable for the reason every other pin here is (board
-            silkscreens disagree), and because it is not a pin every ESP32
-            variant has: on the S3, 22 to 25 do not exist at all. A number the
-            target does not have is rejected by uart_set_pin() inside
-            ESP_ERROR_CHECK, so it aborts at boot rather than failing to build.
+    comment "I2S output -- to this unit's own DAC (this chip is the MASTER)"
 
     config DANCEFLOOR_I2S_LRCK_PIN
         int "I2S LRCK (WS) GPIO"
@@ -103,11 +102,22 @@ menu "Dancefloor hub"
 
     config DANCEFLOOR_MONITOR_GPIO
         int "GPIO watching a satellite's marker pulse"
-        default 21
+        default 5
         depends on DANCEFLOOR_ENABLE_MARKER
         help
             Input. Wire the SATELLITE's marker GPIO here, plus a common ground.
             Must differ from the marker GPIO.
+
+            5 is D4 on the XIAO ESP32-S3, against the classic hub's 21. 21
+            exists on this part but is the board's onboard LED and is not
+            brought out to a pad.
+
+            This default lives here rather than in sdkconfig.defaults, and that
+            is not a style choice. The symbol depends on DANCEFLOOR_ENABLE_MARKER,
+            which is off, so it is invisible when sdkconfig is generated and a
+            value for it in sdkconfig.defaults is silently discarded -- turning
+            the marker on later would then quietly hand the monitor input to the
+            onboard LED. Kconfig is the only place the number survives.
 
     config DANCEFLOOR_DISABLE_PMF
         bool "Disable Protected Management Frames (see help)"

@@ -1,0 +1,2 @@
+# LED and FFT dependencies live with components/dancefloor_leds, which owns them.
+dependencies: {}

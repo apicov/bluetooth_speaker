@@ -30,6 +30,18 @@ Pins, LED count, brightness, pattern and the bench instruments are under
 | GPIO 25 (TX) | GPIO 23 (RX) | SBC at 500 kbaud, one way |
 | GND | GND | **required** |
 
+The hub's end is `DANCEFLOOR_SBC_UART_RX_PIN`, and 23 is only its default —
+it reuses the wire the old three-wire I2S link used for DATA. There is no
+transmit half at all: this chip never answers the bridge, so nothing is
+configured for TX and no second pad is spent on it.
+
+That pin was a literal in `sbc_in.c` until the S3 port needed it moved, which
+is what makes §14's "all configurable under `idf.py menuconfig`" true rather
+than nearly true. It is worth being configurable on this board too: 23 is not a
+pin every ESP32 variant *has*, and `uart_set_pin()` rejects an absent one inside
+`ESP_ERROR_CHECK` — so a wrong number aborts at boot rather than failing to
+build.
+
 This used to be three-wire I2S with the hub as slave. It is UART now: I2S is a
 clocked bus with no framing, so a single lost bit shifted every sample after it
 and nothing in the protocol could notice or recover. The UART link carries
