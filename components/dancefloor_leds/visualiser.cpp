@@ -360,6 +360,14 @@ std::atomic<int32_t>  s_last_drift_us;
 
 [[maybe_unused]] [[maybe_unused]] uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
 void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
+/* Running maximum. Four counters need one, and the CAS loop is the sort of thing
+ * that is right three times and subtly wrong the fourth. */
+void note_max(std::atomic<uint32_t> &c, uint32_t v)
+{
+    uint32_t prev = c.load(std::memory_order_relaxed);
+    while (v > prev && !c.compare_exchange_weak(prev, v, std::memory_order_relaxed)) {
+    }
+}
 
 /*
  * Frames computed but not yet due.
@@ -411,6 +419,28 @@ std::atomic<uint32_t> s_overrun;    /* frames dropped because the queue was full
  * scale with different things -- see the note where they are logged -- and are
  * only useful next to each other. */
 std::atomic<uint32_t> s_render_sum, s_render_max, s_render_n;
+/*
+ * The render cost, split, and how long the task was kept from running.
+ *
+ * These exist to separate two explanations of the same number that call for
+ * completely different fixes. At hop 512 a frame is due every 11.6 ms, and the
+ * measured render max is 20 ms against a mean of 0.7 -- so one draw in a
+ * thousand overruns a whole frame period and pushes the next past
+ * RENDER_LATE_US. Either the work is occasionally slow, or the task is
+ * occasionally not running. Timing the strip write apart from the pattern says
+ * which half; timing the naps says whether the core was available at all.
+ *
+ * `s_wake_*` is the OVERSHOOT of a vTaskDelay, not its length, and it is a
+ * one-sided measurement on purpose. vTaskDelay(N) unblocks the task at a tick
+ * boundary between (N-1) and N ticks away, so quantisation at
+ * CONFIG_FREERTOS_HZ=1000 can only make a nap come up SHORT. Sleeping longer
+ * than asked therefore means the task was ready and not running -- there is no
+ * benign explanation for a positive value beyond a tick of measurement noise,
+ * which is what makes it worth reading.
+ */
+std::atomic<uint32_t> s_pattern_sum, s_pattern_max;
+std::atomic<uint32_t> s_show_sum, s_show_max;
+std::atomic<uint32_t> s_wake_sum, s_wake_max, s_wake_n;
 /* Times the strip went dark because nothing arrived -- see RENDER_IDLE_US. */
 std::atomic<uint32_t> s_idle_dark;
 
@@ -768,13 +798,21 @@ void visualiser_task(void *arg)
             /* Taken unconditionally, then divided -- reading them inside the
              * call would leave the sum uncleared on a window with no frames. */
             const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
+            const uint32_t wn = take(s_wake_n), wsum = take(s_wake_sum);
+            const uint32_t psum = take(s_pattern_sum), ssum = take(s_show_sum);
             ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %" PRIu32
-                          "/%" PRIu32 " us | queued %" PRIu32 " | late %" PRIu32
+                          "/%" PRIu32 " us | pat %" PRIu32 "/%" PRIu32
+                          " | show %" PRIu32 "/%" PRIu32
+                          " | wake +%" PRIu32 "/%" PRIu32 " us"
+                          " | queued %" PRIu32 " | late %" PRIu32
                           " | overrun %" PRIu32 " | dark %" PRIu32
                           " | n %" PRIu32 "/%" PRIu32
                           " | stack free %" PRIu32,
                      cost_analysis / cost_n, cost_analysis_max,
                      rn ? rsum / rn : 0, take(s_render_max),
+                     rn ? psum / rn : 0, take(s_pattern_max),
+                     rn ? ssum / rn : 0, take(s_show_max),
+                     wn ? wsum / wn : 0, take(s_wake_max),
                      s_fq_head.load(std::memory_order_relaxed) -
                          s_fq_tail.load(std::memory_order_relaxed),
                      take(s_late), take(s_overrun), take(s_idle_dark), cost_n, rn,
@@ -848,12 +886,20 @@ void render_task(void *arg)
             if (now_us - last_report_us >= LED_LOG_PERIOD_US) {
                 last_report_us = now_us;
                 const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
+                const uint32_t wn = take(s_wake_n), wsum = take(s_wake_sum);
+                const uint32_t psum = take(s_pattern_sum), ssum = take(s_show_sum);
                 ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
                               " | booms %" PRIu32 " | render %" PRIu32 "/%" PRIu32
-                              " us | queued %" PRIu32 " | late %" PRIu32
+                              " us | pat %" PRIu32 "/%" PRIu32
+                              " | show %" PRIu32 "/%" PRIu32
+                              " | wake +%" PRIu32 "/%" PRIu32 " us"
+                              " | queued %" PRIu32 " | late %" PRIu32
                               " | overrun %" PRIu32 " | dark %" PRIu32 " | %s",
                          take(s_frames), take(s_onsets), take(s_booms),
                          rn ? rsum / rn : 0, take(s_render_max),
+                         rn ? psum / rn : 0, take(s_pattern_max),
+                         rn ? ssum / rn : 0, take(s_show_max),
+                         wn ? wsum / wn : 0, take(s_wake_max),
                          s_fq_head.load(std::memory_order_relaxed) -
                              s_fq_tail.load(std::memory_order_relaxed),
                          take(s_late), take(s_overrun), take(s_idle_dark),
@@ -893,7 +939,18 @@ void render_task(void *arg)
             /* Bounded, so a flush is acted on promptly even when the frame at
              * the head is not due for a couple of hundred milliseconds. */
             const int64_t nap = wait / 1000 < RENDER_NAP_MS ? wait / 1000 : RENDER_NAP_MS;
-            vTaskDelay(pdMS_TO_TICKS(nap ? nap : 1));
+            const int64_t asked = nap ? nap : 1;
+            const int64_t before = esp_timer_get_time();
+            vTaskDelay(pdMS_TO_TICKS(asked));
+            /* Only the naps taken while a frame is waiting to come due. The
+             * idle nap above is a different question -- an empty queue, not a
+             * task that could not run. */
+            const int64_t over = (esp_timer_get_time() - before) - asked * 1000;
+            bump(s_wake_n);
+            if (over > 0) {
+                bump(s_wake_sum, static_cast<uint32_t>(over));
+                note_max(s_wake_max, static_cast<uint32_t>(over));
+            }
             continue;
         }
         if (wait < -RENDER_LATE_US) {
@@ -946,18 +1003,27 @@ void render_task(void *arg)
 #endif
 
         if (pattern) {
+            /* Split, because the two are different kinds of thing: the pattern
+             * is arithmetic over LED_COUNT pixels, and show() hands the buffer
+             * to a driver that may block. Their sum is still reported as
+             * `render`, unchanged, so the figure stays comparable with every
+             * log captured before this split existed. */
+            const int64_t t_pat = esp_timer_get_time();
             pattern->render(f, pixels, LED_COUNT);
+            const int64_t t_show = esp_timer_get_time();
             show(pixels);
+            const int64_t t_end = esp_timer_get_time();
+            bump(s_pattern_sum, static_cast<uint32_t>(t_show - t_pat));
+            note_max(s_pattern_max, static_cast<uint32_t>(t_show - t_pat));
+            bump(s_show_sum, static_cast<uint32_t>(t_end - t_show));
+            note_max(s_show_max, static_cast<uint32_t>(t_end - t_show));
         }
 
         drawn_at = esp_timer_get_time();
         const uint32_t took = static_cast<uint32_t>(drawn_at - t0);
         s_render_sum.fetch_add(took, std::memory_order_relaxed);
         bump(s_render_n);
-        uint32_t prev = s_render_max.load(std::memory_order_relaxed);
-        while (took > prev &&
-               !s_render_max.compare_exchange_weak(prev, took, std::memory_order_relaxed)) {
-        }
+        note_max(s_render_max, took);
     }
 }
 
