@@ -21,6 +21,8 @@
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "nvs_flash.h"
+/* Reached under esp_netif_tcpip_exec() only -- see arp_seed(). */
+#include "lwip/etharp.h"
 
 #include "sync_proto.h"
 #include "visualiser.h"
@@ -359,6 +361,102 @@ static void client_seen(const struct sockaddr_in *from)
 }
 
 /*
+ * The send list's ARP entries, added and removed alongside it.
+ *
+ * These exist because registering a satellite at DHCP-assign time without them
+ * is actively worse than not registering it at all, which is what e6f03d1 did
+ * and why 501f388 reverted it: tx-fail went from 0 -- its value in every log
+ * ever captured from this unit -- to 161 on a clean join, plus 10 failed
+ * allocations, as unicasts piled into a pending-ARP queue that drops its
+ * overflow.
+ *
+ * The reason is in the DHCP server, not in chance. dhcpserver.c adds a static
+ * ARP entry of its own so it can unicast the DHCPACK, and calls
+ * etharp_remove_static_entry() on it BEFORE invoking the callback that raises
+ * IP_EVENT_ASSIGNED_IP_TO_CLIENT. The event therefore fires at the one instant
+ * the entry is guaranteed absent. Nothing repopulates it until the station
+ * itself transmits -- its ARP request for this unit, which immediately precedes
+ * its first probe. That is exactly why registering on a probe works, and it is
+ * the whole of what registering on the DHCP reply was missing.
+ *
+ * So seed it. The event carries the MAC beside the address, so this needs no
+ * lease lookup and cannot misidentify the station.
+ *
+ * Via esp_netif_tcpip_exec(): etharp_add_static_entry() asserts
+ * LWIP_ASSERT_CORE_LOCKED() and CONFIG_LWIP_TCPIP_CORE_LOCKING is not set in
+ * this build, so a direct call from the event task is wrong however well it
+ * appears to work.
+ *
+ * A static entry never ages out, and the ungraceful-departure path below cannot
+ * remove one because it never learns the address. That leak is bounded by the
+ * DHCP pool rather than by reconnect count -- re-adding an address overwrites
+ * its own slot -- so it is at most MAX_CLIENTS (8) against ARP_TABLE_SIZE (10).
+ * It is also harmless: the send list is what gates sending, not the ARP table,
+ * and a client that has been dropped is not transmitted to whatever the table
+ * says about it.
+ */
+typedef struct {
+    ip4_addr_t ip;
+    struct eth_addr mac;
+} arp_seed_t;
+
+static esp_err_t arp_add(void *ctx)
+{
+    arp_seed_t *s = ctx;
+    return etharp_add_static_entry(&s->ip, &s->mac) == ERR_OK ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t arp_drop(void *ctx)
+{
+    return etharp_remove_static_entry((const ip4_addr_t *)ctx) == ERR_OK ? ESP_OK : ESP_FAIL;
+}
+
+/*
+ * Put a satellite on the send list as soon as it has an address, rather than
+ * when it next probes.
+ *
+ * Symmetric with client_gone(), and it exists because that function made a
+ * momentary link bounce more expensive than it used to be: a disassociation
+ * followed by a rejoin 13 ms later has been seen here, and dropping the client
+ * then waiting for re-registration costs up to PROBE_PERIOD_MS of silence
+ * against a satellite ring holding ~150 ms.
+ *
+ * The honest account of what this buys is narrower than that, though. lwIP does
+ * not flush the ARP cache when a station disassociates, so the 13 ms rejoin
+ * probably resolved from a surviving entry all along. The case this actually
+ * repairs is the cold join -- no disconnect anywhere in the run -- which is
+ * where e6f03d1 produced its 161 tx-fails.
+ *
+ * The port is not guessed: satellites bind SYNC_PORT, so it is the source port
+ * of every probe and therefore what client_seen() would have recorded anyway.
+ *
+ * If the ARP entry cannot be seeded, this registers nothing and lets the probe
+ * do it a quarter-second later. Degrading to the behaviour that has always
+ * worked beats degrading to the one that was reverted.
+ */
+static void client_joined(const uint8_t mac[6], const esp_ip4_addr_t *ip)
+{
+    arp_seed_t seed;
+    seed.ip.addr = ip->addr;
+    memcpy(seed.mac.addr, mac, sizeof(seed.mac.addr));
+
+    if (esp_netif_tcpip_exec(arp_add, &seed) != ESP_OK) {
+        ESP_LOGW(TAG, "could not seed an ARP entry for " IPSTR
+                      " -- leaving it to register on its next probe", IP2STR(ip));
+        return;
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(SYNC_PORT),
+    };
+    addr.sin_addr.s_addr = ip->addr;
+    client_seen(&addr);
+    ESP_LOGI(TAG, "satellite " IPSTR " has an address -- on the send list, ARP seeded",
+             IP2STR(ip));
+}
+
+/*
  * Forget a satellite the instant it disassociates, rather than when it stops
  * probing.
  *
@@ -404,6 +502,13 @@ static void client_gone(const uint8_t mac[6])
         }
     }
     portEXIT_CRITICAL(&s_clients_lock);
+
+    /* Unconditionally, not only when the client was still listed: the entry was
+     * seeded when the address was assigned, so it outlives a client the 2 s
+     * timeout removed first. Failure is not worth a line -- there is nothing to
+     * remove if this station never had one seeded. */
+    ip4_addr_t gone = { .addr = pair.ip.addr };
+    (void)esp_netif_tcpip_exec(arp_drop, &gone);
 
     if (found) {
         n_sta_dropped++;
@@ -846,6 +951,14 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (ev) {
             client_gone(ev->mac);
         }
+    } else if (base == IP_EVENT && id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
+        /* Carries the address AND the MAC outright, so unlike the departure
+         * above this needs no lease lookup and cannot fail to identify the
+         * station -- which is what lets client_joined() seed ARP. */
+        const ip_event_assigned_ip_to_client_t *ev = data;
+        if (ev) {
+            client_joined(ev->mac, &ev->ip);
+        }
     }
 }
 
@@ -858,6 +971,11 @@ static void wifi_start_ap(void)
     s_ap_netif = esp_netif_create_default_wifi_ap();
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                        WIFI_EVENT_AP_STADISCONNECTED,
+                                                       wifi_event, NULL, NULL));
+    /* The arrival half. Not WIFI_EVENT_AP_STACONNECTED: a station is associated
+     * before it has an address, and the send list is keyed by one. */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                       IP_EVENT_ASSIGNED_IP_TO_CLIENT,
                                                        wifi_event, NULL, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
