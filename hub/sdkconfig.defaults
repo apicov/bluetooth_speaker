@@ -16,3 +16,23 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 # config rather than left to the component default because a hop mismatch across
 # a floor is the expensive bug.
 CONFIG_DANCEFLOOR_LED_HOP_512=y
+
+# Keep the lwIP tcpip thread off the core the LED tasks run on.
+#
+# It runs at priority 18 -- above every task this firmware creates -- and IDF
+# leaves it unpinned by default. Core locking is off (CONFIG_LWIP_TCPIP_CORE_LOCKING
+# is not set), so every sendto() posts to that thread and blocks; the work is done
+# there, not in the caller. This unit drives ~43 audio sends/s plus 86 analysis
+# frame sends/s at one satellite, against the satellite's 4 probes/s -- so ~30x
+# the priority-18 work, on a core that also carries play, vis-draw and vis.
+#
+# That is the suspect for the hub's render starvation: wake overshoot mean 2057 us
+# and max 26037, against the satellite's 500/8789, with pattern arithmetic over
+# eight pixels reaching 23 ms against a 96 us mean. Nothing in that loop varies
+# 200x; it is being suspended part-way through.
+#
+# Pinned to CPU0 rather than CPU1 because that is where the WiFi task already is,
+# and because CPU1 is the core being cleared. Set on the hub only: the satellite
+# is the control this is measured against and its config is deliberately left
+# alone.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
