@@ -6,7 +6,7 @@ strip on the beat.
 
 This document is the way in. It explains the concepts the system is built on
 before it explains the system, so it should be readable without prior knowledge
-of Bluetooth audio, WiFi, or embedded audio pipelines. Three companion documents
+of Bluetooth audio, WiFi, or embedded audio pipelines. Four companion documents
 go deeper on the parts that needed it:
 
 | Document | Covers |
@@ -14,6 +14,7 @@ go deeper on the parts that needed it:
 | [`clock-sync.md`](clock-sync.md) | The time-sync maths, the servo, measured results |
 | [`sbc-link.md`](sbc-link.md) | The wire between the two master chips |
 | [`two-chip-master.md`](two-chip-master.md) | Why the master is two chips, memory numbers |
+| [`tuning-corpus.md`](tuning-corpus.md) | The recordings the beat detector was tuned against, and the harness that reproduces it |
 
 ---
 
@@ -142,10 +143,38 @@ airtime is affordable and the loss goes to approximately zero. Multicast has
 been removed from the audio path entirely.
 
 Registration is implicit and has a pleasant property: the hub sends audio to
-whatever has sent it a **time-sync probe** in the last 10 seconds. A unit that
-is keeping its clock synchronised is by definition alive and listening, so one
-mechanism does both jobs and there is nothing to configure. Stop probing and you
-stop receiving.
+whatever has sent it a **time-sync probe** recently. A unit that is keeping its
+clock synchronised is by definition alive and listening, so one mechanism does
+both jobs and there is nothing to configure. Stop probing and you stop receiving.
+
+"Recently" is **2 seconds**, and it used to be 10. The window matters more than a
+registry timeout usually does, because during it the hub keeps unicasting audio
+and analysis frames at a station that is not there, and each of those sends takes
+a 1152-byte DMA buffer the driver cannot deliver and will not free until it gives
+up. Pulling a satellite mid-track at the old timeout produced **124 failed
+allocations over exactly ten seconds**, free heap down to 4580 bytes, and
+recovery the instant the timeout expired. Not shorter than 2 s either: a
+satellite forgotten in error gets nothing until its next probe, and at a 250 ms
+probe period against ~150 ms of ring that is an underrun rather than a glitch.
+
+Two events bracket the timeout, so it only ever handles the case neither can see:
+
+- **Joining.** A satellite goes on the send list when the DHCP server hands it an
+  address, rather than a quarter-second later at its first probe. This needs a
+  static ARP entry seeded alongside it, and that detail is the whole of it —
+  registering at DHCP time *without* one is worse than not registering at all,
+  because `dhcpserver.c` removes its own static entry immediately before raising
+  the event, so unicasts pile into a pending-ARP queue that drops its overflow.
+  Measured: 161 tx-failures on a clean join. With the entry seeded, zero.
+- **Leaving.** A clean disassociation drops the satellite at once, resolving its
+  MAC to an IP through the DHCP lease table. That covers a unit being reflashed
+  or restarted, which is what actually happens.
+
+What the timeout is left with is the ungraceful departure — power cut, out of
+range — where no event fires at all and the AP notices inactivity far later. It
+counts those separately (`sta-timeout`), because without that a run where a
+satellite vanished mid-track and a run where nothing happened printed the same
+line.
 
 ### 5. Getting sound out of a chip: I2S, DMA, and why not the internal DAC
 
@@ -214,7 +243,8 @@ it is worth understanding why before reading §8.
 **The master is also a speaker.** The hub chip drives its own DAC and its own LED
 strip, exactly like a satellite. It is not a base station.
 
-Four firmware images live in this repository, plus a Python client:
+Three firmware images live in this repository, plus two host tools and a Python
+client that lives elsewhere:
 
 | Project | Role |
 |---|---|
@@ -222,6 +252,7 @@ Four firmware images live in this repository, plus a Python client:
 | `hub/` | Chip B. WiFi SoftAP, clock master, decoder, DAC, LEDs, streamer |
 | `satellite/` | Every additional speaker. Receives, decodes, plays, lights |
 | `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources |
+| `tools/tuning/` | The detector's sweep harness, behind [`tuning-corpus.md`](tuning-corpus.md) |
 
 ### 8. Why the master is two chips
 
@@ -335,6 +366,26 @@ Packets are ~1041 bytes at 50/s, comfortably under a 1500-byte MTU so nothing
 fragments. Had this been PCM it would be 172 packets/s at 1.4 Mbps — measured at
 ~7% of packets rejected by a full transmit queue plus ~13% lost on air.
 Forwarding SBC quartered both.
+
+Three other message types share the socket. `MSG_TIME_REQ`/`MSG_TIME_RSP` are the
+clock probes (§10), `MSG_META` carries the track title and artist the bridge got
+over AVRCP, and `MSG_FRAME` carries one analysis frame — the hub's own, for units
+built to draw what it decided rather than analyse for themselves (§12). Frames go
+unicast for the same reason the audio does, and cost ~5 kB/s per listener against
+the 30–40 the audio already uses. The hub publishes them whenever its visualiser
+is enabled; a satellite doing its own analysis simply ignores them.
+
+`MSG_FRAME` carries a `len` alongside the payload, which is the one piece of
+defensive framing in the protocol. A hub and a satellite on different builds is
+the mismatch this system is most likely to meet, and a frame of the wrong shape
+reinterpreted silently would put garbage on a strip rather than nothing. The
+receiver checks the length, refuses the frame, and says so exactly once —
+43 complaints a second would bury everything else in the log.
+
+Message type **3 is a deliberate gap**. It was `MSG_BLINK`, for the M4 bring-up
+harness, and it is not reused: a board still running old firmware speaks a
+protocol this one no longer knows, and an unknown message type is a much better
+failure than a silently reinterpreted one.
 
 ### 10. Synchronisation
 
@@ -484,12 +535,16 @@ skipping — makes everything afterwards play early forever.
 
 ### 12. LEDs and beat detection
 
-Each unit analyses **its own copy** of the audio. Sending analysis results over
-the network would add a second thing to synchronise; the audio is already
-synchronised, so anything derived from it locally is synchronised too, for free.
+By default each unit analyses **its own copy** of the audio. Sending analysis
+results over the network would add a second thing to synchronise; the audio is
+already synchronised, so anything derived from it locally is synchronised too,
+for free. (Frames *can* now be sent instead — see "Two sources" below — but that
+is a way of removing the need to prove an algorithm identical across units, not a
+retreat from this idea.)
 
 ```
-PCM ──▶ 1024-point FFT (esp-dsp) ──▶ 4 bands ──▶ spectral flux ──▶ onset ──▶ pattern ──▶ strip
+PCM ──▶ 1024-point FFT (esp-dsp) ──▶ 4 bands ──▶ spectral flux ──▶ onset ──▶ Frame
+Frame ──▶ (queue, wait for due_us) ──▶ pattern ──▶ strip
 ```
 
 **Spectral flux** measures how much energy *increased* since the last frame, per
@@ -498,6 +553,56 @@ against a rolling ~0.5 s history makes it adaptive to loud and quiet passages,
 and a 120 ms refractory period stops one kick registering three times.
 
 Four bands, roughly kick / low-mid / presence / air.
+
+#### The window and the hop are two different numbers
+
+They used to be one, and nothing said so. **The window is 1024 samples** and that
+is what fixes the 43 Hz bin width, the band edges and every tuning figure ever
+measured. **The hop — how far the analysis advances between windows — defaults to
+512**, a 50% overlap, giving 86 frames a second. Changing the window would be a
+retune; changing the hop is not.
+
+The detector was re-swept at hop 512 over 206 recordings and **no constant
+moved**: both flux floors and `BEAT_HIST` are the same numbers at 512 as at 1024.
+[`tuning-corpus.md`](tuning-corpus.md) is the corpus, the commands and the
+ladders. Two of those constants needed no measuring at all and the document says
+why — the refractory periods are already in microseconds, and the two
+`threshold_k` values are provably invariant, since scaling flux scales the mean
+and the standard deviation identically.
+
+What the hop *does* change cannot be tuned away, and it is worth knowing before
+comparing two captures: **which strokes fire**. Flux is a frame-to-frame
+difference, so at hop 512 it is differenced across 11.6 ms of audio and at 1024
+across 23.2 ms, and those are different measurements of the same music. Only 64%
+of the booms at 1024 have a boom at 512 within one window of them, against 91%
+for a floor change at a fixed hop. Roughly a third of the strokes move. That is a
+property of the hop, not a tuning error, and no floor value reduces it.
+
+The hop must divide the window and be a power of two, so it is a menuconfig
+*choice* rather than a number — a bad value cannot be selected at all instead of
+failing the build.
+
+#### Analysis and drawing are separate stages
+
+A frame is computed when the audio for it arrives, and drawn when the instant it
+names comes round. Those are two tasks with a queue between them, and the split
+is what lets a frame be computed on one unit and drawn on another at all.
+
+It also means the render task is the one thing in the component that needs a
+clock: `due_us` is a master-clock instant, so a satellite has to convert it. The
+offset is passed as a *function* rather than a number, because the satellite's
+offset is slewed toward the live estimate at 200 ppm — a value copied once would
+go stale at exactly the crystal difference, which is the same bug clock-sync.md
+§9 records in the audio path. The hub leaves it unset, since local time is master
+time there.
+
+When the timeline restarts — a re-anchor, an underrun recovery — the queue is
+flushed and the strip goes **dark** rather than holding its last frame. Every
+label still queued describes an instant on a timeline that no longer exists, and
+drawing them anyway produces a burst of animation from the old origin. A lit
+strip looks like it is working; a dark one says plainly that there is nothing to
+show. A splice is different and does *not* flush: it moves audio around within a
+timeline, so queued labels stay true.
 
 **LEDs must run off the presentation timeline, not the arrival timeline.**
 Otherwise the lights lead the sound by the entire buffer depth — 200 ms, which
@@ -517,14 +622,19 @@ than from anything local, and that turns out to be the whole difficulty.
 
 Two things are needed, and both come from the same source.
 
-**Blocks must be cut at the same content positions.** The detector chops the
-stream into fixed 1024-sample blocks, and if two units cut them at different
+**Blocks must be cut at the same content positions.** The detector takes a
+1024-sample window every `HOP_N` samples, and if two units cut them at different
 offsets a transient near a boundary is split on one board and centred on the
 other — the marginal onsets then fire on one strip and not its neighbour.
 Boundaries are derived from `play_at`, the instant the audio is *scheduled* to be
 heard, which every unit receives identically. Never from a clock read locally:
 units reach that line milliseconds apart, and 3 ms of skew puts them 132 samples
 out of 1024.
+
+The hop being a power of two that divides the window is what keeps this safe when
+the hop changes: it makes the finer grid a *refinement* of the coarser one rather
+than a cut across it, so two units on different hops still agree about where a
+window may begin.
 
 **Animation must be a function of shared time, not of local counts.** `due_us`
 comes from the block index, so the same audio carries the same label on every
@@ -570,6 +680,40 @@ rather than once the error has grown — but forgetting to is no longer permanen
 `test_align.c` and `test_pattern_sync.cpp` pin both halves mechanically — see
 §15.
 
+#### Two sources for a frame
+
+Everything above is about making two units *independently* reach the same
+decision. There is now a second way to get agreement, which is to have only one
+decision: the hub publishes each frame it computes, and a unit built for
+`CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE` draws those instead of analysing anything.
+No FFT and no detector run there; the analysis task is not even started.
+
+| Source | What the unit does |
+|---|---|
+| `LOCAL` (default) | Runs its own FFT and both detectors. Costs the analysis, gives the pattern the full spectrum |
+| `REMOTE` | Runs no analysis. Draws the hub's frames at the instant each names |
+
+The received frame goes into the same queue local analysis fills and is drawn the
+same way, so the two sources are interchangeable by construction rather than by
+agreement. Nothing is corrected against anything in either case — a remote unit
+still converts `due_us` with its own offset and keeps its own appointment.
+
+**Mixing the two across a floor is intended, not a hazard.** A unit on `LOCAL`
+can run a different pattern or a different detector entirely. What that costs is
+the strength of the guarantee: it is no longer "every strip agrees" but "units
+taking frames from the same source render identically". An *unintended* mismatch
+is still the expensive bug, which is why both the source and the hop are printed
+at startup and carried in the `HEALTH` line — a unit doing its own analysis
+cannot detect that its neighbour is on a different hop, because nothing crosses
+between locally analysing units, and that is exactly the property that makes them
+stay in step. Two consoles settle it.
+
+`Frame::mag` — 512 floats — does not travel and is null on any received frame.
+Patterns using the quantised `spec[]` work either way. This is also the constraint
+that shapes the detector's tuning: anything a remote unit might one day be asked
+to compute has to be derivable from the four `band` floats that do travel, which
+[`tuning-corpus.md`](tuning-corpus.md) §9 makes executable rather than a promise.
+
 #### Where the code lives
 
 `components/dancefloor_leds/` is shared by the hub and every satellite: the same
@@ -580,7 +724,7 @@ everything deciding what the lights *do* has no platform dependencies:
 |---|---|
 | `analysis.cpp` | FFT, band split, onset detection — audio in, `Frame` out |
 | `patterns.cpp` | `Frame` in, pixels out |
-| `visualiser.cpp` | the parts that cannot be shared: stream buffer, block alignment, task, strip |
+| `visualiser.cpp` | the parts that cannot be shared: stream buffer, block alignment, the analysis and render tasks and the queue between them, strip |
 | `fft_host.c` | a radix-2 FFT for the host, where esp-dsp does not exist |
 
 That split exists so `tools/pattern_lab` can run the identical pipeline over a
@@ -589,8 +733,9 @@ than copied. Designing a pattern is a taste problem, and taste needs turnaround
 that reflashing two boards cannot give.
 
 Its `Kconfig` owns the LED options for both firmwares — GPIO, count, strip model,
-and a **brightness cap defaulting to 10%**, which is the figure the power budget
-assumes and which dark-adapted eyes cannot distinguish from full outdoors.
+the analysis hop, the frame source, and a **brightness cap defaulting to 10%**,
+which is the figure the power budget assumes and which dark-adapted eyes cannot
+distinguish from full outdoors.
 
 The strip itself is driven through `components/led_strip_wrapper/`, an RAII C++
 wrapper vendored from the `esp32c3_neopixel` project:
@@ -672,10 +817,30 @@ paid for.
 | `LEAD_US` | 200 ms | Presentation lead. Enough to absorb WiFi jitter; every ms is latency |
 | `LOCAL_RING_BYTES` | 64 kB | ~370 ms of stereo PCM |
 | `MAX_CLIENTS` | 8 | Registry size; unicast airtime is what really limits this |
-| `CLIENT_TIMEOUT_US` | 10 s | A satellite that stops probing is forgotten |
+| `CLIENT_TIMEOUT_US` | **2 s** | Was 10 s. Only covers the ungraceful departure now — see §4 for the 124 failed allocations that shortened it |
 | `MARKER_EVERY_PKTS` | 100 (~2 s) | Sync measurement pulses |
 | `ESP_WIFI_AMPDU_TX_ENABLED` | `n` | Required, or `esp_wifi_internal_set_fix_rate()` returns `ESP_ERR_NOT_SUPPORTED` |
 | PHY rate | pinned, 6 Mbps | See the wart in §16 |
+| `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0` | `y`, **hub only** | See below |
+| `CONFIG_DANCEFLOOR_LED_HOP_512` | `y` | The component default too, but pinned in the tracked config because a hop mismatch across a floor is the expensive bug |
+
+> **The lwIP tcpip thread is pinned to CPU0 on the hub.** It runs at priority 18
+> — above every task this firmware creates — and IDF leaves it unpinned. Core
+> locking is off in this build, so every `sendto()` posts to that thread and
+> blocks: the work happens *there*, not in the caller. The hub drives ~43 audio
+> sends/s plus 86 frame sends/s per satellite against a satellite's 4 probes/s,
+> so ~30× the priority-18 work, free to land on the core also carrying play,
+> vis-draw and vis. Pinning it was the whole fix for the hub's render starvation:
+> wake overshoot mean 2057 → 634 µs, pattern arithmetic max 23226 → 5254 µs, late
+> frames 10 → 0. It is set on the hub **only** — the satellite is deliberately
+> left unpinned as the control the measurement is against.
+>
+> Recorded because the first diagnosis was wrong: the starvation was read as
+> `sbc_in` at priority 9 pinned to core 1, which only blocks vis-draw while it is
+> decoding and yields at every send. One prediction from the fix also failed —
+> analysis was expected to improve alongside the pattern task and did not
+> (17400 → 17370 µs max). The pattern's max was 240× its mean and could only be
+> preemption; analysis's was 8×, which is mostly the FFT doing its own work.
 
 #### `satellite`
 
@@ -685,6 +850,7 @@ paid for.
 | `RING_TARGET_MS` | 200 | Matches the hub's lead |
 | `MAX_SPLICE_MS` | 150 | Ceiling on a track-boundary correction; anything larger is a bug, not drift |
 | `DANCEFLOOR_USE_INTERNAL_DAC` | `n` | Build option for testing with no DAC wired. 8-bit, audibly poor |
+| `DANCEFLOOR_LED_SOURCE` | `LOCAL` | Analyse the audio this unit holds, rather than draw frames the hub sends. See §12 |
 
 ### 14. Pins and wiring
 
@@ -917,13 +1083,16 @@ airtime it is not hurting anything measurable, and
 left at 6 because the system was measured working there and the change deserves
 a listening test rather than a reasoned argument.
 
-**The wideband detector's thresholds have never been tuned against a recording.**
-The `boom` detector has: `flux_floor` was set from ten forró tracks (see below).
-`BEAT_THRESHOLD_K` and `BAND_GAIN`, which the `pulse` pattern runs on, have not.
-`BEAT_THRESHOLD_K` (1.8) and `BAND_GAIN` (12.0) were set against synthetic kicks
-in the host test. They fire on real music and the units agree, but nobody has
-measured how many beats are missed or invented. This is what the WAV recording
-exists to fix.
+**Two of the wideband detector's constants have still never been tuned against a
+recording.** The flux floors have been, both of them, over 206 recordings at two
+hops — see [`tuning-corpus.md`](tuning-corpus.md), which also swept `BEAT_HIST`
+and argues that the two `threshold_k` values need no sweep because a hop change
+cannot reshape `flux > mean + k·sd`. What that leaves is **`BEAT_THRESHOLD_K`
+(1.8) and `BAND_GAIN` (12.0)**, which the `pulse` pattern runs on and which were
+set against synthetic kicks in the host test. Invariance under a hop change is
+not the same as being right in absolute terms: they fire on real music and the
+units agree, but nobody has measured how many beats are missed or invented. That
+is the measurement the recordings still exist to make.
 
 It matters less than it did. The band scaling used to end in a hard clamp at
 1.0, and since spectral flux counts only energy *increases*, a pinned band had a
@@ -932,6 +1101,15 @@ for any 60 Hz content above about -11 dBFS, so on most mastered music the kick
 contributed nothing at all and detection ran on the higher bands alone.
 `beat_normalise()` is now monotonic over the whole input range, so a wrong gain
 costs sensitivity rather than deleting the signal.
+
+**Whether 512 is the right hop has not been established, only that the detector
+is tuned for it.** The retune answered "do the constants still hold at this hop"
+— they do — and in doing so measured something it could not fix: a hop change
+moves roughly a third of the strokes, and no value of any constant changes that
+(§12). Which strokes the strip *should* follow is a question about music, wants a
+listening session rather than a sweep, and has not had one. So 1024 is not a
+safer fallback; it is a different choice, and it is the one now carrying
+constants confirmed against a corpus at 512.
 
 **Nothing has been heard through a real DAC.** M1, M2 and M3 were marked
 complete on log output and on the desktop client's audio. The PCM5102A boards
@@ -942,15 +1120,15 @@ are still to be wired.
 | Milestone | State |
 |---|---|
 | M1–M2 Bluetooth speaker + LEDs | Done, on logs and desktop audio |
-| M3 Beat detection driving LEDs | **Working on hardware** — two units pulsing together on real music. A `boom` detector follows the zabumba's low band alone, tuned against ten forró recordings; the wideband `pulse` thresholds are still untuned |
+| M3 Beat detection driving LEDs | **Working on hardware** — two units pulsing together on real music. A `boom` detector follows the zabumba's low band alone. Both flux floors and `BEAT_HIST` are now swept against a checked-in corpus of 206 recordings at two hops (`tuning-corpus.md`); `BEAT_THRESHOLD_K` and `BAND_GAIN` are still untuned |
 | M4–M6 Clock sync, streaming, drift | Done and measured. Drift needed a second pass: the satellite was converting with an offset frozen at anchoring, which fed the drift back in as the servo's own reference. The clock source is now 802.11 TSF with the probe estimator as fallback |
 | M7 Coexistence | Done — resolved by splitting the chips |
 | M8 Power, enclosure, field test | **Untouched** |
 | Long-run behaviour | **Unknown.** The longest evidenced session is ten minutes against a four-hour target. `HEALTH` exists to answer it and has never been given the chance |
 
 The soak is the cheapest of these and blocks the least: it needs no parts, only
-time. Both units print a `HEALTH` line every 60 s with uptime, current and
-minimum-ever heap, per-task stack headroom, and cumulative counts of underruns,
+time. Both units print a `HEALTH` line every 60 s with uptime, four heap figures,
+per-task stack headroom, failed allocations, and cumulative counts of underruns,
 re-anchors, splices, retunes, lost-packet gaps and WiFi drops. Over ten minutes
 heap was flat and every counter stayed near zero, which is encouraging and is not
 evidence.
@@ -969,11 +1147,13 @@ budget.
 | `components/sbc_decoder/` | Vendored OI SBC decoder from Bluedroid |
 | `bt_bridge/main/sbc_uart.c` | Frames SBC onto the UART, `seq` assigned at enqueue |
 | `bt_bridge/main/avrcp_meta.c` | Track metadata and change notifications |
-| `hub/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo |
+| `hub/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
 | `hub/main/sbc_in.c` | UART receive, decode, feed |
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
 | `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
 | `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |
+| `tools/pattern_lab/` | The LED pipeline over a WAV on a laptop, compiled from the component |
+| `tools/tuning/` | `sweep.py` and `converge.cpp` — the harness behind `tuning-corpus.md` |
 
 ---
 

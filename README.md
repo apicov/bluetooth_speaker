@@ -6,9 +6,11 @@ strip on the beat.
 
 Measured on hardware: **0.1–0.5 ms** between two speakers just after a track
 boundary, a few milliseconds by the end of a long track, against a ~5 ms
-threshold where a listener starts to notice. Nothing about the lights is
-transmitted between units — each derives them from audio that is already
-synchronised, so they agree for free.
+threshold where a listener starts to notice. By default nothing about the lights
+is transmitted between units — each derives them from audio that is already
+synchronised, so they agree for free. A unit can now be built to draw analysis
+frames the hub sends it instead, which is a second way to reach the same
+agreement rather than a replacement; see [`docs/architecture.md`](docs/architecture.md) §12.
 
 ## The shape of it
 
@@ -29,6 +31,7 @@ phone --A2DP/SBC--> bt_bridge --SBC over UART--> hub --SBC over WiFi--> satellit
 | `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver. Shared by hub and satellites. |
 | `components/sbc_decoder/` | Vendored SBC decoder. |
 | `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources. |
+| `tools/tuning/` | The detector's tuning harness — sweeps, the negative control, the corpus manifest. |
 
 The master is two chips because Bluetooth and WiFi on one ESP32 fight over the
 radio, the memory and the CPU. See [`docs/two-chip-master.md`](docs/two-chip-master.md).
@@ -48,6 +51,15 @@ arrives before T.
 the audio it is about to play. Sending analysis results would add a second thing
 to keep synchronised; the audio already is, so anything computed from it locally
 is too.
+
+That second thing now exists as an option, and it is worth being precise about
+why it does not break the idea. A unit built for `LED_SOURCE_REMOTE` runs no
+analysis and draws frames the hub computed, each at the master-clock instant it
+carries — so it still keeps its own appointment against a shared timeline, and
+still corrects nothing against anything. What it buys is that the algorithm need
+not be proved identical across units, because only one copy of the decision
+exists. What guarantees agreement is narrower than before: units taking frames
+from the *same* source render identically.
 
 ## Build and flash
 
@@ -103,10 +115,12 @@ other satellite.
 ## Reading a running system
 
 Both firmwares print a `HEALTH` line every 60 s with uptime, heap (current,
-minimum-ever and largest free block), per-task stack headroom, and cumulative
-counts of underruns, re-anchors, splices, retunes, lost-packet gaps and WiFi
-drops. Anything eventful is logged as it happens; the periodic lines are on
-`CONFIG_DANCEFLOOR_LOG_PERIOD_S`.
+minimum-ever, lowest-this-minute and largest free block), per-task stack
+headroom, failed allocations, and cumulative counts of underruns, re-anchors,
+splices, retunes, lost-packet gaps and WiFi drops. The hub adds how satellites
+left — cleanly, unresolved, or by timing out — and the satellite adds its clock
+source and its LED frame source. Anything eventful is logged as it happens; the
+periodic lines are on `CONFIG_DANCEFLOOR_LOG_PERIOD_S`.
 
 `TRACK DIVERGENCE` prints once per track, at a track boundary — the one instant
 that recurs identically in every track, so it is comparable across tracks,
@@ -121,6 +135,7 @@ you looked.
 | [`docs/clock-sync.md`](docs/clock-sync.md) | The sync maths, the phase servo, TSF, measured results. |
 | [`docs/sbc-link.md`](docs/sbc-link.md) | The wire between the two master chips. |
 | [`docs/two-chip-master.md`](docs/two-chip-master.md) | Why the master is split, with memory numbers. |
+| [`docs/tuning-corpus.md`](docs/tuning-corpus.md) | What the beat detector was tuned against, and the commands to do it again. |
 
 Both long documents end with the pattern that recurred at every level of this
 project: **every real fault was invisible until something counted it.** Several

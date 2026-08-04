@@ -6,8 +6,13 @@ CONFIG_FREERTOS_HZ=1000
 # far the analysis advances between them, so it doubles the frame rate to 86 Hz
 # without changing the FFT's resolution.
 #
-# Stated here as well as being the Kconfig default because the two flux floors
-# were swept at hop 1024 and are not yet re-measured -- a floor running this is
-# running a detector that is over-sensitive until they are, and that should be
-# visible in the tracked config rather than only in a component default.
+# Stated here as well as being the Kconfig default because it is the hop the
+# detector is tuned at. Both flux floors and the beat history were swept against
+# 206 recordings at 512 and none of the three moved, so a floor running this is
+# running the tuned detector -- see docs/tuning-corpus.md. Kept in the tracked
+# config rather than left to the component default because a hop mismatch across
+# a floor is the expensive bug, and this is the unit it is most likely to happen
+# on: nothing crosses between locally analysing units, so a satellite on the
+# wrong hop cannot be detected from either console except by reading the hop the
+# HEALTH line prints.
 CONFIG_DANCEFLOOR_LED_HOP_512=y

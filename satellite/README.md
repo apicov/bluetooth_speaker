@@ -2,7 +2,9 @@
 
 Joins the master's SoftAP, keeps its clock aligned with the hub's, receives
 unicast SBC, decodes it, and plays each chunk at the instant it was stamped for.
-Drives an LED strip from the audio it is about to play.
+Drives an LED strip from the audio it is about to play — or, if built for
+`DANCEFLOOR_LED_SOURCE_REMOTE`, from analysis frames the hub sends, drawn at the
+instant each names. See [`../docs/architecture.md`](../docs/architecture.md) §12.
 
 **No Bluetooth here.** The master owns the phone connection; this board only
 listens on WiFi. Any ESP32 variant would work for this role, but the project
@@ -10,8 +12,14 @@ standardises on the classic ESP32 so every unit is interchangeable with the
 master, which does need Bluetooth Classic.
 
 Run as many of these as you like. Registration is implicit: the hub sends audio
-to whatever has sent it a time probe in the last 10 seconds, so a unit that is
-keeping its clock synchronised is by definition alive and listening.
+to whatever has sent it a time probe in the last **2 seconds**, so a unit that is
+keeping its clock synchronised is by definition alive and listening. In practice
+the timeout rarely does the work — the hub registers a satellite the moment DHCP
+hands it an address, and forgets it the moment it disassociates cleanly. What the
+timeout covers is the unit that vanishes without saying so, and it is 2 s rather
+than the old 10 because during that window the hub keeps unicasting at a station
+that is not there, taking a DMA buffer per send that the driver will not free
+until it gives up.
 
 ## Build and flash
 
@@ -102,17 +110,33 @@ reading of how far this unit is from the published timeline. It should sit
 within a few milliseconds and be spliced back toward zero at each track change.
 
 ```
-W sat: HEALTH: up 3721 s | heap 83380 (min 73924, largest 61240)
+W sat: HEALTH: up 3721 s | heap 83380 (min 73924, window 81002, largest 61240)
        | stack play 3048 drift 1796 | underruns 0 anchors 1 splices 2
-       | retunes 7 (0 refused) | gaps 0 wifi-drops 0 | clock TSF (tsf 1/probe 0)
+       | retunes 7 (0 refused) | gaps 0 wifi-drops 0 | alloc-fail 0
+       | clock TSF (tsf 1/probe 0) | leds local hop 512 (rx 0, bad 0)
 ```
 
-Every 60 s, and the line a long run is judged on. Minimum-ever heap matters more
-than current, since a leak shows as the minimum walking down, and `largest`
-catches fragmentation that total free heap hides. `clock TSF (tsf N/probe M)`
-says which source is live and how many anchors used each; a rising `probe` means
-TSF is dropping out. **An uptime that resets to 0 means it crashed and
-rebooted.**
+Every 60 s, and the line a long run is judged on. **An uptime that resets to 0
+means it crashed and rebooted.**
+
+`min` is the all-time heap watermark and cannot be dated — one bad moment an hour
+ago pins it for the whole run — which is what `window` is for: the lowest seen
+this minute, cleared by each line, so a dip lands in a named minute. `largest` is
+the largest free block and fails before the total does, since a fragmented heap
+refuses a contiguous request while the free total still looks fine.
+`alloc-fail` counts allocations that actually failed, which used to be silent and
+surfaced as an underrun.
+
+`clock TSF (tsf N/probe M)` says which source is live and how many anchors used
+each; a rising `probe` means TSF is dropping out.
+
+`leds <source> hop <N> (rx, bad)` is the other half of the same question. Both
+values are also printed at startup. They are reported because a unit doing its
+own analysis **cannot detect** that its neighbour is on a different hop or a
+different source — nothing crosses between locally analysing units, which is
+exactly the property that makes them stay in step. Two consoles settle it. `rx`
+counts frames received from the hub and `bad` counts frames refused for being the
+wrong size, which means the hub and this unit are not the same build.
 
 ## Verification
 

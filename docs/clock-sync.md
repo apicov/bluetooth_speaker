@@ -196,8 +196,10 @@ that is M6's job (§8).
 The maths above is the fiddly part. This is the part that makes it work, and it
 is much simpler.
 
-**The master never says "blink now."** It says *"blink at master-time T"*, where
-T is 500 ms ahead. Each satellite converts with `local = T − offset` and waits.
+**The master never says "play now."** Every packet says *"play this at
+master-time T"*, where T is `LEAD_US` — 200 ms — ahead. Each satellite converts
+with `local = T − offset` and waits. (The M4 harness said "blink at T" instead;
+the sentence is the design, and the audio path inherited it unchanged.)
 
 ```c
 static inline int64_t sync_to_local(int64_t master_us, int64_t offset)
@@ -216,8 +218,10 @@ A useful consequence: nothing passes between the boards at the moment of firing.
 Each one keeps its own appointment independently. The measurement wire described
 in §12 observes the result; it plays no part in producing it.
 
-The cost is latency. Nothing can happen sooner than the lead time, which is why
-M5 budgets 300 ms of audio buffer and accepts ~0.5 s of total delay.
+The cost is latency. Nothing can happen sooner than the lead time, so the
+satellite holds a ring around a 200 ms target to match, and total end-to-end
+delay is ~150–200 ms of Bluetooth plus that — roughly half a second. Fine for
+music, useless for video.
 
 ---
 
@@ -227,8 +231,10 @@ The estimator is only as good as its stamps, so:
 
 - `t2` is taken **immediately** after `recvfrom` returns, before any parsing.
 - `t3` is taken **immediately** before `sendto`, so service time is excluded.
-- The blink task wakes 2 ms early and then busy-waits to the deadline. Sleeping
-  straight there would fold FreeRTOS scheduler jitter into the measurement.
+- The task waiting for the scheduled instant wakes 2 ms early and then busy-waits
+  to the deadline. Sleeping straight there would fold FreeRTOS scheduler jitter
+  into the measurement. This started in the M4 blink task and is now how the
+  satellite holds its first sample; after that, I2S paces everything.
 - `CONFIG_FREERTOS_HZ=1000`. At the default 100 Hz, `vTaskDelay` granularity is
   10 ms — ten times the entire error budget.
 - `esp_wifi_set_ps(WIFI_PS_NONE)`. Power save parks the radio between beacons and
@@ -296,10 +302,12 @@ visible without measuring on real hardware.
 
 ### 3. Making it measurable at all
 
-Wiring the satellite's blink output into an input pin on the master (§12) turned a
+Wiring the satellite's blink output into an input pin on the master turned a
 milestone that was blocked on test equipment into one verifiable with a jumper
 wire, and produced the data that drove change 2. Worth doing early: a milestone
-you cannot measure is a milestone you cannot finish.
+you cannot measure is a milestone you cannot finish. The harness is gone and the
+same wire now carries the audio marker instead (§12), which is the same idea
+pointed at the thing that actually ships.
 
 ### Bugs fixed along the way
 
@@ -309,8 +317,9 @@ you cannot measure is a milestone you cannot finish.
 - `CONFIG_DANCEFLOOR_ROLE_MASTER` was used directly as a C expression. A Kconfig
   `bool` set to `n` is left **undefined**, not defined as `0`, so the satellite
   build failed to compile while the master built fine.
-- Blink and monitor pins became per-board `menuconfig` options. Board silkscreens
-  disagree — `G4` is GPIO 4 on one board, `D4` is emphatically not on another.
+- Marker and monitor pins became per-board `menuconfig` options. Board
+  silkscreens disagree — `G4` is GPIO 4 on one board, `D4` is emphatically not on
+  another.
 
 ### What was deliberately not done
 
@@ -663,9 +672,13 @@ where every suite sits next to the code it exercises.
 The estimator is deliberately free of platform dependencies. It is the part most
 likely to be subtly wrong, and hardware bring-up is a bad place to discover that.
 
-Time probes are **unicast**; blink announcements are **multicast**, because that
-is the path audio will take in M5 — one transmission feeding every satellite, so
-radio airtime does not scale with unit count.
+Everything on this socket is **unicast**, probes included. That was not the
+original plan — the M4 harness announced over multicast on the reasoning that one
+transmission feeding every satellite keeps airtime independent of unit count —
+and the measurement went the other way: group-addressed frames are never
+acknowledged and so never retried, which put a ~20% loss floor under the audio at
+every PHY rate tried. Multicast is gone from the whole system, and
+`SYNC_MCAST_ADDR` went with the harness.
 
 ---
 
@@ -685,43 +698,70 @@ afterwards; the costs accumulate faster than the servo absorbs them and the
 audio degrades over a long run.
 
 A stable offset in the log means the satellite *believes* it is synced. It does
-not prove the pulse lands where it should — that needs an independent
+not prove the audio lands where it should — that needs an independent
 measurement, and there are two ways to get one.
+
+This used to be done with the M4 blink harness, which announced "flash at time T"
+and timed the result. That harness is deleted; what replaced it measures the
+audio path itself, which is the thing under test now.
 
 ### Self-measurement, no instruments needed
 
-The master can time the satellite itself:
+The hub can time the satellite itself, using the **audio marker**:
 
 ```
-   SATELLITE                              MASTER
-   blink GPIO (output)  ───────────────>  monitor GPIO (input)
-   GND                  ───────────────   GND
+   SATELLITE                              HUB
+   GPIO 4  marker (output)  ───────────>  GPIO 21  monitor (input)
+   GND                      ───────────   GND
 ```
 
-The master already knows the master-clock instant it announced, so the gap
-between that and the observed edge **is** the sync error, in a single time base
-with no clock conversion involved. It prints:
+Roughly every 2 s the hub flags one audio packet with `marker`. Every unit that
+plays that packet — the hub included — pulses its marker pin at the instant the
+audio reaches the DAC. The hub already knows when its own pulse happened, so the
+gap between that and the observed edge **is** the audio sync error, in a single
+time base with no clock conversion involved. It prints:
 
 ```
-I (34521) sync: SYNC ERROR: +83 us   (satellite late)
+W (34521) stream: AUDIO SYNC: satellite +83 us (late)
 ```
 
 Wire propagation is nanoseconds and GPIO interrupt latency a few microseconds,
-both negligible at this scale. Set the pin in `menuconfig` → *Dancefloor* →
-*GPIO the master watches*; it must differ from the blink GPIO.
+both negligible at this scale. Both pins are under `menuconfig` → *Dancefloor
+hub* / *Dancefloor satellite*; enable `DANCEFLOOR_ENABLE_MARKER` on each.
 
 > This is one **output** into one **input**. Do not connect the two boards'
-> *blink* pins together — those are both outputs, and tying them makes one drive
+> *marker* pins together — those are both outputs, and tying them makes one drive
 > against the other.
 
-Errors beyond ±100 ms are reported as "not a sync measurement": a pulse is only
-10 ms wide, so a gap that large means an announcement went missing rather than
-the clocks disagreeing.
+Readings beyond ±500 ms are discarded rather than reported: markers are 2 s
+apart, so a gap that large is a missed pulse and calling it a sync error would
+mislead. The reading is taken on every marker but printed on
+`CONFIG_DANCEFLOOR_LOG_PERIOD_S`, since one every 2 s is more than anyone reads —
+the value is kept for the track-boundary summary either way.
+
+Nothing corrects on this. Every servo and every splice closes through `play_at`
+and the phase queue, so enabling or disabling the instrument changes no
+behaviour — a correction loop closed through an instrument absent in deployment
+would be tuned to a configuration nobody ships.
+
+Without any wiring at all, `TRACK DIVERGENCE (wifi)` reports the same quantity
+once per track from the splices each unit reports back over WiFi. Take that one
+in preference to a figure scavenged from log windows: it is sampled at a track
+boundary, the one instant that recurs identically in every track, so it is
+comparable across tracks, sessions and builds. Cross-unit error resets there and
+grows until the next one — §8.
 
 ### With a scope
 
-Probe the blink GPIO on both units with a **common ground**, trigger on the
-master. Both pulse high for 10 ms every 2 s. Pass is rising edges within 1 ms.
+Probe the marker GPIO on both units with a **common ground**, trigger on the hub.
+Pass is rising edges within 1 ms.
 
 Worth doing if you have one, since it measures the pins directly and shares no
 code with the thing being tested.
+
+There is a second marker for the *light* path, `DANCEFLOOR_ENABLE_LED_MARKER` on
+GPIO 2, which flashes once per second of master-clock time on every unit. It
+exists because every measurement above covers the audio only: between playback
+and the pixels sit the analysis stream buffer, the FFT, the detector and the
+render, and nothing else reports on any of it. Two boards side by side settle it
+with no console and no wiring.
