@@ -122,10 +122,20 @@ void visualiser_realign(void);
 /*
  * Feed interleaved 16-bit stereo PCM. Non-blocking: never delays audio.
  *
- * Feed this from the PLAYBACK path -- where samples are handed to the DAC -- and
- * not from wherever they arrive. Audio sits in a ~200 ms buffer between the two,
- * and lights driven from the arrival side run that far ahead of their own
- * speaker, which is clearly visible.
+ * Feed this from the ARRIVAL path -- where audio enters the playback ring -- and
+ * not from where it is handed to the DAC. That is the opposite of what this said
+ * before rendering became scheduled, and the reason is worth keeping.
+ *
+ * Feeding from the DAC meant a frame was computed at the moment its audio was
+ * played, which left an algorithm one frame period to run in and no way to look
+ * ahead at all. Feeding from arrival puts the ~200 ms the audio is buffered for
+ * at the analysis's disposal instead. The objection to it -- that lights driven
+ * from arrival run 200 ms ahead of their own speaker -- was correct, and stopped
+ * applying when frames began to be drawn at the instant they name rather than
+ * the instant they were computed.
+ *
+ * So: this is safe only while the render stage is scheduled. Move it back to the
+ * DAC and the lead disappears; move the scheduling away and the lead returns.
  *
  * `due_master_us` is the master-clock instant this chunk's FIRST sample is
  * SCHEDULED to be heard -- interpolated from the play_at stamps the hub puts on

@@ -301,6 +301,12 @@ uint32_t streamer_take_dropped(void)
     return d;
 }
 
+/* Ring position and scheduled instant of the last packet sent, so the analysis
+ * -- fed on arrival, before this packet's stamp exists -- can date what it is
+ * given. See where they are set. */
+static volatile int32_t s_vis_anchor_pos;
+static volatile int64_t s_vis_anchor_due;
+
 void streamer_feed(const uint8_t *pcm, uint32_t len)
 {
     /*
@@ -320,6 +326,21 @@ void streamer_feed(const uint8_t *pcm, uint32_t len)
     if (sent < len) {
         s_feed_dropped += len - sent;
     }
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /*
+     * The analysis sees the audio here, on arrival, rather than at the DAC.
+     *
+     * Fed what the ring TOOK, and dated by interpolating from the last packet's
+     * (position, play_at) pair, so the count the block grid rides on stays equal
+     * to the audio that will actually be played. Before the first packet is sent
+     * there is no pair and no timeline, and 0 says so.
+     */
+    visualiser_feed(pcm, (uint32_t)sent,
+                    s_vis_anchor_due
+                        ? s_vis_anchor_due + (int64_t)(s_samples_in - s_vis_anchor_pos)
+                                             * 1000000LL / (int64_t)sample_rate
+                        : 0);
+#endif
     s_samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
 }
 
@@ -427,6 +448,8 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         xStreamBufferReset(local_ring);
         s_samples_in = 0;                  /* same origin as the reset ring */
         s_pending_pos = 0;                 /* and so does anything flagged here */
+        s_vis_anchor_pos = 0;
+        s_vis_anchor_due = 0;              /* no timeline until the next packet */
         s_marker_sample = -1;
         s_phase_head = s_phase_tail = 0;
         s_phase_valid = false;
@@ -556,10 +579,13 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
      * Queued, that entry sits at the head of a queue playback reaches only
      * after playing the same hours of audio. The tail never advances, the queue
      * fills, no further points are ever recorded, and s_phase_valid stays false
-     * for good: the ring servo stops, anchor_due stays zero, and the visualiser
-     * is fed a due of zero for ever -- hue frozen and no envelope decay, while
-     * every satellite carries on. One local underrun took the hub's strip out
-     * for the rest of the session.
+     * for good, so the ring servo stops. The strip used to go with it -- the
+     * analysis was dated from the same dead queue, so it was fed a due of zero
+     * for ever, hue frozen and no envelope decay, while every satellite carried
+     * on. One local underrun took the hub's strip out for the rest of the
+     * session. That half is gone now: the analysis is dated from the send side
+     * (s_vis_anchor_due), which does not depend on playback reaching anything.
+     * The servo half is still worth every line below.
      *
      * Nothing is lost by skipping it. This packet's audio went into the ring
      * before the reset cleared it, so it has no position to record; the next
@@ -572,6 +598,19 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_phase_q[s_phase_head].play_at = next_play_at;
         s_phase_head = nq;
     }
+    /*
+     * The same pair, kept for the analysis, which is fed on arrival and so runs
+     * ahead of the instant it is dating audio with.
+     *
+     * streamer_feed() cannot know this packet's play_at -- sbc_in decodes and
+     * feeds before calling here, which is what assigns it. Interpolating from
+     * the previous packet's pair covers that: the anchor is one packet stale and
+     * the arithmetic is the same interpolation the playback side used to do, so
+     * the label is right to the microsecond either way.
+     */
+    s_vis_anchor_pos = s_pending_pos;
+    s_vis_anchor_due = next_play_at;
+
     msg.play_at = next_play_at;
     memcpy(msg.payload, sbc, len);
 
@@ -986,13 +1025,14 @@ static void retune_dac(uint32_t hz)
     s_retune_phase_before = s_phase_err_us;
     s_retune_watch = true;
 
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-    /* The disable above discarded the DMA buffer: ~32 ms that the playback task
-     * counted as played and fed to the visualiser, and that nobody heard. Left
-     * alone, every label after this runs early by that much, on this unit only.
-     * Covers the initial rate match too, which comes through here as well. */
-    visualiser_realign();
-#endif
+    /*
+     * Nothing to tell the visualiser: it counts what ARRIVES, and a retune
+     * disturbs playback rather than arrival. It used to need telling, on the
+     * reasoning that the disable discarded the DMA buffer this task had already
+     * counted as played -- retired both by moving the analysis off the playback
+     * path and by the satellite's REFILL instrument showing the descriptors are
+     * not discarded at all.
+     */
 }
 
 /*
@@ -1028,11 +1068,6 @@ static void local_play_task(void *arg)
          * counters therefore share an origin -- do NOT reset s_samples_in here,
          * it has legitimately been counting the audio buffered during the wait. */
         int32_t samples_played = 0;
-        /* Last phase point seen, for labelling audio with the instant it is due.
-         * Zero until the first point lands; the visualiser waits rather than
-         * aligning to a guess. */
-        int32_t anchor_pos = 0;
-        int64_t anchor_due = 0;
         /*
          * When the DAC last accepted a chunk -- the reference the phase reading
          * is dated against. See the note in the phase loop for why it is not a
@@ -1159,12 +1194,6 @@ static void local_play_task(void *arg)
                     s_phase_err_us = err;
                     s_phase_valid = true;
                 }
-                /* Keep the last point: interpolating from it labels each chunk
-                 * with the instant it is DUE, which every unit agrees on because
-                 * they all got the same play_at. The visualiser cuts its
-                 * analysis blocks on that. */
-                anchor_pos = s_phase_q[s_phase_tail].pos;
-                anchor_due = s_phase_q[s_phase_tail].play_at;
                 s_phase_tail = (s_phase_tail + 1) % PHASE_Q_LEN;
             }
 
@@ -1214,14 +1243,6 @@ static void local_play_task(void *arg)
                     while (left > 0) {
                         int32_t n = left > AUDIO_FRAMES ? AUDIO_FRAMES : left;
                         size_t bytes = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-                        /* This silence is genuinely played, so the visualiser
-                         * sees it like everything else that reaches the DAC --
-                         * the satellite already fed its own through write_audio()
-                         * and the two must not differ. No scheduled instant to
-                         * label it with; the realign below supplies one. */
-                        visualiser_feed(quiet, bytes, 0);
-#endif
                         i2s_channel_write(i2s_tx, quiet, bytes, &w, portMAX_DELAY);
                         left -= n;
                     }
@@ -1266,16 +1287,12 @@ static void local_play_task(void *arg)
                              (long)(s_hub_splice_us / 1000),
                              (long)s_phase_err_us);
                 }
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-                if (adj != 0) {
-                    /* Samples were added to or taken out of what the visualiser
-                     * counts, so its block boundaries and its due_us stopped
-                     * describing the timeline. Each unit splices by its own
-                     * phase error, so leaving this out is what stepped the
-                     * strips apart at every track change. */
-                    visualiser_realign();
-                }
-#endif
+                /*
+                 * The visualiser is not told. A splice moves audio WITHIN the
+                 * timeline to correct this unit's position in it; the timeline
+                 * every frame is dated against and drawn on does not move, and
+                 * arrival is untouched.
+                 */
             }
 
             int32_t mark = s_marker_sample;
@@ -1292,18 +1309,6 @@ static void local_play_task(void *arg)
             }
             samples_played += AUDIO_FRAMES;
 
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-            /* Fed here, at the DAC, and not where the audio arrived: ~200 ms of
-             * buffer separates the two, and lights driven from the arrival side
-             * run that far ahead of this unit's own speaker.
-             *
-             * The label is when this chunk is DUE, not the clock now -- see
-             * visualiser.h. On the hub local time is master time, so no offset. */
-            int64_t due = anchor_due
-                ? anchor_due + (int64_t)(samples_played - anchor_pos) * 1000000 / sample_rate
-                : 0;
-            visualiser_feed(chunk, sizeof(chunk), due);
-#endif
             size_t written = 0;
             if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,
                                   portMAX_DELAY) != ESP_OK) {
