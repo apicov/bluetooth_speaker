@@ -141,7 +141,10 @@ void Analysis::init(int sample_rate)
     boom_.refractory_us = BOOM_REFRACTORY_US;
 
     /*
-     * The flux floor, measured against ten forró recordings.
+     * The flux floor, measured against ten forró recordings AT HOP 1024, and
+     * re-measured at hop 512 against those ten plus 196 more. It did not move.
+     * Full ladders, corpus and method in docs/tuning-corpus.md; this comment is
+     * no longer the only record, which is what made the last retune expensive.
      *
      * It was 0.15 on the strength of synthetic material, and that was wrong by
      * an order of magnitude and in the wrong direction -- on real tracks it
@@ -157,7 +160,7 @@ void Analysis::init(int sample_rate)
      * 0.016 to 0.019, p99 0.038 to 0.131. A floor of 0.15 is above nearly every
      * stroke in the material.
      *
-     * Swept over the ten tracks, booms per minute against floor:
+     * Swept over the ten tracks at hop 1024, booms per minute against floor:
      *
      *   0.15   0-16      dark, the bug
      *   0.06   0-80      still clipping most tracks
@@ -173,8 +176,19 @@ void Analysis::init(int sample_rate)
      * is not the floor at all. It is the single-band input and the adaptive
      * threshold above it.
      *
+     * At hop 512 that last sentence is not a remark, it is the result. Over 196
+     * tracks, sweeping this floor across a factor of five moves the boom rate by
+     * about 1% (98-201 per minute at 0.02, 97-200 at 0.028) and the near-
+     * threshold frame rate not at all. The floor is simply not the binding
+     * constraint on real music; it binds on quiet material and on nothing else,
+     * and no value of it recovers the near-threshold rate that overlapping
+     * windows raised from 2.2% to 2.9% of frames. So it stays where the ten
+     * tracks put it.
+     *
      * Lower it toward 0.012 if the lights miss strokes; that costs occasional
-     * firing where there is no drum.
+     * firing where there is no drum. At hop 512 that cost arrives sooner than
+     * this ladder suggests -- 0.012 is the one rung the drumless control still
+     * rejects there.
      */
     boom_.flux_floor = BOOM_FLUX_FLOOR;
 

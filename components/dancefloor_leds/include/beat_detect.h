@@ -67,15 +67,31 @@ extern "C" {
  * comment here used to claim 0.5 s "at a 512-sample hop", which described a hop
  * this code has never actually run at.
  *
- * Whether it should stay a frame count or be scaled to hold the span constant is
- * a tuning question and not a mechanical one, and it is open: a shorter window
- * of history adapts faster but is a noisier estimate of the mean and standard
- * deviation. It wants measuring against the corpus rather than reasoning about,
- * which is why nothing here scales it yet.
+ * It stays a frame count. That was measured, not assumed, and the measurement
+ * is in docs/tuning-corpus.md section 7; both axes were swept over 22, 43, 64
+ * and 86 at hop 512.
  *
- * Note the second axis above before deciding: this also sets how long a unit
- * that missed frames takes to agree with its neighbours again, so "adapts
- * faster" is a sync argument for the shorter window and not only a taste one.
+ * On the tuning axis 43 sits at the knee. Going 22 -> 43 buys a 22% quieter
+ * threshold estimate; going 43 -> 86 buys a further 19% and takes twice the
+ * history to do it, by which point the onset rate has almost stopped responding
+ * (199 per minute against 191 across that doubling).
+ *
+ * On the second axis above -- how long a unit that missed frames takes to agree
+ * with its neighbours again -- shorter is simply better, and it was measured
+ * rather than reasoned about, by tools/tuning/converge.cpp. The history turns
+ * over in exactly BEAT_HIST frames, but only a fraction of that is visible,
+ * since a threshold difference changes a decision only when the flux lands
+ * between the two thresholds: at 43 and hop 512 the median loss event never
+ * produces a disagreement at all, and the 95th percentile is back in agreement
+ * within 37 frames. That figure roughly doubles at 86.
+ *
+ * So the two axes agree and there was no trade-off to adjudicate. What is worth
+ * knowing is the road not taken: scaling this to 86 to hold the original 998 ms
+ * span across the hop change is the obvious mechanical move, and it is wrong on
+ * BOTH axes at once.
+ *
+ * Note also that this sizes both of Analysis's detectors, not just the wideband
+ * one -- boom_ is a beat_det_t too.
  *
  * A command-line -DBEAT_HIST wins, which is what lets the host harness sweep it
  * -- `make HIST=86` in tools/pattern_lab or components/dancefloor_leds/test.
@@ -87,9 +103,23 @@ extern "C" {
 #  define BEAT_HIST  43
 #endif
 
-/* Below this, flux is treated as silence rather than signal. Without it the
+/*
+ * Below this, flux is treated as silence rather than signal. Without it the
  * adaptive threshold collapses toward zero during quiet passages and fires on
- * dither noise. */
+ * dither noise.
+ *
+ * Set to match the boom detector's floor and carried unswept ever since. It has
+ * its own ladder now, at both hops and over 206 recordings -- docs/tuning-corpus.md
+ * section 6 -- and 0.02 survives it: across a factor of five the onset rate moves
+ * by under 1% on the large set, and 0.02 is well clear of 0.012, the one rung the
+ * drumless control rejects at hop 512.
+ *
+ * The figure that ladder did turn up is about the OLD hop, not this one. At hop
+ * 1024 this detector fires 11 times in 30 seconds on material with no drum in it,
+ * at this very floor; at 512 it fires none. Overlapping the windows improved its
+ * false-positive behaviour, which is the opposite of what a shorter hop was
+ * expected to cost.
+ */
 #define BEAT_FLUX_FLOOR 0.02f
 
 /* Onsets closer together than this are suppressed. 120 ms allows 500 BPM,
