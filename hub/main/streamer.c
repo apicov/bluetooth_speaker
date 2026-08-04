@@ -436,6 +436,11 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_slew_told = false;
         started = true;
         n_restarts++;
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+        /* Frames are drawn when the instant they name comes round, so anything
+         * already computed is dated against the origin this line replaces. */
+        visualiser_flush();
+#endif
         ESP_LOGI(TAG, "timeline start");
     } else {
         /*

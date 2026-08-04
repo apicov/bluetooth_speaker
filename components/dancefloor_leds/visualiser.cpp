@@ -271,6 +271,70 @@ std::atomic<int32_t>  s_last_drift_us;
 uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
 void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
 
+/*
+ * Frames computed but not yet due.
+ *
+ * Analysis and display are separate stages. A frame is computed whenever the
+ * audio for it is available and drawn when the instant it describes comes
+ * round, which is the same schedule-the-future trick docs/clock-sync.md section
+ * 4 uses for the audio itself: nothing passes between the boards at the moment
+ * of drawing, they each keep the same appointment.
+ *
+ * What that buys is worth stating plainly, because it is not obvious. Before
+ * this, a frame was drawn as soon as it was computed, so two strips agreed only
+ * as closely as the two units' PLAYBACK agreed -- and each unit tolerates
+ * PHASE_DEADBAND_US (7 ms) of its own error, so up to 14 ms between them, which
+ * is inside what an eye resolves. Drawn on the label instead, they agree as
+ * closely as the two CLOCKS do, which TSF puts under a millisecond. The servo
+ * stops being in the path at all.
+ *
+ * Single producer (the analysis task), single consumer (the render task), so
+ * the indices need no locking. They are free-running counts, not wrapped
+ * positions: the difference is the depth and stays right across a uint32 wrap.
+ *
+ * 32 frames is ~740 ms at the current hop, comfortably more than the 200 ms of
+ * lead the audio carries, so the queue is sized by the audio buffer rather than
+ * the other way round.
+ */
+constexpr uint32_t FRAME_RING = 32;
+df::Frame s_fq[FRAME_RING];
+std::atomic<uint32_t> s_fq_head;    /* analysis task writes */
+std::atomic<uint32_t> s_fq_tail;    /* render task writes */
+std::atomic<uint32_t> s_fq_flush;   /* bumped to discard what is queued */
+std::atomic<uint32_t> s_late;       /* frames that came due before we got to them */
+std::atomic<uint32_t> s_overrun;    /* frames dropped because the queue was full */
+/* Render-side cost, published for the analysis task's log line. The two halves
+ * scale with different things -- see the note where they are logged -- and are
+ * only useful next to each other. */
+std::atomic<uint32_t> s_render_sum, s_render_max, s_render_n;
+
+/*
+ * Master -> local, or null on a unit where they are the same thing.
+ *
+ * A function rather than a stored offset because the satellite's is slewed
+ * continuously; see visualiser_set_clock().
+ */
+std::atomic<int64_t (*)(int64_t)> s_to_local{nullptr};
+
+/*
+ * How early is close enough to draw now rather than sleep again.
+ *
+ * The audio marker busy-waits to hit its deadline within microseconds. This
+ * does not need to: vTaskDelay resolves to 1 ms at CONFIG_FREERTOS_HZ=1000,
+ * and an eye resolves 10-20 ms, so a millisecond is already an order of
+ * magnitude better than the thing being served. Spinning for it would burn a
+ * core to move an error nobody can see.
+ */
+constexpr int64_t RENDER_SLACK_US = 1000;
+
+/* Sleep at most this long in one go, so a flush is acted on promptly even when
+ * the frame at the head is not due for a while. */
+constexpr int64_t RENDER_NAP_MS = 20;
+
+/* Past this, the frame was not merely a little late -- something stalled. Drawn
+ * anyway, because a stale frame is better than a gap, but counted. */
+constexpr int64_t RENDER_LATE_US = 20000;
+
 void show(const uint8_t *rgb)
 {
     for (uint32_t i = 0; i < LED_COUNT; i++) {
@@ -315,7 +379,6 @@ void visualiser_task(void *arg)
      * Task-local: only this task writes or reads them.
      */
     int64_t  cost_analysis = 0, cost_analysis_max = 0;
-    int64_t  cost_render = 0, cost_render_max = 0;
     uint32_t cost_n = 0;
 
     while (true) {
@@ -369,10 +432,15 @@ void visualiser_task(void *arg)
                 /* Genuinely starved rather than mid-block. Go dark once instead
                  * of holding the last frame; bounded to one refresh per timeout,
                  * so it cannot become a spin. */
+                /*
+                 * Genuinely starved rather than mid-block. Going dark is the
+                 * render task's job now -- the strip and the pattern belong to
+                 * it, and drawing to them from here would race it. A flush is
+                 * exactly the right request: what is queued describes a stream
+                 * that has stopped.
+                 */
                 starved_shown = true;
-                if (pattern) pattern->reset();
-                std::memset(pixels, 0, sizeof(pixels));
-                show(pixels);
+                visualiser_flush();
                 /* the stream broke; re-align on return */
                 s_align_pending.store(true, std::memory_order_relaxed);
             }
@@ -390,45 +458,6 @@ void visualiser_task(void *arg)
         const df::Frame &f = analysis.process(raw, block_index, due_us, 0);
         const int64_t t_analysed = esp_timer_get_time();
 
-#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-        /*
-         * Raise when due_us crosses a second, lower two blocks later. Both
-         * edges are handled here, so nothing blocks and nothing needs a timer.
-         *
-         * Which block that lands on is quantised to the 23 ms block period, but
-         * it is the SAME block on every unit, which is the only thing that
-         * matters for comparing two boards.
-         */
-        static int64_t last_sec = -1;
-        static int lower_in = -1;
-        const int64_t sec = due_us / LED_MARKER_PERIOD_US;
-        if (sec != last_sec) {
-            last_sec = sec;
-            lower_in = LED_MARKER_BLOCKS_HIGH;
-            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 1);
-            /*
-             * Say so for the first few, then go quiet.
-             *
-             * Without this, "the LED is not blinking" is three different faults
-             * wearing the same face: the code never runs (no audio, so no
-             * complete block ever reaches here), the code runs but the pin is
-             * not wired to an LED on this board, or the option was not built
-             * in. Those need completely different fixes and the console could
-             * not tell them apart. If these lines appear, the firmware is doing
-             * its job and the question is the pin.
-             */
-            static int told;
-            if (told < 3) {
-                told++;
-                ESP_LOGW(TAG, "LED marker fired on GPIO %d (%d of 3) -- if the "
-                              "LED is dark, this board's LED is not on that pin",
-                         CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
-            }
-        } else if (lower_in > 0 && --lower_in == 0) {
-            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 0);
-        }
-#endif
-
         block_index++;
 
         bump(s_frames);
@@ -439,17 +468,32 @@ void visualiser_task(void *arg)
             bump(s_marginal);
         }
 
-        if (pattern) {
-            pattern->render(f, pixels, LED_COUNT);
-            show(pixels);
+        /*
+         * Queue it for the instant it names, rather than drawing it now.
+         *
+         * Dropping the newest when full is deliberate. The alternative --
+         * evicting the oldest -- discards a frame that is about to be due in
+         * order to keep one that is not, so a strip that is already behind
+         * skips forward instead of catching up. Full means the render task is
+         * not keeping pace, and the honest response is to stop adding to its
+         * backlog.
+         */
+        {
+            const uint32_t head = s_fq_head.load(std::memory_order_relaxed);
+            const uint32_t tail = s_fq_tail.load(std::memory_order_acquire);
+            if (head - tail >= FRAME_RING) {
+                bump(s_overrun);
+            } else {
+                s_fq[head % FRAME_RING] = f;
+                /* Release, against the acquire on the reader: the frame must be
+                 * fully written before the index that publishes it moves. */
+                s_fq_head.store(head + 1, std::memory_order_release);
+            }
         }
         {
-            const int64_t t_shown = esp_timer_get_time();
-            const int64_t a = t_analysed - t_in, r = t_shown - t_analysed;
+            const int64_t a = t_analysed - t_in;
             cost_analysis += a;
-            cost_render   += r;
             if (a > cost_analysis_max) cost_analysis_max = a;
-            if (r > cost_render_max)   cost_render_max = r;
             cost_n++;
         }
 
@@ -484,20 +528,171 @@ void visualiser_task(void *arg)
              * anomaly can trigger this block early, and a mean over three
              * frames is not a mean.
              */
-            ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %lld/%lld us"
-                          " | n %" PRIu32 " | stack free %" PRIu32,
+            /* Taken unconditionally, then divided -- reading them inside the
+             * call would leave the sum uncleared on a window with no frames. */
+            const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
+            ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %" PRIu32
+                          "/%" PRIu32 " us | queued %" PRIu32 " | late %" PRIu32
+                          " | overrun %" PRIu32 " | n %" PRIu32 "/%" PRIu32
+                          " | stack free %" PRIu32,
                      cost_analysis / cost_n, cost_analysis_max,
-                     cost_render / cost_n, cost_render_max,
-                     cost_n, uxTaskGetStackHighWaterMark(nullptr));
+                     rn ? rsum / rn : 0, take(s_render_max),
+                     s_fq_head.load(std::memory_order_relaxed) -
+                         s_fq_tail.load(std::memory_order_relaxed),
+                     take(s_late), take(s_overrun), cost_n, rn,
+                     uxTaskGetStackHighWaterMark(nullptr));
             cost_analysis = cost_analysis_max = 0;
-            cost_render = cost_render_max = 0;
             cost_n = 0;
             last_report_us = now;
         }
     }
 }
 
+/*
+ * Draw each frame at the instant it names.
+ *
+ * Nothing passes between the boards here and nothing is corrected against
+ * anything: each unit converts due_us with its own offset and keeps its own
+ * appointment, exactly as the audio does. That is what makes two strips agree
+ * to the accuracy of the clocks rather than to the accuracy of the servo.
+ */
+void render_task(void *arg)
+{
+    (void)arg;
+    uint32_t seen_flush = s_fq_flush.load(std::memory_order_relaxed);
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+    int64_t last_sec = -1;
+    int     lower_in = -1;
+#endif
+
+    while (true) {
+        const uint32_t flush = s_fq_flush.load(std::memory_order_acquire);
+        if (flush != seen_flush) {
+            seen_flush = flush;
+            /* Only this task writes the tail, so catching it up to the head is
+             * safe whatever the producer is doing. Frames added after this are
+             * on the new timeline and are kept. */
+            s_fq_tail.store(s_fq_head.load(std::memory_order_acquire),
+                            std::memory_order_release);
+            /*
+             * Dark, not the last frame held.
+             *
+             * A flush means the audio behind what is on the strip has stopped
+             * or moved to a new origin. Holding the last frame leaves a lit
+             * strip that looks like it is working; going dark says plainly that
+             * there is nothing to show, which is what the starve path did
+             * before rendering was deferred.
+             */
+            if (pattern) pattern->reset();
+            std::memset(pixels, 0, sizeof(pixels));
+            show(pixels);
+        }
+
+        const uint32_t tail = s_fq_tail.load(std::memory_order_relaxed);
+        const uint32_t head = s_fq_head.load(std::memory_order_acquire);
+        if (head == tail) {
+            vTaskDelay(pdMS_TO_TICKS(RENDER_NAP_MS));
+            continue;
+        }
+
+        /*
+         * How long until this frame is due, in local time.
+         *
+         * A label of 0 means the feed had no timeline to date the audio
+         * against, so there is nothing to wait for -- draw it and move on. An
+         * unset hook means master time IS local time, which is the hub's case
+         * and the safe default anywhere.
+         */
+        const int64_t due = s_fq[tail % FRAME_RING].due_us;
+        int64_t wait = 0;
+        if (due > 0) {
+            const auto to_local = s_to_local.load(std::memory_order_relaxed);
+            wait = (to_local ? to_local(due) : due) - esp_timer_get_time();
+        }
+        if (wait > RENDER_SLACK_US) {
+            /* Bounded, so a flush is acted on promptly even when the frame at
+             * the head is not due for a couple of hundred milliseconds. */
+            const int64_t nap = wait / 1000 < RENDER_NAP_MS ? wait / 1000 : RENDER_NAP_MS;
+            vTaskDelay(pdMS_TO_TICKS(nap ? nap : 1));
+            continue;
+        }
+        if (wait < -RENDER_LATE_US) {
+            bump(s_late);
+        }
+
+        const int64_t t0 = esp_timer_get_time();
+        df::Frame f = s_fq[tail % FRAME_RING];
+        /* Points into the Analysis that produced it and was overwritten several
+         * frames ago. Null rather than dangling -- see Frame::mag. */
+        f.mag = nullptr;
+        s_fq_tail.store(tail + 1, std::memory_order_release);
+
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+        /*
+         * Raise when due_us crosses a second, lower two frames later.
+         *
+         * It fires here rather than at analysis because what it exists to show
+         * is when a unit DRAWS, which is now a different instant from when it
+         * computed. Two boards side by side answer "do the strips share a
+         * timeline" without a console, and after this change the answer is a
+         * property of the clocks alone.
+         */
+        const int64_t sec = f.due_us / LED_MARKER_PERIOD_US;
+        if (sec != last_sec) {
+            last_sec = sec;
+            lower_in = LED_MARKER_BLOCKS_HIGH;
+            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 1);
+            /*
+             * Say so for the first few, then go quiet.
+             *
+             * Without this, "the LED is not blinking" is three different faults
+             * wearing the same face: the code never runs (no audio, so no frame
+             * ever reaches here), the code runs but the pin is not wired to an
+             * LED on this board, or the option was not built in. Those need
+             * completely different fixes and the console could not tell them
+             * apart. If these lines appear, the firmware is doing its job and
+             * the question is the pin.
+             */
+            static int told;
+            if (told < 3) {
+                told++;
+                ESP_LOGW(TAG, "LED marker fired on GPIO %d (%d of 3) -- if the "
+                              "LED is dark, this board's LED is not on that pin",
+                         CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
+            }
+        } else if (lower_in > 0 && --lower_in == 0) {
+            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 0);
+        }
+#endif
+
+        if (pattern) {
+            pattern->render(f, pixels, LED_COUNT);
+            show(pixels);
+        }
+
+        const uint32_t took = static_cast<uint32_t>(esp_timer_get_time() - t0);
+        s_render_sum.fetch_add(took, std::memory_order_relaxed);
+        bump(s_render_n);
+        uint32_t prev = s_render_max.load(std::memory_order_relaxed);
+        while (took > prev &&
+               !s_render_max.compare_exchange_weak(prev, took, std::memory_order_relaxed)) {
+        }
+    }
+}
+
 }  // namespace
+
+void visualiser_set_clock(int64_t (*master_to_local)(int64_t))
+{
+    s_to_local.store(master_to_local, std::memory_order_relaxed);
+}
+
+void visualiser_flush(void)
+{
+    /* Release, so everything the caller did to establish the new timeline is
+     * visible to the render task before it acts on this. */
+    s_fq_flush.fetch_add(1, std::memory_order_release);
+}
 
 void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
 {
@@ -676,9 +871,19 @@ void visualiser_start(void)
     strip->clear();
     strip->show();
 
-    /* Core 1 alongside playback, at a lower priority than it: a dropped frame
-     * here is invisible, dropped audio is not. */
+    /*
+     * Core 1 alongside playback, at a lower priority than it: a dropped frame
+     * here is invisible, dropped audio is not.
+     *
+     * Two tasks, because the two halves are paced by different things. Analysis
+     * runs when audio is available and may run well ahead of the sound; the
+     * render runs on the clock, and its whole job is to be late for nothing.
+     * Render sits one priority above analysis for that reason -- if the board is
+     * busy, a frame drawn on time from slightly stale analysis beats a frame
+     * drawn late from fresh analysis, and only one of the two is visible.
+     */
     xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1);
+    xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1);
     ESP_LOGI(TAG, "started: %lu LEDs on GPIO %d at %d%% brightness, pattern %s",
              LED_COUNT, CONFIG_DANCEFLOOR_LED_GPIO, CONFIG_DANCEFLOOR_LED_BRIGHTNESS,
              pattern ? pattern->name() : "none");

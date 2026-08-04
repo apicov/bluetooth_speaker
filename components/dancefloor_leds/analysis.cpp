@@ -219,7 +219,7 @@ const Frame &Analysis::process(const int16_t *stereo, int64_t index,
     frame_.index     = index;
     frame_.due_us    = due_us;
     frame_.mag       = mag_;
-    frame_.band      = band_;
+    std::memcpy(frame_.band, band_, sizeof(frame_.band));
     frame_.flux      = beat_det_last_flux(&beat_);
     frame_.threshold = beat_det_last_threshold(&beat_);
     frame_.onset     = onset;

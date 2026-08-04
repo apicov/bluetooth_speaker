@@ -100,8 +100,26 @@ constexpr int64_t BOOM_REFRACTORY_US = 200000;
 struct Frame {
     int64_t      index;      /* block number, from an origin all units share */
     int64_t      due_us;     /* master-clock instant this audio is heard */
+    /*
+     * The spectrum, by pointer, and the ONLY field that does not survive being
+     * stored.
+     *
+     * It points into the Analysis that produced it and is overwritten by the
+     * next process(). Rendering is deferred now -- frames are queued and drawn
+     * when due -- so a queued frame's mag is long gone by the time a pattern
+     * sees it, and the render path sets it null rather than leaving it dangling.
+     *
+     * So: usable by anything that consumes a frame immediately, which means
+     * tools/pattern_lab. Not usable by a Pattern. 512 floats is 2 KB a frame,
+     * which is why it is not simply copied like everything else here.
+     */
     const float *mag;        /* BINS raw magnitudes, lowest bin first */
-    const float *band;       /* BEAT_BANDS, normalised to 0..1 */
+    /*
+     * By value, not by pointer, so a frame can be queued. Four floats -- the
+     * cost of copying them is nothing against needing a second lifetime rule
+     * for one field of a struct that is otherwise plain data.
+     */
+    float        band[BEAT_BANDS];   /* normalised to 0..1 */
     float        flux;       /* weighted spectral flux this frame */
     float        threshold;  /* what flux had to beat to count as an onset */
     bool         onset;

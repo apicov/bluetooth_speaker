@@ -402,6 +402,23 @@ static void write_audio(const uint8_t *pcm, size_t bytes, int64_t due_master_us)
     dac_write(pcm, bytes);
 }
 
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+/*
+ * When a master-clock instant falls on this board's clock.
+ *
+ * The same conversion playback uses, against the same slewed offset, so the
+ * strip and the speaker are answering to one timeline rather than two. Before
+ * the first anchor stream_offset is 0 and this is the identity, which dates the
+ * handful of frames produced before a timeline exists into the past -- they are
+ * drawn at once, which is the right thing to do with a frame that has no
+ * schedule to keep.
+ */
+static int64_t vis_master_to_local(int64_t master_us)
+{
+    return sync_to_local(master_us, stream_offset);
+}
+#endif
+
 /* --------------------------------------------------------------- receiving */
 
 static void probe_task(void *arg)
@@ -505,6 +522,10 @@ static void handle_audio(const audio_msg_t *msg)
          * would separate the count from the timeline at the difference -- 8.8%
          * for a 48 kHz source against the 44.1 kHz this used to assume. */
         visualiser_set_rate(stream_rate);
+        /* A new origin: stream_offset is about to be re-seeded, so any frame
+         * already computed and waiting to be drawn is dated against a timeline
+         * that stops existing on the next line. */
+        visualiser_flush();
 #endif
         sbc_decoder_init();
         stream_start_local = sync_to_local(msg->play_at, offset);
@@ -1425,6 +1446,17 @@ void app_main(void)
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
     visualiser_start();
+    /*
+     * The strip draws each frame when the instant it names comes round, and on
+     * this board that instant has to be converted out of master time first.
+     *
+     * Read live rather than captured: stream_offset is slewed toward the
+     * estimate at 200 ppm, so a copy taken once would go stale at exactly the
+     * crystal difference -- which is the bug docs/clock-sync.md section 9
+     * records in the audio path, where the servo was fed its own drift as its
+     * reference and faithfully parked the speaker at the growing error.
+     */
+    visualiser_set_clock(vis_master_to_local);
 #else
     ESP_LOGW(TAG, "visualiser DISABLED (menuconfig) -- LEDs will stay dark");
 #endif

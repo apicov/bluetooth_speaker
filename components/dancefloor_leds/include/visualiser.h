@@ -17,8 +17,50 @@
 extern "C" {
 #endif
 
-/* Brings up the strip and starts the analysis task. Call once. */
+/* Brings up the strip and starts the analysis and render tasks. Call once. */
 void visualiser_start(void);
+
+/*
+ * How to convert a master-clock instant into this board's local clock.
+ *
+ * Analysis and display are separate stages now: a frame is computed whenever
+ * the audio for it arrives and drawn when the instant it describes comes round.
+ * Waiting for that instant is the one thing in here that needs a clock, so it
+ * is the one thing that has to be told about the offset between them.
+ *
+ * This used to be true of nothing here, deliberately -- every unit derived
+ * due_us from the play_at stamps the audio carried, so the whole component
+ * worked in master time and never needed an offset. Deriving is still how the
+ * label is produced; what is new is that something now has to WAIT for it.
+ *
+ * Passed as a function rather than a number because the satellite's offset is
+ * not constant: it is slewed toward the live estimate at 200 ppm, so a value
+ * copied once would go stale at exactly the crystal difference -- the same bug
+ * docs/clock-sync.md section 9 records in the audio path, where the servo was
+ * fed its own drift as a reference.
+ *
+ * Leave it unset on the hub, where local time IS master time. A unit that never
+ * calls this draws every frame at the instant its label names, which is correct
+ * there and is also the safest thing to do anywhere else.
+ */
+void visualiser_set_clock(int64_t (*master_to_local)(int64_t master_us));
+
+/*
+ * Drop every frame computed but not yet drawn.
+ *
+ * Call when the timeline restarts -- a re-anchor or an underrun recovery -- and
+ * not for a splice, which visualiser_realign() covers. The difference is what
+ * happened to due_us: a splice moves audio around WITHIN a timeline, so queued
+ * labels stay true, while a re-anchor establishes a new origin and every label
+ * still queued describes an instant on a timeline that no longer exists. Drawn
+ * anyway, those become a burst of animation from the old origin at the moment
+ * the new one starts.
+ *
+ * The same shape of bug as the stale phase point in docs/clock-sync.md section
+ * 9, which was queued before a timeline restart and left the hub's ring servo
+ * dead for the rest of the session.
+ */
+void visualiser_flush(void);
 
 /*
  * Switch pattern by name. See pattern_count()/pattern_at() in patterns.hpp for
