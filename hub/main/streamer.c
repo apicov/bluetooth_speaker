@@ -818,35 +818,6 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
 /* ------------------------------------------------------------------- wifi */
 
 /*
- * Put a satellite back on the send list the moment it has an address, rather
- * than when it next probes.
- *
- * Symmetric with client_gone(), and it exists because that function made a
- * momentary link bounce more expensive than it used to be. A disassociation
- * followed by a rejoin 13 ms later has been observed here; dropping the client
- * and waiting for re-registration would then cost up to PROBE_PERIOD_MS of
- * silence against a satellite ring holding ~150 ms, where before the drop
- * existed the hub simply carried on. This closes that window to the ~80 ms
- * between association and the DHCP reply.
- *
- * The port is not guessed: satellites bind SYNC_PORT, so it is the source port
- * of every probe and therefore what client_seen() would have recorded anyway.
- *
- * Registering a client that has an address but is not listening yet is
- * harmless. It costs the same UDP sends the timeout would have started a
- * quarter-second later, to a unit that is about to want them.
- */
-static void client_joined(const esp_ip4_addr_t *ip)
-{
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port   = htons(SYNC_PORT),
-    };
-    addr.sin_addr.s_addr = ip->addr;
-    client_seen(&addr);
-}
-
-/*
  * Count them, and stop sending to them.
  *
  * Counting was the original reason: a satellite dropping off is invisible
@@ -868,13 +839,6 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (ev) {
             client_gone(ev->mac);
         }
-    } else if (base == IP_EVENT && id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
-        /* Carries the address outright, so unlike the departure above this
-         * needs no lease lookup and cannot fail to identify the station. */
-        const ip_event_assigned_ip_to_client_t *ev = data;
-        if (ev) {
-            client_joined(&ev->ip);
-        }
     }
 }
 
@@ -887,11 +851,6 @@ static void wifi_start_ap(void)
     s_ap_netif = esp_netif_create_default_wifi_ap();
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                        WIFI_EVENT_AP_STADISCONNECTED,
-                                                       wifi_event, NULL, NULL));
-    /* The rejoin half. Not WIFI_EVENT_AP_STACONNECTED: a station is associated
-     * before it has an address, and the send list is keyed by one. */
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                       IP_EVENT_ASSIGNED_IP_TO_CLIENT,
                                                        wifi_event, NULL, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
