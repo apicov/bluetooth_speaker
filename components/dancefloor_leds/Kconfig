@@ -151,19 +151,29 @@ menu "Dancefloor LEDs"
             each window begins where the last one ended -- which is what shipped
             before overlap existed.
 
-            THE DETECTOR IS NOT YET RETUNED FOR 512. Flux is a frame-to-frame
-            difference, so overlapping windows make it smaller and make adjacent
-            samples correlated, and both flux floors (BEAT_FLUX_FLOOR and
-            BOOM_FLUX_FLOOR) were swept against ten recordings at 1024. Expect
-            the detector to be over-sensitive until they are re-measured; sweep
-            against a recording in tools/pattern_lab rather than guessing.
+            The detector has been retuned for 512 -- see docs/tuning-corpus.md,
+            which is the corpus, the commands and the ladders. The outcome was
+            that no constant needed to move: both flux floors and BEAT_HIST are
+            the same numbers at 512 as at 1024, now measured over 206 recordings
+            at both hops rather than ten at one.
 
             What is NOT affected, and needs no measurement: both refractory
             periods, which are already in microseconds, and both threshold_k
             values -- scaling flux scales the mean and the standard deviation
             identically, so those decisions are unchanged.
 
-            Set 1024 to get the last fully tuned configuration back.
+            What this setting DOES change, and cannot be tuned away: which
+            strokes fire. Flux is a frame-to-frame difference, so at 512 it is
+            differenced across 11.6 ms of audio and at 1024 across 23.2 ms, and
+            those are different measurements of the same music. Measured over
+            the ten reference tracks, only 64% of the booms at 1024 have a boom
+            at 512 within one window of them, against 91% for a comparable
+            change made at a fixed hop. Expect roughly a third of the strokes to
+            move when this setting does. That is a property of the hop and not a
+            tuning error; no floor value reduces it.
+
+            So 1024 is not a safer fallback, it is a different choice, and it is
+            the one now carrying constants confirmed against a corpus at 512.
 
             A choice rather than a number because the hop must divide the window
             and be a power of two. Anything else fails the build in
