@@ -85,6 +85,32 @@ void Analysis::init(int sample_rate)
         }
     }
 
+    /*
+     * The portable spectrum's bins, geometrically spaced -- see SPEC_BINS.
+     *
+     * Edges from a ratio rather than a table so the spacing survives a rate
+     * change: the frequencies are fixed, the bins they land on are not. Clamped
+     * to Nyquist for the same reason the bands are, and never empty, so a bin
+     * narrower than the FFT's resolution reads one bin rather than none. Several
+     * of the low bins reading the same underlying bin is expected.
+     */
+    {
+        const float ratio = std::pow(SPEC_HI_HZ / SPEC_LO_HZ, 1.0f / SPEC_BINS);
+        float edge = SPEC_LO_HZ;
+        for (int s = 0; s < SPEC_BINS; s++) {
+            const float next = edge * ratio;
+            int lo = band_bin(static_cast<int>(edge + 0.5f), sample_rate);
+            int hi = band_bin(static_cast<int>(next + 0.5f), sample_rate) - 1;
+            if (lo < 1) lo = 1;                      /* never DC */
+            if (lo > BINS - 1) lo = BINS - 1;
+            if (hi > BINS - 1) hi = BINS - 1;
+            if (hi < lo) hi = lo;
+            spec_lo_[s] = lo;
+            spec_hi_[s] = hi;
+            edge = next;
+        }
+    }
+
     /* Exactly esp-dsp's dsps_wind_hann_f32, so the host and the board window
      * identically -- symmetric Hann, not the periodic variant. */
     const float m = 1.0f / static_cast<float>(FFT_N - 1);
@@ -218,6 +244,27 @@ const Frame &Analysis::process(const int16_t *stereo, int64_t index,
 
     frame_.index     = index;
     frame_.due_us    = due_us;
+    /*
+     * The portable spectrum, on exactly the scale band[] uses -- same averaging
+     * over the bins of a bin, same BAND_GAIN, same beat_normalise() compression
+     * -- so a pattern can read one against the other without a conversion, and
+     * so nothing here needs a second empirical constant.
+     *
+     * Quantised last, and only here. 8 bits over a 0..1 range is a step of
+     * 0.004, two orders below anything an eye resolves on a strip and well below
+     * the difference between two units' own measurements of the same audio.
+     */
+    for (int s = 0; s < SPEC_BINS; s++) {
+        float sum = 0.0f;
+        for (int k = spec_lo_[s]; k <= spec_hi_[s]; k++) {
+            sum += mag_[k];
+        }
+        const float v = (sum / static_cast<float>(spec_hi_[s] - spec_lo_[s] + 1))
+                        * BAND_GAIN / static_cast<float>(FFT_N) * 2.0f;
+        const float n = beat_normalise(v);
+        frame_.spec[s] = static_cast<uint8_t>(n * 255.0f + 0.5f);
+    }
+
     frame_.mag       = mag_;
     std::memcpy(frame_.band, band_, sizeof(frame_.band));
     frame_.flux      = beat_det_last_flux(&beat_);

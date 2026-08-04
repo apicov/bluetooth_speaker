@@ -92,6 +92,32 @@ static_assert(band_bin(BAND_EDGE_HZ[3], RATE) == 117, "band 3 moved");
  * The reasoning behind each value stays with the code that explains it, in
  * Analysis::init().
  */
+/*
+ * The spectrum a pattern is allowed to use, as opposed to the one the FFT
+ * produces.
+ *
+ * `mag` is 512 floats and cannot outlive the Analysis that made it, so nothing
+ * that renders later can read it -- and if one unit is ever to compute frames
+ * for another, 2 KB at 43 Hz is 88 KB/s against audio already using 30-40 on the
+ * same radio. Neither limit is about precision: an LED strip cannot show 512
+ * bands or 24 bits of one.
+ *
+ * So the spectrum every consumer sees is this reduction, and it is filled the
+ * same way whoever produced the frame -- computed here, or received already
+ * reduced. A pattern reading it therefore behaves identically either way, which
+ * is the property that makes frames portable at all.
+ *
+ * 64 log-spaced bins from 40 Hz to 16 kHz: 8.6 octaves at about 1/7 octave each,
+ * which is near enough to how the ear divides the range and to how anyone would
+ * draw it. Below ~500 Hz a bin is narrower than the FFT's 43 Hz resolution and
+ * several of them read the same underlying bins -- inherent at this window
+ * length, and preferable to spacing them linearly and spending 90% of the strip
+ * on the top two octaves.
+ */
+constexpr int   SPEC_BINS   = 64;
+constexpr float SPEC_LO_HZ  = 40.0f;
+constexpr float SPEC_HI_HZ  = 16000.0f;
+
 constexpr float   BOOM_THRESHOLD_K  = 1.4f;
 constexpr float   BOOM_FLUX_FLOOR   = 0.02f;
 constexpr int64_t BOOM_REFRACTORY_US = 200000;
@@ -120,6 +146,12 @@ struct Frame {
      * for one field of a struct that is otherwise plain data.
      */
     float        band[BEAT_BANDS];   /* normalised to 0..1 */
+    /*
+     * The portable spectrum -- see SPEC_BINS. By value, like band[], because a
+     * frame outlives the Analysis that made it. Same scale as band[], quantised:
+     * 0 is silence, 255 is the top of the normalised range.
+     */
+    uint8_t      spec[SPEC_BINS];
     float        flux;       /* weighted spectral flux this frame */
     float        threshold;  /* what flux had to beat to count as an onset */
     bool         onset;
@@ -188,6 +220,8 @@ private:
     float      band_[BEAT_BANDS];
     int        band_lo_[BEAT_BANDS];     /* derived from BAND_EDGE_HZ and the rate */
     int        band_hi_[BEAT_BANDS];
+    int        spec_lo_[SPEC_BINS];      /* likewise, for the portable spectrum */
+    int        spec_hi_[SPEC_BINS];
     beat_det_t beat_;
     beat_det_t boom_;        /* the low band alone -- see Frame::boom */
     Frame      frame_;
