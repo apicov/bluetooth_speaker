@@ -300,6 +300,23 @@ void visualiser_task(void *arg)
     int64_t  last_report_us = esp_timer_get_time();
     bool     starved_shown = false;
     uint32_t seen_rate = s_rate.load(std::memory_order_relaxed);
+    /*
+     * What a frame costs, so a change to the analysis rate can be judged
+     * against a measurement rather than an expectation.
+     *
+     * Split because the two halves scale with different things and only one of
+     * them is CPU. `analysis` is the FFT and the detectors, and it doubles if
+     * the hop halves. `render` is mostly show(), which blocks in
+     * spi_device_transmit() for about 30 us per LED -- so it scales with strip
+     * length, not with the frame rate, and at the 8 LEDs on the bench it is
+     * nearly free. On a real floor it is the term that decides whether a faster
+     * analysis rate fits.
+     *
+     * Task-local: only this task writes or reads them.
+     */
+    int64_t  cost_analysis = 0, cost_analysis_max = 0;
+    int64_t  cost_render = 0, cost_render_max = 0;
+    uint32_t cost_n = 0;
 
     while (true) {
         /*
@@ -369,7 +386,9 @@ void visualiser_task(void *arg)
          * this unit was told the audio is, which is the same rate its playback
          * used to date the audio in the first place. */
         const int64_t due_us = block_index * FFT_N * 1000000LL / rate;
+        const int64_t t_in = esp_timer_get_time();
         const df::Frame &f = analysis.process(raw, block_index, due_us, 0);
+        const int64_t t_analysed = esp_timer_get_time();
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
         /*
@@ -424,6 +443,15 @@ void visualiser_task(void *arg)
             pattern->render(f, pixels, LED_COUNT);
             show(pixels);
         }
+        {
+            const int64_t t_shown = esp_timer_get_time();
+            const int64_t a = t_analysed - t_in, r = t_shown - t_analysed;
+            cost_analysis += a;
+            cost_render   += r;
+            if (a > cost_analysis_max) cost_analysis_max = a;
+            if (r > cost_render_max)   cost_render_max = r;
+            cost_n++;
+        }
 
         /*
          * Quiet when nothing is wrong, immediate when something is.
@@ -450,6 +478,20 @@ void visualiser_task(void *arg)
                      take(s_dropped), take(s_aligns),
                      take(s_drifts), (long)s_last_drift_us.load(std::memory_order_relaxed),
                      pattern ? pattern->name() : "no pattern");
+            /*
+             * Its own line, so the one above stays comparable with every log
+             * ever captured from this component. `n` is printed because an
+             * anomaly can trigger this block early, and a mean over three
+             * frames is not a mean.
+             */
+            ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %lld/%lld us"
+                          " | n %" PRIu32 " | stack free %" PRIu32,
+                     cost_analysis / cost_n, cost_analysis_max,
+                     cost_render / cost_n, cost_render_max,
+                     cost_n, uxTaskGetStackHighWaterMark(nullptr));
+            cost_analysis = cost_analysis_max = 0;
+            cost_render = cost_render_max = 0;
+            cost_n = 0;
             last_report_us = now;
         }
     }
