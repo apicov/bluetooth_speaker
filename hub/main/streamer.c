@@ -314,6 +314,13 @@ static volatile uint32_t alloc_fail_caps;
  * ~150 ms of ring against a 250 ms probe period that is an underrun rather than
  * a glitch. The event handler below is what makes a clean disassociation instant
  * regardless; this bound is for the satellite that vanishes without saying so.
+ *
+ * What remains after both is 3 to 5 failed allocations per disconnect, and that
+ * is the floor rather than a leftover to chase. Those are frames handed to the
+ * WiFi driver before client_gone() ran -- about 20 buffers outstanding by the
+ * same heap arithmetic that gave the 124 above -- and nothing above the driver
+ * can reach a buffer it has already taken. Audio is unaffected: underruns stay
+ * 0 across it. A run showing 3-5 here is this working, not regressing.
  */
 #define CLIENT_TIMEOUT_US 2000000
 
