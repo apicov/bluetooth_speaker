@@ -32,6 +32,33 @@ namespace {
 
 constexpr const char *TAG = "vis";
 
+/*
+ * The two capabilities the source choice implies, named separately because they
+ * are two things and not one.
+ *
+ * Every conditional in this file used to test CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+ * directly, and about half of them meant "does this unit transform samples"
+ * while the other half meant "does this unit take frames off the wire". Today
+ * those are exact complements, so one symbol served for both and the difference
+ * never showed.
+ *
+ * They stop being complements as soon as a unit is given a spectrum by the hub
+ * and runs its own detector on it -- which is a mode this is deliberately being
+ * left ready for. Such a unit takes remote frames AND decides, while analysing
+ * no audio and needing none of the FFT's buffers. Adding it should be adding a
+ * mode, not re-deriving which of ten conditionals meant which thing.
+ *
+ * So each site below says what it depends on. Nothing about the current builds
+ * changes; these are still one symbol apart.
+ */
+#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#define DF_ANALYSES_AUDIO      0
+#define DF_TAKES_REMOTE_FRAMES 1
+#else
+#define DF_ANALYSES_AUDIO      1
+#define DF_TAKES_REMOTE_FRAMES 0
+#endif
+
 using df::FFT_N;
 using df::HOP_N;
 using df::TAIL_N;
@@ -390,7 +417,7 @@ static_assert(VIS_SPEC_BINS == df::SPEC_BINS, "wire frame and spectrum disagree"
  *
  * Only compiled where frames are produced here -- a unit that is given them
  * never converts one out. */
-#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if DF_ANALYSES_AUDIO
 void to_wire(const df::Frame &f, vis_frame_t *w)
 {
     w->due_us = f.due_us;
@@ -414,7 +441,7 @@ void to_wire(const df::Frame &f, vis_frame_t *w)
  *
  * Only compiled where frames are taken from elsewhere -- a unit doing its own
  * analysis never converts one back. */
-#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if DF_TAKES_REMOTE_FRAMES
 void from_wire(const vis_frame_t *w, df::Frame &f)
 {
     f.due_us = w->due_us;
@@ -518,7 +545,7 @@ void show(const uint8_t *rgb)
 
 /* Not built at all on a unit that is given its frames: there is no audio to
  * analyse there, and the FFT and detectors would be pure cost. */
-#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if DF_ANALYSES_AUDIO
 void visualiser_task(void *arg)
 {
     (void)arg;
@@ -742,7 +769,7 @@ void visualiser_task(void *arg)
     }
 }
 
-#endif  /* !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE */
+#endif  /* DF_ANALYSES_AUDIO */
 
 /*
  * Draw each frame at the instant it names.
@@ -757,7 +784,7 @@ void render_task(void *arg)
     (void)arg;
     uint32_t seen_flush = s_fq_flush.load(std::memory_order_relaxed);
     int64_t  drawn_at = 0;      /* when the strip last showed something */
-#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if !DF_ANALYSES_AUDIO
     int64_t  last_report_us = esp_timer_get_time();
 #endif
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
@@ -788,10 +815,10 @@ void render_task(void *arg)
             show(pixels);
         }
 
-#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if !DF_ANALYSES_AUDIO
         /*
          * The periodic line lives in the analysis task, which is not built on a
-         * unit that is given its frames -- so without this such a unit reports
+         * unit that analyses no audio -- so without this such a unit reports
          * nothing at all, and the numbers that say whether frames are arriving
          * are exactly the ones missing.
          *
@@ -931,7 +958,7 @@ void visualiser_set_publish(void (*publish)(const vis_frame_t *))
 
 void visualiser_submit_frame(const vis_frame_t *f)
 {
-#if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if DF_TAKES_REMOTE_FRAMES
     if (!f) {
         return;
     }
@@ -1165,7 +1192,7 @@ void visualiser_set_pattern(const char *name)
 
 void visualiser_start(void)
 {
-#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if DF_ANALYSES_AUDIO
     /* Trigger level is one HOP: waking the task for a handful of bytes at a time
      * is pure overhead now that partial reads accumulate, and once the first
      * window is held a frame needs only a hop of fresh audio to produce the
@@ -1225,7 +1252,7 @@ void visualiser_start(void)
      * busy, a frame drawn on time from slightly stale analysis beats a frame
      * drawn late from fresh analysis, and only one of the two is visible.
      */
-#if !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#if DF_ANALYSES_AUDIO
     xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1);
 #endif
     xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1);
