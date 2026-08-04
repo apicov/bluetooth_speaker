@@ -980,9 +980,6 @@ static void socket_start(void)
 
 /* ------------------------------------------------------ sync measurement */
 
-#if CONFIG_DANCEFLOOR_ENABLE_MARKER
-static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
-
 /*
  * Last cross-unit measurement, for the per-track summary below.
  *
@@ -1000,6 +997,21 @@ static volatile int64_t s_sync_at;        /* 0 = never measured */
  * against when they report theirs. */
 static volatile int32_t s_hub_splice_us;
 static volatile int64_t s_hub_splice_at;  /* 0 = no boundary yet */
+
+/*
+ * These four sit OUTSIDE the marker guard although only the marker writes
+ * s_sync_*, because the splice path and probe_task read all four
+ * unconditionally -- a satellite reporting its own splice over WiFi is compared
+ * against them, and that path exists precisely when no marker is fitted.
+ *
+ * They were inside it, which meant the hub did not compile from its tracked
+ * config: CONFIG_DANCEFLOOR_ENABLE_MARKER defaults to n, and the "no marker
+ * fitted" branch below says in as many words that this is the normal deployed
+ * case. Every build that had ever been run carried a local sdkconfig with the
+ * marker switched on, so nothing showed it.
+ */
+#if CONFIG_DANCEFLOOR_ENABLE_MARKER
+static QueueHandle_t s_edge_q;            /* satellite edge timestamps */
 
 static void IRAM_ATTR monitor_isr(void *arg)
 {
