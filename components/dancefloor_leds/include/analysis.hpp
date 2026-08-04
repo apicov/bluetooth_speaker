@@ -76,6 +76,26 @@ static_assert(band_bin(BAND_EDGE_HZ[1], RATE) == 4,   "band 1 moved");
 static_assert(band_bin(BAND_EDGE_HZ[2], RATE) == 24,  "band 2 moved");
 static_assert(band_bin(BAND_EDGE_HZ[3], RATE) == 117, "band 3 moved");
 
+/*
+ * The boom detector's tuning, named here because two places need it: init(),
+ * which applies it, and pattern_lab, which sweeps around it.
+ *
+ * They used to be literals in both, and the copies disagreed. pattern_lab
+ * substituted its own defaults for whichever --boom-* flags were not given, and
+ * its stand-in for the floor was 0.15 -- the value analysis.cpp records as "dark,
+ * the bug". So sweeping k or the refractory silently reverted the floor to the
+ * one number known to be wrong, and every such run measured something other than
+ * what it reported. The sweep in analysis.cpp is the only recorded measurement in
+ * this component; the tool that reproduces it must not have its own idea of what
+ * the firmware does.
+ *
+ * The reasoning behind each value stays with the code that explains it, in
+ * Analysis::init().
+ */
+constexpr float   BOOM_THRESHOLD_K  = 1.4f;
+constexpr float   BOOM_FLUX_FLOOR   = 0.02f;
+constexpr int64_t BOOM_REFRACTORY_US = 200000;
+
 /* One analysis frame: ~23 ms of audio, reduced. */
 struct Frame {
     int64_t      index;      /* block number, from an origin all units share */

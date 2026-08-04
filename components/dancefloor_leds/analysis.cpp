@@ -111,8 +111,8 @@ void Analysis::init(int sample_rate)
      * prints boom_flux against boom_threshold per frame for exactly that.
      */
     beat_det_init(&boom_);
-    boom_.threshold_k   = 1.4f;
-    boom_.refractory_us = 200000;
+    boom_.threshold_k   = BOOM_THRESHOLD_K;
+    boom_.refractory_us = BOOM_REFRACTORY_US;
 
     /*
      * The flux floor, measured against ten forró recordings.
@@ -150,7 +150,7 @@ void Analysis::init(int sample_rate)
      * Lower it toward 0.012 if the lights miss strokes; that costs occasional
      * firing where there is no drum.
      */
-    boom_.flux_floor = 0.02f;
+    boom_.flux_floor = BOOM_FLUX_FLOOR;
 
     std::memset(&frame_, 0, sizeof(frame_));
 }

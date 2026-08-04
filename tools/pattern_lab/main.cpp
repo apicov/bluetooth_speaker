@@ -48,9 +48,10 @@ void usage()
         "  --no-tty         skip the live terminal render\n"
         "  --speed X        terminal playback rate (default 1.0, 0 = as fast as possible)\n"
         "  --unit N         value of Frame::unit, for cross-unit effects (default 0)\n"
-        "  --boom-floor X   boom detector flux floor (default: the firmware's)\n"
+        "  --boom-floor X   boom detector flux floor\n"
         "  --boom-k X       boom detector threshold, in std devs\n"
-        "  --boom-refr MS   boom detector refractory period\n");
+        "  --boom-refr MS   boom detector refractory period\n"
+        "                   any --boom-* left unset keeps the firmware's value\n");
 }
 
 }  // namespace
@@ -125,10 +126,14 @@ int main(int argc, char **argv)
 
     df::Analysis analysis;
     analysis.init(wav.rate);
+    /* Unset flags fall back to what the firmware actually uses, not to a second
+     * set of literals kept here -- sweeping one value must hold the others at
+     * the shipped ones or the run measures a configuration nothing runs. */
     if (boom_floor >= 0 || boom_k >= 0 || boom_refr >= 0) {
-        analysis.set_boom_tuning(boom_k    >= 0 ? float(boom_k)    : 1.4f,
-                                 boom_floor >= 0 ? float(boom_floor) : 0.15f,
-                                 boom_refr  >= 0 ? int64_t(boom_refr * 1000) : 200000);
+        analysis.set_boom_tuning(
+            boom_k     >= 0 ? float(boom_k)             : df::BOOM_THRESHOLD_K,
+            boom_floor >= 0 ? float(boom_floor)         : df::BOOM_FLUX_FLOOR,
+            boom_refr  >= 0 ? int64_t(boom_refr * 1000) : df::BOOM_REFRACTORY_US);
     }
     pattern->reset();
 
