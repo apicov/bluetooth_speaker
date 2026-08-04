@@ -810,8 +810,10 @@ Smoothed phase is the number to watch; the raw one is noisy on the hub. Depth
 should sit near 200 ms.
 
 ```
-W stream: HEALTH: up 3721 s | heap 59464 (min 52268) | stack play 3036 mon 1864
-          | underruns 0 restarts 1 splices 1 retunes 9 (0 refused) | sta-left 0
+W stream: HEALTH: up 3721 s | heap 59464 (min 52268, window 58120, largest 55296)
+          | stack play 3036 mon 1864 | underruns 0 restarts 1 splices 1
+          | retunes 9 (0 refused) | sta-left 0 (dropped 0, no-lease 0)
+          | sta-timeout 0 | alloc-fail 0
 W sat:    HEALTH: ... | gaps 0 wifi-drops 0 | clock TSF (tsf 1/probe 0)
 ```
 

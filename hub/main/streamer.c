@@ -344,6 +344,19 @@ static portMUX_TYPE s_clients_lock = portMUX_INITIALIZER_UNLOCKED;
 static esp_netif_t *s_ap_netif;           /* for the MAC -> IP lookup below */
 static volatile uint32_t n_sta_dropped;   /* forgotten on the event, not the timeout */
 static volatile uint32_t n_sta_nolease;   /* ... and the times the lookup could not say who */
+/*
+ * ... and the ones the timeout got, which nothing counted.
+ *
+ * This is the only path by which a satellite leaves the send list without
+ * incrementing anything, and it is the path an ungraceful departure takes: the
+ * AP notices inactivity far later than CLIENT_TIMEOUT_US, so a unit that loses
+ * power or walks out of range is dropped here and raises no event. A HEALTH line
+ * therefore read identically whether a satellite had vanished mid-track and come
+ * back or nothing had happened at all, which made a disconnect test
+ * uninterpretable after the fact -- the counters could not say whether a quiet
+ * run meant the departure was handled well or was never seen.
+ */
+static volatile uint32_t n_sta_timeout;
 
 static void client_seen(const struct sockaddr_in *from)
 {
@@ -911,6 +924,10 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
             portENTER_CRITICAL(&s_clients_lock);
             s_clients[i].last_seen = 0;
             portEXIT_CRITICAL(&s_clients_lock);
+            /* Once per departure, not once per packet: the slot is cleared
+             * above, so the !last_seen test at the top of the next pass skips
+             * it before reaching here again. */
+            n_sta_timeout++;
             continue;
         }
         if (sendto(sock, &msg, bytes, 0,
@@ -1806,14 +1823,15 @@ static void ring_monitor_task(void *arg)
                           " restarts %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | sta-left %" PRIu32
                           " (dropped %" PRIu32 ", no-lease %" PRIu32
-                          ") | alloc-fail %" PRIu32,
+                          ") | sta-timeout %" PRIu32
+                          " | alloc-fail %" PRIu32,
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_mon, n_underruns, n_restarts, n_splices,
                      n_retunes, n_retunes_bad, n_sta_left, n_sta_dropped,
-                     n_sta_nolease, n_alloc_fail);
+                     n_sta_nolease, n_sta_timeout, n_alloc_fail);
         }
 
         if (local_start == 0 || rate_ema == 0) {
