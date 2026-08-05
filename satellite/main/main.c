@@ -208,6 +208,17 @@ static volatile bool phase_stepped;
 #define ANCHOR_MIN_INTERVAL_US 1000000
 #define ANCHOR_GIVE_UP_US      5000000
 
+/*
+ * A gap beyond this is an outage, not jitter, and is re-anchored rather than
+ * filled with silence. See the reasoning at the fill in handle_audio().
+ *
+ * 150 ms is about seven packets. Normal loss on a healthy link is one to three
+ * -- 20 to 60 ms -- so this sits well clear of anything that should be filled,
+ * while staying below the 200 ms RING_TARGET_MS that a fill this size would
+ * otherwise push the ring past.
+ */
+#define GAP_RESYNC_MS 150
+
 /* How long after an anchor the drift servo ignores buffer depth and servos on
  * phase alone. See the safety net in drift_task() for what it was doing to a
  * ring that had simply not finished filling yet. */
@@ -277,6 +288,12 @@ static volatile uint32_t n_gap_frames;    /* silence inserted for lost packets *
 static volatile uint32_t n_gap_short;     /* gap fills the ring could not take */
 static volatile uint32_t n_gap_short_frames;
 static volatile uint32_t n_ring_full;     /* decoded blocks dropped, ring full */
+static volatile uint32_t n_gap_resyncs;   /* gaps too large to fill, re-anchored */
+/*
+ * Set by the receive task when a gap is too large to fill, cleared by the
+ * playback task when it parks. See GAP_RESYNC_MS.
+ */
+static volatile bool resync_request;
 static volatile uint32_t n_anchor_late;   /* anchors refused, play_at already past */
 static volatile uint32_t n_anchor_soon;   /* anchors refused, one just happened */
 static volatile uint32_t n_frames_rx;     /* analysis frames taken from the hub */
@@ -682,6 +699,26 @@ static void handle_audio(const audio_msg_t *msg)
          * have played badly is not the better failure. Take the packet, say so
          * at ERROR, and let the servo do what it can.
          */
+        /*
+         * Wait for the playback task to park before touching the ring.
+         *
+         * A gap-triggered resync sets have_seq false immediately, so the very
+         * next packet reaches here -- possibly ~20 ms later, while playback is
+         * still draining the ring this is about to reset. xStreamBufferReset()
+         * refuses while a task is blocked on the buffer, so the reset would
+         * silently not happen while samples_in went to zero underneath it: a
+         * stale ring measured against a fresh count, which reads as an insane
+         * phase and costs another re-anchor to clear.
+         *
+         * Bounded, and cannot deadlock: the flag is cleared when the play task
+         * parks, which it does within one chunk on seeing the flag, within
+         * 500 ms if it is blocked on an empty ring, and unconditionally in the
+         * outer loop above whichever route it took.
+         */
+        if (resync_request) {
+            return;
+        }
+
         const int64_t now_local = esp_timer_get_time();
         const int64_t start_local = sync_to_local(msg->play_at, offset);
         static int64_t refuse_since;         /* first refusal of this streak */
@@ -705,6 +742,7 @@ static void handle_audio(const audio_msg_t *msg)
         refuse_since = 0;
         last_anchor = now_local;
         anchor_at = now_local;
+        resync_request = false;   /* may have been set while playback was parked */
 
         stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
@@ -755,6 +793,41 @@ static void handle_audio(const audio_msg_t *msg)
         uint32_t frames_missing = missing * msg->frames;
         n_gaps++;
         n_gap_frames += frames_missing;
+
+        /*
+         * Past a point, filling the gap is the wrong answer.
+         *
+         * Silence of exactly the right length is right for one or two lost
+         * packets: it costs 20 ms of audio and keeps this speaker's position in
+         * the timeline, which is the whole reason the fill exists. It stops
+         * being right when the gap is an OUTAGE rather than jitter, because the
+         * silence has to go somewhere and the ring is not sized for it.
+         *
+         * Measured, at a stream start where the hub's transmit path dropped ~98
+         * datagrams stepping from idle to ~135 a second: the satellite filled
+         * 443 ms of silence across twelve gaps, into a ring only 78 ms deep. It
+         * came out at `buffer 400 ms` against a 464 ms cap, with ring-full 31 --
+         * and a 400 ms ring IS playing late, so phase read +172 ms and the servo
+         * spent FIVE MINUTES and nine retunes draining it. The anchor had been
+         * perfect: 175 ms of lead, playback started +1 us. All of the damage came
+         * from the fill.
+         *
+         * So beyond GAP_RESYNC_MS this asks for a re-anchor instead. That costs
+         * one clean stop and the wait for a packet with proper lead -- a few
+         * hundred ms of silence, once -- against minutes of a speaker sitting
+         * audibly behind the floor. Both are silence; only one of them ends.
+         *
+         * have_seq is dropped so the next packet enters the anchor path, where
+         * ANCHOR_MIN_LEAD_US decides when playback may start again. The playback
+         * task is told separately, because it is mid-stream and will otherwise
+         * keep draining a ring that is about to be reset under it.
+         */
+        if (frames_missing > (uint32_t)((uint64_t)GAP_RESYNC_MS * stream_rate / 1000)) {
+            n_gap_resyncs++;
+            resync_request = true;
+            have_seq = false;
+            return;
+        }
         /*
          * samples_in must count this silence, and the old loop did not.
          *
@@ -1231,23 +1304,27 @@ static void drift_task(void *arg)
          */
         static uint32_t gaps_told, gap_frames_told, gap_short_told,
                         gap_short_frames_told, ring_full_told,
-                        anchor_late_told, anchor_soon_told;
+                        anchor_late_told, anchor_soon_told, gap_resyncs_told;
         const uint32_t gaps_now = n_gaps, gap_frames_now = n_gap_frames,
                        gap_short_now = n_gap_short,
                        gap_short_frames_now = n_gap_short_frames,
                        ring_full_now = n_ring_full,
                        anchor_late_now = n_anchor_late,
-                       anchor_soon_now = n_anchor_soon;
+                       anchor_soon_now = n_anchor_soon,
+                       gap_resyncs_now = n_gap_resyncs;
         if (gaps_now != gaps_told || ring_full_now != ring_full_told ||
-            anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told) {
+            anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told ||
+            gap_resyncs_now != gap_resyncs_told) {
             ESP_LOGW(TAG, "RX 5s: gaps %" PRIu32 " (%" PRIu32 " ms silence, %"
                           PRIu32 " short by %" PRIu32 " ms) | ring-full %" PRIu32
+                          " | too big to fill %" PRIu32
                           " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon",
                      gaps_now - gaps_told,
                      (gap_frames_now - gap_frames_told) * 1000 / stream_rate,
                      gap_short_now - gap_short_told,
                      (gap_short_frames_now - gap_short_frames_told) * 1000 / stream_rate,
                      ring_full_now - ring_full_told,
+                     gap_resyncs_now - gap_resyncs_told,
                      anchor_late_now - anchor_late_told,
                      anchor_soon_now - anchor_soon_told);
         }
@@ -1258,6 +1335,7 @@ static void drift_task(void *arg)
         ring_full_told = ring_full_now;
         anchor_late_told = anchor_late_now;
         anchor_soon_told = anchor_soon_now;
+        gap_resyncs_told = gap_resyncs_now;
 
         /* Soak line, every 60 s, ahead of the streaming check below: if audio
          * has stopped, that is when the heap and the counters matter most.
@@ -1276,7 +1354,7 @@ static void drift_task(void *arg)
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | gaps %" PRIu32 " (%" PRIu32
-                          " short) ring-full %" PRIu32 " anchors-refused %" PRIu32
+                          " short, %" PRIu32 " too big) ring-full %" PRIu32 " anchors-refused %" PRIu32
                           " | wifi-drops %" PRIu32
                           " | alloc-fail %" PRIu32
                           " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
@@ -1286,7 +1364,7 @@ static void drift_task(void *arg)
                      heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
-                     n_retunes, n_retunes_bad, n_gaps, n_gap_short, n_ring_full,
+                     n_retunes, n_retunes_bad, n_gaps, n_gap_short, n_gap_resyncs, n_ring_full,
                      n_anchor_late + n_anchor_soon, n_wifi_drops, n_alloc_fail,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",
@@ -1508,6 +1586,11 @@ static void play_task(void *arg)
 
     while (1) {
         if (stream_start_local == 0) {
+            /* Parked, by whichever route -- resync, underrun or a changed
+             * timeline. The flag has been served either way, and clearing it
+             * here rather than only where it is consumed is what lets the
+             * anchor path below wait on it without being able to deadlock. */
+            resync_request = false;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -1547,6 +1630,24 @@ static void play_task(void *arg)
                 was_retuning = true;
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
+            }
+            /*
+             * The receive task found a gap too large to fill and wants a clean
+             * restart -- see GAP_RESYNC_MS. Leave by the same door as an
+             * underrun, so the anchor path owns the ring reset rather than
+             * racing this loop for it. Noticed within one chunk (~5.8 ms),
+             * comfortably inside the ~20 ms until the next packet arrives.
+             *
+             * Not logged here. This task is the audio path, and putting an
+             * ESP_LOGW on it is the mistake the RX counters exist to undo;
+             * drift_task narrates n_gap_resyncs within 5 s instead.
+             */
+            if (resync_request) {
+                resync_request = false;
+                stream_start_local = 0;
+                phase_valid = false;
+                phase_stepped = true;
+                break;
             }
             if (was_retuning) {         /* TEMPORARY: see REFILL_FAST_US */
                 was_retuning = false;
