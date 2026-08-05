@@ -16,3 +16,17 @@ CONFIG_FREERTOS_HZ=1000
 # wrong hop cannot be detected from either console except by reading the hop the
 # HEALTH line prints.
 CONFIG_DANCEFLOOR_LED_HOP_512=y
+
+# The pattern the floor runs, which is a floor-wide agreement and not a per-unit
+# preference: two units on different patterns are not comparable by eye, and the
+# eye is the only instrument most of this project has.
+#
+# Pinned here for the same reason the hop above is, and it matters most on this
+# unit for the same reason too -- a floor is mostly satellites, so this is the
+# file most copies of the wrong pattern would come from. The Kconfig default is
+# "pulse"; this floor runs "boom"; sdkconfig is gitignored, so this line is the
+# only place the floor's choice survives a fresh checkout. It did not survive
+# one: hub_s3 was built without it and came up cycling a 28-second hue against
+# its neighbours' fixed amber, which reads as a sync fault rather than as a
+# config difference.
+CONFIG_DANCEFLOOR_LED_PATTERN="boom"

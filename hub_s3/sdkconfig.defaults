@@ -30,6 +30,22 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 # history were swept against 206 recordings at 512 -- see docs/tuning-corpus.md.
 CONFIG_DANCEFLOOR_LED_HOP_512=y
 
+# The pattern the floor runs, which is a floor-wide agreement and not a per-unit
+# preference: two units on different patterns are not comparable by eye, and the
+# eye is the only instrument most of this project has.
+#
+# Pinned here for the same reason the hop above is, and this build is the one
+# that proved the reason. The Kconfig default is "pulse"; this floor runs
+# "boom"; sdkconfig is gitignored, so the "boom" on the classic hub and the
+# satellite lived only in untracked files and did not come across. The first S3
+# hub therefore came up cycling a 28-second hue against its neighbours' fixed
+# amber, and the immediate reading of that was a sync fault.
+#
+# Cheaper than a hop mismatch, which is invisible -- this one is obvious the
+# moment the strips are side by side. It is still worth a tracked line, because
+# what it looks like is the expensive thing rather than what it is.
+CONFIG_DANCEFLOOR_LED_PATTERN="boom"
+
 # ---------------------------------------------------------------------------
 # Pin map: Seeed Studio XIAO ESP32-S3 (Sense)
 # ---------------------------------------------------------------------------

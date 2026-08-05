@@ -17,6 +17,18 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 # a floor is the expensive bug.
 CONFIG_DANCEFLOOR_LED_HOP_512=y
 
+# The pattern the floor runs, which is a floor-wide agreement and not a per-unit
+# preference: two units on different patterns are not comparable by eye, and the
+# eye is the only instrument most of this project has.
+#
+# Pinned here for the same reason the hop above is. The Kconfig default is
+# "pulse"; this floor runs "boom"; sdkconfig is gitignored, so this line is the
+# only place the floor's choice survives a fresh checkout. It did not survive
+# one: hub_s3 was built without it and came up cycling a 28-second hue against
+# its neighbours' fixed amber, which reads as a sync fault rather than as a
+# config difference.
+CONFIG_DANCEFLOOR_LED_PATTERN="boom"
+
 # Keep the lwIP tcpip thread off the core the LED tasks run on.
 #
 # It runs at priority 18 -- above every task this firmware creates -- and IDF
