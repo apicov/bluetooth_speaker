@@ -130,6 +130,38 @@
 #define RESYNC_HARD_US 300000
 
 /*
+ * How steadily the source must be delivering before a timeline may start.
+ *
+ * A timeline start publishes an origin every unit anchors to, and then playback
+ * begins LEAD_US later. That only works if the source can hand over LEAD_US of
+ * audio in LEAD_US of wall clock. Nothing checked whether it could.
+ *
+ * Measured, at a track start: `timeline start` fired on `pkts 12 | eff 2070 Hz`
+ * with a 1.76 SECOND hole in the SBC input behind it. Playback began, drained,
+ * and underran 700 ms later; the recovery restarted the timeline, and what came
+ * out the far side was displaced 338 ms -- which every satellite then saw as
+ * packets arriving past their play_at, refusing 237 in a row and anchoring 317
+ * ms late. The whole cascade came from starting a timeline on a source that was
+ * not yet running.
+ *
+ * STALL is what separates a real hole from the ordinary burst pattern. A2DP
+ * arrives in lumps of ~43 ms and sbc_in's `max gap` sits at 110-150 ms in every
+ * healthy window, so 300 ms is clear of normal and far below the 1.76 s that
+ * mattered.
+ *
+ * STEADY is how long it must go without one. 500 ms is more than twice LEAD_US,
+ * so a source that manages it can fill the ring before playback reaches it.
+ *
+ * GIVE_UP bounds the wait, for the same reason the satellite's anchor guard has
+ * one: a source that stalls forever is not fixed by refusing to play it, and a
+ * hub that stays silent through a whole track is the worse failure. Say so and
+ * start anyway.
+ */
+#define SOURCE_STALL_US    300000
+#define SOURCE_STEADY_US   500000
+#define SOURCE_GIVE_UP_US 5000000
+
+/*
  * How far the timeline moves per packet while slewing back to real time.
  *
  * At ~50 packets/s this is 1 ms/s. The bound that matters is the servo's: it
@@ -739,6 +771,19 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     int64_t target = now + LEAD_US;
 
     /*
+     * Is the source actually running? See SOURCE_STEADY_US. Tracked on every
+     * packet, whether or not a start is pending, so the answer is already there
+     * when one is.
+     */
+    static int64_t s_last_pkt_us;
+    static int64_t s_steady_since;
+    static int64_t s_wait_since;
+    if (s_last_pkt_us == 0 || now - s_last_pkt_us > SOURCE_STALL_US) {
+        s_steady_since = now;              /* a hole; the run starts again here */
+    }
+    s_last_pkt_us = now;
+
+    /*
      * Recovering from a local underrun. The flag cannot be raised here: the
      * timeline-start branch below clears s_restart_pending, because a start
      * throws away any track boundary that was waiting for the old timeline. So
@@ -757,6 +802,24 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     bool started = false;
 
     if (next_play_at == 0) {
+        /*
+         * Hold the start until the source has gone SOURCE_STEADY_US without a
+         * hole. Returning here drops this packet, which costs nothing: the ring
+         * is reset at the start anyway, so audio fed before one is discarded
+         * regardless, and no satellite can anchor until a timeline exists.
+         */
+        if (now - s_steady_since < SOURCE_STEADY_US) {
+            if (s_wait_since == 0) {
+                s_wait_since = now;
+            }
+            if (now - s_wait_since < SOURCE_GIVE_UP_US) {
+                return;
+            }
+            ESP_LOGW(TAG, "source still stalling after %lld ms -- starting the "
+                          "timeline on it anyway",
+                     (now - s_wait_since) / 1000);
+        }
+        s_wait_since = 0;
         next_play_at = target;
         /*
          * local_start is assigned at the END of this call, not here.
