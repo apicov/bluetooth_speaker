@@ -181,18 +181,6 @@ adapter GND ← board GND.
 **Unmeasured.** Nothing yet says how much WiFi performance this returns. It is
 one run to find out, and now possible to run at all.
 
----|---|---|
-| console | `ESP_CONSOLE_UART_DEFAULT`, via a bridge chip | `ESP_CONSOLE_USB_SERIAL_JTAG` |
-
-A **liability**, not a feature. `CONFIG_SOC_WIFI_PHY_NEEDS_USB_WORKAROUND=y` is
-set on this part — the USB peripheral and the WiFi PHY interact, and on this
-board the console *is* that peripheral. IDF applies a workaround, so it should be
-fine, but every measurement in the session was taken with a USB monitor attached.
-
-**Untested and cheap:** run the hub with the monitor detached for a few minutes,
-then reattach and compare `tx-fail` and satellite gaps. If they differ, the
-confound was on for every reading taken so far.
-
 ---
 
 ## 3. What the portable items bought, measured
@@ -261,3 +249,115 @@ until the next probe gets through. That is a silent speaker, reported as
 `sta-timeout`, and no counter anywhere distinguishes it from a real departure.
 
 Port it to the classic hub with the §1 items.
+
+---
+
+## 6. Sync work landed on `hub_s3/` only — the current porting debt
+
+Everything above is configuration. This section is **code**, and it is a
+different kind of debt: the two `streamer.c` files were near-identical and are
+now diverging on purpose, because the bench has an S3 hub on it and the classic
+hub is not being run. Nothing here is S3-specific — the classic hub has the same
+bugs — so all of it is portable, and none of it has been tested on that board.
+
+The work is staged, each stage evaluated on `TRACK DIVERGENCE (wifi)` over a
+session before the next lands. Stage 0 is behaviour-neutral instrumentation and
+is what is in the tree now; the rest is written up in the plan that produced it.
+
+### 6.1 What has landed (Stage 0 — measurement only)
+
+Nothing here changes what either unit does. Every item is a counter or a log
+line, and the `apart` figure must be unchanged in distribution from the build
+before it — if it moved, the stage was not neutral.
+
+| change | where | notes for the classic hub |
+|---|---|---|
+| `sync_phase_hist_t`, `sync_phase_reset/push/median` | `components/dancefloor_sync/` | **shared already** — the classic hub picks it up for free, and the host tests come with it |
+| `splice_msg_t.applied_med_us` | `sync_proto.h` | **a wire change.** A classic hub against a satellite on this build reads a `splice_msg_t` four bytes shorter than it expects, and its `n >= sizeof(splice_msg_t)` guard makes it print *no* divergence line at all. Silent, and it looks like a satellite that stopped reporting. Port before pairing them |
+| push readings into the hist; reset at play-task start and after a splice | `hub_s3/main/streamer.c`, `satellite/main/main.c` | mechanical |
+| median shadow computed at the boundary; `TRACK DIVERGENCE` gains a `median:` clause | both | mechanical |
+| `s_retune_done_at`, `s_retune_tail_left`; `RETUNE COST` gains the crossing age; three `RETUNE TAIL` lines | both | mechanical |
+| `n_phase_drop` | both | the hub counts it only when a timeline start was *not* the reason for skipping |
+| `n_short_reads` / `n_short_frames` | both | |
+| `REFILL` armed at every playback **start**, not only after a retune; tagged `start` / `retune` | both | **the classic hub has no `REFILL` instrument at all** — it is a satellite one that was never ported, and the hub is the unit with the larger startup offset. See §6.2 |
+| rejoin latency, first-anchor clock source and probe age, `n_tsf_wide` | satellite only | nothing to port |
+| stale comments corrected | both | `LOCAL_RING_BYTES` said "32 kB is 181 ms" against a 64 kB define; the restart-flag comment claimed the timeline step is capped at `RESYNC_US` and inside `MAX_SPLICE_MS`, which stopped being true when `RESYNC_US` became 150000; the satellite's TSF block still called TSF "measurement only" long after `clock_offset()` began anchoring on it |
+
+### 6.2 What is queued, and why the classic hub wants it
+
+These are the actual fixes. Each names a defect the classic hub shares unless
+said otherwise.
+
+**The DMA prefill at playback start is unguarded, on both units.** Found from a
+field observation that reconnecting a satellite gives perfect sync while a cold
+start sometimes does not — the two cases differ in that a reconnect restarts one
+unit against a converged reference, and a cold start restarts both at once.
+`i2s_channel_write()` does not block while descriptors are free, so on an empty
+channel the first writes return at memory speed: `samples_played` advances by
+the whole DMA depth (6 × `AUDIO_FRAMES` = 34.8 ms at 44.1 kHz) against a
+`wrote_at` that has barely moved, and every phase reading dated inside that
+window is measured against a reference the DAC is not pacing. This is the same
+mechanism the `retuning` park exists to prevent, where `clock-sync.md` records it
+costing +42, +43 and +50 ms; nothing guards it at startup. It is very likely the
+"-42 ms (hub), -26 ms (satellite)" startup phase in §8 of that document — a 16 ms
+cross-unit difference taking ~45 s to walk off — which it notes "nothing accounts
+for at anchor time" and calls compensating "the obvious next improvement". The
+fix is to withhold phase readings until the first blocking write, exactly as the
+retune path does. **Applies to the classic hub identically, and the classic hub
+additionally needs the `REFILL` instrument itself, which it has never had.**
+
+**The splice runs on one raw phase reading.** Both units snap their playback
+position at a track boundary using the newest reading, while the servo has used
+a 4-sample average since it was measured triggering on noise. The hub's own
+comment records two reads of `s_phase_err_us` a millisecond apart differing by
+15.7 ms, and §16 of `architecture.md` lists the wander as a wart with the cause
+unfound. So at every boundary the hub jumps to a position several ms wrong in a
+direction nothing predicts while the satellite — a third the scatter, a fraction
+the load — lands closer, and the two splice to *different* places. That is why a
+track change sometimes improves cross-unit sync and sometimes degrades it. The
+fix is `sync_phase_median()`; the shadow in §6.1 is what decides whether it
+ships. **Applies to the classic hub identically, and must land on both units at
+once** — one-sided would guarantee they splice to different places, which is the
+bug itself.
+
+**Only one phase reading is withheld after a retune.** Crossings arrive ~20 ms
+apart and the transient is measured landing 1–22 ms after the retune, inside the
+refill every time, so a one-shot flag hands most of the disturbance to the servo
+as position error and each retune injects what the next one corrects. Replace
+with a `RETUNE_SETTLE_US` window sized from the `RETUNE TAIL` ages. **Same
+one-shot flag on the classic hub.**
+
+**A hard timeline jump is unannounced.** At `|err| > RESYNC_HARD_US` the hub
+jumps `next_play_at` and sets no `restart` flag, so satellites take a step of up
+to the threshold with no splice hint, below `PHASE_INSANE_US` and therefore with
+no re-anchor either — the servo walks it off at 2.27 ms/s. Flag a boundary a few
+packets after the jump, once the median window is clear of the discontinuity.
+**The classic hub has this too, and worse in one respect and better in another:
+its `RESYNC_HARD_US` is still 1 s, so it fires more rarely and costs more when it
+does.**
+
+**The underrun-recovery restart flag can be lost.** `s_underrun_recover` is
+consumed into a local before the source-steadiness gate, which can then return
+before the flag is ever written to a packet — so no satellite learns the timeline
+restarted, reintroducing the exact bug the comment above it was written to fix.
+**S3-only, because the gate is S3-only.** The classic hub should still take the
+restructuring so the two files stay diffable and the next person is not misled.
+
+**Client aging only runs inside the audio send loop**, so nothing ages out while
+audio is stopped. Move it to `ring_monitor_task`'s 5 s tick. **Applies to the
+classic hub.**
+
+**A short ring read biases `samples_played`.** The pad is played but was never in
+the ring, while `samples_played` advances by a whole chunk regardless, so every
+later phase point is permanently displaced — the same shape as the "silence
+inserted for a lost packet was not counted in `samples_in`" bug that put a unit
+20 ms out per loss. Whether it fires at all is what `n_short_reads` is for.
+**Applies to the classic hub.**
+
+### 6.3 The rule this section exists to serve
+
+Same one as everywhere else here: when a fix lands in one unit, the question is
+not whether it works but whether the other unit has the same bug. The answer for
+every item above is yes. What is missing is not the analysis but a classic hub on
+a bench, and the cost of waiting is that the two files drift — so this list is
+the substitute for the diff that would otherwise have shown it.
