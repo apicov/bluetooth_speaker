@@ -361,3 +361,56 @@ not whether it works but whether the other unit has the same bug. The answer for
 every item above is yes. What is missing is not the analysis but a classic hub on
 a bench, and the cost of waiting is that the two files drift — so this list is
 the substitute for the diff that would otherwise have shown it.
+
+---
+
+## 7. The SPI link — `hub/` can no longer receive anything
+
+Everything in §6 is a defect the classic hub shares and could go on running
+without. This one is different in kind: it is not a bug it has, it is a wire it
+no longer speaks.
+
+The bridge forwards SBC over **SPI** now, and there is only one bridge. The
+classic hub still listens on a UART at 500 kbaud for a byte stream nobody is
+sending. It builds, it boots, its `sbc_in` reports `pkts 0`, and it plays
+nothing. Pairing it with the current bridge produces silence, not a degraded
+link, and no counter anywhere says why — `max gap` grows, everything else stays
+at zero, which reads exactly like a phone that stopped.
+
+### 7.1 Why the link moved
+
+The UART was 50 kB/s hard against a measured ~42 kB/s of payload — 84% of the
+wire — and 500000 baud was where breadboard jumpers began producing bad sync
+bytes, not where the protocol stopped. `max_bitpool` was capped at 53 for that
+reason and could not rise. SPI starts at 1 MHz (20×) and has 10 MHz (25×)
+available. See [`sbc-link.md`](sbc-link.md).
+
+### 7.2 What the port needs
+
+`hub/main/sbc_in.c` was **byte-identical** to `hub_s3/main/sbc_in.c` until this
+change. That file is now the whole diff — the port is to take it, and change
+only the pins.
+
+| item | detail |
+|---|---|
+| bus | **VSPI / `SPI3_HOST`**. `SPI2_HOST` is the LED strip on this hub too |
+| pins | four, and the classic part has them to spare, unlike the XIAO. SCK can keep GPIO 23, the pin the UART arrived on. Avoid 16/17 (PSRAM die on WROVER), 5 and 12 (strapping), and 34–39 (input only, so no handshake output there) |
+| handshake | an **output** on the hub, input on the bridge. Not optional — `spi_slave` loses any transfer clocked with nothing queued |
+| header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` keeps the old `sbc_link_hdr_t` purely so this firmware still compiles; it is dead the moment the port lands and should be deleted with it |
+| checksum | CRC-16 via `sbc_link_crc16()`, not the XOR byte |
+| framing | fixed 1036-byte transactions, two DMA buffers queued alternately |
+| log line | `sync` becomes `hdr`. Any script or habit reading that column changes with it |
+| Kconfig | `DANCEFLOOR_SBC_UART_RX_PIN` → the four `DANCEFLOOR_SBC_SPI_*_PIN` symbols |
+| CMakeLists | `esp_driver_uart` → `esp_driver_spi` |
+
+### 7.3 What the classic hub does *not* have to give up
+
+The S3 paid a pin for this and the classic hub does not have to. On the XIAO the
+four signals took all but one free pad, and `DANCEFLOOR_MONITOR_GPIO` (GPIO 5)
+was one of them — so the marker/monitor instrument, which needs GPIO 4 **and**
+GPIO 5, is finished on that board. The classic hub breaks out far more pins and
+can keep both the marker pair and the LED marker while taking four for SPI.
+
+Worth knowing because it inverts the usual direction of this document: on this
+item the classic hub can end up with **more** instrument than the S3, and if the
+marker measurement is ever wanted again, that is the board to want it on.

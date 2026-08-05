@@ -202,15 +202,28 @@ are useful for bring-up when you have no hardware, and the satellite has a build
 option for exactly that, but the real output is an external **PCM5102A** I2S
 DAC.
 
-### 6. UART, and why the boring option won
+### 6. Serial links, and the difference between two kinds of clock
 
-**UART** is asynchronous serial — the oldest and simplest digital link there is.
-One wire, no clock. The receiver recovers timing from the **start bit** at the
-beginning of every byte, resynchronising on each one, which is why the two ends
-only need to agree on the baud rate to within a percent or so.
+Three serial links appear in this project and the distinction between them is
+what §8 turns on, so it is worth having first.
 
-That property — **no shared clock** — is the entire reason it is used here, and
-it is worth understanding why before reading §8.
+**UART** is asynchronous. One wire, no clock at all. The receiver recovers
+timing from the **start bit** at the beginning of every byte, resynchronising on
+each one, so the two ends only need to agree on the baud rate to within a
+percent or so. Nothing is shared and nothing can drift out of step.
+
+**I2S** and **SPI** both send a clock alongside the data, and are usually filed
+together as "synchronous" for that reason. For our purposes they are not alike:
+
+- **I2S is continuous.** The clock free-runs and the slave tracks it for ever,
+  with no boundary at which alignment is re-established.
+- **SPI is transactional.** A chip-select line frames every transfer and the
+  slave's bit counter resets at each assertion. Nothing carries over between
+  frames.
+
+That difference is the whole of §8. It is why an I2S slave failed here, why a
+UART was the fix, and why the link is now SPI without being the same mistake
+twice.
 
 ---
 
@@ -221,13 +234,13 @@ it is worth understanding why before reading §8.
 ```
   ┌─────────────────── MASTER ENCLOSURE ────────────────────┐
   │                                                          │
-  │   ESP32 #1: bt_bridge          ESP32 #2: hub             │
+  │   ESP32 #1: bt_bridge          ESP32-S3 #2: hub          │
   │   ┌──────────────────┐         ┌──────────────────────┐  │
- phone │ A2DP sink        │  UART   │ SoftAP + clock master│  │
+ phone │ A2DP sink        │   SPI   │ SoftAP + clock master│  │
  ──────▶ AVRCP metadata   ├────────▶│ SBC decoder          │  │
-  BT  │ forwards raw SBC │ 500 kbd │ presentation timeline│  │
-  │   │ no decode at all │  1 wire │ I2S ──▶ DAC ──▶ amp  │  │
-  │   └──────────────────┘         │ SPI ──▶ NeoPixels    │  │
+  BT  │ forwards raw SBC │  1 MHz  │ presentation timeline│  │
+  │   │ no decode at all │ 4 wires │ I2S ──▶ DAC ──▶ amp  │  │
+  │   └──────────────────┘ +hshake │ SPI ──▶ NeoPixels    │  │
   │                                └──────────┬───────────┘  │
   └───────────────────────────────────────────┼──────────────┘
                                               │ WiFi, UDP unicast
@@ -248,7 +261,7 @@ client that lives elsewhere:
 
 | Project | Role |
 |---|---|
-| `bt_bridge/` | Chip A. Bluetooth only. Receives A2DP, forwards raw SBC over UART |
+| `bt_bridge/` | Chip A. Bluetooth only. Receives A2DP, forwards raw SBC over SPI |
 | `hub/` | Chip B. WiFi SoftAP, clock master, decoder, DAC, LEDs, streamer |
 | `satellite/` | Every additional speaker. Receives, decodes, plays, lights |
 | `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources |
@@ -321,10 +334,11 @@ did not deliver what arrived at its pins.
 
 UART sidesteps the whole category, because **no clock is shared** — each byte
 resynchronises on its own start bit. It also carries a quarter of the bytes (SBC
-rather than PCM) and needs one signal wire instead of three.
+rather than PCM) and needs one signal wire instead of three. That was the link
+for most of this project's life.
 
-Running at **500 kbaud**, which is 84% utilisation and tighter than anyone would
-choose. That ceiling is a property of breadboard jumper leads, not the protocol:
+It ran at **500 kbaud**, which is 84% utilisation and tighter than anyone would
+choose. The ceiling was a property of breadboard jumper leads, not the protocol:
 
 | Baud | Result per 5 s |
 |---|---|
@@ -332,7 +346,34 @@ choose. That ceiling is a property of breadboard jumper leads, not the protocol:
 | 750,000 | 20–30 bad sync, 15–20 CRC errors |
 | **500,000** | **0–2 bad sync, 0–1 CRC errors** |
 
-Full detail in [`sbc-link.md`](sbc-link.md).
+#### And why it is SPI now
+
+84% of a 50 kB/s wire leaves nothing, and it was being paid for in audio. The
+SBC endpoint advertised `max_bitpool = 250` — about five times what the wire
+could carry — with nothing enforcing the difference, so a phone choosing a
+higher bitpool simply had the surplus dropped. `max_bitpool` came down to **53**
+to make the advertisement honest, which is a quality ceiling set by jumper
+leads.
+
+SPI removes it: 1 MHz is 20× the UART and 10 MHz is 25×.
+
+The objection is obvious — that is a shared clock again, and a shared clock is
+what §8 is about. The answer is the distinction in §6. I2S is continuous, so a
+slave tracking a foreign crystal accumulates error with no boundary to discard
+it at; SPI is transactional, CS resets the bit counter every frame, and the
+worst a clock difference can cost is one frame that the CRC catches. **That is
+an argument rather than a measurement**, and `crc` in the `sbc_in` line is the
+instrument that tests it.
+
+CS also pays for itself in deleted code: one assertion is one packet, so the
+sync bytes, the resync scan and the whole boundary-recovery half of the receiver
+are gone.
+
+The cost is pins — four instead of one, which on an eleven-pad XIAO ended the
+marker/monitor instrument — and a handshake line, because ESP-IDF's `spi_slave`
+loses any transfer clocked with nothing queued.
+
+Full detail, and the bring-up order, in [`sbc-link.md`](sbc-link.md).
 
 ### 9. Over the air
 
@@ -854,12 +895,25 @@ paid for.
 
 ### 14. Pins and wiring
 
-**Between the two master chips** — one signal wire and a shared ground:
+**Between the two master chips** — four signals and a shared ground. The bridge
+is the SPI master, the hub the slave, and the link is one-way so there is no
+MISO:
 
-| bt_bridge | hub | |
+| bt_bridge (ESP32) | hub_s3 (XIAO ESP32-S3) | |
 |---|---|---|
-| GPIO 25 (UART TX) | GPIO 23 (UART RX) | the only signal |
-| GND ×4 | GND ×4 | keep them all — this link will not run above 500 kbaud on thin leads |
+| GPIO 14 (SCK) | GPIO 44 (D7) | HSPI IOMUX on the bridge |
+| GPIO 13 (MOSI) | GPIO 6 (D5) | |
+| GPIO 15 (CS) | GPIO 5 (D4) | the framing — one assertion is one packet |
+| GPIO 25 (HANDSHAKE in) | GPIO 3 (D2, out) | hub says "buffer armed"; not optional |
+| GND ×4 | GND ×4 | keep them all — jumper leads set the UART's ceiling and will set this one's |
+
+GPIO 25 and GPIO 44 were the UART's TX and RX, so two leads were already run.
+GPIO 5 was the sync monitor input, and taking it ends the marker/monitor
+instrument on this board — it needs GPIO 4 and GPIO 5 both.
+
+`hub/`, the classic ESP32 hub, still expects the old UART on GPIO 23 and can no
+longer receive anything from the bridge. See
+[`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
 
 **On the hub and each satellite:**
 
@@ -952,14 +1006,14 @@ default), not every window. Two of them print *immediately* on a bad window
 regardless, because waiting to hear about a fault is how faults get missed.
 
 ```
-I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 dec 0
+I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | hdr 0 crc 0 gaps 0 dec 0
           | fed-drop 0 B | max gap 100189 us
 ```
 
 | Field | Meaning |
 |---|---|
 | `eff` | **PCM samples/s actually reaching playback** — the honest health metric |
-| `sync` / `crc` | UART link integrity. Single digits fine, tens are not |
+| `hdr` / `crc` | Link integrity. Single digits fine, tens are not. `hdr` is a frame refused on an impossible `kind` or `len`; it was called `sync` on the UART and counted bytes skipped hunting for a sync word, which SPI's CS framing makes meaningless |
 | `gaps` | Packets the bridge dropped. Visible only because `seq` is assigned at *enqueue*, not at transmit |
 | `fed-drop` | PCM discarded because a buffer was full. **Must be 0** |
 | `max gap` | Longest silence between audio packets. **79–112 ms is normal** — the source is bursty. Past 150 ms the window prints at once |
@@ -1145,10 +1199,10 @@ budget.
 |---|---|
 | `components/dancefloor_sync/` | Wire formats and the clock estimator. **No ESP-IDF dependencies** — it is the part most likely to be subtly wrong, and hardware bring-up is a bad place to find out |
 | `components/sbc_decoder/` | Vendored OI SBC decoder from Bluedroid |
-| `bt_bridge/main/sbc_uart.c` | Frames SBC onto the UART, `seq` assigned at enqueue |
+| `bt_bridge/main/sbc_spi.c` | Frames SBC onto the SPI link as master, `seq` assigned at enqueue |
 | `bt_bridge/main/avrcp_meta.c` | Track metadata and change notifications |
 | `hub/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
-| `hub/main/sbc_in.c` | UART receive, decode, feed |
+| `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed. `hub/`'s copy is still the UART receiver and no longer has anything to listen to |
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
 | `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
 | `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |
