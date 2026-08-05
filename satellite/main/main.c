@@ -48,9 +48,30 @@
 
 #define PROBE_PERIOD_MS 250             /* see docs/clock-sync.md §3 */
 
-/* Must hold the master's lead time (250 ms ~ 44 kB at 44.1 kHz stereo) plus
- * headroom for jitter. */
-#define RING_BYTES  (64 * 1024)
+/*
+ * Must hold the master's lead time plus headroom for jitter -- specifically
+ * LEAD_US + RESYNC_US, which is how far the hub's timeline can legitimately be
+ * from real time when a chunk is stamped.
+ *
+ * 80 kB, up from 64: 464 ms at 44.1 kHz stereo against 371 ms.
+ *
+ * The 16 kB buys the hub's RESYNC_US the headroom its own comment says it
+ * wants and cannot have. Delivery from the Bluetooth bridge is bursty by
+ * construction -- A2DP packets arrive ~23/s carrying ~43 ms each -- and the
+ * measured swing of the hub's timeline against real time reaches +-132 ms
+ * against a 120 ms threshold. So it trips about seven times a minute on
+ * entirely normal delivery. Raising the threshold past the swing was blocked by
+ * this constant: 200 + 120 = 320 already sat close enough to 371 that 150 was
+ * not affordable.
+ *
+ * It is affordable here rather than on the hub because the hub is not the unit
+ * that has to hold it. This one is, and it is the classic ESP32 -- 117 kB free
+ * with a largest block of 106 kB, so 80 kB fits and 107 kB (which is what a
+ * 500 ms lead would need) would not allocate at all. That asymmetry is worth
+ * knowing before anyone proposes a longer lead on the strength of the S3 hub's
+ * PSRAM: the buffer a lead has to fit in is on the other board.
+ */
+#define RING_BYTES  (80 * 1024)
 
 static const char *TAG = "sat";
 
@@ -66,6 +87,12 @@ static i2s_chan_handle_t i2s_tx;
 /* Local-clock instant the next byte entering the ring should reach the DAC.
  * Zero means playback has not started. */
 static volatile int64_t stream_start_local;
+/*
+ * When the current stream was anchored. Written by the receive task, read by
+ * the drift servo, which holds its depth safety net off for a while after --
+ * see DEPTH_NET_HOLD_US.
+ */
+static volatile int64_t anchor_at;
 static volatile uint32_t stream_rate = 44100;
 static uint32_t tx_rate = 44100;      /* what the output clock is actually set to */
 /*
@@ -141,6 +168,52 @@ static volatile bool phase_stepped;
 #define PHASE_INSANE_US 1000000
 
 /*
+ * What an anchorable packet looks like. See the refusals in handle_audio().
+ *
+ * The hub stamps every chunk LEAD_US = 200 ms ahead, so a healthy packet
+ * arrives with most of that still in front of it -- a good anchor was measured
+ * at "in 154 ms". This is half of that lead, and the number is not arbitrary
+ * caution: the scheduled wait below is the ONLY thing that prefills the ring,
+ * so whatever lead survives to here is the prefill, and half the design depth
+ * is the least worth starting on.
+ *
+ * It was 20 ms, chosen as "the floor below which prefill is not worth having",
+ * and that was the wrong test. A run cleared it by four milliseconds: 144
+ * packets refused, then one accepted at +24 ms, anchoring with `buffer 0 ms`.
+ * The ring then overfilled to 400 ms behind it (ring-full 59), phase reached
+ * +118 ms, and the servo spent over 200 seconds walking it back. The guard
+ * fired 144 times and still let through the one that mattered.
+ *
+ * There is a real tension in the value, and it is not resolved so much as
+ * chosen. The hub's RESYNC_US allows its timeline to wander 150 ms from real
+ * time before slewing, so a perfectly healthy packet arriving during a trough
+ * can show as little as ~50 ms of lead -- below this floor. Such a packet WILL
+ * be refused. That is deliberate: anchoring mid-trough is how a stream starts
+ * with a lead it cannot keep, and troughs recover within a second or two, so
+ * refusing costs a second and buys an anchor taken on the recovery instead.
+ * ANCHOR_GIVE_UP_US bounds the cost if the trough is not a trough.
+ *
+ * Tied by convention to the hub's LEAD_US, which this unit cannot see. If the
+ * lead ever changes, this is the second place to look.
+ *
+ * A second between anchors, against a hub that would supply forty-nine packets
+ * in that time: if none of them anchors, the link is not in a state a re-anchor
+ * can fix.
+ *
+ * Five seconds before giving up and anchoring anyway. Long enough that no
+ * plausible burst of lateness reaches it, short enough that a genuine
+ * lead/path mismatch does not leave a speaker silent for a whole track.
+ */
+#define ANCHOR_MIN_LEAD_US     100000
+#define ANCHOR_MIN_INTERVAL_US 1000000
+#define ANCHOR_GIVE_UP_US      5000000
+
+/* How long after an anchor the drift servo ignores buffer depth and servos on
+ * phase alone. See the safety net in drift_task() for what it was doing to a
+ * ring that had simply not finished filling yet. */
+#define DEPTH_NET_HOLD_US      20000000
+
+/*
  * A track-boundary correction waiting to be reported to the hub, so it can
  * print how far apart the units had drifted -- see splice_msg_t. Written by
  * playback, sent by the probe task, because a sendto() in the audio path is
@@ -183,6 +256,29 @@ static volatile uint32_t n_retunes;
 static volatile uint32_t n_retunes_bad;
 static volatile uint32_t n_gaps;          /* lost-packet gaps filled with silence */
 static volatile uint32_t n_wifi_drops;    /* disconnects from the hub's AP */
+/*
+ * The receive path's own instruments, counted here rather than logged there.
+ *
+ * These three used to be an ESP_LOGW each, per event, from inside
+ * handle_audio() -- which runs in rx_task, which is the only thing draining a
+ * UDP mailbox six datagrams deep against ~136 datagrams a second. The console
+ * is a 115200-baud UART, so a ~60-character line is ~5 ms of blocking write.
+ *
+ * That closes a loop: packet loss makes lines, lines block the receive task,
+ * a blocked receive task overflows the mailbox, and the overflow is more loss.
+ * A run of it printed several hundred lines across six seconds and the loss
+ * outlived the disturbance that started it by about that much.
+ *
+ * So the audio path increments and drift_task talks, within 5 s, from a task
+ * that can afford to wait on a UART. Cumulative, like every other counter here;
+ * the narration below prints the window by subtracting what it said last time.
+ */
+static volatile uint32_t n_gap_frames;    /* silence inserted for lost packets */
+static volatile uint32_t n_gap_short;     /* gap fills the ring could not take */
+static volatile uint32_t n_gap_short_frames;
+static volatile uint32_t n_ring_full;     /* decoded blocks dropped, ring full */
+static volatile uint32_t n_anchor_late;   /* anchors refused, play_at already past */
+static volatile uint32_t n_anchor_soon;   /* anchors refused, one just happened */
 static volatile uint32_t n_frames_rx;     /* analysis frames taken from the hub */
 static volatile uint32_t n_frames_bad;    /* ... and rejected, wrong size */
 static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
@@ -554,6 +650,62 @@ static void handle_audio(const audio_msg_t *msg)
             }
             return;
         }
+
+        /*
+         * Two refusals, both learned from one run where this loop anchored
+         * eighteen times in three seconds and every one of them was doomed
+         * before playback started.
+         *
+         * FIRST: a packet whose play_at has already passed cannot be anchored
+         * to. The scheduled wait below is what buys the ring its prefill --
+         * ~200 ms of audio accumulates while playback holds for its instant --
+         * and a negative wait skips it entirely. The run started at "in -90 ms"
+         * with `buffer 29 ms`, and every re-anchor after it read worse: -871,
+         * -1022, -1234 ms. Anchoring on those produced phase readings of one to
+         * 1.25 seconds, which tripped PHASE_INSANE_US, which re-anchored, which
+         * reset the ring and threw away the only audio that could have fixed it.
+         *
+         * The cause was upstream -- the hub's transmit path was refusing sends
+         * and what arrived was late and sparse -- and nothing here could have
+         * fixed that. But nothing here should have amplified it either. A packet
+         * that is already late is evidence about the link, not a timeline.
+         *
+         * SECOND: one anchor per second. A re-anchor that does not stick is
+         * worse than no re-anchor, because xStreamBufferReset() below discards
+         * the buffer each time. Refusing for a second parks playback for a
+         * second; the alternative measured six seconds of noise.
+         *
+         * Both are bounded. If every packet is late for ANCHOR_GIVE_UP_US the
+         * refusal itself becomes the fault -- a hub whose lead is genuinely
+         * shorter than the path, or a clock offset wrong in a way TSF agrees
+         * with -- and a satellite that stays silent forever on a stream it could
+         * have played badly is not the better failure. Take the packet, say so
+         * at ERROR, and let the servo do what it can.
+         */
+        const int64_t now_local = esp_timer_get_time();
+        const int64_t start_local = sync_to_local(msg->play_at, offset);
+        static int64_t refuse_since;         /* first refusal of this streak */
+        static int64_t last_anchor;
+
+        if (start_local - now_local < ANCHOR_MIN_LEAD_US ||
+            (last_anchor && now_local - last_anchor < ANCHOR_MIN_INTERVAL_US)) {
+            const bool late = start_local - now_local < ANCHOR_MIN_LEAD_US;
+            if (late) n_anchor_late++; else n_anchor_soon++;
+            if (refuse_since == 0) {
+                refuse_since = now_local;
+            }
+            if (now_local - refuse_since < ANCHOR_GIVE_UP_US) {
+                return;
+            }
+            ESP_LOGE(TAG, "no anchorable packet for %lld ms (lead %+lld ms) -- "
+                          "anchoring on a bad one rather than staying silent",
+                     (now_local - refuse_since) / 1000,
+                     (start_local - now_local) / 1000);
+        }
+        refuse_since = 0;
+        last_anchor = now_local;
+        anchor_at = now_local;
+
         stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
         /* Same number the playback task dates its audio with below. The LEDs
@@ -567,7 +719,7 @@ static void handle_audio(const audio_msg_t *msg)
         visualiser_flush();
 #endif
         sbc_decoder_init();
-        stream_start_local = sync_to_local(msg->play_at, offset);
+        stream_start_local = start_local;
         stream_offset = offset;
         offset_slew_last = 0;                /* re-seed the slew for this stream */
         /* The visualiser is told nothing here. Anything of its that advances on
@@ -602,8 +754,7 @@ static void handle_audio(const audio_msg_t *msg)
         static const int16_t silence[128 * AUDIO_CHANNELS] = {0};
         uint32_t frames_missing = missing * msg->frames;
         n_gaps++;
-        ESP_LOGW(TAG, "lost %" PRIu32 " packet(s), inserting %" PRIu32 " frames of silence",
-                 missing, frames_missing);
+        n_gap_frames += frames_missing;
         /*
          * samples_in must count this silence, and the old loop did not.
          *
@@ -620,16 +771,38 @@ static void handle_audio(const audio_msg_t *msg)
          *
          * The tail below 128 frames is now inserted too, for the same reason:
          * dropping it left up to 2.9 ms uncounted per loss.
+         *
+         * Asked of the ring first, rather than discovered 128 frames at a time.
+         * A gap is worth `missing` whole packets and a packet is ~20 ms, so a
+         * burst loss asks for more than the ring holds: one run's ten-packet
+         * gap wanted 8960 frames -- 203 ms, against a 200 ms target depth and
+         * the 372 ms ring of the time -- and got 5120 of them in. (RING_BYTES
+         * is 80 kB now, so that particular gap would fit; a longer one still
+         * would not, and the arithmetic below is what makes the shortfall
+         * honest either way.) Pushing until it jams then
+         * breaking out reached the same place, but it did so through seventy
+         * failing sends, and the shortfall came out as a number nobody could
+         * check against the ring's actual free space at the time.
+         *
+         * What the shortfall MEANS is unchanged and is not fixed here: those
+         * frames were owed to the timeline and are not in it, so playback runs
+         * that much early until the servo walks it back. Capping only makes the
+         * amount honest and the attempt cheap.
          */
+        size_t room = xStreamBufferSpacesAvailable(ring);
+        uint32_t can_take = (uint32_t)(room / (AUDIO_CHANNELS * sizeof(int16_t)));
+        if (can_take < frames_missing) {
+            n_gap_short++;
+            n_gap_short_frames += frames_missing - can_take;
+            frames_missing = can_take;
+        }
         while (frames_missing > 0) {
             uint32_t n = frames_missing > 128 ? 128 : frames_missing;
             size_t want = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
             size_t sent = xStreamBufferSend(ring, silence, want, 0);
             samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
             if (sent < want) {
-                ESP_LOGW(TAG, "ring full while filling a gap, %" PRIu32 " frames short",
-                         frames_missing - (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t))));
-                break;
+                break;                       /* raced the playback task; counted above */
             }
             frames_missing -= n;
         }
@@ -699,7 +872,7 @@ static void handle_audio(const audio_msg_t *msg)
         pkt_frames += (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
 #endif
         if (sent < want) {
-            ESP_LOGW(TAG, "ring full, dropping audio");
+            n_ring_full++;
         }
         samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
     }
@@ -1047,6 +1220,45 @@ static void drift_task(void *arg)
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         }
 
+        /*
+         * The receive path's window, said here because it cannot afford to say
+         * it itself -- see the counters' declaration.
+         *
+         * Only when something moved, so a healthy run stays quiet, and one line
+         * per 5 s window however bad it gets. That bound is the point: the
+         * failure this replaces produced output in proportion to the damage,
+         * from the task that had to stop the damage.
+         */
+        static uint32_t gaps_told, gap_frames_told, gap_short_told,
+                        gap_short_frames_told, ring_full_told,
+                        anchor_late_told, anchor_soon_told;
+        const uint32_t gaps_now = n_gaps, gap_frames_now = n_gap_frames,
+                       gap_short_now = n_gap_short,
+                       gap_short_frames_now = n_gap_short_frames,
+                       ring_full_now = n_ring_full,
+                       anchor_late_now = n_anchor_late,
+                       anchor_soon_now = n_anchor_soon;
+        if (gaps_now != gaps_told || ring_full_now != ring_full_told ||
+            anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told) {
+            ESP_LOGW(TAG, "RX 5s: gaps %" PRIu32 " (%" PRIu32 " ms silence, %"
+                          PRIu32 " short by %" PRIu32 " ms) | ring-full %" PRIu32
+                          " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon",
+                     gaps_now - gaps_told,
+                     (gap_frames_now - gap_frames_told) * 1000 / stream_rate,
+                     gap_short_now - gap_short_told,
+                     (gap_short_frames_now - gap_short_frames_told) * 1000 / stream_rate,
+                     ring_full_now - ring_full_told,
+                     anchor_late_now - anchor_late_told,
+                     anchor_soon_now - anchor_soon_told);
+        }
+        gaps_told = gaps_now;
+        gap_frames_told = gap_frames_now;
+        gap_short_told = gap_short_now;
+        gap_short_frames_told = gap_short_frames_now;
+        ring_full_told = ring_full_now;
+        anchor_late_told = anchor_late_now;
+        anchor_soon_told = anchor_soon_now;
+
         /* Soak line, every 60 s, ahead of the streaming check below: if audio
          * has stopped, that is when the heap and the counters matter most.
          * Totals, not rates -- see the hub's copy. */
@@ -1063,7 +1275,9 @@ static void drift_task(void *arg)
                           ", window %" PRIu32 ", largest %u) | "
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
-                          " (%" PRIu32 " refused) | gaps %" PRIu32 " wifi-drops %" PRIu32
+                          " (%" PRIu32 " refused) | gaps %" PRIu32 " (%" PRIu32
+                          " short) ring-full %" PRIu32 " anchors-refused %" PRIu32
+                          " | wifi-drops %" PRIu32
                           " | alloc-fail %" PRIu32
                           " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
                      " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")",
@@ -1072,7 +1286,8 @@ static void drift_task(void *arg)
                      heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
-                     n_retunes, n_retunes_bad, n_gaps, n_wifi_drops, n_alloc_fail,
+                     n_retunes, n_retunes_bad, n_gaps, n_gap_short, n_ring_full,
+                     n_anchor_late + n_anchor_soon, n_wifi_drops, n_alloc_fail,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",
                      n_tsf_used, n_tsf_fallback,
@@ -1165,9 +1380,40 @@ static void drift_task(void *arg)
         if (adj >  RATE_TRIM_MAX_HZ) adj =  RATE_TRIM_MAX_HZ;
         if (adj < -RATE_TRIM_MAX_HZ) adj = -RATE_TRIM_MAX_HZ;
 
-        /* Safety net: if the buffer is heading for empty or full, that matters
-         * more than phase. */
-        if (err_frames * 1000 / (int32_t)stream_rate < -120) {
+        /*
+         * Safety net: if the buffer is heading for empty or full, that matters
+         * more than phase.
+         *
+         * Held off for DEPTH_NET_HOLD_US after an anchor, because for that
+         * stretch the depth is not evidence of anything the net exists to
+         * catch.
+         *
+         * A fresh stream starts below target by construction. RING_TARGET_MS is
+         * 200, matching the hub's LEAD_US, but the deepest prefill an anchor can
+         * ever buy is that lead MINUS transit -- the scheduled wait is the only
+         * thing that fills the ring before playback begins, so the best measured
+         * start was 154 ms and a 107 ms one is unremarkable. The reading is
+         * lower still in the first moments, because playback has begun consuming
+         * while the rest of the stream is in flight: a run read `buffer 40 ms`
+         * 100 ms after playback started, from a 107 ms prefill.
+         *
+         * The net fired on exactly that, dropping the clock 44100 -> 44080 to
+         * rescue a ring that was not in trouble. The stream then spent 110 s and
+         * six retunes walking off the phase excursion it caused -- peak +48 ms,
+         * with the visualiser rendering 7% of its frames late while the sound
+         * ran behind the timeline the lights were drawn on.
+         *
+         * 20 s is four servo windows and matches the retune cooldown, by which
+         * point the phase measurement is trustworthy and is the better input
+         * anyway. Nothing about underrun protection is given up here: an
+         * actually empty ring is caught by the playback task's 500 ms receive
+         * timeout, which is a different mechanism and still armed.
+         */
+        const int64_t since_anchor = anchor_at ? esp_timer_get_time() - anchor_at
+                                               : INT64_MAX;
+        if (since_anchor < DEPTH_NET_HOLD_US) {
+            /* say nothing; the buffer line above already prints the depth */
+        } else if (err_frames * 1000 / (int32_t)stream_rate < -120) {
             adj = -20;                       /* nearly empty: slow down */
         } else if (err_frames * 1000 / (int32_t)stream_rate > 120) {
             adj = 20;                        /* nearly full: speed up */

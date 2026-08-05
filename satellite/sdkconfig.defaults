@@ -2,6 +2,24 @@
 # tick makes vTaskDelay granularity 10 ms.
 CONFIG_FREERTOS_HZ=1000
 
+# The socket's receive queue, in datagrams. The IDF default is 6, and the boot
+# banner prints it as `udp mbox: 6`.
+#
+# One socket carries everything the hub sends this unit: ~49 audio packets a
+# second, ~86 analysis frames, four probe replies, and metadata -- about 136
+# datagrams a second through a queue six deep. That is 44 ms of headroom, and
+# whatever lwIP cannot hand over in 44 ms it discards silently. On this unit the
+# only thing draining it is rx_task, which also decodes SBC.
+#
+# 44 ms is less than the jitter this link produces on a good day and far less
+# than a retry burst, and a datagram lost here is indistinguishable in the log
+# from one lost on the air: both arrive as a sequence gap. So the counter that
+# was being read as radio loss could not have told the difference.
+#
+# 32 is ~235 ms, which covers the ring's own target depth. It costs a pointer
+# each plus the packet buffers the queue holds, against 118 kB free.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+
 # 50% overlap between analysis windows. The window stays 1024; this is only how
 # far the analysis advances between them, so it doubles the frame rate to 86 Hz
 # without changing the FFT's resolution.
