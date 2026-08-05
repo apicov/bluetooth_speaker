@@ -34,9 +34,19 @@
  * How far ahead of playback each chunk is stamped. Must exceed worst-case
  * network delivery -- measured RTT peaked at 28 ms, so this is a ~7x margin.
  *
- * Reduced from 250 ms so that LEAD + RESYNC stays inside the satellite's 64 kB
- * ring (372 ms): with bursty input the actual lead swings around this value
- * rather than sitting on it.
+ * Reduced from 250 ms so that LEAD + RESYNC stays inside the satellite's ring:
+ * with bursty input the actual lead swings around this value rather than
+ * sitting on it. That ring is 80 kB / 464 ms now and the bound is 350, so there
+ * is room here again -- but do not spend it on the lead without a reason the
+ * lead itself can serve. It buys tolerance for LATE delivery, and the delivery
+ * fault this system has actually suffered was the transmit path refusing sends
+ * outright, which no lead recovers. The 30 ms went to RESYNC_US below, which
+ * had a measured seven-times-a-minute misfire to its name.
+ *
+ * The same answers "the S3 hub has PSRAM, can the lead not be 500 ms": the ring
+ * a lead must fit in belongs to the SATELLITE, which is a classic ESP32 with no
+ * PSRAM and a largest free block of 106 kB against the ~107 kB a 500 ms lead
+ * would need. Memory on this board buys the lead nothing.
  */
 #define LEAD_US   200000
 
@@ -57,10 +67,21 @@
  * and stepping every unit's phase by the whole amount; the slew moves 1 ms/s,
  * so a trip that lasts a second costs 1 ms and the burst refill does the rest.
  *
- * Raising it above the swing would stop the tripping, but the headroom is not
- * there: LEAD + RESYNC bounds how much a satellite must buffer, 200 + 120 = 320
- * against a 372 ms ring, and the swing is 132. Left as is, with the reporting
- * filtered to episodes that persist.
+ * Now raised past the swing, which is what this comment used to say it wanted
+ * and could not have. The blocker was never this constant: LEAD + RESYNC bounds
+ * how much a satellite must buffer, and at 200 + 120 = 320 against a 372 ms
+ * ring there was no room to add the 30 ms that would clear a 132 ms trough.
+ *
+ * The satellite's ring is 80 kB now -- 464 ms -- so the bound is 200 + 150 =
+ * 350 against 464, and a swing that reaches 132 no longer touches it. What
+ * should disappear from the log is the "timeline off by ... slewing back" line
+ * arriving about seven times a minute on entirely normal delivery. If it still
+ * does, the swing is larger than 132 on this hardware and the number to look at
+ * is sbc_in's max gap, not this one.
+ *
+ * NOTE the ordering: a satellite still running a 64 kB ring against this must
+ * buffer 350 ms of a 372 ms ring, which fits but leaves little. Flash the
+ * satellite first, or together.
  *
  * The original note, still true: SBC over UART is bursty. A2DP packets arrive ~23/s, each
  * carrying ~43 ms of audio that decodes in one go, so the timeline legitimately
@@ -72,9 +93,9 @@
  *
  * This does not affect the local ring, which is governed by rate rather than by
  * the timeline. It does set how far a satellite's start time can be off, so
- * LEAD + RESYNC must fit the satellite ring: 200 + 120 = 320 ms against 372 ms.
+ * LEAD + RESYNC must fit the satellite ring: 200 + 150 = 350 ms against 464 ms.
  */
-#define RESYNC_US 120000
+#define RESYNC_US 150000
 
 /*
  * Past this the timeline is not merely off, it is wrong, and no gradual
@@ -1034,6 +1055,37 @@ static void wifi_start_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
 
+    /*
+     * 20 MHz, not the 40 the driver comes up with.
+     *
+     * Left alone, this AP negotiated HT40: the log reads `wifi:new:<11,2>` and
+     * stations join as `bgn, 40D`. On channel 11 that puts the secondary at
+     * channel 7, so the AP occupies roughly the whole 2.4 GHz band and collides
+     * with every other network in it. Nothing here can use the width -- the
+     * traffic is ~135 small datagrams a second per satellite, which is limited
+     * by transmit opportunities rather than by bits per symbol, and with the
+     * PHY rate pinned to 6 Mbps it cannot use it even in principle.
+     *
+     * So it was paying the full interference cost of HT40 for none of its
+     * throughput. Halving the occupied spectrum is the cheapest thing available
+     * that reduces how often the channel is busy when this unit wants it.
+     *
+     * This is the one part of that experiment that stayed. The rate and the
+     * aggregation went back -- see sdkconfig.defaults for the measurements that
+     * sent them back -- but nothing about HT20 was part of that trade: it costs
+     * this traffic nothing and takes interference away. Kept on its own merits,
+     * not as a leftover.
+     *
+     * Must follow esp_wifi_set_config(), which resets the bandwidth to the
+     * default. Not asserted: it is a mitigation, not a requirement, and a build
+     * that cannot set it should still stream.
+     *
+     * WIFI_BW20, not WIFI_BW_HT20 -- IDF 6 removed the older spelling, and the
+     * classic hub will want the same name when this comes across to it.
+     */
+    const esp_err_t bw = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);
+    ESP_LOGW(TAG, "AP bandwidth set to HT20: %s", esp_err_to_name(bw));
+
 #if CONFIG_DANCEFLOOR_DISABLE_PMF
     /*
      * Turn off Protected Management Frames, because its Secure Association
@@ -1110,6 +1162,10 @@ static void wifi_start_ap(void)
                       "unicast too; set to 0 to restore it",
                  CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS);
     }
+#else
+    /* Said out loud, because which of the two this build is running is the
+     * first thing to know when reading a tx-fail figure off the status line. */
+    ESP_LOGW(TAG, "PHY rate adaptation is ON (rate not pinned)");
 #endif
     ESP_LOGI(TAG, "SoftAP \"%s\" pass \"%s\" ch %d, radio at defaults",
              AP_SSID, AP_PASS, CONFIG_DANCEFLOOR_WIFI_CHANNEL);
