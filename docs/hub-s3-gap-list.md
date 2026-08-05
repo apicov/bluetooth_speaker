@@ -146,10 +146,42 @@ the board that has to hold it. **Memory on the hub buys the lead nothing.**
 
 Board difference. No use for it yet.
 
-### 2.6 USB Serial/JTAG console
+### 2.6 UART console instead of USB Serial/JTAG — S3-only *problem*, now solved
 
 | | classic hub | S3 hub |
 |---|---|---|
+| console | `ESP_CONSOLE_UART_DEFAULT`, via a bridge chip | `ESP_CONSOLE_UART_CUSTOM`, GPIO 43 |
+| `ESP_PHY_ENABLE_USB` | n/a | **n** |
+
+Listed here because the classic hub needs nothing: this was an S3-only problem
+created by the S3-only console, and the classic hub's bridge chip meant its
+radio never saw USB at all.
+
+`SOC_WIFI_PHY_NEEDS_USB_WORKAROUND` is set on the S3. IDF's fix is to disable
+the USB PHY when WiFi initialises, for best WiFi performance; `ESP_PHY_ENABLE_USB`
+overrides that fix, and it defaults to `y` whenever the console is USB
+Serial/JTAG. So the original build ran this unit's radio with IDF's own
+mitigation permanently off — on the one board whose measured problem was the
+transmit path.
+
+Now: console on **UART0 TX = GPIO 43** (pad D6, silkscreened TX, free), RX = -1
+since GPIO 44 is the SBC link and a log needs no input, 921600 baud, and
+`ESP_PHY_ENABLE_USB=n`.
+
+Two settings are load-bearing and easy to lose: `ESP_CONSOLE_SECONDARY_NONE`,
+because the secondary-console choice defaults back to USB Serial/JTAG as soon as
+the primary is not USB, and `ESP_PHY_ENABLE_USB` itself, whose default is
+`y if IDF_TARGET_ESP32S3` regardless of the console.
+
+**Bench cost:** the USB PHY is down from the moment WiFi starts, so the port
+vanishes a few hundred ms into boot and esptool cannot reset the board itself.
+Hold BOOT and tap RESET before every flash. Wiring is adapter RX ← GPIO 43,
+adapter GND ← board GND.
+
+**Unmeasured.** Nothing yet says how much WiFi performance this returns. It is
+one run to find out, and now possible to run at all.
+
+---|---|---|
 | console | `ESP_CONSOLE_UART_DEFAULT`, via a bridge chip | `ESP_CONSOLE_USB_SERIAL_JTAG` |
 
 A **liability**, not a feature. `CONFIG_SOC_WIFI_PHY_NEEDS_USB_WORKAROUND=y` is

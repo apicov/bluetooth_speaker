@@ -48,15 +48,55 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 # DIO and reflash.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 
-# There is no USB-UART bridge on this board -- the S3's USB peripheral is wired
-# straight to the connector. Without this the console goes nowhere and the board
-# looks dead on arrival.
+# The console is a WIRE, not the USB connector, and that is the whole point.
 #
-# Worth knowing before the first long run: the port disappears on every reboot,
-# because it IS the chip. `idf.py monitor` reconnects, but a panic during
-# enumeration can lose its own backtrace, which on a project whose whole method
-# is "everything that works, works because something counts it" is a real cost.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# This board has no USB-UART bridge: the S3's USB peripheral is wired straight to
+# the connector, so the obvious console is ESP_CONSOLE_USB_SERIAL_JTAG and that
+# is what this build used to be. The cost of that only became visible late.
+#
+# SOC_WIFI_PHY_NEEDS_USB_WORKAROUND is set on this part -- the USB and WiFi PHYs
+# interfere -- and IDF's fix is blunt: on affected targets the PHY library
+# DISABLES the USB PHY when WiFi initialises, to get best WiFi performance.
+# ESP_PHY_ENABLE_USB overrides that fix and keeps USB powered, and it defaults to
+# y whenever the console is USB Serial/JTAG. components/esp_phy/Kconfig says what
+# that costs in plain words: "the USB PHY can interfere with WiFi thus lowering
+# WiFi performance ... this option can be disabled to increase WiFi performance".
+#
+# So a USB console means running this unit's radio with IDF's own mitigation
+# switched off, permanently, on the one board in this project whose measured
+# problem was the transmit path. The classic hub never had the question: its
+# console goes through a separate bridge chip and its radio never sees USB.
+#
+# UART0 TX on GPIO 43 -- pad D6, the one silkscreened TX, and free in the pin map
+# below. RX is -1, meaning no pin at all: GPIO 44 is already the SBC link and a
+# log needs no input. D2 (GPIO 3) and D5 (GPIO 6) are still spare if a REPL is
+# ever wanted. UART0 for the console against UART_NUM_1 for SBC, so the two
+# peripherals do not collide either.
+#
+# 921600 baud, not the 115200 default, because logging is on the critical path in
+# this firmware and has already caused one fault on the satellite: an ESP_LOGW
+# per lost packet from the receive task, ~5 ms of blocking UART per line at
+# 115200, feeding back into more loss. Drop this if an adapter cannot keep up --
+# garbage on the console is the only symptom and it costs a rebuild.
+#
+# SECONDARY_NONE is load-bearing. The ESP_CONSOLE_SECONDARY choice defaults to
+# USB_SERIAL_JTAG the moment the primary console is not USB, which would quietly
+# pull the USB PHY back in and undo all of the above. So must ESP_PHY_ENABLE_USB
+# be set explicitly: its default is `y if IDF_TARGET_ESP32S3` regardless of what
+# the console is doing.
+#
+# WHAT THIS COSTS AT THE BENCH. The USB PHY is down from the moment WiFi starts,
+# so the port vanishes a few hundred ms into boot and esptool cannot reset the
+# board into download mode by itself. Flashing now means holding BOOT and tapping
+# RESET first, every time. Wire the adapter as: adapter RX <- GPIO 43 (D6),
+# adapter GND <- board GND. Nothing else.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=43
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=-1
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_PHY_ENABLE_USB=n
 
 # The radio settles back where the classic hub has it, and the record of why is
 # worth more than the two lines it takes to say it.
@@ -272,7 +312,8 @@ CONFIG_DANCEFLOOR_LED_PATTERN="boom"
 #   D8=7(SCK)  D9=8(MISO)  D10=9(MOSI)
 #
 # The hub wants seven of them, so the map below is not one arrangement among
-# many -- it is close to the only one. What is left over is D1, D2, D5 and D6.
+# many -- it is close to the only one. D6 is the console UART TX (see the top of
+# this file); what is left over after that is D1, D2 and D5.
 #
 # None of the classic hub's numbers carry over except the marker. 23 and 25 do
 # not exist on this part; 26 and 27 do, but are wired to the SPI flash.

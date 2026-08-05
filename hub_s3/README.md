@@ -59,7 +59,7 @@ them, so this is close to the only arrangement rather than one among many.
 | Sync marker out | D3 | 4 | 4 |
 | Sync monitor in | D4 | 5 | 21 |
 
-Free afterwards: D1, D2, D5, D6.
+Free afterwards: D1, D2, D5. (D6 = GPIO 43 is the console UART TX.)
 
 The I2S trio sits on the three SPI-labelled pads so the DAC is one ribbon off
 the end of the header. The LED strip does not need those pads — the SPI backend
@@ -97,14 +97,25 @@ external antenna, on the unit that is the SoftAP in a field.
 ```sh
 . ~/.espressif/v6.0.1/esp-idf/export.sh
 idf.py set-target esp32s3
-idf.py -p /dev/ttyACM0 flash monitor
+idf.py -p /dev/ttyACM0 flash          # hold BOOT, tap RESET first
+idf.py -p /dev/ttyUSB0 -b 921600 monitor
 ```
 
-Note `ttyACM0`, not `ttyUSB`. There is no USB-UART bridge on this board — the
-S3's USB peripheral is wired straight to the connector, which is why
-`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` is in the defaults and why the port
-disappears on every reboot. `idf.py monitor` reconnects, but a panic during
-enumeration can lose its own backtrace.
+**Two ports, and they are different things.** Flashing goes over `ttyACM0`, the
+S3's own USB peripheral wired straight to the connector — there is no USB-UART
+bridge on this board. The console does not: it comes out of **UART0 TX on
+GPIO 43 (pad D6)** into a separate USB-UART adapter, whatever that enumerates as,
+at 921600 baud. Wire adapter RX ← GPIO 43, adapter GND ← board GND.
+
+The console was moved off USB deliberately and it is not cosmetic. This part sets
+`SOC_WIFI_PHY_NEEDS_USB_WORKAROUND`; IDF's mitigation is to power the USB PHY
+down when WiFi starts, and a USB console forces `ESP_PHY_ENABLE_USB=y` to keep it
+up, which IDF's own help says lowers WiFi performance. `sdkconfig.defaults` has
+the full reasoning next to the settings.
+
+**Hold BOOT and tap RESET before every flash.** Since the USB PHY now goes down a
+few hundred ms into boot, the port vanishes once the app is running and esptool
+cannot reset the board into download mode on its own.
 
 ## Size, measured
 
