@@ -368,6 +368,19 @@ CONFIG_DANCEFLOOR_SBC_SPI_HS_PIN=3
 # WS2812 encoding needs. Never RMT: see architecture.md S12.
 CONFIG_DANCEFLOOR_LED_GPIO=1
 
+# gpio_set_level() into IRAM, for the SBC link's handshake.
+#
+# The two spi_slave callbacks that raise and drop the handshake are IRAM_ATTR
+# because they run in interrupt context, and without this that attribute is
+# decoration: the callback is in IRAM and the one function it calls is not.
+# IDF defaults this off and the cost is a few hundred bytes of IRAM.
+#
+# It does not make the handshake work with the flash cache disabled -- the
+# spi_slave ISR is registered without ESP_INTR_FLAG_IRAM, so a flash write
+# defers the interrupt rather than taking it, and the handshake drops late. That
+# is the bridge's 100 ms timeout's problem, and it counts what it refuses.
+CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+
 # The LED sync marker, on D1 = GPIO 2, which the Kconfig already defaults to.
 #
 # Tracked here rather than left to menuconfig because it was ON in this board's

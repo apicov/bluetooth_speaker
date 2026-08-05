@@ -104,8 +104,16 @@ static uint32_t s_max_gap_us;
  * hardware has loaded a transaction, post_trans when that transfer ends, which
  * is exactly the window during which the bridge may start one.
  *
- * Both run in interrupt context, hence IRAM_ATTR: they must not fault on a
- * flash cache miss, and the transfer they gate is the audio path.
+ * Both run in interrupt context, hence IRAM_ATTR -- and IRAM_ATTR on the
+ * callback alone would be decoration, because gpio_set_level() lives in flash
+ * unless GPIO_CTRL_FUNC_IN_IRAM is set, which sdkconfig.defaults now sets for
+ * this reason.
+ *
+ * What that does NOT buy is running with the cache disabled. The spi_slave ISR
+ * is registered without ESP_INTR_FLAG_IRAM, so during a flash write the
+ * interrupt is deferred rather than taken, and the handshake drops late instead
+ * of dangerously. The bridge's 100 ms timeout is what covers that, and a stall
+ * there is counted rather than silent.
  */
 static void IRAM_ATTR spi_post_setup(spi_slave_transaction_t *t)
 {
