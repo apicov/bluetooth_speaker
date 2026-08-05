@@ -1,19 +1,57 @@
 menu "Dancefloor hub"
 
-    comment "SBC link in -- from the bt_bridge chip"
+    comment "SBC link in -- SPI slave, from the bt_bridge chip"
 
-    config DANCEFLOOR_SBC_UART_RX_PIN
-        int "UART RX GPIO, listening to the bridge"
+    config DANCEFLOOR_SBC_SPI_SCK_PIN
+        int "SPI clock in, from the bridge"
         default 44
         help
-            One wire and a common ground, 500 kbaud, one way. There is no TX
-            half -- the bridge talks and this chip only listens.
+            Four wires and a common ground, one way: the bridge is the master
+            and this chip only ever receives, so there is no MISO.
 
-            44 is D7 on the XIAO ESP32-S3, the pad silkscreened RX. The
-            classic-ESP32 hub uses 23, which does not exist on this part: the
-            S3's GPIOs are 0-21 and 26-48, so 22 to 25 are simply absent. 26-32
-            exist but are wired to the SPI flash, and 33-37 to the octal PSRAM,
-            so of the classic hub's pin map only the marker pin survives.
+            The bus is SPI3. SPI2 belongs to the LED strip, which reserves a
+            whole bus to drive one WS2812 pin.
+
+            44 is D7 on the XIAO ESP32-S3, the pad silkscreened RX, and the pin
+            this link used to arrive on as a UART. The classic-ESP32 hub used
+            23, which does not exist on this part: the S3's GPIOs are 0-21 and
+            26-48, so 22 to 25 are simply absent. 26-32 exist but are wired to
+            the SPI flash, and 33-37 to the octal PSRAM.
+
+    config DANCEFLOOR_SBC_SPI_MOSI_PIN
+        int "SPI data in, from the bridge"
+        default 6
+
+    config DANCEFLOOR_SBC_SPI_CS_PIN
+        int "SPI chip select in, from the bridge"
+        default 5
+        help
+            CS is the framing. One assertion is one packet, which is why this
+            link carries no sync bytes and the receiver runs no resync scan.
+
+            5 is D4, and it was DANCEFLOOR_MONITOR_GPIO. Taking it ends the
+            marker/monitor instrument, which needs both 4 and 5 -- see the help
+            on DANCEFLOOR_ENABLE_MARKER. It was the cheapest of the four pads
+            that could have gone: the instrument is off by default, needs a wire
+            between two boards that a deployed floor cannot have, and nothing
+            corrects on it.
+
+    config DANCEFLOOR_SBC_SPI_HS_PIN
+        int "Handshake out, telling the bridge a buffer is armed"
+        default 3
+        help
+            Output. Raised while a transaction is queued and dropped for the
+            duration of a transfer; the bridge waits for it before clocking.
+
+            Not optional. ESP-IDF's spi_slave loses any transfer that arrives
+            with nothing queued -- the peripheral has nowhere to put it -- so
+            without this the link drops frames at random and neither end can
+            tell that from corruption.
+
+            3 is D2. It is also the S3's JTAG_SEL strapping pin, which is inert
+            unless the STRAP_JTAG_SEL eFuse is burned; the handshake is put here
+            rather than a bridge-driven signal so that nothing external is
+            driving a strapping pin while this board boots.
 
     comment "I2S output -- to this unit's own DAC (this chip is the MASTER)"
 

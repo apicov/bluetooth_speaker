@@ -22,7 +22,7 @@
 #include "a2dp_sink_ext_codec_utils.h"
 #endif
 
-#include "sbc_uart.h"
+#include "sbc_spi.h"
 #include "avrcp_meta.h"
 
 /* device name */
@@ -108,7 +108,7 @@ static void bt_app_a2d_audio_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_
 {
     /* Undecoded SBC straight out to the hub -- no decode on this chip at all.
      * bt_a2d_audio_data_hdl() owns the buffer and frees it. */
-    sbc_uart_send(audio_buf->data, audio_buf->data_len);
+    sbc_link_send(audio_buf->data, audio_buf->data_len);
     bt_a2d_audio_data_hdl(conn_hdl, audio_buf);
 }
 #endif
@@ -152,30 +152,28 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         /*
          * The bitpool ceiling is a WIRE budget, not a quality preference.
          *
-         * Everything this chip receives leaves again down one UART at
-         * SBC_LINK_BAUD, and that is 500000 baud 8N1 -- 50 kB/s, hard. There is
-         * no flow control on that link and sbc_uart.c queues only ~10 packets
-         * before dropping, so anything the phone sends above 50 kB/s is not
-         * slowed down, it is thrown away.
+         * 53 is what the UART link was measured carrying: the hub reported
+         * ~42 kB/s of SBC, which is bitpool 53 at 44.1 kHz joint stereo -- the
+         * standard A2DP "high quality" value, and 85% of that wire. 250 was
+         * here before, advertising about five times what the wire could take
+         * with nothing enforcing the difference, so a phone choosing bitpool 76
+         * asked for ~59 kB/s down a 50 kB/s link and the surplus was not slowed
+         * down, it was dropped. Whether that happened depended on which handset
+         * connected, which is a fine recipe for an intermittent fault nobody can
+         * reproduce.
          *
-         * 53 is what the link was measured carrying: the hub reports ~42 kB/s of
-         * SBC, which is bitpool 53 at 44.1 kHz joint stereo -- the standard A2DP
-         * "high quality" value. That is already 85% of the wire.
+         * THE WIRE HAS MOVED AND THIS NUMBER HAS NOT, deliberately. The link is
+         * SPI now, 20-25x the headroom, and the whole reason for changing it was
+         * to let this go back up. But raising it is a separate experiment and
+         * belongs after the new link has been shown clean at the OLD rate:
+         * change the transport and the bitpool together and a fault has two
+         * candidate causes, which is how this project has produced most of its
+         * confident wrong answers.
          *
-         * 250 was here, and it advertises about five times what the wire can
-         * take. Nothing enforced it: a phone choosing bitpool 76, which some
-         * "extra quality" modes do, asks for ~59 kB/s down a 50 kB/s link. The
-         * queue then fills, sbc_uart drops, and the hub sees gaps in the audio
-         * it is publishing a timeline for. Whether that happened depended on
-         * which handset connected, which is a fine recipe for an intermittent
-         * fault nobody can reproduce.
-         *
-         * So this is the honest statement of the link's capacity, and it should
-         * move only when the link does. sbc_link.h explains why 500000 is the
-         * ceiling -- it is the wiring, not the protocol -- and what would lift
-         * it: better leads for a higher baud, or SPI for ~30x the headroom, at
-         * which point this can go back up. Raising it before then buys nothing
-         * and costs audio.
+         * So raise it once sbc_in reports `hdr 0 crc 0` with gaps no worse than
+         * the UART's, and watch two things when you do. The link ceiling is no
+         * longer the constraint; SBC_LINK_MAX_PAYLOAD is, at 1024 bytes against
+         * ~830 today, and sbc_spi.c counts what it refuses. See docs/sbc-link.md.
          */
         mcc.cie.sbc_info.max_bitpool = 53;
         mcc.cie.sbc_info.min_bitpool = 2;
@@ -208,7 +206,7 @@ void app_main(void)
 {
     ESP_ERROR_CHECK(bredr_app_common_init());
 
-    sbc_uart_start();
+    sbc_link_start();
 
     bt_app_task_start_up();
     /* bluetooth device name, connection mode and profile set up */

@@ -335,14 +335,51 @@ CONFIG_DANCEFLOOR_I2S_BCK_PIN=7
 CONFIG_DANCEFLOOR_I2S_LRCK_PIN=8
 CONFIG_DANCEFLOOR_I2S_DATA_PIN=9
 
-# One wire in from the bridge chip. D7, the pad silkscreened RX.
-CONFIG_DANCEFLOOR_SBC_UART_RX_PIN=44
+# Four wires in from the bridge chip, on SPI3 -- SPI2 is the LED strip.
+#
+# SCK keeps D7, the pad this link used to arrive on as a UART, so one lead of
+# the old wiring survives. The other three take what was left: D5 and D2 were
+# genuinely spare, and D4 was not.
+#
+# D4 = GPIO 5 was DANCEFLOOR_MONITOR_GPIO, and taking it ends the marker/monitor
+# instrument for good, because that needs GPIO 4 AND GPIO 5 and only one of them
+# survives. Four pads had to come from somewhere and this was the cheapest of
+# them: the instrument is off (DANCEFLOOR_ENABLE_MARKER defaults to n), it needs
+# a wire between two boards that a deployed floor cannot have, and nothing in
+# either firmware corrects on it. TRACK DIVERGENCE over WiFi is untouched and
+# covers every satellite rather than the one on the bench.
+#
+# The alternative was D1 = GPIO 2, the LED sync marker, which is enabled in this
+# build and is the check that needs no console at all. Keeping a working
+# instrument beat keeping a disabled one.
+#
+# The handshake is the OUTPUT of the four, and it is on D2 = GPIO 3 for that
+# reason: 3 is this part's JTAG_SEL strapping pin -- inert unless the
+# STRAP_JTAG_SEL eFuse is burned -- and a pin this board drives itself is a
+# safer thing to put there than one the bridge is driving while we boot.
+CONFIG_DANCEFLOOR_SBC_SPI_SCK_PIN=44
+CONFIG_DANCEFLOOR_SBC_SPI_MOSI_PIN=6
+CONFIG_DANCEFLOOR_SBC_SPI_CS_PIN=5
+CONFIG_DANCEFLOOR_SBC_SPI_HS_PIN=3
 
 # WS2812 data, still via the 74AHCT125 -- the S3 drives 3.3 V exactly as the
 # classic ESP32 does, so the level shifter is no less necessary here. Driven
 # through SPI2_HOST and the GPIO matrix, which is fine at the ~2.4 MHz the
 # WS2812 encoding needs. Never RMT: see architecture.md S12.
 CONFIG_DANCEFLOOR_LED_GPIO=1
+
+# The LED sync marker, on D1 = GPIO 2, which the Kconfig already defaults to.
+#
+# Tracked here rather than left to menuconfig because it was ON in this board's
+# untracked sdkconfig and was lost the moment that file was regenerated -- the
+# same way the "boom" pattern below was lost, for the same reason, and this file
+# already carries a paragraph about that. A bench instrument nobody can find the
+# switch for is one nobody uses.
+#
+# It also earned its place in the pin argument above: the four SPI pads were
+# chosen to keep this working, and a setting that decided a pin allocation
+# should not live somewhere a rebuild can drop it.
+CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=y
 
 # The bench marker pins are NOT set here, on purpose.
 #

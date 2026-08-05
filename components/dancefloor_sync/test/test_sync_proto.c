@@ -13,7 +13,23 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <inttypes.h>
+
+/* An independent CRC-16/CCITT-FALSE, so the link's CRC is checked against
+ * another implementation rather than against itself. Pinned on the published
+ * "123456789" -> 0x29B1 vector before it certifies anything. */
+static uint16_t ref_crc16(const uint8_t *p, size_t n)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (uint16_t)p[i] << 8;
+        for (int k = 0; k < 8; k++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
 
 static int failures = 0;
 
@@ -295,6 +311,90 @@ int main(void)
         sync_phase_reset(&h);
         int32_t med;
         check("reset drops the whole history", !sync_phase_median(&h, &med), NULL);
+    }
+
+    /*
+     * 17. The SPI link's frame must satisfy the SPI slave's DMA rule in the
+     *     TYPE, not at the allocation. The driver needs a 4-byte-aligned buffer
+     *     whose length is a multiple of 4, and sbc_link.h claims the 12-byte
+     *     header is sized to deliver that. Nothing else checks the claim, and a
+     *     field added to the header later would break it silently on hardware.
+     */
+    {
+        char d[80];
+        snprintf(d, sizeof d, "hdr=%zu frame=%zu", sizeof(spi_link_hdr_t),
+                 (size_t)SBC_LINK_FRAME_BYTES);
+        check("the SPI frame is a multiple of 4 bytes",
+              sizeof(spi_link_hdr_t) == 12 && SBC_LINK_FRAME_BYTES % 4 == 0, d);
+    }
+
+    /*
+     * 18. The CRC is CRC-16/CCITT-FALSE, checked against an independent
+     *     implementation rather than against a number this file copied from
+     *     the one under test.
+     *
+     * ref_crc16() is pinned first on the published check value for "123456789",
+     * 0x29B1, so a wrong reference cannot certify a wrong production function.
+     */
+    {
+        check("the reference CRC matches the published vector",
+              ref_crc16((const uint8_t *)"123456789", 9) == 0x29B1, NULL);
+
+        spi_link_hdr_t h = { .kind = LINK_KIND_SBC, .len = 9, .seq = 12345,
+                             .crc = 0 };
+        const uint8_t payload[9] = "123456789";
+        uint8_t flat[sizeof h + 9];
+        memcpy(flat, &h, sizeof h);
+        memcpy(flat + sizeof h, payload, 9);
+
+        char d[64];
+        const uint16_t got = sbc_link_crc16(&h, payload, 9);
+        snprintf(d, sizeof d, "got=0x%04X ref=0x%04X", got,
+                 ref_crc16(flat, sizeof flat));
+        check("the frame CRC covers header then payload",
+              got == ref_crc16(flat, sizeof flat), d);
+    }
+
+    /*
+     * 19. Whatever is already in the crc field must not change the answer.
+     *
+     * That convention is what lets the sender compute over a header it has
+     * filled in and the receiver over a header carrying the sender's value,
+     * neither one copying the struct to blank a field. If it ever stops
+     * holding, every frame fails its check on hardware and nothing here says
+     * why.
+     */
+    {
+        const uint8_t payload[32] = { 1, 2, 3 };
+        spi_link_hdr_t a = { .kind = LINK_KIND_SBC, .len = 32, .seq = 7, .crc = 0 };
+        spi_link_hdr_t b = a;
+        b.crc = 0xBEEF;
+        check("the crc field does not feed itself",
+              sbc_link_crc16(&a, payload, 32) == sbc_link_crc16(&b, payload, 32), NULL);
+    }
+
+    /*
+     * 20. The error the XOR byte could not see.
+     *
+     * Flip the same bit in two payload bytes and the XOR is unchanged -- it is
+     * a parity per bit position, so any even number of flips in one column is
+     * invisible to it. Run this against sbc_link_checksum() and the first half
+     * passes, which is the point of writing it: the UART link would have
+     * accepted this frame, and on a wire running 20x faster there is no resync
+     * scan behind it to notice.
+     */
+    {
+        uint8_t good[64], bad[64];
+        for (int i = 0; i < 64; i++) good[i] = (uint8_t)(i * 7 + 3);
+        memcpy(bad, good, sizeof bad);
+        bad[0] ^= 0x01;
+        bad[1] ^= 0x01;
+
+        spi_link_hdr_t h = { .kind = LINK_KIND_SBC, .len = 64, .seq = 99, .crc = 0 };
+        check("the XOR the link used to carry misses this",
+              sbc_link_checksum(good, 64) == sbc_link_checksum(bad, 64), NULL);
+        check("the CRC catches it",
+              sbc_link_crc16(&h, good, 64) != sbc_link_crc16(&h, bad, 64), NULL);
     }
 
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");

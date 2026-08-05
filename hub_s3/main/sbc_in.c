@@ -5,7 +5,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "driver/spi_slave.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -14,35 +16,58 @@
 #include "sbc_decoder.h"
 #include "streamer.h"
 
-#define UART_PORT   UART_NUM_1
+/*
+ * SPI3. SPI2 is the LED strip -- led_strip_wrapper.cpp asks for SPI2_HOST and
+ * the WS2812 encoding needs a whole bus to use one pin -- so this link takes
+ * the other one. The S3 has no IOMUX pins for SPI3, meaning everything here
+ * goes through the GPIO matrix; that costs a little propagation delay and is
+ * irrelevant at the clock this link starts at. It is the first thing to suspect
+ * if the crc counter starts moving as the clock is raised.
+ *
+ * Pins are Kconfig, like every other pin in this firmware, and the four of them
+ * take all but one of the free pads on a XIAO ESP32-S3. GPIO 44 was the UART RX
+ * pin this link used to arrive on, so the board keeps one wire it already had.
+ *
+ * WHAT THIS COST. GPIO 5 was DANCEFLOOR_MONITOR_GPIO, the input that watches a
+ * satellite's marker pulse, and taking it kills the marker/monitor instrument
+ * for good -- it needs both 4 and 5, and only one of them survives. That was
+ * the cheapest of the available prices: the instrument is off
+ * (DANCEFLOOR_ENABLE_MARKER defaults to n), needs a wire between two boards
+ * that a deployed floor cannot have, and nothing corrects on it. Track-boundary
+ * divergence is still reported over WiFi, for every satellite rather than the
+ * wired one.
+ *
+ * NOT GPIO 43. The console lives there, deliberately moved off USB so
+ * ESP_PHY_ENABLE_USB could be disabled -- see hub_s3/sdkconfig.defaults.
+ */
+#define SPI_LINK_HOST SPI3_HOST
+#define PIN_SCK  CONFIG_DANCEFLOOR_SBC_SPI_SCK_PIN
+#define PIN_MOSI CONFIG_DANCEFLOOR_SBC_SPI_MOSI_PIN
+#define PIN_CS   CONFIG_DANCEFLOOR_SBC_SPI_CS_PIN
+#define PIN_HS   CONFIG_DANCEFLOOR_SBC_SPI_HS_PIN
 
 /*
- * The receive pin is Kconfig, like every other pin in this firmware. It was the
- * literal 23 here -- the one pin the "board silkscreens disagree" argument in
- * architecture.md S14 never reached.
+ * Two frame buffers, and the reason is the decode.
  *
- * It had to move for the S3 port, and the reason generalises past that board:
- * 23 is not a pin the ESP32-S3 HAS. Its GPIOs are 0-21 and 26-48, so 22 to 25
- * are absent from the part, 26-32 are wired to the SPI flash and 33-37 to the
- * PSRAM. uart_set_pin() rejects an absent pin inside ESP_ERROR_CHECK, so a
- * number that is wrong for the target aborts at boot rather than failing to
- * compile. Kconfig at least puts it somewhere a person looks.
- *
- * There is no transmit half. The bridge talks and this chip listens -- one wire
- * and a common ground, 500 kbaud. This used to name GPIO 22 anyway and drive it
- * as an idle-high TX line nothing was connected to; UART_PIN_NO_CHANGE leaves
- * the pin alone instead, which costs nothing here and matters on a board that
- * only breaks out eleven of them.
+ * The bridge will not clock a transfer until the handshake says a buffer is
+ * armed, so anything that leaves this chip with none queued stalls the link.
+ * Decoding a packet takes far longer than the transfer does, so a single buffer
+ * would leave the bridge waiting through every decode. With two, one is always
+ * armed while the other is being decoded in place -- there is no staging copy,
+ * which is also why a buffer cannot be re-queued until its packet is finished
+ * with.
  */
-#define UART_RX_PIN CONFIG_DANCEFLOOR_SBC_UART_RX_PIN
-#define UART_TX_PIN UART_PIN_NO_CHANGE
+#define NFRAMES 2
 
 static const char *TAG = "sbc_in";
+
+static uint8_t *s_frame[NFRAMES];
+static spi_slave_transaction_t s_trans[NFRAMES];
 
 /* Statistics, reported every 5 s. These replace the rate/loss instrumentation
  * that audio_in.c needed -- with no shared clock there is no rate to measure,
  * so what matters now is whether packets arrive intact. */
-static uint32_t s_packets, s_bad_sync, s_bad_crc, s_gaps, s_decode_err;
+static uint32_t s_packets, s_bad_hdr, s_bad_crc, s_gaps, s_decode_err;
 static uint64_t s_pcm_samples;
 
 /*
@@ -50,8 +75,8 @@ static uint64_t s_pcm_samples;
  *
  * The counters above all describe packets that ARRIVED and were wrong. Nothing
  * described packets that never came, and a source that simply stops sending
- * produces no bad sync word, no CRC failure, no sequence gap and no decode
- * error -- it is invisible to every one of them.
+ * produces no bad header, no CRC failure, no sequence gap and no decode error
+ * -- it is invisible to every one of them.
  *
  * That blindness cost a real diagnosis: the hub's timeline was seen jumping
  * -126734 us, and drift accounted for 7% of it. The remaining ~118 ms was a
@@ -71,111 +96,81 @@ static uint32_t s_max_gap_us;
 #define GAP_ALARM_US 150000
 
 /*
- * Bulk-read into a local buffer and parse in memory.
+ * The handshake: "a buffer is armed, you may clock a frame."
  *
- * The first version called uart_read_bytes() one byte at a time to hunt for the
- * sync word. After a CRC error that meant rescanning ~660 bytes of a corrupt
- * packet with 660 separate driver calls, tens of thousands per second -- which
- * backed up the RX buffer and caused further corruption. A self-sustaining
- * failure, and largely why half of all packets were being lost.
+ * ESP-IDF's spi_slave loses any transfer that arrives with no transaction
+ * queued -- the peripheral has nowhere to put it -- so this is what makes the
+ * link reliable rather than what makes it fast. post_setup fires when the
+ * hardware has loaded a transaction, post_trans when that transfer ends, which
+ * is exactly the window during which the bridge may start one.
+ *
+ * Both run in interrupt context, hence IRAM_ATTR: they must not fault on a
+ * flash cache miss, and the transfer they gate is the audio path.
  */
-#define PARSE_BUF (SBC_LINK_MAX_PAYLOAD * 4)
-
-static uint8_t s_buf[PARSE_BUF];
-static size_t s_have;          /* valid bytes in s_buf */
-
-/* Drop `n` bytes from the front. */
-static void consume(size_t n)
+static void IRAM_ATTR spi_post_setup(spi_slave_transaction_t *t)
 {
-    if (n >= s_have) {
-        s_have = 0;
-    } else {
-        memmove(s_buf, s_buf + n, s_have - n);
-        s_have -= n;
-    }
+    gpio_set_level(PIN_HS, 1);
 }
 
-/* Index of the next sync pair at or after `from`, or -1. */
-static int find_sync_at(size_t from)
+static void IRAM_ATTR spi_post_trans(spi_slave_transaction_t *t)
 {
-    for (size_t i = from; i + 1 < s_have; i++) {
-        if (s_buf[i] == SBC_LINK_SYNC0 && s_buf[i + 1] == SBC_LINK_SYNC1) {
-            return (int)i;
-        }
-    }
-    return -1;
+    gpio_set_level(PIN_HS, 0);
 }
 
 static void rx_task(void *arg)
 {
-    /* No staging buffer: the parser decodes in place from s_buf. */
-    static int16_t pcm[SBC_MAX_PCM_SAMPLES];
     uint32_t expect_seq = 0;
     bool have_seq = false;
     int64_t next_report = 0;
 
+    /* Arm every buffer before the bridge can clock anything at us. */
+    for (int i = 0; i < NFRAMES; i++) {
+        ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_LINK_HOST, &s_trans[i], portMAX_DELAY));
+    }
+
     while (1) {
-        /* Top up from the driver in bulk. */
-        if (s_have < sizeof(s_buf)) {
-            int r = uart_read_bytes(UART_PORT, s_buf + s_have, sizeof(s_buf) - s_have,
-                                    pdMS_TO_TICKS(20));
-            if (r > 0) {
-                s_have += r;
-            }
-        }
+        /*
+         * One completed transfer is one packet: CS framed it, so there is no
+         * sync word to hunt for, no partial header to wait on and no resync
+         * scan. The 20 ms timeout is not idleness -- it is what keeps the
+         * report below running when the source has stopped, which is the case
+         * `max gap` exists to catch.
+         */
+        spi_slave_transaction_t *done = NULL;
+        if (spi_slave_get_trans_result(SPI_LINK_HOST, &done,
+                                       pdMS_TO_TICKS(20)) == ESP_OK) {
+            const uint8_t *frame = (const uint8_t *)done->rx_buffer;
+            spi_link_hdr_t hdr;
+            memcpy(&hdr, frame, sizeof(hdr));
+            const uint8_t *payload = frame + sizeof(spi_link_hdr_t);
 
-        /* Drain every complete packet the buffer holds. */
-        while (1) {
-            int sync = find_sync_at(0);
-            if (sync < 0) {
-                /* Keep the last byte: a sync pair may straddle the boundary. */
-                if (s_have > 1) consume(s_have - 1);
-                break;
+            /*
+             * Header first, because a wrong length would decide how much of the
+             * frame the CRC covers. Past this point len is known sane and the
+             * CRC is checking content rather than deciding where content ends.
+             */
+            if (hdr.len == 0 || hdr.len > SBC_LINK_MAX_PAYLOAD ||
+                (hdr.kind != LINK_KIND_SBC && hdr.kind != LINK_KIND_META)) {
+                s_bad_hdr++;
+                goto rearm;
             }
-            if (sync > 0) {
-                s_bad_sync++;
-                consume((size_t)sync);
-                continue;
-            }
-            if (s_have < sizeof(sbc_link_hdr_t)) {
-                break;                      /* header still arriving */
-            }
-
-            uint8_t kind = s_buf[2];
-            uint16_t len;
-            uint32_t seq;
-            memcpy(&len, s_buf + 4, 2);
-            memcpy(&seq, s_buf + 6, 4);
-            uint8_t crc = s_buf[10];
-
-            if (len == 0 || len > SBC_LINK_MAX_PAYLOAD) {
-                s_bad_sync++;
-                consume(2);                 /* false sync, skip past it */
-                continue;
-            }
-            if (s_have < sizeof(sbc_link_hdr_t) + len) {
-                break;                      /* payload still arriving */
-            }
-
-            const uint8_t *payload = s_buf + sizeof(sbc_link_hdr_t);
-            if (sbc_link_checksum(payload, len) != crc) {
+            if (sbc_link_crc16(&hdr, payload, hdr.len) != hdr.crc) {
                 s_bad_crc++;
-                consume(2);                 /* resync from just after this sync */
-                continue;
+                goto rearm;
             }
 
-            if (have_seq && seq != expect_seq) {
+            if (have_seq && hdr.seq != expect_seq) {
                 s_gaps++;
             }
-            expect_seq = seq + 1;
+            expect_seq = hdr.seq + 1;
             have_seq = true;
 
-            if (kind == LINK_KIND_META) {
-                if (len == sizeof(link_meta_t)) {
+            if (hdr.kind == LINK_KIND_META) {
+                if (hdr.len == sizeof(link_meta_t)) {
                     const link_meta_t *m = (const link_meta_t *)payload;
                     ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
                              m->track_id, m->title, m->artist, m->album);
-                    streamer_send_meta(payload, len);
+                    streamer_send_meta(payload, hdr.len);
 
                     /* A new track is the one moment a splice is inaudible, so
                      * take it: flag the next audio packet and let every unit
@@ -189,8 +184,7 @@ static void rx_task(void *arg)
                     last_track_id = m->track_id;
                     have_track = true;
                 }
-                consume(sizeof(sbc_link_hdr_t) + len);
-                continue;
+                goto rearm;
             }
             s_packets++;
 
@@ -220,11 +214,15 @@ static void rx_task(void *arg)
                 streamer_mark_here();
             }
 
+            /* Decoded straight out of the DMA buffer -- no staging copy, which
+             * is why this buffer is not re-armed until the loop below is done
+             * with it, and why there are two of them. */
+            static int16_t pcm[SBC_MAX_PCM_SAMPLES];
             uint32_t frames_here = 0;
             size_t off = 0;
-            while (off < len) {
+            while (off < hdr.len) {
                 size_t consumed = 0, samples = 0;
-                if (!sbc_decode_frame(payload + off, len - off, &consumed, pcm, &samples)) {
+                if (!sbc_decode_frame(payload + off, hdr.len - off, &consumed, pcm, &samples)) {
                     s_decode_err++;
                     sbc_decoder_init();
                     break;
@@ -246,9 +244,10 @@ static void rx_task(void *arg)
             }
 
             /* Satellites get the SBC itself, not what we decoded from it. */
-            streamer_send_sbc(payload, len, frames_here, tagged);
+            streamer_send_sbc(payload, hdr.len, frames_here, tagged);
 
-            consume(sizeof(sbc_link_hdr_t) + len);
+rearm:
+            ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_LINK_HOST, done, portMAX_DELAY));
         }
 
         int64_t now = esp_timer_get_time();
@@ -273,24 +272,31 @@ static void rx_task(void *arg)
              * The window stays 5 s -- streamer_set_sample_rate() below feeds the
              * servo's rate estimate and must keep its cadence -- but a healthy
              * window says the same thing every time, so only one window per
-             * log period gets printed. Any window with a bad sync word, a CRC failure, a
+             * log period gets printed. Any window with a bad header, a CRC failure, a
              * sequence gap, a decode error or a dropped feed prints regardless,
              * because those are the windows worth seeing and waiting 20 s to
              * hear about a fault is how faults get missed.
+             *
+             * `hdr` used to be `sync`, and counted bytes skipped while hunting
+             * for the UART link's sync word. CS frames a packet now, so there is
+             * no such thing to count and a column that could only ever print 0
+             * would be an instrument with nothing behind it. Same position, same
+             * job -- a frame refused before its contents were trusted -- and it
+             * now counts an impossible kind or length.
              */
             static int quiet_left;
-            const bool bad = s_bad_sync || s_bad_crc || s_gaps || s_decode_err || dropped
+            const bool bad = s_bad_hdr || s_bad_crc || s_gaps || s_decode_err || dropped
                              || s_max_gap_us > GAP_ALARM_US;
             if (bad || --quiet_left <= 0) {
                 if (!bad) {
                     quiet_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
                 }
                 ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
-                              "sync %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32
+                              "hdr %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32
                               " dec %" PRIu32 " | fed-drop %" PRIu32 " B | "
                               "max gap %" PRIu32 " us",
                          s_packets, info.sample_rate, info.channels, eff,
-                         s_bad_sync, s_bad_crc, s_gaps, s_decode_err, dropped,
+                         s_bad_hdr, s_bad_crc, s_gaps, s_decode_err, dropped,
                          s_max_gap_us);
             }
             s_pcm_samples = 0;
@@ -298,7 +304,7 @@ static void rx_task(void *arg)
             streamer_set_sample_rate(info.sample_rate ? info.sample_rate : 44100);
             /* Per-window, not cumulative: a rising total tells you far less than
              * a rate, and cumulative counters made 500 k look worse than it was. */
-            s_packets = s_bad_sync = s_bad_crc = s_gaps = s_decode_err = 0;
+            s_packets = s_bad_hdr = s_bad_crc = s_gaps = s_decode_err = 0;
             s_max_gap_us = 0;
             next_report = now + 5000000;
         }
@@ -307,23 +313,46 @@ static void rx_task(void *arg)
 
 void sbc_in_start(void)
 {
-    uart_config_t cfg = {
-        .baud_rate = SBC_LINK_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_APB,
+    const gpio_config_t hs = {
+        .pin_bit_mask = 1ULL << PIN_HS,
+        .mode = GPIO_MODE_OUTPUT,
     };
-    /* Generous RX buffer: the bridge sends in bursts as A2DP packets arrive. */
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 8192, 0, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &cfg));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(gpio_config(&hs));
+    gpio_set_level(PIN_HS, 0);
+
+    const spi_bus_config_t bus = {
+        .mosi_io_num = PIN_MOSI,
+        .miso_io_num = -1,          /* one-way link */
+        .sclk_io_num = PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+    const spi_slave_interface_config_t slv = {
+        .spics_io_num = PIN_CS,
+        .flags = 0,
+        .queue_size = NFRAMES,
+        .mode = 0,
+        .post_setup_cb = spi_post_setup,
+        .post_trans_cb = spi_post_trans,
+    };
+    ESP_ERROR_CHECK(spi_slave_initialize(SPI_LINK_HOST, &bus, &slv, SPI_DMA_CH_AUTO));
+
+    for (int i = 0; i < NFRAMES; i++) {
+        /* DMA-capable and 4-byte aligned, with a length that is a multiple of
+         * 4 -- the driver requires all three, and SBC_LINK_FRAME_BYTES is sized
+         * in sbc_link.h so the last one comes for free. */
+        s_frame[i] = heap_caps_aligned_alloc(4, SBC_LINK_FRAME_BYTES, MALLOC_CAP_DMA);
+        assert(s_frame[i]);
+        s_trans[i].length = SBC_LINK_FRAME_BYTES * 8;
+        s_trans[i].rx_buffer = s_frame[i];
+        s_trans[i].tx_buffer = NULL;
+    }
 
     if (!sbc_decoder_init()) {
         ESP_LOGE(TAG, "SBC decoder init failed");
     }
     xTaskCreatePinnedToCore(rx_task, "sbc_in", 4096, NULL, 9, NULL, 1);
-    ESP_LOGI(TAG, "SBC link listening on GPIO %d at %d baud", UART_RX_PIN, SBC_LINK_BAUD);
+    ESP_LOGI(TAG, "SBC link listening: SPI slave at %d Hz, sck %d mosi %d cs %d, "
+                  "handshake out on %d", SBC_LINK_SPI_HZ, PIN_SCK, PIN_MOSI,
+             PIN_CS, PIN_HS);
 }

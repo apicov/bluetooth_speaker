@@ -1,5 +1,6 @@
 #include "sync_proto.h"
 
+#include <stddef.h>
 #include <string.h>
 
 void sync_est_init(sync_est_t *e)
@@ -122,4 +123,46 @@ bool sync_phase_median(const sync_phase_hist_t *h, int32_t *out)
      */
     *out = s[h->count / 2];
     return true;
+}
+
+/*
+ * CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final xor.
+ *
+ * Bitwise rather than table-driven. The covered span is ~840 bytes at 50
+ * packets a second, so this is ~3 M inner iterations a second on each chip --
+ * around 1% of one core at 240 MHz. Affordable on both ends, and if it ever
+ * stops being, a 256-entry table is a change to this function and nothing else.
+ */
+static uint16_t crc16_bytes(uint16_t crc, const uint8_t *p, uint16_t n)
+{
+    for (uint16_t i = 0; i < n; i++) {
+        crc ^= (uint16_t)p[i] << 8;
+        for (int k = 0; k < 8; k++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                                 : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/*
+ * Header and payload are separate arguments because they are separate buffers
+ * at both ends and always will be: the bridge builds a header around a pointer
+ * the Bluetooth stack owns, and the hub checks the frame before it has decided
+ * the payload is real.
+ */
+uint16_t sbc_link_crc16(const void *hdr, const void *payload, uint16_t len)
+{
+    const uint16_t off = offsetof(spi_link_hdr_t, crc);
+    const uint8_t *h = (const uint8_t *)hdr;
+    const uint8_t zero[2] = { 0, 0 };
+    uint16_t crc = 0xFFFF;
+
+    /* The crc field reads as zero wherever it lands, so both ends compute over
+     * the header they already hold rather than copying it to blank a field. */
+    crc = crc16_bytes(crc, h, off);
+    crc = crc16_bytes(crc, zero, sizeof(zero));
+    crc = crc16_bytes(crc, h + off + 2, (uint16_t)(sizeof(spi_link_hdr_t) - off - 2));
+    crc = crc16_bytes(crc, (const uint8_t *)payload, len);
+    return crc;
 }

@@ -8,7 +8,7 @@
 #include "esp_timer.h"
 
 #include "sbc_link.h"
-#include "sbc_uart.h"
+#include "sbc_spi.h"
 
 static const char *TAG = "avrcp";
 
@@ -41,7 +41,7 @@ static int64_t s_last_change_us;
  * update from a new track. */
 static void publish(void)
 {
-    sbc_uart_send_meta(&s_meta);
+    sbc_link_send_meta(&s_meta);
 }
 
 static void request_metadata(void)
