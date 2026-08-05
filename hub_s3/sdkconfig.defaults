@@ -5,6 +5,49 @@ CONFIG_FREERTOS_HZ=1000
 # The XIAO ESP32-S3 carries 8 MB of flash, against the classic hub's 4.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
+# QIO, up from the DIO this build inherited from the classic hub.
+#
+# The application is mapped from flash and pulled through the instruction cache
+# a line at a time -- 32 bytes here -- so every cache miss is a burst read whose
+# cost is set by how many data lines the flash uses. DIO drives two (IO0, IO1)
+# for address and data alike; QIO drives four, adding IO2 and IO3, which on a
+# plain part are the WP and HOLD signals and get repurposed as data lines. At
+# the 80 MHz this board clocks flash, that is ~20 MB/s against ~40.
+#
+# It does not reduce how OFTEN the cache misses -- the 32 kB cache setting
+# further down does that -- it halves what each miss costs. The two are worth
+# having together: fewer misses, and cheaper ones.
+#
+# Octal is not available here and never will be: it needs eight data lines and
+# a module built for them, and CONFIG_ESPTOOLPY_OCT_FLASH is unset because this
+# board's flash is quad. (The 8 MB of PSRAM on the XIAO IS octal, which is where
+# GPIO 33-37 would go if it were ever enabled -- see the note at the end of this
+# file for why it is not.) So QIO at 80 MHz STR is this board's ceiling.
+#
+# DO NOT "FIX" THE `dio` YOU WILL SEE WHEN FLASHING. `idf.py flash` prints
+# `--flash-mode dio` and build/flash_args says the same, with this set to QIO.
+# That is correct and deliberate -- IDF's own Kconfig says so:
+#
+#     # Note: we use esptool to flash bootloader in
+#     # dio mode for QIO/QOUT, bootloader then upgrades
+#     # itself to quad mode during initialisation
+#     config ESPTOOLPY_FLASHMODE
+#         default "dio" if ESPTOOLPY_FLASHMODE_QIO
+#
+# The image header has to be readable by the ROM before any of our code runs, so
+# it is stamped DIO; the second-stage bootloader raises the flash to quad during
+# init. CONFIG_ESPTOOLPY_FLASHMODE_QIO in sdkconfig.h is the setting that is
+# actually in force. Reading the flasher output as "it did not apply" and
+# reverting this is the obvious wrong move, which is why this paragraph is here.
+#
+# Flash it with a full `idf.py flash`, not `app-flash`: the bootloader is the
+# part that performs the upgrade, so a stale one leaves the app in DIO.
+#
+# If the board does not come up, the chip is not damaged and the ROM downloader
+# is in silicon: hold BOOT, tap RESET to force download mode, set this back to
+# DIO and reflash.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
 # There is no USB-UART bridge on this board -- the S3's USB peripheral is wired
 # straight to the connector. Without this the console goes nowhere and the board
 # looks dead on arrival.
@@ -15,10 +58,183 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 # is "everything that works, works because something counts it" is a real cost.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
-# esp_wifi_internal_set_fix_rate() returns ESP_ERR_NOT_SUPPORTED while TX AMPDU
-# is enabled, and DANCEFLOOR_WIFI_PHY_RATE_MBPS is still 6. Unchanged from the
-# classic hub, and unchanged for the same reason.
+# The radio settles back where the classic hub has it, and the record of why is
+# worth more than the two lines it takes to say it.
+#
+# THE FAULT. A satellite joining a playing stream measured 1016 sendto()
+# rejections in one 20 s window -- the `tx-fail` figure on the status line --
+# with a previous session in the same log peaking at 1653. The satellite saw
+# the other side as ~85% packet loss, phase reaching +1.25 s, and eighteen
+# re-anchors in three seconds. alloc-fail stayed 0 throughout, so this was never
+# the heap: it is the WiFi driver's transmit path refusing work it has not put
+# on the air yet. The IDF's own help for ESP_WIFI_DYNAMIC_TX_BUFFER_NUM
+# describes it exactly -- "especially UDP applications, the upper layer can
+# deliver frames faster than WiFi layer can transmit".
+#
+# THE WRONG FIX, which was tried and is recorded here because it looked right.
+# Turning aggregation on and unpinning the rate removed the storm completely:
+# tx-fail went to 152 once and then zero across twelve consecutive windows, and
+# the satellite anchored once instead of eighteen times. It also made the
+# STEADY STATE worse by more than an order of magnitude. Satellite gaps per
+# minute, from the logs:
+#
+#   6 Mbps pinned, settled ....... 0.33   (1 gap in 180 s)
+#   adaptation + AMPDU ........... 3.5 to 14
+#
+# The reason is margin. 6 Mbps is the most robust OFDM rate there is; rate
+# adaptation at rssi -24 climbs to the top of the MCS range, where a brief
+# interferer costs frames that 6 Mbps would have survived. A fixed 24 Mbps was
+# tried far earlier in this project and measured 23% loss (see the comment on
+# esp_wifi_internal_set_fix_rate in main/streamer.c), which is the same effect
+# further along.
+#
+# WHAT WAS ACTUALLY WRONG. tx-fail in the 6 Mbps run decayed to 0 and stayed
+# there for the rest of the session. The transmit path was never broken -- it
+# was broken for the first minute of a stream, on the step from idle to ~135
+# datagrams a second, and 10% airtime does not saturate anything. That is a
+# BUFFER COUNT problem, not a rate problem, and it is fixed below where it
+# lives rather than by trading away the robustness that was working.
+#
+# So: aggregation off (esp_wifi_internal_set_fix_rate refuses to run with it
+# on), the rate pinned again, and the burst absorbed by TX buffers instead.
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+
+# 6 Mbps. THE AXIS IS EXHAUSTED -- all four points have now been measured on
+# this hardware, and this is the one that wins. Do not re-open it without a new
+# reason; the pattern below is not subtle.
+#
+#   rate            satellite gaps            note
+#   ----            --------------            ----
+#   6 Mbps          5 in 245 s (1.2/min)      this line
+#   12 Mbps         241 by 125 s (~115/min)   ~50x worse than 6
+#   24 Mbps         23% loss                  measured far earlier in the project
+#   0 (adaptive)    3.5 to 14/min             plus AMPDU, see the block above
+#
+# The 12 Mbps run also ran phase to +221 ms and had the visualiser rendering
+# 1762 frames late in one window. It was tried on a specific and reasonable
+# theory -- that the startup transient is airtime-bound, so halving the air time
+# per frame should shorten it -- and that theory is now dead. Whatever the
+# transient is, it is not something a faster pinned rate improves, and every
+# step away from 6 Mbps costs far more in steady-state margin than it returns.
+#
+# What remains unfixed, and is NOT a rate problem: 64 TX buffers cut the startup
+# transient about fourfold (tx-fail 1016 -> 251, then 78, then zero) but did not
+# end it. A satellite joining during what is left can find 203 CONSECUTIVE
+# packets already past their play_at, exhaust its five-second anchor window, and
+# have to anchor at -64 ms lead -- costing phase +62 ms and seven retunes over
+# ~180 s. The satellite side handles that exactly as designed and can do nothing
+# better, because there is no anchorable packet to be had.
+#
+# The next lever for that is buffers against heap, which on this unit is already
+# at a 34.7 kB minimum with a 31.7 kB largest block. That is a real constraint,
+# not a free knob.
+CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS=6
+
+# 240 MHz, up from the 160 that IDF defaults to and that this build inherited
+# without anyone choosing it.
+#
+# Set alongside the cache line below because they answer the same question, and
+# the question was a good one: why does the S3 hub perform the same as or worse
+# than the classic ESP32 it replaced?
+#
+# The honest accounting, which is worth writing down because the intuition is
+# so strongly the other way. Against the classic part the S3 offers: a higher
+# maximum clock (was not enabled -- this line), 512 kB of SRAM against 320
+# (nothing here asked for it; it went to the heap), PSRAM (deliberately off, and
+# correctly -- see the note at the end of this file), an LX7 with SIMD (ACTIVE,
+# via esp-dsp, and the one advantage this build was already collecting), a USB
+# peripheral (a liability here: SOC_WIFI_PHY_NEEDS_USB_WORKAROUND is set on this
+# part and the console runs on it), and the same class of WiFi radio -- 2.4 GHz
+# only, b/g/n, single spatial stream, MCS7 ceiling. There was never a radio
+# upgrade to collect, which matters because the radio is what looked broken.
+#
+# One usable advantage, already on. Everything else disabled by default, unused,
+# declined on purpose, or nonexistent -- plus one DISADVANTAGE taken by default
+# in the cache. "Same or worse" was the expected result, not an anomaly, and the
+# fix is to enable the things that were never enabled rather than to keep
+# looking for a fault.
+#
+# Costs power and heat, and it moves timing everywhere. Read analysis mean/max
+# on the vis cost line and tx-fail on the status line after changing it.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# 32 KB of instruction cache, and this is the line that should never have needed
+# writing. It is the best current candidate for why an S3 hub struggles at a job
+# the classic hub has done for months.
+#
+# The ESP32-S3 can run 16 or 32 kB of I-cache and IDF defaults to 16. The classic
+# ESP32 HAS NO SUCH SETTING -- components/esp_system/port/soc/esp32/ contains no
+# Kconfig.cache at all, because its cache is fixed. So when this project was
+# retargeted, there was nothing in the classic hub's config to inherit: the
+# symbol appeared for the first time and silently took IDF's default, and this
+# unit has been running half the instruction cache of the one it was copied
+# from, ever since.
+#
+# That is the trap worth remembering, more than the setting. "The configuration
+# started the same as the classic ESP32" is TRUE and is exactly the reason: a
+# symbol that exists only on the new target cannot be inherited from the old
+# one, and no diff of the tracked files will ever show it. It is the same shape
+# as the LED pattern note below, which cost a false sync-fault reading.
+#
+# Why it should matter here specifically: this unit runs the FFT analysis, SBC
+# decode, LED rendering and the WiFi driver, all out of flash through that
+# cache, and a miss stalls the CPU on a SPI fetch. If those stalls land in the
+# transmit path, TX buffers do not drain and sendto() starts refusing -- which
+# is the fault. Corroborating evidence already in the logs: this is an LX7 with
+# SIMD esp-dsp and should beat the classic hub's LX6 at the FFT, yet it reports
+# analysis 3900/21000 us mean/max against an 11.6 ms frame period. A max of
+# nearly two frame periods on the FASTER chip is not compute.
+#
+# Partly offset by flash at 80 MHz here against the classic hub's 40, which
+# makes each miss cheaper. Evidently not enough.
+#
+# Costs 16 kB of heap: the unused half is given to the allocator at 16 kB, and
+# is not at 32. Paid for by the line below.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+
+# Back to the IDF default of 32, from 64, and deliberately.
+#
+# 64 was the right guess when the transient looked like a buffer shortage: it
+# cut tx-fail from 1016 to 251, then 78. But it never ended the transient, and
+# it costs the heap this unit no longer has spare once the cache above takes its
+# 16 kB back -- the minimum was already 34.7 kB with a 31.7 kB largest block.
+#
+# Returning it also makes the cache change a SINGLE-VARIABLE experiment. 32
+# buffers with a 16 kB cache is exactly the configuration that measured tx-fail
+# 1016; if 32 buffers with a 32 kB cache measures near zero, the cache was the
+# cause and the buffer count never was. If the storm comes back, the cache is
+# not the answer and 64 should return.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+
+# The socket's receive queue, in datagrams. IDF defaults to 6 and the boot
+# banner prints it as `udp mbox: 6`.
+#
+# Raised on the satellite first, where the case was obvious: one socket taking
+# ~136 datagrams a second through a six-deep queue is 44 ms of headroom, and
+# whatever lwIP cannot hand over in 44 ms it discards silently.
+#
+# The hub's case is quieter and slower to see, which is why it was nearly left
+# alone. This socket carries only time probes and splice reports -- four probes
+# a second per satellite -- so at one satellite six deep is 1.5 s of slack and
+# nothing could plausibly overflow it.
+#
+# It does not stay that way. The rate scales with the floor: at MAX_CLIENTS = 8
+# it is 32 datagrams a second and under 200 ms of headroom, from eight units
+# free-running on independent 250 ms timers whose probes will sometimes arrive
+# together. probe_task serves this socket at priority 6, below playback and the
+# sync monitor.
+#
+# What makes it worth the bytes rather than merely tidy is the FAILURE MODE. A
+# probe lost in this queue is indistinguishable from a satellite that stopped
+# probing, and CLIENT_TIMEOUT_US is 2 s -- eight probes. Lose enough and the hub
+# forgets a satellite that is sitting right there, drops it from the send list,
+# and stops sending it audio until its next probe gets through. That is a silent
+# speaker, reported as sta-timeout, and no counter anywhere would say the
+# difference.
+#
+# 32 matches the satellite, so there is one number for this on the floor rather
+# than two.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 
 # 50% overlap between analysis windows. The window stays 1024; this is only how
 # far the analysis advances between them.
@@ -142,12 +358,23 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # PSRAM. The board has 8 MB of octal PSRAM and this build leaves it off.
 #
 # It is tempting, because architecture.md S16 ends the burstiness wart at
-# "fixing it properly means a smaller lead or a larger ring", and LEAD + RESYNC
-# is 320 ms against a 372 ms ring. But the S3 already has 512 kB of internal
-# SRAM against the classic part's 320, so a larger ring does not need PSRAM --
-# and PSRAM is the wrong memory for it regardless, since the ring is touched
-# from the playback path and cache misses there are the one thing that loop
-# cannot absorb.
+# "fixing it properly means a smaller lead or a larger ring". But PSRAM is the
+# wrong memory for a ring regardless, since the ring is touched from the
+# playback path and cache misses there are the one thing that loop cannot
+# absorb.
+#
+# And it is the wrong BOARD. The ring that bounds LEAD + RESYNC is the
+# satellite's, and the satellite is a classic ESP32 with no PSRAM at all -- so
+# no amount of memory on this unit buys the lead a single millisecond. That is
+# the whole answer to "the S3 has plenty of PSRAM, can we not have a 500 ms
+# lead": a 500 ms lead needs ~107 kB of satellite ring against a largest free
+# block of 106 kB, and it would fail to allocate on the board that has to hold
+# it.
+#
+# The larger ring the wart actually wanted has since been taken, in the
+# satellite's internal SRAM, where it belongs: 64 -> 80 kB, which moved the
+# bound from 320 ms against 372 to 350 against 464 and let RESYNC_US go from
+# 120 to 150.
 #
 # Enabling it also costs: the octal interface eats GPIO 33-37 (not broken out,
 # so no loss) and adds cache-miss jitter to every task, including the ones being
