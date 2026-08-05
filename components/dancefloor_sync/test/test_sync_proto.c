@@ -201,6 +201,102 @@ int main(void)
         check("sync_to_local inverts the offset", local + TRUE_OFFSET == master_now, NULL);
     }
 
+    /* ------------------------------------------------ the splice phase filter */
+
+    /* 11. Too few readings is not an estimate. The caller splices on nothing
+     *     rather than on one sample taken just after a re-anchor. */
+    {
+        sync_phase_hist_t h; sync_phase_reset(&h);
+        int32_t med;
+        bool early = false;
+        for (int i = 0; i < SYNC_PHASE_MIN; i++) {
+            early = early || sync_phase_median(&h, &med);
+            sync_phase_push(&h, 1000);
+        }
+        check("no median below SYNC_PHASE_MIN", !early, NULL);
+        check("a median appears at SYNC_PHASE_MIN", sync_phase_median(&h, &med), NULL);
+    }
+
+    /* 12. A steady reading must survive the filter unchanged. If the phase
+     *     really is +8 ms the splice must still correct +8 ms. */
+    {
+        sync_phase_hist_t h; sync_phase_reset(&h);
+        for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, 8231);
+        int32_t med = 0; bool ok = sync_phase_median(&h, &med);
+        char d[64]; snprintf(d, sizeof d, "med=%" PRId32, med);
+        check("constant input passes through unchanged", ok && med == 8231, d);
+    }
+
+    /*
+     * 13. The whole reason this exists.
+     *
+     * Eight readings agreeing on +2 ms and one at +50 ms -- the shape the hub
+     * actually produces, where two reads a millisecond apart differed by 15.7 ms.
+     * The mean moves by 5.3 ms and the splice cuts that much real audio for an
+     * error that is not there; the median does not move at all.
+     *
+     * The comparison is computed here rather than asserted in a comment, so the
+     * test is what documents the choice.
+     */
+    {
+        static const int32_t reading[SYNC_PHASE_HIST] =
+            { 2000, 2100, 1900, 2000, 50000, 2050, 1950, 2000, 2100 };
+        sync_phase_hist_t h; sync_phase_reset(&h);
+        int64_t sum = 0;
+        for (int i = 0; i < SYNC_PHASE_HIST; i++) {
+            sync_phase_push(&h, reading[i]);
+            sum += reading[i];
+        }
+        int32_t med = 0;
+        sync_phase_median(&h, &med);
+        const int32_t mean = (int32_t)(sum / SYNC_PHASE_HIST);
+        char d[96];
+        snprintf(d, sizeof d, "med=%" PRId32 ", mean=%" PRId32 " (%+" PRId32 " us of phantom phase)",
+                 med, mean, mean - med);
+        check("one outlier in nine cannot move the median",
+              med == 2000 && mean - med > 5000, d);
+    }
+
+    /*
+     * 14. It must forget. The history spans ~180 ms of playback and a splice or
+     *     a re-anchor resets it, but nothing else bounds how long a unit runs --
+     *     a reading from an earlier position must not still be voting.
+     */
+    {
+        sync_phase_hist_t h; sync_phase_reset(&h);
+        for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, -30000);
+        for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, 4000);
+        int32_t med = 0; sync_phase_median(&h, &med);
+        char d[64]; snprintf(d, sizeof d, "med=%" PRId32, med);
+        check("the ring keeps only the newest window", med == 4000, d);
+    }
+
+    /*
+     * 15. A partly-filled history must not count the slots it has not written.
+     *
+     * Five readings of +9 ms with four zeroed slots left over: a median taken
+     * over all nine slots returns 0 and the boundary passes with no correction
+     * at all. Run this against a version that sorts SYNC_PHASE_HIST instead of
+     * count -- it fails, which is the point of writing it.
+     */
+    {
+        sync_phase_hist_t h; sync_phase_reset(&h);
+        for (int i = 0; i < 5; i++) sync_phase_push(&h, 9000);
+        int32_t med = 0; bool ok = sync_phase_median(&h, &med);
+        char d[72]; snprintf(d, sizeof d, "med=%" PRId32 " (unwritten slots would give 0)", med);
+        check("unwritten slots do not vote", ok && med == 9000, d);
+    }
+
+    /* 16. Reset must actually clear, not just rewind -- a splice calls it and
+     *     the next boundary must not see anything from before the correction. */
+    {
+        sync_phase_hist_t h; sync_phase_reset(&h);
+        for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, 12000);
+        sync_phase_reset(&h);
+        int32_t med;
+        check("reset drops the whole history", !sync_phase_median(&h, &med), NULL);
+    }
+
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");
     return failures != 0;
 }

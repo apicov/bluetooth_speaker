@@ -141,6 +141,17 @@ static phase_pt_t phase_q[PHASE_Q_LEN];
 static volatile uint32_t phase_head, phase_tail;
 static volatile int32_t phase_err_us;         /* + = playing late */
 static volatile bool phase_valid;
+/*
+ * The last few raw readings, for the splice alone. Play task only -- pushed in
+ * the crossing loop, read and reset in the splice, reset at the top of the
+ * outer loop -- so no volatile and no lock, unlike everything around it.
+ *
+ * The servo has smoothed its input since it was measured triggering on noise;
+ * the splice never did, and it is the larger correction of the two. See
+ * sync_phase_hist_t. Nothing acts on this yet: it is measured against the raw
+ * value first, on the same boundaries, and only then does the splice move.
+ */
+static sync_phase_hist_t phase_hist;
 static volatile int32_t restart_pos = -1;     /* ring position of a track boundary */
 /*
  * Set after a splice. The phase genuinely steps at that instant, so the running
@@ -232,6 +243,10 @@ static volatile bool phase_stepped;
  */
 static volatile int32_t splice_report_us;
 static volatile int32_t splice_report_phase;
+/* SHADOW: the correction the median would have produced instead. Acted on by
+ * nothing here; the hub prints it beside the real one so both units' figures
+ * are compared at the same boundary. See splice_msg_t.applied_med_us. */
+static volatile int32_t splice_report_med;
 static volatile bool    splice_report_pending;
 
 /*
@@ -303,6 +318,63 @@ static volatile bool resync_request;
 static volatile bool anchor_provisional;
 static volatile uint32_t n_anchor_late;   /* anchors refused, play_at already past */
 static volatile uint32_t n_anchor_soon;   /* anchors refused, one just happened */
+/*
+ * Phase points dropped because phase_q was full. The only loss path in this
+ * file that had no counter, which is the one thing the rest of this system is
+ * built not to allow: every real fault here was invisible until something
+ * counted it. A full queue means playback is not consuming points as fast as
+ * the receive path records them, and the servo silently stops getting fresh
+ * input while every log line still reads normally.
+ */
+static volatile uint32_t n_phase_drop;
+/*
+ * Ring reads that came back short of a full chunk, and the frames of silence
+ * padded in to cover them.
+ *
+ * Suspected, not established, which is why this is a counter and not a fix. The
+ * pad is played but was never in the ring, while samples_played advances by a
+ * whole chunk regardless -- so if it happens, every later phase point is
+ * displaced by the pad and the servo's only input carries a permanent bias.
+ * That is the exact shape of the "silence inserted for a lost packet was not
+ * counted in samples_in" bug, which put this unit ~20 ms out per loss and
+ * stayed hidden because the marker was derived from the same count.
+ *
+ * The ring's trigger level is one chunk, so a short read means the 500 ms
+ * timeout expired on a partly-filled ring -- a near-underrun. If these stay
+ * zero over a long session the concern is latent and the fix can ride along
+ * with anything; if they do not, n_short_frames IS the bias, in frames.
+ */
+static volatile uint32_t n_short_reads;
+static volatile uint32_t n_short_frames;
+/*
+ * TSF samples whose read pair took longer than TSF_SPAN_MAX_US -- i.e. samples
+ * something preempted between the two counter reads, so the offset they carry
+ * is off by whatever landed in the gap.
+ *
+ * COUNTED, NOT ENFORCED. TSF is the anchor clock source now, and a threshold
+ * chosen blind could silently demote it to the probe estimator, which is worse
+ * -- that is a regression wearing no log line. This says what the reject rate
+ * WOULD be, so the threshold can be chosen from the distribution instead.
+ */
+#define TSF_SPAN_MAX_US 100
+static volatile uint32_t n_tsf_wide;
+/*
+ * When this unit went off the air, and when it came back.
+ *
+ * The suspicion being measured: nothing invalidates the probe estimator's
+ * window on a disconnect. sync_est_offset() selects the lowest-RTT sample in a
+ * 10-sample window and neither it nor sync_est_settled() decays with time, so
+ * after an outage of any length the unit may anchor on an offset measured
+ * before the drop -- and an offset error at the anchor is baked in for the life
+ * of the stream, since play_at is consulted once. The first anchor after a
+ * rejoin therefore says which clock it used and how stale the estimator's
+ * newest sample was. If it reads "TSF" the concern does not arise, because TSF
+ * is re-derived from a fresh beacon; if it reads "probe" with an age spanning
+ * the outage, it does.
+ */
+static volatile int64_t wifi_down_at;
+static volatile int64_t rejoined_at;      /* 0 = the next anchor is not the first */
+static volatile int64_t est_newest_at;    /* when the newest probe landed */
 static volatile uint32_t n_frames_rx;     /* analysis frames taken from the hub */
 static volatile uint32_t n_frames_bad;    /* ... and rejected, wrong size */
 static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
@@ -361,6 +433,10 @@ static IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *fu
 #define REFILL_FAST_US 1000     /* below this, the write did not block */
 static bool    s_refill_active;
 static int32_t s_refill_frames;
+/* Which emptying this refill follows. A start and a retune drain the DMA for
+ * different reasons and the startup one happens on every unit at once, so a
+ * line that cannot tell them apart cannot answer the question either. */
+static const char *s_refill_why = "start";
 
 /* ------------------------------------------------------------------- wifi */
 
@@ -376,12 +452,32 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = data;
         n_wifi_drops++;
+        /* Only the first drop of a streak dates the outage: repeated
+         * association failures raise this repeatedly, and taking the latest
+         * would measure the last retry rather than how long the unit was off
+         * the air, which is the number that matters to playback. */
+        if (wifi_down_at == 0) {
+            wifi_down_at = esp_timer_get_time();
+        }
         ESP_LOGW(TAG, "disconnected from \"%s\" (reason %d), retrying",
                  AP_SSID, d->reason);
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *e = data;
+        if (wifi_down_at) {
+            /*
+             * How long this unit was actually off the air. Playback survives
+             * roughly the ring's worth of it and then underruns, so this is the
+             * number that says whether a drop cost a glitch or a re-anchor --
+             * and it is the baseline any change to the reconnect path has to
+             * beat. rejoined_at arms the report on the next anchor.
+             */
+            ESP_LOGW(TAG, "rejoined \"%s\" after %lld ms",
+                     AP_SSID, (esp_timer_get_time() - wifi_down_at) / 1000);
+            wifi_down_at = 0;
+            rejoined_at = esp_timer_get_time();
+        }
         ESP_LOGI(TAG, "joined \"%s\", IP " IPSTR, AP_SSID, IP2STR(&e->ip_info.ip));
     }
 }
@@ -533,8 +629,10 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
             s_refill_frames += (int32_t)(written / (AUDIO_CHANNELS * sizeof(int16_t)));
         } else {
             s_refill_active = false;
-            ESP_LOGW(TAG, "REFILL: %ld frames (%ld ms) before a write blocked",
-                     (long)s_refill_frames,
+            ESP_LOGW(TAG, "REFILL after %s: %ld frames (%ld ms) before a write "
+                          "blocked -- phase readings inside this window are not "
+                          "DAC-paced",
+                     s_refill_why, (long)s_refill_frames,
                      (long)(s_refill_frames * 1000 / (int32_t)stream_rate));
         }
     }
@@ -603,6 +701,7 @@ static void probe_task(void *arg)
                 .type = MSG_SPLICE,
                 .applied_us = splice_report_us,
                 .phase_us = splice_report_phase,
+                .applied_med_us = splice_report_med,
             };
             sendto(sock, &s, sizeof(s), 0, (struct sockaddr *)&dest, sizeof(dest));
         }
@@ -788,6 +887,21 @@ static void handle_audio(const audio_msg_t *msg)
                  msg->play_at, stream_start_local,
                  (stream_start_local - esp_timer_get_time()) / 1000,
                  by_tsf ? "TSF" : "probe estimator");
+        /*
+         * The first anchor after a rejoin, which is the one that can be built on
+         * a clock estimate measured before the outage -- see wifi_down_at. The
+         * age is of the NEWEST sample in the estimator's window; if it exceeds
+         * the outage then every sample min-RTT selection can choose from
+         * predates the drop, and this anchor is as stale as it looks.
+         */
+        if (rejoined_at) {
+            const int64_t age = est_newest_at ? (now_local - est_newest_at) / 1000 : -1;
+            ESP_LOGW(TAG, "first anchor after a rejoin: %s, %lld ms since the "
+                          "rejoin, newest probe %lld ms old",
+                     by_tsf ? "TSF" : "PROBE ESTIMATOR",
+                     (now_local - rejoined_at) / 1000, age);
+            rejoined_at = 0;
+        }
     }
 
     /*
@@ -943,6 +1057,8 @@ static void handle_audio(const audio_msg_t *msg)
         phase_q[phase_head].pos = samples_in;
         phase_q[phase_head].play_at = msg->play_at;
         phase_head = next;
+    } else {
+        n_phase_drop++;      /* see the counter: this used to be silent */
     }
 
     /* Decode here rather than at the hub: that is the entire point of sending
@@ -1009,6 +1125,9 @@ static void rx_task(void *arg)
             time_msg_t msg;
             memcpy(&msg, buf, sizeof(msg));
             sync_est_add(&est, msg.t1, msg.t2, msg.t3, t4);
+            /* The window carries no timestamps of its own, and the whole
+             * question about a rejoin is how old the newest sample in it is. */
+            est_newest_at = t4;
         } else if (buf[0] == MSG_META && n >= (int)sizeof(meta_msg_t)) {
             const link_meta_t *m = (const link_meta_t *)((const meta_msg_t *)buf)->payload;
             ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
@@ -1049,9 +1168,11 @@ static void rx_task(void *arg)
 #endif
         } else if (buf[0] == MSG_TSF && n >= (int)sizeof(tsf_msg_t)) {
             /*
-             * Measurement only. Nothing below feeds anchoring, stream_offset,
-             * track_offset() or any splice -- the probe estimator still drives
-             * all of it. If TSF turns out to be garbage, audio is unaffected.
+             * This is the CLOCK SOURCE, not a measurement. It was one, and this
+             * comment still said so long after clock_offset() started
+             * preferring it for anchoring and for track_offset() -- the
+             * declaration comment on tsf_offset_us is the accurate one. Read
+             * everything below as feeding playback directly, because it does.
              *
              * The comparison: both units relate their own TSF to their own
              * esp_timer, and because both TSFs track the same AP counter the
@@ -1109,6 +1230,13 @@ static void rx_task(void *arg)
             }
 
             const int64_t tsf_offset = (m.local - m.tsf) - (my_local - my_tsf);
+
+            /* Counted, not enforced -- see n_tsf_wide. This sample is published
+             * below exactly as it was before; the counter only says how many
+             * would be refused if the span were acted on. */
+            if (span > TSF_SPAN_MAX_US) {
+                n_tsf_wide++;
+            }
 
             /* Published for anchoring and for the slew. This is the promotion
              * from measurement to source; everything else about the comparison
@@ -1196,6 +1324,24 @@ static volatile bool    retune_watch;      /* playback reports the next reading 
 static volatile int64_t retune_outage_us;
 
 /*
+ * When the retune finished, and how many crossings have been narrated since.
+ *
+ * MEASUREMENT ONLY -- the servo still withholds exactly one reading, so this
+ * build behaves identically to the last and merely says more.
+ *
+ * The bench numbers behind the one-shot withholding were taken here: 19
+ * same-rate retunes, net +4.4 ms against a 3.6 ms outage, every one positive,
+ * the crossing landing 1-22 ms after the retune and inside the refill every
+ * time. Crossings arrive one per packet, ~20 ms apart, so one withheld reading
+ * covers perhaps the first of a disturbance that reaches 22 ms -- and whatever
+ * is left goes to the servo as position error, so each retune injects what the
+ * next one corrects. These lines say how far the tail actually reaches, which
+ * is what sizes a settle window instead of guessing one.
+ */
+static volatile int64_t retune_done_at;
+static volatile uint8_t retune_tail_left;
+
+/*
  * Held across a retune, and the playback task parks on it.
  *
  * i2s_channel_write() returns IMMEDIATELY once the channel is disabled -- it
@@ -1272,6 +1418,10 @@ static void retune_output(uint32_t hz)
      * ticks with several ms of wander in each. */
     retune_phase_before = phase_err_us;
     retune_watch = true;
+    /* Ordered after the two above: the play task reads them together and this
+     * is what arms the narration. See retune_done_at. */
+    retune_tail_left = 3;
+    retune_done_at = esp_timer_get_time();
 
     /*
      * Nothing to tell the visualiser. It counts what ARRIVES now, and a retune
@@ -1402,7 +1552,10 @@ static void drift_task(void *arg)
                           " short, %" PRIu32 " too big) ring-full %" PRIu32 " upgrades %" PRIu32 " anchors-refused %" PRIu32
                           " | wifi-drops %" PRIu32
                           " | alloc-fail %" PRIu32
-                          " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
+                          " | clock %s (tsf %" PRIu32 "/probe %" PRIu32
+                          ", wide-span %" PRIu32 ")"
+                          " | phase-drop %" PRIu32 " short-reads %" PRIu32
+                          " (%" PRIu32 " frames)"
                      " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
@@ -1414,7 +1567,8 @@ static void drift_task(void *arg)
                      n_anchor_late + n_anchor_soon, n_wifi_drops, n_alloc_fail,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",
-                     n_tsf_used, n_tsf_fallback,
+                     n_tsf_used, n_tsf_fallback, n_tsf_wide,
+                     n_phase_drop, n_short_reads, n_short_frames,
                      visualiser_source_name(), visualiser_hop(),
                      n_frames_rx, n_frames_bad);
         }
@@ -1662,6 +1816,37 @@ static void play_task(void *arg)
          * and zeroing it shifts every marker by the buffer depth.
          */
         int32_t samples_played = 0;
+        /* Every reading in it was measured against the stream this anchor
+         * replaces, so none of them describes where this unit now is. */
+        sync_phase_reset(&phase_hist);
+        /*
+         * Measure the DMA prefill at every playback START, not only after a
+         * retune. The channel has been draining while this task was parked, so
+         * it is empty here for exactly the same reason it is empty after a
+         * disable -- and i2s_channel_write() does not block until the
+         * descriptors are full, so the first writes return at memory speed and
+         * samples_played advances by the whole DMA depth against a wrote_at
+         * that has barely moved. Every phase reading dated from that window is
+         * measured against a reference the DAC is not pacing.
+         *
+         * This is the same mechanism the `retuning` park exists to prevent, and
+         * clock-sync.md records it costing +42, +43 and +50 ms there before the
+         * park existed. Nothing guards it here.
+         *
+         * It is very likely the "-42 ms (hub), -26 ms (satellite)" startup phase
+         * in clock-sync.md §8 -- a 16 ms difference between two units that then
+         * takes ~45 s to walk off, on a cold start, on both units at once. On a
+         * reconnect only this unit restarts, against a hub already servoed to
+         * zero, which is a different and much easier situation.
+         *
+         * MEASUREMENT ONLY: the REFILL line reports, nothing withholds. Whether
+         * to withhold is the next question and this is what sizes it.
+         */
+#if !CONFIG_DANCEFLOOR_USE_INTERNAL_DAC
+        s_refill_active = true;
+        s_refill_frames = 0;
+        s_refill_why = "start";
+#endif
         /* When the DAC last accepted a chunk -- what the phase reading is dated
          * against. See the hub's copy for why it is not a clock read taken in
          * the phase loop. Seeded so the first pass has a sane value. */
@@ -1695,10 +1880,11 @@ static void play_task(void *arg)
                 phase_stepped = true;
                 break;
             }
-            if (was_retuning) {         /* TEMPORARY: see REFILL_FAST_US */
+            if (was_retuning) {         /* see REFILL_FAST_US */
                 was_retuning = false;
                 s_refill_active = true;
                 s_refill_frames = 0;
+                s_refill_why = "retune";
             }
             hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
             size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -1710,6 +1896,9 @@ static void play_task(void *arg)
             }
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
+                n_short_reads++;
+                n_short_frames += (uint32_t)((sizeof(chunk) - got)
+                                             / (AUDIO_CHANNELS * sizeof(int16_t)));
             }
             /* Before measuring anything against the master clock, make sure the
              * conversion still describes it. */
@@ -1742,8 +1931,12 @@ static void play_task(void *arg)
                  * read here -- the write is the only DAC-paced event in this
                  * loop, and everything between it and this line is unpaced.
                  * See the hub's copy, which is where that mattered. */
-                int64_t now_master = wrote_at + stream_offset
+                /* The crossing instant on THIS unit's clock. now_master is the
+                 * same instant converted; the local form is what dates the
+                 * crossing against a retune, which is a local event. */
+                int64_t crossed_at = wrote_at
                                    - (int64_t)overshoot * 1000000 / stream_rate;
+                int64_t now_master = crossed_at + stream_offset;
                 int64_t err = now_master - due;
                 /*
                  * Seconds of error is not drift and not jitter. It means the
@@ -1769,15 +1962,31 @@ static void play_task(void *arg)
                  * then thrown away rather than handed to the servo. See the
                  * hub's copy for what the outage figure actually covers and
                  * for the bench numbers that came off this unit. */
+                const int64_t since_retune = retune_done_at
+                                           ? crossed_at - retune_done_at : -1;
                 if (retune_watch) {
                     retune_watch = false;
                     ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+lld us (net %+lld), "
-                                  "channel was down %lld us -- withheld from the servo",
+                                  "channel was down %lld us -- withheld from the "
+                                  "servo, crossed %lld us after the retune",
                              (long)retune_phase_before, err, err - retune_phase_before,
-                             retune_outage_us);
+                             retune_outage_us, since_retune);
                 } else {
+                    /*
+                     * Narrated but NOT withheld -- these reach the servo exactly
+                     * as they did before, so behaviour is unchanged and only the
+                     * log says more. Whether they SHOULD be withheld is the
+                     * question these lines exist to answer.
+                     */
+                    if (retune_tail_left) {
+                        retune_tail_left--;
+                        ESP_LOGW(TAG, "RETUNE TAIL: phase %+lld us at %lld us after "
+                                      "the retune (net %+lld from before it)",
+                                 err, since_retune, err - retune_phase_before);
+                    }
                     phase_err_us = (int32_t)err;
                     phase_valid = true;
+                    sync_phase_push(&phase_hist, (int32_t)err);
                 }
                 phase_tail = (phase_tail + 1) % PHASE_Q_LEN;
             }
@@ -1810,6 +2019,23 @@ static void play_task(void *arg)
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
                 int32_t applied = 0;      /* what the splice actually moved */
+
+                /*
+                 * SHADOW: the correction the median of the last few readings
+                 * would have asked for, clamped identically so it subtracts
+                 * meaningfully against the hub's. Reported to the hub, acted on
+                 * by nothing -- the splice above still runs on phase_err_us.
+                 * Same computation as the hub's copy, deliberately.
+                 */
+                int32_t med_us = 0;
+                if (phase_valid && sync_phase_median(&phase_hist, &med_us)) {
+                    int32_t med_adj = (int32_t)((int64_t)med_us * stream_rate / 1000000);
+                    if (med_adj > max_frames)  med_adj = max_frames;
+                    if (med_adj < -max_frames) med_adj = -max_frames;
+                    splice_report_med = (int32_t)((int64_t)med_adj * 1000000 / stream_rate);
+                } else {
+                    splice_report_med = 0;
+                }
 
                 if (adj > 0) {
                     /* Late: discard input so playback jumps forward in content.
@@ -1859,6 +2085,9 @@ static void play_task(void *arg)
                  */
                 if (applied != 0) {
                     n_splices++;
+                    /* Same reason phase_stepped is set above: every reading in
+                     * the history was taken before this unit moved. */
+                    sync_phase_reset(&phase_hist);
                 }
                 splice_report_us = (int32_t)((int64_t)applied * 1000000 / stream_rate);
                 splice_report_phase = phase_valid ? phase_err_us : 0;

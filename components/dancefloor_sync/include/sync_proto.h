@@ -114,6 +114,20 @@ typedef struct __attribute__((packed)) {
     uint8_t type;         /* MSG_SPLICE */
     int32_t applied_us;   /* + = skipped content (was late), - = inserted silence */
     int32_t phase_us;     /* the phase error it was correcting */
+    /*
+     * The correction this unit WOULD have applied had the splice run on
+     * sync_phase_median() instead of on the newest reading. Same units and same
+     * clamp as applied_us, so the two subtract meaningfully -- that is the whole
+     * reason it is the correction rather than the median phase itself.
+     *
+     * Carried so the hub can print the counterfactual divergence beside the real
+     * one on a single line, both measured at the same boundary. Comparing two
+     * builds' log windows instead is what produced three wrong diagnoses here.
+     *
+     * Reported, not acted on: the splice still ran on phase_us. Once the shadow
+     * has said which number is better on hardware, the splice moves to it.
+     */
+    int32_t applied_med_us;
 } splice_msg_t;
 
 /*
@@ -316,3 +330,57 @@ static inline int64_t sync_to_local(int64_t master_us, int64_t offset)
 {
     return master_us - offset;
 }
+
+/*
+ * A short history of raw phase readings, for the track-boundary splice.
+ *
+ * The servo has smoothed its input since it was measured triggering on noise;
+ * the splice never did. It snaps this unit's position using the single most
+ * recent reading, and on the hub that reading is not trustworthy on its own:
+ * two reads of it a millisecond apart differed by 15.7 ms, and
+ * docs/architecture.md §16 lists "the hub's absolute phase reading wanders" as
+ * a wart with the cause unfound. So at every boundary the hub jumps to a
+ * position several milliseconds wrong in a direction nothing predicts, while
+ * the satellite -- quieter by a factor of three, its load being a fraction of
+ * the hub's -- lands closer. The two splice to different places, which is why a
+ * track change sometimes improves cross-unit sync and sometimes degrades it.
+ *
+ * The EMA the servo uses cannot serve here: it is updated once per 5 s window,
+ * so at a boundary it is up to 20 s stale. This is a separate, short filter
+ * over the raw readings themselves.
+ *
+ * MEDIAN, not mean. What is left after the overshoot and wrote_at corrections
+ * (see either unit's crossing loop) is preemption latency on a board also
+ * running a SoftAP, SBC decode and the bridge UART: bounded below, long-tailed
+ * to the right. There is a minimum latency and no mechanism that makes a
+ * reading early. The mean is dragged by that tail; the median sits on the mode.
+ * If the noise is symmetric after all, the median merely costs ~1.25x in
+ * standard error at this window length, which is nothing against a 15.7 ms
+ * swing -- so it is the right answer under both models and the mean under only
+ * one. It is the same shape as the offset estimator's minimum-RTT selection,
+ * which beat a median 117 us to 1080 us on hardware for the same reason.
+ */
+#define SYNC_PHASE_HIST 9   /* odd, so the median is an element and not an average */
+#define SYNC_PHASE_MIN  5   /* below this no median is offered */
+
+typedef struct {
+    int32_t v[SYNC_PHASE_HIST];
+    uint8_t next;
+    uint8_t count;
+} sync_phase_hist_t;
+
+void sync_phase_reset(sync_phase_hist_t *h);
+
+/* One accepted phase reading, in microseconds, + = playing late. */
+void sync_phase_push(sync_phase_hist_t *h, int32_t us);
+
+/*
+ * The median of what is held. False below SYNC_PHASE_MIN readings, which is the
+ * guard against splicing on one or two samples taken just after a re-anchor.
+ *
+ * Nine readings arrive in about 180 ms at ~50 packets/s. Over that span drift
+ * contributes 5 us, the hub's timeline slew 0.4 ms and the satellite's offset
+ * slew 78 us -- all far below the millisecond scatter being removed, and all
+ * common-mode across units, so nothing here separates them.
+ */
+bool sync_phase_median(const sync_phase_hist_t *h, int32_t *out);

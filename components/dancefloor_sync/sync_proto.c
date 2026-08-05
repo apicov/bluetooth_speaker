@@ -73,3 +73,53 @@ bool sync_est_offset(const sync_est_t *e, int64_t *offset_out)
     *offset_out = e->offset[best];
     return true;
 }
+
+void sync_phase_reset(sync_phase_hist_t *h)
+{
+    memset(h, 0, sizeof(*h));
+}
+
+void sync_phase_push(sync_phase_hist_t *h, int32_t us)
+{
+    h->v[h->next] = us;
+    h->next = (uint8_t)((h->next + 1) % SYNC_PHASE_HIST);
+    if (h->count < SYNC_PHASE_HIST) {
+        h->count++;
+    }
+}
+
+bool sync_phase_median(const sync_phase_hist_t *h, int32_t *out)
+{
+    if (h->count < SYNC_PHASE_MIN) {
+        return false;
+    }
+
+    /*
+     * Insertion sort of at most nine elements, on a copy. Called once per track
+     * boundary from the playback task, so the cost is irrelevant and the
+     * simplicity is not -- this runs on both units and must be obviously the
+     * same computation on each.
+     *
+     * Only the first `count` slots are read. The rest are zero from the reset
+     * and would otherwise vote as perfect readings while the history fills.
+     */
+    int32_t s[SYNC_PHASE_HIST];
+    for (int i = 0; i < h->count; i++) {
+        int32_t v = h->v[i];
+        int j = i - 1;
+        while (j >= 0 && s[j] > v) {
+            s[j + 1] = s[j];
+            j--;
+        }
+        s[j + 1] = v;
+    }
+
+    /*
+     * With an even count -- only possible before the history has filled -- this
+     * takes the upper of the two middle elements rather than averaging them.
+     * Averaging would reintroduce exactly the sensitivity to a single reading
+     * that this function exists to remove.
+     */
+    *out = s[h->count / 2];
+    return true;
+}

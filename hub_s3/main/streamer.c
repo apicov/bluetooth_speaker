@@ -172,7 +172,7 @@
 
 /* Local playback ring. The master delays its own audio by LEAD_US exactly like a
  * satellite, otherwise it would play ahead of every other speaker. Must hold the
- * lead (~21 kB) with headroom; 32 kB is 181 ms. */
+ * lead (~21 kB) with headroom; 64 kB is 371 ms at 44.1 kHz stereo. */
 #define LOCAL_RING_BYTES (64 * 1024)
 
 static const char *TAG = "stream";
@@ -221,6 +221,13 @@ static phase_pt_t s_phase_q[PHASE_Q_LEN];
 static volatile uint32_t s_phase_head, s_phase_tail;
 static volatile int32_t s_phase_err_us;   /* + = playing late */
 static volatile bool s_phase_valid;
+/*
+ * The last few raw readings, for the splice. Play task only -- pushed in the
+ * crossing loop, read and reset in the splice, reset at the top of the outer
+ * loop -- so no volatile and no lock. See sync_phase_hist_t for why the splice
+ * needs its own filter and cannot borrow the servo's.
+ */
+static sync_phase_hist_t s_phase_hist;
 /* Set when a splice steps the phase, so the shadow average in ring_monitor_task
  * forgets a history that describes the situation before it -- the satellite has
  * done this since "Forget the phase average after a splice". */
@@ -360,6 +367,54 @@ static volatile uint32_t heap_min_window = UINT32_MAX;
 static volatile uint32_t n_alloc_fail;
 static volatile uint32_t alloc_fail_size;   /* the largest request that failed */
 static volatile uint32_t alloc_fail_caps;
+
+/*
+ * Phase points dropped because s_phase_q was full -- the only loss path in this
+ * file with no counter. It is worth one, because a wedged phase queue is not a
+ * degradation here but a stop: the ring servo runs on nothing but points coming
+ * off this queue, and it has already been wedged once for a whole session by a
+ * stale entry queued across a timeline restart. Every log line read normally
+ * throughout.
+ */
+static volatile uint32_t n_phase_drop;
+
+/*
+ * Ring reads that came back short of a chunk, and the frames of silence padded
+ * in to cover them. Suspected, not established -- see the satellite's copy for
+ * the full argument. The pad is played but was never in the ring, while
+ * samples_played advances by a whole chunk regardless, so if this fires at all
+ * it is a permanent displacement of every later phase point.
+ */
+static volatile uint32_t n_short_reads;
+static volatile uint32_t n_short_frames;
+
+/*
+ * How much audio goes into the DMA before a write first blocks.
+ *
+ * The satellite has had this since a retune was found to be costing tens of
+ * milliseconds; the hub never did, and the hub is the unit with the larger
+ * startup offset. i2s_channel_write() does not block while descriptors are
+ * free, so on an empty channel the first writes return at memory speed:
+ * samples_played advances by the whole DMA depth (6 x AUDIO_FRAMES = 34.8 ms
+ * at 44.1 kHz) against a wrote_at that has barely moved, and every phase
+ * reading dated inside that window is measured against a reference the DAC is
+ * not pacing.
+ *
+ * The channel is empty at every playback START as well as after a retune -- the
+ * play task was parked, so it drained. Nothing guards it there on either unit.
+ * This is very likely the "-42 ms (hub), -26 ms (satellite)" startup phase in
+ * clock-sync.md §8: a 16 ms difference between two units, on a cold start, on
+ * both at once, taking ~45 s to walk off. On a reconnect only the satellite
+ * restarts, against a hub already servoed to zero, which is why that case
+ * behaves so much better.
+ *
+ * MEASUREMENT ONLY. Nothing is withheld and nothing is corrected; this says how
+ * big the window is so a guard can be sized rather than guessed.
+ */
+#define REFILL_FAST_US 1000     /* below this, the write did not block */
+static bool s_refill_active;
+static int32_t s_refill_frames;
+static const char *s_refill_why = "start";
 
 /*
  * Satellites are sent audio by UNICAST, not multicast.
@@ -941,8 +996,12 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
      *
      * A timeline restart after a local underrun: the satellites did NOT restart
      * with us. They are still playing against the old timeline, and the stamps
-     * they are about to receive step by up to RESYNC_US -- inside the 150 ms a
-     * splice can absorb, which is why telling them is worth doing at all. We
+     * they are about to receive step by however far the timeline moved, which is
+     * why telling them is worth doing at all. That step is NOT bounded by what a
+     * splice can absorb -- this comment used to claim it was capped at RESYNC_US
+     * and inside MAX_SPLICE_MS, which stopped being true when RESYNC_US became
+     * 150000, exactly the ceiling. A satellite absorbs what it can and servos off
+     * the rest. We
      * must not splice: our phase was just re-anchored to zero by construction,
      * while s_phase_err_us still holds whatever it read before the underrun.
      * Acting on that would cut up to MAX_SPLICE_MS out of the first audio of
@@ -992,6 +1051,11 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
         s_phase_q[s_phase_head].pos = s_pending_pos;
         s_phase_q[s_phase_head].play_at = next_play_at;
         s_phase_head = nq;
+    } else if (!started) {
+        /* Full. Deliberately not counted at a timeline start, where skipping is
+         * correct and routine; here it means playback is not draining the queue
+         * and the servo is about to stop getting input. */
+        n_phase_drop++;
     }
     /*
      * The same pair, kept for the analysis, which is fed on arrival and so runs
@@ -1293,6 +1357,19 @@ static volatile int32_t s_hub_splice_us;
 static volatile int64_t s_hub_splice_at;  /* 0 = no boundary yet */
 
 /*
+ * SHADOW, acted on by nothing: what this unit's boundary correction would have
+ * been had the splice used sync_phase_median() instead of the single most
+ * recent phase reading. See sync_phase_hist_t.
+ *
+ * Reported beside the real figure on the same line so the two can be compared
+ * at the same boundary, which is the only place they are comparable. Judging
+ * the filter by flashing it and reading a log window is exactly the mistake
+ * that produced three wrong diagnoses here; this makes the comparison
+ * simultaneous instead.
+ */
+static volatile int32_t s_hub_splice_med_us;
+
+/*
  * These four sit OUTSIDE the marker guard although only the marker writes
  * s_sync_*, because the splice path and probe_task read all four
  * unconditionally -- a satellite reporting its own splice over WiFi is compared
@@ -1449,6 +1526,30 @@ static volatile int32_t s_retune_phase_before;
 static volatile bool    s_retune_watch;
 static volatile int64_t s_retune_outage_us;
 
+/*
+ * When the retune finished, and how many crossings have been narrated since.
+ *
+ * MEASUREMENT ONLY. The servo still withholds exactly one reading, as before;
+ * these only add ages to the lines it already prints and narrate the three
+ * crossings after it without withholding them.
+ *
+ * The question they answer is whether withholding one crossing is enough.
+ * Crossings arrive one per audio packet, ~20 ms apart, and the note in the
+ * crossing loop records the transient landing 1-22 ms after the retune with the
+ * buffer refilling "over the following few writes" -- so a one-shot flag may be
+ * covering the first third of a disturbance and handing the rest to the servo
+ * as position error. Every retune then injects what the next one corrects,
+ * which is the loop that pinned the trim at RATE_TRIM_MAX_HZ and ran phase to
+ * +500 ms before the `retuning` park existed.
+ *
+ * That comment says "if the transient turns out to outlast it, the REFILL line
+ * says so". It does not, for the hub -- REFILL is a satellite instrument. This
+ * is the hub's version, and it sizes RETUNE_SETTLE_US directly instead of by
+ * inference.
+ */
+static volatile int64_t s_retune_done_at;
+static volatile uint8_t s_retune_tail_left;
+
 static void retune_dac(uint32_t hz)
 {
     /*
@@ -1496,6 +1597,10 @@ static void retune_dac(uint32_t hz)
 
     s_retune_phase_before = s_phase_err_us;
     s_retune_watch = true;
+    /* Ordered after the two above: the play task reads them together and this
+     * is what arms the narration. */
+    s_retune_tail_left = 3;
+    s_retune_done_at = esp_timer_get_time();
 
     /*
      * Nothing to tell the visualiser: it counts what ARRIVES, and a retune
@@ -1540,6 +1645,15 @@ static void local_play_task(void *arg)
          * counters therefore share an origin -- do NOT reset s_samples_in here,
          * it has legitimately been counting the audio buffered during the wait. */
         int32_t samples_played = 0;
+        bool was_retuning = false;    /* armed by the park below, see s_refill_active */
+        /* Every reading in it was measured against the timeline this start
+         * replaces, so none of them describes where this unit now is. */
+        sync_phase_reset(&s_phase_hist);
+        /* The channel drained while this task was parked, so it is empty here
+         * for the same reason it is empty after a disable. See s_refill_active. */
+        s_refill_active = true;
+        s_refill_frames = 0;
+        s_refill_why = "start";
         /*
          * When the DAC last accepted a chunk -- the reference the phase reading
          * is dated against. See the note in the phase loop for why it is not a
@@ -1552,8 +1666,15 @@ static void local_play_task(void *arg)
             if (retuning) {
                 /* Do not pull from the ring while the channel is down -- writes
                  * would return instantly and drain it. */
+                was_retuning = true;
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
+            }
+            if (was_retuning) {
+                was_retuning = false;
+                s_refill_active = true;
+                s_refill_frames = 0;
+                s_refill_why = "retune";
             }
             hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
             size_t got = xStreamBufferReceive(local_ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -1566,6 +1687,9 @@ static void local_play_task(void *arg)
             }
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
+                n_short_reads++;
+                n_short_frames += (uint32_t)((sizeof(chunk) - got)
+                                             / (AUDIO_CHANNELS * sizeof(int16_t)));
             }
             /* Local time IS master time here, so this is a direct read of how
              * far playback has slipped from the published timeline. */
@@ -1655,16 +1779,33 @@ static void local_play_task(void *arg)
                  * out to outlast it, the REFILL line says so -- a reading taken
                  * before the refill completes is the one to distrust.
                  */
+                const int64_t since_retune = s_retune_done_at
+                                           ? crossed_at - s_retune_done_at : -1;
                 if (s_retune_watch) {
                     s_retune_watch = false;
                     ESP_LOGW(TAG, "RETUNE COST: phase %+ld -> %+ld us (net %+ld), "
-                                  "channel was down %lld us -- withheld from the servo",
+                                  "channel was down %lld us -- withheld from the "
+                                  "servo, crossed %lld us after the retune",
                              (long)s_retune_phase_before, (long)err,
                              (long)(err - s_retune_phase_before),
-                             s_retune_outage_us);
+                             s_retune_outage_us, since_retune);
                 } else {
+                    /*
+                     * Narrated but NOT withheld -- these still reach the servo
+                     * exactly as they did before, so this build behaves
+                     * identically and only says more. Whether they should be
+                     * withheld is the question; answering it first is the point.
+                     */
+                    if (s_retune_tail_left) {
+                        s_retune_tail_left--;
+                        ESP_LOGW(TAG, "RETUNE TAIL: phase %+ld us at %lld us after "
+                                      "the retune (net %+ld from before it)",
+                                 (long)err, since_retune,
+                                 (long)(err - s_retune_phase_before));
+                    }
                     s_phase_err_us = err;
                     s_phase_valid = true;
+                    sync_phase_push(&s_phase_hist, err);
                 }
                 s_phase_tail = (s_phase_tail + 1) % PHASE_Q_LEN;
             }
@@ -1687,6 +1828,25 @@ static void local_play_task(void *arg)
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
                 int32_t applied = 0;      /* what the splice actually moved */
+
+                /*
+                 * SHADOW: what the correction would have been on the median of
+                 * the last few readings instead of the newest one. Computed
+                 * here, beside the real decision and from the same history, so
+                 * the two are answers to the same question at the same instant.
+                 * Nothing below reads it -- the splice above still runs on
+                 * s_phase_err_us. If the shadow says the median is the better
+                 * number, this is the line that moves.
+                 */
+                int32_t med_us = 0;
+                if (s_phase_valid && sync_phase_median(&s_phase_hist, &med_us)) {
+                    int32_t med_adj = (int32_t)((int64_t)med_us * sample_rate / 1000000);
+                    if (med_adj > max_frames)  med_adj = max_frames;
+                    if (med_adj < -max_frames) med_adj = -max_frames;
+                    s_hub_splice_med_us = (int32_t)((int64_t)med_adj * 1000000 / sample_rate);
+                } else {
+                    s_hub_splice_med_us = 0;
+                }
 
                 if (adj > 0) {
                     /* Its own buffer, not chunk: chunk holds the audio read at
@@ -1725,6 +1885,9 @@ static void local_play_task(void *arg)
                 if (adj != 0) {
                     n_splices++;
                     s_phase_stepped = true;   /* the average before it is stale */
+                    /* And so is the splice's own history, for the same reason:
+                     * every reading in it was taken before this unit moved. */
+                    sync_phase_reset(&s_phase_hist);
                 }
 
                 /*
@@ -1745,19 +1908,23 @@ static void local_play_task(void *arg)
                 if (s_sync_at) {
                     ESP_LOGW(TAG, "TRACK DIVERGENCE: satellite %+lld us "
                                   "(marker, %lld ms before this boundary) | "
-                                  "hub spliced %+ld ms | hub phase %+ld us",
+                                  "hub spliced %+ld ms | hub phase %+ld us "
+                                  "(median %+ld us, would have spliced %+ld ms)",
                              s_sync_err_us,
                              (s_hub_splice_at - s_sync_at) / 1000,
                              (long)(s_hub_splice_us / 1000),
-                             (long)s_phase_err_us);
+                             (long)s_phase_err_us,
+                             (long)med_us, (long)(s_hub_splice_med_us / 1000));
                 } else {
                     /* No marker wire -- the normal deployed case, since it is a
                      * bench instrument. Satellites report over WiFi instead, and
                      * their line arrives within PROBE_PERIOD_MS of this one. */
                     ESP_LOGW(TAG, "TRACK BOUNDARY: hub spliced %+ld ms | "
-                                  "hub phase %+ld us | no marker fitted",
+                                  "hub phase %+ld us (median %+ld us, would have "
+                                  "spliced %+ld ms) | no marker fitted",
                              (long)(s_hub_splice_us / 1000),
-                             (long)s_phase_err_us);
+                             (long)s_phase_err_us,
+                             (long)med_us, (long)(s_hub_splice_med_us / 1000));
                 }
                 /*
                  * The visualiser is not told. A splice moves audio WITHIN the
@@ -1782,9 +1949,22 @@ static void local_play_task(void *arg)
             samples_played += AUDIO_FRAMES;
 
             size_t written = 0;
+            const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
             if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,
                                   portMAX_DELAY) != ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(2));
+            }
+            if (s_refill_active) {
+                if (esp_timer_get_time() - w0 < REFILL_FAST_US) {
+                    s_refill_frames += (int32_t)(written / (AUDIO_CHANNELS * sizeof(int16_t)));
+                } else {
+                    s_refill_active = false;
+                    ESP_LOGW(TAG, "REFILL after %s: %ld frames (%ld ms) before a "
+                                  "write blocked -- phase readings inside this "
+                                  "window are not DAC-paced",
+                             s_refill_why, (long)s_refill_frames,
+                             (long)(s_refill_frames * 1000 / (int32_t)sample_rate));
+                }
             }
             /* Immediately, and before anything else can delay this task: it is
              * the instant the next pass dates its phase reading from. */
@@ -1822,11 +2002,26 @@ static void probe_task(void *arg)
             const int64_t age = s_hub_splice_at ? (t2 - s_hub_splice_at) / 1000 : -1;
             const char *who = inet_ntoa(from.sin_addr);
             if (age >= 0 && age < 10000) {
+                /*
+                 * The second clause is the counterfactual, and it is the whole
+                 * point of this build: what `apart` would have been had both
+                 * units spliced on a median of their last few phase readings
+                 * rather than on the newest one. Both figures are measured at
+                 * the same boundary from the same histories, so they can be
+                 * compared directly -- unlike two builds' log windows, which
+                 * cannot, and which is how three wrong diagnoses were reached
+                 * here. If the median column is consistently the smaller one
+                 * across a session, the splice moves to it.
+                 */
                 ESP_LOGW(TAG, "TRACK DIVERGENCE (wifi): %s spliced %+ld ms "
-                              "(phase %+ld us), hub spliced %+ld ms -> %+ld ms apart",
+                              "(phase %+ld us), hub spliced %+ld ms -> %+ld ms apart"
+                              " | median: sat %+ld ms, hub %+ld ms -> %+ld ms apart",
                          who, (long)(s.applied_us / 1000), (long)s.phase_us,
                          (long)(s_hub_splice_us / 1000),
-                         (long)((s.applied_us - s_hub_splice_us) / 1000));
+                         (long)((s.applied_us - s_hub_splice_us) / 1000),
+                         (long)(s.applied_med_us / 1000),
+                         (long)(s_hub_splice_med_us / 1000),
+                         (long)((s.applied_med_us - s_hub_splice_med_us) / 1000));
             } else {
                 /* No boundary of our own to compare against -- the hub's phase
                  * was invalid, or this arrived nowhere near one. */
@@ -1968,14 +2163,17 @@ static void ring_monitor_task(void *arg)
                           " (%" PRIu32 " refused) | sta-left %" PRIu32
                           " (dropped %" PRIu32 ", no-lease %" PRIu32
                           ") | sta-timeout %" PRIu32
-                          " | alloc-fail %" PRIu32,
+                          " | alloc-fail %" PRIu32
+                          " | phase-drop %" PRIu32 " short-reads %" PRIu32
+                          " (%" PRIu32 " frames)",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      heap_win == UINT32_MAX ? 0 : heap_win,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_mon, n_underruns, n_restarts, n_splices,
                      n_retunes, n_retunes_bad, n_sta_left, n_sta_dropped,
-                     n_sta_nolease, n_sta_timeout, n_alloc_fail);
+                     n_sta_nolease, n_sta_timeout, n_alloc_fail,
+                     n_phase_drop, n_short_reads, n_short_frames);
         }
 
         if (local_start == 0 || rate_ema == 0) {
