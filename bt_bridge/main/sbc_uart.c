@@ -25,10 +25,27 @@ static const char *TAG = "sbc_uart";
 static RingbufHandle_t s_ring;
 static uint32_t s_seq;
 static uint32_t s_dropped;
+static uint32_t s_oversize;
 
 void sbc_uart_send(const uint8_t *sbc, uint16_t len)
 {
-    if (!s_ring || len == 0 || len > SBC_LINK_MAX_PAYLOAD) {
+    if (!s_ring || len == 0) {
+        return;
+    }
+
+    /*
+     * Too big for the protocol to carry, and until now this returned silently:
+     * the one place in this file that loses audio without counting it.
+     *
+     * It cannot fire at max_bitpool 53 -- A2DP packets measure ~830 bytes
+     * against a 1024 byte ceiling -- and that is exactly why it needs a
+     * counter rather than a comment. Raising the bitpool is what makes the
+     * packets grow, and this is the first thing that would give way. Silent, it
+     * would present as a hub-side gap: a link fault, investigated on the link,
+     * when the link was innocent and the ceiling was here.
+     */
+    if (len > SBC_LINK_MAX_PAYLOAD) {
+        s_oversize++;
         return;
     }
 
@@ -82,8 +99,27 @@ void sbc_uart_send_meta(const link_meta_t *meta)
     }
 }
 
+/* Report only when the count moves. Reprinting a static total every five
+ * seconds makes a finished startup burst look like an ongoing fault, which is
+ * worse than saying nothing. Shared by both counters so neither can quietly
+ * acquire different reporting rules from the other. */
+static void report_when_moved(const char *what, uint32_t count,
+                              uint32_t *last, int64_t *last_at)
+{
+    const int64_t now = esp_timer_get_time();
+    if (count != *last && now - *last_at > 2000000) {
+        ESP_LOGW(TAG, "%s: %" PRIu32 " dropped (+%" PRIu32 ")",
+                 what, count, count - *last);
+        *last = count;
+        *last_at = now;
+    }
+}
+
 static void tx_task(void *arg)
 {
+    static uint32_t last_dropped, last_oversize;
+    static int64_t dropped_at, oversize_at;
+
     while (1) {
         size_t len = 0;
         uint8_t *item = (uint8_t *)xRingbufferReceive(s_ring, &len, portMAX_DELAY);
@@ -95,18 +131,9 @@ static void tx_task(void *arg)
         uart_write_bytes(UART_PORT, item, len);
         vRingbufferReturnItem(s_ring, item);
 
-        /* Report only when the count moves. Reprinting a static total every
-         * five seconds makes a finished startup burst look like an ongoing
-         * fault, which is worse than saying nothing. */
-        static uint32_t last_reported;
-        static int64_t last_report_at;
-        int64_t now = esp_timer_get_time();
-        if (s_dropped != last_reported && now - last_report_at > 2000000) {
-            ESP_LOGW(TAG, "queue full: %" PRIu32 " dropped (+%" PRIu32 ")",
-                     s_dropped, s_dropped - last_reported);
-            last_reported = s_dropped;
-            last_report_at = now;
-        }
+        report_when_moved("queue full", s_dropped, &last_dropped, &dropped_at);
+        report_when_moved("payload past the link ceiling", s_oversize,
+                          &last_oversize, &oversize_at);
     }
 }
 
