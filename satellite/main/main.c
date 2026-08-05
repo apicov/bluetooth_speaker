@@ -289,11 +289,18 @@ static volatile uint32_t n_gap_short;     /* gap fills the ring could not take *
 static volatile uint32_t n_gap_short_frames;
 static volatile uint32_t n_ring_full;     /* decoded blocks dropped, ring full */
 static volatile uint32_t n_gap_resyncs;   /* gaps too large to fill, re-anchored */
+static volatile uint32_t n_anchor_upgrades; /* provisional anchors replaced */
 /*
  * Set by the receive task when a gap is too large to fill, cleared by the
  * playback task when it parks. See GAP_RESYNC_MS.
  */
 static volatile bool resync_request;
+/*
+ * Set when ANCHOR_GIVE_UP_US forced an anchor onto a packet that was already
+ * late. Playback is running but its position is known to be wrong, so the
+ * receive path keeps watching for a packet it could have anchored on properly.
+ */
+static volatile bool anchor_provisional;
 static volatile uint32_t n_anchor_late;   /* anchors refused, play_at already past */
 static volatile uint32_t n_anchor_soon;   /* anchors refused, one just happened */
 static volatile uint32_t n_frames_rx;     /* analysis frames taken from the hub */
@@ -738,6 +745,9 @@ static void handle_audio(const audio_msg_t *msg)
                           "anchoring on a bad one rather than staying silent",
                      (now_local - refuse_since) / 1000,
                      (start_local - now_local) / 1000);
+            anchor_provisional = true;
+        } else {
+            anchor_provisional = false;   /* this one had the lead it needed */
         }
         refuse_since = 0;
         last_anchor = now_local;
@@ -778,6 +788,37 @@ static void handle_audio(const audio_msg_t *msg)
                  msg->play_at, stream_start_local,
                  (stream_start_local - esp_timer_get_time()) / 1000,
                  by_tsf ? "TSF" : "probe estimator");
+    }
+
+    /*
+     * Playback is running on an anchor we already know was bad. Take the first
+     * packet that could have been anchored on properly and start again.
+     *
+     * A give-up anchor is the least-bad answer to "nothing anchorable for five
+     * seconds", but it is permanent as it stands: a run anchored at -317 ms
+     * lead, read phase +331 ms, and nothing ever re-anchored because that is
+     * comfortably inside PHASE_INSANE_US. So the two servos were left to argue
+     * about it -- the phase servo pulling the rate up to catch up, the depth net
+     * pulling it down because catching up drains the ring -- and the speaker sat
+     * a third of a second behind the floor for minutes.
+     *
+     * None of that is drift, and no rate fixes it. The lateness came from the
+     * hub's timeline being displaced, and the moment the hub recovers there is a
+     * packet with proper lead in front of it. Re-anchoring on that erases the
+     * error in one step instead of asking a 1 ms/s loop to walk it off.
+     *
+     * The flag is cleared here rather than when the new anchor lands, so one
+     * provisional anchor buys exactly one upgrade attempt. If the attempt runs
+     * into the give-up path again it sets the flag again, and ANCHOR_MIN_INTERVAL_US
+     * bounds how fast that can cycle.
+     */
+    if (anchor_provisional &&
+        sync_to_local(msg->play_at, offset) - esp_timer_get_time() >= ANCHOR_MIN_LEAD_US) {
+        anchor_provisional = false;
+        n_anchor_upgrades++;
+        resync_request = true;
+        have_seq = false;
+        return;
     }
 
     /*
@@ -1304,20 +1345,22 @@ static void drift_task(void *arg)
          */
         static uint32_t gaps_told, gap_frames_told, gap_short_told,
                         gap_short_frames_told, ring_full_told,
-                        anchor_late_told, anchor_soon_told, gap_resyncs_told;
+                        anchor_late_told, anchor_soon_told, gap_resyncs_told,
+                        upgrades_told;
         const uint32_t gaps_now = n_gaps, gap_frames_now = n_gap_frames,
                        gap_short_now = n_gap_short,
                        gap_short_frames_now = n_gap_short_frames,
                        ring_full_now = n_ring_full,
                        anchor_late_now = n_anchor_late,
                        anchor_soon_now = n_anchor_soon,
-                       gap_resyncs_now = n_gap_resyncs;
+                       gap_resyncs_now = n_gap_resyncs,
+                       upgrades_now = n_anchor_upgrades;
         if (gaps_now != gaps_told || ring_full_now != ring_full_told ||
             anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told ||
-            gap_resyncs_now != gap_resyncs_told) {
+            gap_resyncs_now != gap_resyncs_told || upgrades_now != upgrades_told) {
             ESP_LOGW(TAG, "RX 5s: gaps %" PRIu32 " (%" PRIu32 " ms silence, %"
                           PRIu32 " short by %" PRIu32 " ms) | ring-full %" PRIu32
-                          " | too big to fill %" PRIu32
+                          " | too big to fill %" PRIu32 " | upgrades %" PRIu32
                           " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon",
                      gaps_now - gaps_told,
                      (gap_frames_now - gap_frames_told) * 1000 / stream_rate,
@@ -1325,6 +1368,7 @@ static void drift_task(void *arg)
                      (gap_short_frames_now - gap_short_frames_told) * 1000 / stream_rate,
                      ring_full_now - ring_full_told,
                      gap_resyncs_now - gap_resyncs_told,
+                     upgrades_now - upgrades_told,
                      anchor_late_now - anchor_late_told,
                      anchor_soon_now - anchor_soon_told);
         }
@@ -1336,6 +1380,7 @@ static void drift_task(void *arg)
         anchor_late_told = anchor_late_now;
         anchor_soon_told = anchor_soon_now;
         gap_resyncs_told = gap_resyncs_now;
+        upgrades_told = upgrades_now;
 
         /* Soak line, every 60 s, ahead of the streaming check below: if audio
          * has stopped, that is when the heap and the counters matter most.
@@ -1354,7 +1399,7 @@ static void drift_task(void *arg)
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
                           " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                           " (%" PRIu32 " refused) | gaps %" PRIu32 " (%" PRIu32
-                          " short, %" PRIu32 " too big) ring-full %" PRIu32 " anchors-refused %" PRIu32
+                          " short, %" PRIu32 " too big) ring-full %" PRIu32 " upgrades %" PRIu32 " anchors-refused %" PRIu32
                           " | wifi-drops %" PRIu32
                           " | alloc-fail %" PRIu32
                           " | clock %s (tsf %" PRIu32 "/probe %" PRIu32 ")"
@@ -1365,6 +1410,7 @@ static void drift_task(void *arg)
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT),
                      hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
                      n_retunes, n_retunes_bad, n_gaps, n_gap_short, n_gap_resyncs, n_ring_full,
+                     n_anchor_upgrades,
                      n_anchor_late + n_anchor_soon, n_wifi_drops, n_alloc_fail,
                      (tsf_offset_at && esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US)
                          ? "TSF" : "probe",

@@ -99,10 +99,35 @@
 
 /*
  * Past this the timeline is not merely off, it is wrong, and no gradual
- * correction closes it in useful time -- a second at 1 ms/s would take a
- * quarter of an hour. Jump instead.
+ * correction closes it in useful time. Jump instead.
+ *
+ * 300 ms, down from 1 s, and the number that matters is LEAD_US rather than
+ * anything about the slew.
+ *
+ * A satellite anchors on a packet whose play_at is still ahead of it, and the
+ * lead it sees is LEAD_US plus this error. So at err = -100 ms the lead has
+ * already fallen to the 100 ms a satellite insists on before it will anchor at
+ * all, and past roughly -200 ms packets arrive with their play_at already gone.
+ * Beyond that the timeline is not merely inaccurate, it is unusable: no
+ * satellite can start, and any satellite already playing is being asked to
+ * absorb an error far outside the +-100 Hz its servo can trim.
+ *
+ * Which is what made 1 s wrong. A displacement of ~380 ms was measured sitting
+ * below it and therefore slewing: the hub's own phase read +281 ms and walked
+ * back at exactly the 0.9 ms/s the slew delivers, taking about five minutes,
+ * with its local ring starved to 46 ms and its servo alternating 44200 / 44080
+ * the whole time because a starved ring and a late phase are the same fact seen
+ * twice. The satellite meanwhile refused 237 consecutive packets, gave up, and
+ * anchored 317 ms late. Nothing was being protected by correcting that
+ * gradually, because nothing downstream was still working.
+ *
+ * The slew keeps everything it was right about. Between RESYNC_US and this, the
+ * error is small enough that satellites can still anchor and still follow, so
+ * moving smoothly is worth more than moving fast -- see the long note above
+ * TIMELINE_SLEW_US, and the -126 ms excursion that argued for it. This only
+ * changes where "gradual" stops being a kindness.
  */
-#define RESYNC_HARD_US 1000000
+#define RESYNC_HARD_US 300000
 
 /*
  * How far the timeline moves per packet while slewing back to real time.
