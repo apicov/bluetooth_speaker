@@ -149,7 +149,35 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
                                      ESP_A2D_SBC_CIE_BLOCK_LEN_16;
         mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_4 | ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
         mcc.cie.sbc_info.alloc_mthd = ESP_A2D_SBC_CIE_ALLOC_MTHD_SNR | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
-        mcc.cie.sbc_info.max_bitpool = 250;
+        /*
+         * The bitpool ceiling is a WIRE budget, not a quality preference.
+         *
+         * Everything this chip receives leaves again down one UART at
+         * SBC_LINK_BAUD, and that is 500000 baud 8N1 -- 50 kB/s, hard. There is
+         * no flow control on that link and sbc_uart.c queues only ~10 packets
+         * before dropping, so anything the phone sends above 50 kB/s is not
+         * slowed down, it is thrown away.
+         *
+         * 53 is what the link was measured carrying: the hub reports ~42 kB/s of
+         * SBC, which is bitpool 53 at 44.1 kHz joint stereo -- the standard A2DP
+         * "high quality" value. That is already 85% of the wire.
+         *
+         * 250 was here, and it advertises about five times what the wire can
+         * take. Nothing enforced it: a phone choosing bitpool 76, which some
+         * "extra quality" modes do, asks for ~59 kB/s down a 50 kB/s link. The
+         * queue then fills, sbc_uart drops, and the hub sees gaps in the audio
+         * it is publishing a timeline for. Whether that happened depended on
+         * which handset connected, which is a fine recipe for an intermittent
+         * fault nobody can reproduce.
+         *
+         * So this is the honest statement of the link's capacity, and it should
+         * move only when the link does. sbc_link.h explains why 500000 is the
+         * ceiling -- it is the wiring, not the protocol -- and what would lift
+         * it: better leads for a higher baud, or SPI for ~30x the headroom, at
+         * which point this can go back up. Raising it before then buys nothing
+         * and costs audio.
+         */
+        mcc.cie.sbc_info.max_bitpool = 53;
         mcc.cie.sbc_info.min_bitpool = 2;
         /* register stream end point, only support SBC currently */
         esp_a2d_sink_register_stream_endpoint(0, &mcc);
