@@ -48,3 +48,9 @@ CONFIG_DANCEFLOOR_LED_HOP_512=y
 # its neighbours' fixed amber, which reads as a sync fault rather than as a
 # config difference.
 CONFIG_DANCEFLOOR_LED_PATTERN="boom"
+
+# Forward this unit's logs and HEALTH snapshots over the sync socket to a
+# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
+# production flash, where the shipper compiles out entirely. Each satellite
+# ships to the hub, which relays to the collector.
+CONFIG_DANCEFLOOR_WIFI_LOGS=y

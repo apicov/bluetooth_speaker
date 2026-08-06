@@ -41,6 +41,7 @@
 #include "sbc_link.h"
 #include "sbc_decoder.h"
 #include "visualiser.h"
+#include "wifi_log.h"
 
 #define AP_SSID    "dancefloor"
 #define AP_PASS    "dancefloor"
@@ -1571,6 +1572,45 @@ static void drift_task(void *arg)
                      n_phase_drop, n_short_reads, n_short_frames,
                      visualiser_source_name(), visualiser_hop(),
                      n_frames_rx, n_frames_bad);
+
+#if CONFIG_DANCEFLOOR_WIFI_LOGS
+            /* The structured twin of the line above, for the collector's CSV.
+             * Every field is already in scope here; the role aliases are
+             * documented on health_msg_t in sync_proto.h. */
+            static uint32_t health_seq;
+            health_msg_t h;
+            memset(&h, 0, sizeof h);
+            h.type = MSG_HEALTH;
+            h.role = LOG_ROLE_SAT;
+            const bool tsf_now = tsf_offset_at &&
+                esp_timer_get_time() - tsf_offset_at < TSF_MAX_AGE_US;
+            h.clock_src = tsf_now ? 1 : 0;
+            h.seq = health_seq++;
+            h.uptime_s = (uint64_t)(esp_timer_get_time() / 1000000);
+            h.heap_cur = esp_get_free_heap_size();
+            h.heap_min = esp_get_minimum_free_heap_size();
+            h.heap_win = heap_win == UINT32_MAX ? 0 : heap_win;
+            h.heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+            h.hw_play = hw_play;
+            h.hw_mon = hw_drift;
+            h.underruns = n_underruns;
+            h.reanchors_or_restarts = n_reanchors;
+            h.splices = n_splices;
+            h.retunes = n_retunes;
+            h.retunes_refused = n_retunes_bad;
+            h.gaps_or_sta_left = n_gaps;
+            h.wifi_drops_or_oversize = n_wifi_drops;
+            h.alloc_fail = n_alloc_fail;
+            h.phase_drop = n_phase_drop;
+            h.short_reads = n_short_reads;
+            h.short_frames = n_short_frames;
+            h.ring_full_or_sta_dropped = n_ring_full;
+            h.upgrades_or_sta_nolease = n_anchor_upgrades;
+            h.anchors_refused_or_timeout = n_anchor_late + n_anchor_soon;
+            h.log_dropped = wifi_log_dropped();
+            h.log_no_dest = wifi_log_no_dest();
+            wifi_log_send_to_dest(&h, sizeof h);
+#endif
         }
 
         if (stream_start_local == 0) {
@@ -2156,6 +2196,9 @@ void app_main(void)
 
     wifi_start_sta();
     socket_start();
+    /* Mirror ESP_LOG lines to the hub (and a structured HEALTH, below). No-op
+     * and compiles to nothing unless CONFIG_DANCEFLOOR_WIFI_LOGS is set. */
+    wifi_log_init(LOG_ROLE_SAT, MASTER_IP);
     i2s_start(44100);
     tx_rate = 44100;
 

@@ -26,6 +26,7 @@
 
 #include "sync_proto.h"
 #include "visualiser.h"
+#include "wifi_log.h"
 
 #define AP_SSID   "dancefloor"
 #define AP_PASS   "dancefloor"
@@ -1987,7 +1988,9 @@ static void local_play_task(void *arg)
 static void probe_task(void *arg)
 {
     (void)arg;
-    uint8_t buf[64];
+    /* Holds a max log_msg_t (~222 bytes); the time/splice messages it also
+     * fields are far smaller. */
+    uint8_t buf[256];
     struct sockaddr_in from;
 
     while (1) {
@@ -1996,6 +1999,47 @@ static void probe_task(void *arg)
         socklen_t from_len = sizeof(from);
         int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
         int64_t t2 = esp_timer_get_time();          /* stamp on arrival */
+
+#if CONFIG_DANCEFLOOR_WIFI_LOGS
+        /*
+         * Collector registration. Not client_seen(): the laptop never sends a
+         * time probe, so it must not enter s_clients, or it would be unicasted
+         * audio like a satellite. Refreshed on every SUB; wifi_log ages the
+         * address out after ~30 s if the collector stops sending them.
+         */
+        if (n >= (int)sizeof(log_sub_msg_t) && buf[0] == MSG_LOG_SUB) {
+            log_sub_msg_t sub;
+            memcpy(&sub, buf, sizeof sub);
+            if (sub.magic == LOG_SUB_MAGIC) {
+                wifi_log_note_collector(from.sin_addr.s_addr);
+            }
+            continue;
+        }
+
+        /*
+         * A satellite's log line or HEALTH snapshot, relayed to the collector.
+         * Stamped with the source address -- the satellite does not know its own
+         * DHCP lease -- and forwarded verbatim. Not client_seen(): this is not a
+         * probe, and the satellite that sent it is already registered by its
+         * probes anyway. The whole relay is a couple of non-blocking sendto()s;
+         * probe latency is unaffected.
+         */
+        if (buf[0] == MSG_LOG && n >= (int)(sizeof(log_msg_t) - LOG_MSG_MAX)) {
+            log_msg_t *m = (log_msg_t *)buf;
+            if (m->msg_len <= LOG_MSG_MAX &&
+                n >= (int)LOG_MSG_BYTES(m->msg_len)) {
+                m->src_ip = from.sin_addr.s_addr;
+                wifi_log_send_to_dest(m, LOG_MSG_BYTES(m->msg_len));
+            }
+            continue;
+        }
+        if (buf[0] == MSG_HEALTH && n >= (int)sizeof(health_msg_t)) {
+            health_msg_t *m = (health_msg_t *)buf;
+            m->src_ip = from.sin_addr.s_addr;
+            wifi_log_send_to_dest(m, sizeof *m);
+            continue;
+        }
+#endif
 
         /*
          * A satellite reporting what it corrected at a track boundary. Both
@@ -2183,6 +2227,44 @@ static void ring_monitor_task(void *arg)
                      n_retunes, n_retunes_bad, n_sta_left, n_sta_dropped,
                      n_sta_nolease, n_sta_timeout, n_alloc_fail,
                      n_phase_drop, n_short_reads, n_short_frames, n_wifi_oversize);
+
+#if CONFIG_DANCEFLOOR_WIFI_LOGS
+            /* The structured twin of the line above, for the collector's CSV.
+             * The role-aliased fields carry this unit's counters: reanchors_or_
+             * restarts = restarts, gaps_or_sta_left = sta-left, wifi_drops_or_
+             * oversize = wifi-over, and the tail three are sta-dropped /
+             * sta-nolease / sta-timeout (see health_msg_t). */
+            static uint32_t health_seq;
+            health_msg_t h;
+            memset(&h, 0, sizeof h);
+            h.type = MSG_HEALTH;
+            h.role = LOG_ROLE_HUB;
+            h.seq = health_seq++;
+            h.uptime_s = (uint64_t)(esp_timer_get_time() / 1000000);
+            h.heap_cur = esp_get_free_heap_size();
+            h.heap_min = esp_get_minimum_free_heap_size();
+            h.heap_win = heap_win == UINT32_MAX ? 0 : heap_win;
+            h.heap_largest = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+            h.hw_play = hw_play;
+            h.hw_mon = hw_mon;
+            h.underruns = n_underruns;
+            h.reanchors_or_restarts = n_restarts;
+            h.splices = n_splices;
+            h.retunes = n_retunes;
+            h.retunes_refused = n_retunes_bad;
+            h.gaps_or_sta_left = n_sta_left;
+            h.wifi_drops_or_oversize = n_wifi_oversize;
+            h.alloc_fail = n_alloc_fail;
+            h.phase_drop = n_phase_drop;
+            h.short_reads = n_short_reads;
+            h.short_frames = n_short_frames;
+            h.ring_full_or_sta_dropped = n_sta_dropped;
+            h.upgrades_or_sta_nolease = n_sta_nolease;
+            h.anchors_refused_or_timeout = n_sta_timeout;
+            h.log_dropped = wifi_log_dropped();
+            h.log_no_dest = wifi_log_no_dest();
+            wifi_log_send_to_dest(&h, sizeof h);
+#endif
         }
 
         if (local_start == 0 || rate_ema == 0) {
@@ -2350,6 +2432,11 @@ void streamer_start(void)
 
     wifi_start_ap();
     socket_start();
+    /* Mirror this hub's own logs and relay every satellite's to a collector.
+     * Destination starts unset -- the collector announces itself with
+     * MSG_LOG_SUB (handled in probe_task) and wifi_log_note_collector() points
+     * this at it. No-op unless CONFIG_DANCEFLOOR_WIFI_LOGS is set. */
+    wifi_log_init(LOG_ROLE_HUB, NULL);
     i2s_start(sample_rate);
 #if CONFIG_DANCEFLOOR_ENABLE_MARKER
     marker_start();

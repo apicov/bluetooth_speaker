@@ -411,6 +411,41 @@ int main(void)
               sbc_link_crc16(&h, good, 64) != sbc_link_crc16(&h, bad, 64), NULL);
     }
 
+    /*
+     * 21. The log/health messages are the collector's wire format, unpacked in
+     *     Python against this packed C layout. A field added, removed or
+     *     reordered here shifts every offset after it silently and the
+     *     collector reads garbage, so the sizes are pinned the way the SPI
+     *     frame is above. log_msg_t is variable-length (only the first msg_len
+     *     bytes of its 192-byte array go on the wire); health_msg_t and
+     *     log_sub_msg_t are fixed.
+     */
+    {
+        char d[96];
+        snprintf(d, sizeof d, "log=%zu health=%zu sub=%zu",
+                 sizeof(log_msg_t), sizeof(health_msg_t), sizeof(log_sub_msg_t));
+        check("the log/health message sizes are pinned",
+              sizeof(log_msg_t) == 222 && sizeof(health_msg_t) == 108 &&
+              sizeof(log_sub_msg_t) == 5, d);
+    }
+
+    /*
+     * 22. LOG_MSG_BYTES is bytes-on-the-wire for a given message length -- the
+     *     fixed header plus the payload, never the whole 222-byte ceiling -- and
+     *     the ceiling itself must stay clear of the MTU so a longest line never
+     *     fragments. The receiver sizes its buffer off this relationship.
+     */
+    {
+        char d[96];
+        const size_t hdr = sizeof(log_msg_t) - LOG_MSG_MAX;
+        snprintf(d, sizeof d, "hdr=%zu full=%zu mtu=1500",
+                 hdr, LOG_MSG_BYTES(LOG_MSG_MAX));
+        check("LOG_MSG_BYTES is header + payload and clears the MTU",
+              LOG_MSG_BYTES(0) == hdr &&
+              LOG_MSG_BYTES(LOG_MSG_MAX) == sizeof(log_msg_t) &&
+              LOG_MSG_BYTES(LOG_MSG_MAX) <= 1500, d);
+    }
+
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");
     return failures != 0;
 }
