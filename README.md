@@ -74,6 +74,13 @@ above. The one clock knob is `DANCEFLOOR_SBC_LINK_SPI_HZ` under *Dancefloor
 diagnostics*: the SCK the bridge drives, default **5 MHz**, changed by
 reflashing the bridge only.
 
+**Add a 10 kΩ pull-up from CS to 3V3.** CS is active-low and carries the
+framing, and the bridge's pin is high-Z until the firmware drives it — during
+boot, reset or a reflash the line floats, a floating CS reads as asserted, and
+the slave then clocks whatever sits on SCK and MOSI into a buffer as if it were
+a packet. The pull-up holds it deasserted until the master takes over, the
+mirror of the handshake line's pull-down for the opposite fault.
+
 **The handshake is not optional.** ESP-IDF's `spi_slave` loses any transfer the
 master clocks with nothing queued, so the hub holds the line high while a buffer
 is armed and drops it for the transfer, and the bridge waits on a GPIO interrupt

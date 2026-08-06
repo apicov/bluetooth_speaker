@@ -118,6 +118,13 @@ Four signals and a common ground. Bridge is master, hub is slave.
 No MISO — the link is one-way, and not claiming HSPI's MISO leaves GPIO 12
 alone, which is the MTDI strapping pin that must be low at boot.
 
+**Add a 10 kΩ pull-up from CS to 3V3.** CS is active-low and carries the
+framing, and the bridge's pin is high-Z until the firmware drives it — during
+boot, reset or a reflash the line floats, a floating CS reads as asserted, and
+the slave then clocks whatever sits on SCK and MOSI into a buffer as if it were
+a packet. The pull-up holds it deasserted until the master takes over, the
+mirror of the handshake line's pull-down for the opposite fault.
+
 Two pins carry history. **GPIO 25** was the UART TX and **GPIO 44** the UART RX,
 so two of the four leads were already run.
 
