@@ -24,6 +24,20 @@ typedef struct {
     uint8_t  channels;
 } sbc_stream_info_t;
 
+/*
+ * The outcome of the last decode, kept distinct because the distinction is
+ * diagnostic. CRC is the SBC frame's own CRC-8, not the link's CRC-16: a CRC
+ * result means the link check passed but the payload it carried was still
+ * corrupt, which is a path the link CRC does not cover. Recovered through a
+ * getter rather than returned so callers that don't care (the satellite, the
+ * classic hub) keep their existing `if (!sbc_decode_frame(...))` test unchanged.
+ */
+typedef enum {
+    SBC_DECODE_OK,    /* decoded; pcm_out holds the samples */
+    SBC_DECODE_CRC,   /* OI_CODEC_SBC_CHECKSUM_MISMATCH: the SBC frame's CRC-8 failed */
+    SBC_DECODE_ERR,   /* anything else: no syncword, truncated header/body, bad bitpool */
+} sbc_decode_result_t;
+
 /* Call once before the first frame, and again to recover after a hard error. */
 bool sbc_decoder_init(void);
 
@@ -41,3 +55,12 @@ bool sbc_decode_frame(const uint8_t *in, size_t in_len, size_t *in_consumed,
                       int16_t *pcm_out, size_t *pcm_samples);
 
 void sbc_decoder_get_info(sbc_stream_info_t *out);
+
+/*
+ * The result of the most recent sbc_decode_frame(); SBC_DECODE_OK before the
+ * first call, after sbc_decoder_init(), and after a successful decode. Mirrors
+ * sbc_decoder_get_info(): the decoder keeps state across calls, so a getter is
+ * how a caller that needs the detail recovers it without every caller paying
+ * for an extra out-parameter.
+ */
+sbc_decode_result_t sbc_decoder_last_result(void);

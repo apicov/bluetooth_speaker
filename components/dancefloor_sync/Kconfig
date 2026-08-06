@@ -25,4 +25,24 @@ menu "Dancefloor diagnostics"
             because Kconfig symbols are global in ESP-IDF: the LED component
             reads it without needing to depend on the sync protocol.
 
+    config DANCEFLOOR_SBC_LINK_SPI_HZ
+        int "Bridge -> hub SPI clock (Hz)"
+        default 1000000
+        range 100000 40000000
+        help
+            SCK frequency the bt_bridge master drives on the one-way SPI link to
+            the hub. The slave is clocked by the master, so only the bridge
+            build's value is on the wire; the hub build carries a copy only so
+            its startup log prints the right number.
+
+            1 MHz is where the link starts -- 20x the UART's 50 kB/s, against a
+            measured ~42 kB/s stream. The breadboard jumpers this lives on were
+            the UART's ceiling at 500 kbaud, and SPI adds a clock line to the
+            bundle, so expect signal integrity, not the protocol, to be the
+            limit. If the sbc_in crc/hdr counters move at one speed, drop this
+            and reflash the BRIDGE; the hub need not match unless its log should.
+
+            Lives here (rather than the bridge's own Kconfig) because the symbol
+            is shared through this component and both ends print it.
+
 endmenu

@@ -67,7 +67,7 @@ static spi_slave_transaction_t s_trans[NFRAMES];
 /* Statistics, reported every 5 s. These replace the rate/loss instrumentation
  * that audio_in.c needed -- with no shared clock there is no rate to measure,
  * so what matters now is whether packets arrive intact. */
-static uint32_t s_packets, s_bad_hdr, s_bad_crc, s_gaps, s_decode_err;
+static uint32_t s_packets, s_bad_hdr, s_bad_crc, s_short, s_gaps, s_decode_err, s_dec_crc;
 static uint64_t s_pcm_samples;
 
 /*
@@ -147,6 +147,26 @@ static void rx_task(void *arg)
         spi_slave_transaction_t *done = NULL;
         if (spi_slave_get_trans_result(SPI_LINK_HOST, &done,
                                        pdMS_TO_TICKS(20)) == ESP_OK) {
+            /*
+             * CS framed this transfer, but framing is not the same thing as
+             * delivering it whole. trans_len is how many bits the master
+             * actually clocked before CS rose again; anything short of a full
+             * frame means CS glitched and split the transfer, so the buffer
+             * holds a prefix of the new packet on top of the stale tail of the
+             * last one. Nothing in there is to be trusted -- not the header,
+             * not the length that would scope the CRC -- so count it and re-arm
+             * without reading either.
+             *
+             * This does not contradict the fixed-frame-size design in
+             * sbc_link.h: that refuses to TRUST trans_len to say where the
+             * payload ends (the fixed size and len do that). This uses trans_len
+             * only as an alarm that the frame was not delivered whole.
+             */
+            if (done->trans_len != SBC_LINK_FRAME_BYTES * 8) {
+                s_short++;
+                goto rearm;
+            }
+
             const uint8_t *frame = (const uint8_t *)done->rx_buffer;
             spi_link_hdr_t hdr;
             memcpy(&hdr, frame, sizeof(hdr));
@@ -231,7 +251,15 @@ static void rx_task(void *arg)
             while (off < hdr.len) {
                 size_t consumed = 0, samples = 0;
                 if (!sbc_decode_frame(payload + off, hdr.len - off, &consumed, pcm, &samples)) {
-                    s_decode_err++;
+                    /* CRC here is the SBC frame's own, not the link's: the link
+                     * CRC already passed, so a CRC result means corruption the
+                     * link check did not catch. Either way the decoder state is
+                     * suspect, so reset it and drop the rest of this packet. */
+                    if (sbc_decoder_last_result() == SBC_DECODE_CRC) {
+                        s_dec_crc++;
+                    } else {
+                        s_decode_err++;
+                    }
                     sbc_decoder_init();
                     break;
                 }
@@ -293,26 +321,27 @@ rearm:
              * now counts an impossible kind or length.
              */
             static int quiet_left;
-            const bool bad = s_bad_hdr || s_bad_crc || s_gaps || s_decode_err || dropped
+            const bool bad = s_bad_hdr || s_bad_crc || s_short || s_gaps
+                             || s_decode_err || s_dec_crc || dropped
                              || s_max_gap_us > GAP_ALARM_US;
             if (bad || --quiet_left <= 0) {
                 if (!bad) {
                     quiet_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
                 }
                 ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
-                              "hdr %" PRIu32 " crc %" PRIu32 " gaps %" PRIu32
-                              " dec %" PRIu32 " | fed-drop %" PRIu32 " B | "
-                              "max gap %" PRIu32 " us",
+                              "hdr %" PRIu32 " crc %" PRIu32 " short %" PRIu32
+                              " gaps %" PRIu32 " dec %" PRIu32 " dcrc %" PRIu32
+                              " | fed-drop %" PRIu32 " B | max gap %" PRIu32 " us",
                          s_packets, info.sample_rate, info.channels, eff,
-                         s_bad_hdr, s_bad_crc, s_gaps, s_decode_err, dropped,
-                         s_max_gap_us);
+                         s_bad_hdr, s_bad_crc, s_short, s_gaps, s_decode_err,
+                         s_dec_crc, dropped, s_max_gap_us);
             }
             s_pcm_samples = 0;
             /* Rate the decoder actually produced, which is what the DAC must match. */
             streamer_set_sample_rate(info.sample_rate ? info.sample_rate : 44100);
             /* Per-window, not cumulative: a rising total tells you far less than
              * a rate, and cumulative counters made 500 k look worse than it was. */
-            s_packets = s_bad_hdr = s_bad_crc = s_gaps = s_decode_err = 0;
+            s_packets = s_bad_hdr = s_bad_crc = s_short = s_gaps = s_decode_err = s_dec_crc = 0;
             s_max_gap_us = 0;
             next_report = now + 5000000;
         }

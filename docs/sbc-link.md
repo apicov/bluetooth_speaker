@@ -7,9 +7,15 @@ phone ──A2DP/SBC──▶ bt_bridge ──SBC over SPI──▶ hub_s3 ─�
                     no decode     4 wires          decodes here
 ```
 
-**Status: built, not yet run on hardware.** The UART link it replaces ran
-sustained ~44,050 Hz effective against 44,100 nominal with `crc 0 gaps 0`, and
-that is the bar this has to clear before anything else changes.
+**Status: live.** Cleared the UART's bar on first hardware: sustained
+`eff ~43.7–44.2 kHz` against 44,100 nominal (the UART did ~44,050), with
+`crc 1–2 short 1–2 gaps 1–2` per window — at the UART's own residual floor
+(`0–2 bad sync, 0–1 CRC errors`), not zero. The bring-up's first fault was
+physical, exactly as step 3 below predicts: a marginal CS/data jumper that the
+`short` detector localised and reseating the wire cleared. `crc` is the counter
+that says when the wiring is outpaced as the clock is raised — and the wiring
+has since cleared it clean all the way to 10 MHz, so the bitpool cap of 53 (the
+UART's honest limit) is now the last ceiling to lift.
 
 > `hub/`, the classic ESP32 hub, still speaks the UART and **can no longer
 > receive anything from the bridge**. See
@@ -226,8 +232,8 @@ each was found only by adding a counter for the specific thing being lost.
 ## Reading the log
 
 ```
-I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | hdr 0 crc 0 gaps 0 dec 0
-          | fed-drop 0 B | max gap 100189 us
+I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | hdr 0 crc 0 short 0 gaps 0
+          dec 0 dcrc 0 | fed-drop 0 B | max gap 100189 us
 ```
 
 | Field | Meaning |
@@ -237,7 +243,10 @@ I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | hdr 0 crc 0 gaps 0 dec 0
 | `eff` | **PCM samples/s actually reaching playback** — the number that matters |
 | `hdr` | frames refused on an impossible `kind` or `len`, before the CRC ran |
 | `crc` | link integrity. **This is the counter that tests the argument above** |
+| `short` | a transfer that did not arrive whole (`trans_len` short of a full frame): CS split or merged one. Zero means every `crc`/`hdr` failure is a bit error inside a complete frame, not a framing break |
 | `gaps` | packets the bridge dropped, visible because `seq` is set at enqueue |
+| `dec` | SBC decode failures other than the frame's own CRC |
+| `dcrc` | SBC frames whose own CRC-8 failed despite the link CRC-16 passing — corruption past the link check |
 | `fed-drop` | PCM discarded because the input buffer was full; must be 0 |
 | `max gap` | longest silence between audio packets. 79–112 ms is normal — the source is bursty. Past 150 ms the window prints at once |
 
@@ -274,14 +283,20 @@ The order matters, and each step is one variable.
    and the queue ~430 ms — so it is either the source stopping or the queue
    dropping everything, and `queue full: N dropped` says which. That log has
    never been read.
-2. **Run at `SBC_LINK_SPI_HZ` = 1 MHz** across at least one track change.
-   Looking for: `hdr 0 crc 0`, `gaps` no worse than the UART's, `max gap` back
-   to the 110–150 ms burst pattern, `eff` ~44050, `fed-drop 0`, and no bridge
-   counter moving at all.
-3. **Raise the clock** — 2, 5, 10 MHz — confirming step 2 at each. These are the
-   same breadboard jumpers that set the UART's ceiling, and SPI adds a clock
-   line to the bundle. Expect wiring to be the limit again, and keep every
-   ground wire.
+2. **Run at `DANCEFLOOR_SBC_LINK_SPI_HZ` = 1 MHz** across at least one track
+   change. Looking for: `hdr 0 crc 0 short 0 dcrc 0`, `gaps` no worse than the
+   UART's, `max gap` back to the 110–150 ms burst pattern, `eff` ~44050,
+   `fed-drop 0`, and no bridge counter moving at all. `short` is the one that
+   names a wiring fault's shape: non-zero means CS is splitting transfers
+   (framing), zero-with-`crc` means SCK/MOSI bit errors (signal integrity). If
+   `crc`/`hdr` move here, drop the clock (step 3) before anything else.
+3. **Move the clock** — `DANCEFLOOR_SBC_LINK_SPI_HZ`, reflash the **bridge**
+   only. If step 2 was not clean, go the other way first: 500 k, then 250 k. If
+   `crc`/`hdr` fall toward 0 as the clock drops, the fault is confirmed physical
+   (jumpers / grounds / SCK edge rate), not code. Once a speed is clean, raise
+   it — 2, 5, 10 MHz — confirming step 2 at each. These are the same breadboard
+   jumpers that set the UART's ceiling, and SPI adds a clock line to the bundle.
+   Expect wiring to be the limit again, and keep every ground wire.
 4. **Only then raise `max_bitpool`** above 53 in `bt_bridge/main/main.c`. The
    new constraint is `SBC_LINK_MAX_PAYLOAD` at 1024 bytes against ~830 today,
    and `payload past the link ceiling` is the counter that says when packets

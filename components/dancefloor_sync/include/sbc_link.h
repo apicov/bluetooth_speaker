@@ -69,8 +69,11 @@ typedef enum {
  * where breadboard jumpers began producing bad sync bytes. SPI adds a clock
  * line to the same bundle, so expect the same wiring to set the same kind of
  * limit, and raise this in steps against the crc counter rather than in one go.
+ *
+ * Set through the DANCEFLOOR_SBC_LINK_SPI_HZ Kconfig symbol (default 1 MHz);
+ * only the bridge build's value is on the wire, as the slave is clocked by it.
  */
-#define SBC_LINK_SPI_HZ 1000000
+#define SBC_LINK_SPI_HZ CONFIG_DANCEFLOOR_SBC_LINK_SPI_HZ
 
 /*
  * CS is the framing.

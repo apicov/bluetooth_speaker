@@ -399,8 +399,9 @@ only the pins.
 | header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` keeps the old `sbc_link_hdr_t` purely so this firmware still compiles; it is dead the moment the port lands and should be deleted with it |
 | checksum | CRC-16 via `sbc_link_crc16()`, not the XOR byte |
 | framing | fixed 1036-byte transactions, two DMA buffers queued alternately |
-| log line | `sync` becomes `hdr`. Any script or habit reading that column changes with it |
-| Kconfig | `DANCEFLOOR_SBC_UART_RX_PIN` → the four `DANCEFLOOR_SBC_SPI_*_PIN` symbols |
+| log line | `sync` becomes `hdr`, and the SPI line gains two columns the UART one never had: `short` (a transfer that did not arrive whole -- CS split it) and `dcrc` (an SBC frame whose own CRC failed despite the link CRC passing). Both come along when the file is copied; only `dcrc` is meaningful on a UART, and the classic hub does not report it yet |
+| decode split | `dcrc` vs `dec` is told apart by `sbc_decoder_last_result()` in the shared `components/sbc_decoder/`. The classic hub already links it; only its `sbc_in.c` call site would need it, and only when it adopts the `dcrc` column. `short` is SPI-only -- a UART has no `trans_len` |
+| Kconfig | `DANCEFLOOR_SBC_UART_RX_PIN` → the four `DANCEFLOOR_SBC_SPI_*_PIN` symbols, plus `DANCEFLOOR_SBC_LINK_SPI_HZ` (shared through `dancefloor_sync`; only the bridge's value is on the wire) |
 | CMakeLists | `esp_driver_uart` → `esp_driver_spi` |
 
 ### 7.3 What the classic hub does *not* have to give up
