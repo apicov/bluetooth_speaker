@@ -24,6 +24,7 @@
 /* Reached under esp_netif_tcpip_exec() only -- see arp_seed(). */
 #include "lwip/etharp.h"
 
+#include "audio_out.h"
 #include "sync_proto.h"
 #include "visualiser.h"
 #include "wifi_log.h"
@@ -1511,9 +1512,11 @@ static void i2s_start(uint32_t rate)
     /* Compare this against the satellite's line. The sync marker fires when a
      * chunk is written, not when it is heard, so unequal output buffering shows
      * up as a fixed offset unrelated to clock sync. */
-    ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms",
+    ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms, "
+                  "channels=%s",
              chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
-             (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate));
+             (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate),
+             AUDIO_CHANNEL_MODE_NAME);
 }
 
 /*
@@ -1957,6 +1960,12 @@ static void local_play_task(void *arg)
                 s_marker_sample = -1;
             }
             samples_played += AUDIO_FRAMES;
+
+            /* Last thing before the DMA buffer, and deliberately after every
+             * count above: it rewrites slots within frames that already exist,
+             * so samples_played and the phase queue are looking at the same
+             * timeline whatever this unit's speaker is placed as. */
+            audio_apply_channel_mode((int16_t *)chunk, AUDIO_FRAMES);
 
             size_t written = 0;
             const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;

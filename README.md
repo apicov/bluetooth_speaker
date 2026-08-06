@@ -190,6 +190,15 @@ Four things that are not obvious from the table:
   They sit on the SPI-labelled pads so the DAC is one ribbon off the end of the
   header.
 
+**Which channels a box plays** is a `menuconfig` choice on the hub and on each
+satellite, `DANCEFLOOR_OUTPUT_CHANNELS`: stereo (the default), left only, right
+only, or a `(L+R)/2` mono downmix. Every unit still receives the same stereo
+stream — this only decides what that box's speaker does with it — so a stereo
+pair is two differently-configured images, and the `OUTPUT:` line at boot says
+which one a board is running. The selected channel goes into *both* I2S slots
+rather than the other being muted, because which slot an amp latches is a
+hardware strap and muting the wrong one gives silence.
+
 A satellite can run with **no DAC at all** for bring-up:
 `DANCEFLOOR_USE_INTERNAL_DAC` plays through the ESP32's built-in converters on
 GPIO 25 (left) and 26 (right). They are 8-bit — 48 dB of dynamic range against

@@ -37,6 +37,7 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 
+#include "audio_out.h"
 #include "sync_proto.h"
 #include "sbc_link.h"
 #include "sbc_decoder.h"
@@ -564,8 +565,8 @@ static void i2s_start(uint32_t rate)
      * written, so any difference in output buffering between units appears as a
      * fixed offset that has nothing to do with clock sync. */
     ESP_LOGW(TAG, "OUTPUT: internal DAC (8-bit), GPIO 25=L 26=R, "
-                  "buffer 8 x 2048 B = %d ms",
-             (8 * 2048) * 1000 / (int)(rate * 2));
+                  "buffer 8 x 2048 B = %d ms, channels=%s",
+             (8 * 2048) * 1000 / (int)(rate * 2), AUDIO_CHANNEL_MODE_NAME);
 }
 
 /* int16 signed interleaved -> uint8 unsigned, which is what the DAC wants. */
@@ -610,9 +611,11 @@ static void i2s_start(uint32_t rate)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
-    ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms",
+    ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms, "
+                  "channels=%s",
              chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
-             (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate));
+             (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate),
+             AUDIO_CHANNEL_MODE_NAME);
 }
 
 static void dac_write(const uint8_t *pcm, size_t bytes)
@@ -2153,6 +2156,17 @@ static void play_task(void *arg)
                 marker_sample = -1;
             }
             samples_played += AUDIO_FRAMES;
+
+            /* Last thing before the output, and deliberately after every count
+             * above: it rewrites slots within frames that already exist, so
+             * samples_played and the phase queue are looking at the same
+             * timeline whatever this unit's speaker is placed as.
+             *
+             * Here rather than inside write_audio() because that is also called
+             * with the const `quiet` buffer a splice inserts, which must not be
+             * written to -- and needs nothing doing to it, since every mode
+             * maps silence to silence. */
+            audio_apply_channel_mode((int16_t *)chunk, AUDIO_FRAMES);
 
             write_audio(chunk, sizeof(chunk));
             /* Immediately: it is the instant the next pass dates its phase
