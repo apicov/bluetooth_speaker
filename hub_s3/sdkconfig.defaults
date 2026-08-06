@@ -135,13 +135,35 @@ CONFIG_ESP_PHY_ENABLE_USB=n
 # BUFFER COUNT problem, not a rate problem, and it is fixed below where it
 # lives rather than by trading away the robustness that was working.
 #
-# So: aggregation off (esp_wifi_internal_set_fix_rate refuses to run with it
-# on), the rate pinned again, and the burst absorbed by TX buffers instead.
-CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+# So: aggregation off was the verdict then (esp_wifi_internal_set_fix_rate
+# refuses to run with it on), the rate pinned, and the burst absorbed by TX
+# buffers. That was the right call for *reliability at small N*. It is now
+# RE-OPENED because the goal moved to satellite COUNT: unicast fan-out makes
+# downlink airtime scale with N, and at 6 Mbps the duty-cycle wall lands around
+# 6-8 satellites (the table below is where that became visible). A-MPDU
+# amortises the ~350 us per-frame DIFS/backoff/preamble across a burst and lets
+# rate adaptation reach MCS7 (~65 Mbps), buying roughly 10x airtime headroom.
+# Aggregation requires the rate unpinned (the constraint above), so the two
+# flips below go together; the satellite needs no rebuild -- AMPDU RX is on
+# (RX_BA_WIN 6) and it accepted aggregates when this was tried before, the run
+# where tx-fail went 1016 -> 0 (see THE WRONG FIX above).
+#
+# Steady-state cost on the OLD hardware: 0.33 -> 3.5-14 gaps/min (table below).
+# That number was taken with a 16 kB I-cache and the USB-PHY mitigation off;
+# both have since flipped (32 kB cache below, ESP_PHY_ENABLE_USB=n). Re-measured
+# on this hardware: 0 audio gaps/min over 18 min at 1 satellite, tx-fail 0, hub
+# min heap ~68 kB -- clears the ~2.5 gaps/min bar that the old number failed, so
+# the flip holds. Scaling to more satellites is still unmeasured (the airtime
+# model predicts ~30 at light aggregation); the satellite also logged 17 brief
+# STA re-associations that the play buffer absorbed without an audio gap.
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_TX_BA_WIN=6
 
-# 6 Mbps. THE AXIS IS EXHAUSTED -- all four points have now been measured on
-# this hardware, and this is the one that wins. Do not re-open it without a new
-# reason; the pattern below is not subtle.
+# The rate axis. All four points were measured on this hardware and 6 Mbps was
+# the one that held, 0.33 gaps/min; "do not re-open without a new reason" was
+# the standing instruction. The new reason is scaling satellite count (see the
+# AMPDU block above), so the rate is unpinned to 0 below and the table stands
+# as the record on the OLD hardware.
 #
 #   rate            satellite gaps            note
 #   ----            --------------            ----
@@ -168,7 +190,11 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 # The next lever for that is buffers against heap, which on this unit is already
 # at a 34.7 kB minimum with a 31.7 kB largest block. That is a real constraint,
 # not a free knob.
-CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS=6
+#
+# Rate unpinned (0 = adaptation), paired with the AMPDU flip above. The 3.5-14
+# gaps/min in the table is the stale number; on this hardware it re-measures at
+# 0 gaps/min at 1 satellite (see the AMPDU block), so the flip holds.
+CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS=0
 
 # 240 MHz, up from the 160 that IDF defaults to and that this build inherited
 # without anyone choosing it.

@@ -2365,11 +2365,16 @@ void streamer_start(void)
      * Safe before visualiser_start(): this only stores a pointer the analysis
      * task reads, and that task does not exist yet.
      *
-     * Registered unconditionally. A satellite built to do its own analysis
-     * ignores what arrives, so whether frames are worth sending is the
-     * receiver's decision, not this one's -- and a floor may hold some of each.
+     * Registered only when DANCEFLOOR_PUBLISH_FRAMES is on. The hub's own strip
+     * renders from the analysis either way; this gates only whether those frames
+     * go out to satellites. A floor where every satellite is LED_SOURCE_LOCAL
+     * analyses its own audio and gains nothing from the ~5 kB/s per listener this
+     * costs -- turn it off there to recover the airtime at scale. The per-satellite
+     * case (some of each) wants a subscribe message, not a build switch.
      */
+#if CONFIG_DANCEFLOOR_PUBLISH_FRAMES
     visualiser_set_publish(publish_frame);
+#endif
 #endif
     ESP_LOGI(TAG, "streaming on port %d, unicast to registered listeners", SYNC_PORT);
 }

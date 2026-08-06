@@ -89,6 +89,23 @@ menu "Dancefloor hub"
             Note this pins ALL transmission on the interface, unicast included,
             so any non-zero value disables rate adaptation entirely.
 
+    config DANCEFLOOR_PUBLISH_FRAMES
+        bool "Broadcast analysis frames to satellites (LED_SOURCE_REMOTE)"
+        default y
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Whether the hub unicasts its per-track analysis frames (MSG_FRAME,
+            ~5 kB/s per listener on top of the audio) to every registered
+            satellite. Leave on when any satellite is built LED_SOURCE_REMOTE
+            and renders from these; turn off when every satellite is
+            LED_SOURCE_LOCAL and analyses its own audio, to recover that ~5 kB/s
+            of downlink airtime per satellite.
+
+            Airtime scales with satellite count under unicast fan-out, so on a
+            large floor of local-source satellites this is free capacity. The
+            hub's own local strip is unaffected either way: this gates the
+            broadcast, not the analysis.
+
     config DANCEFLOOR_AP_OPEN
         bool "Run the SoftAP with no password (diagnostic)"
         default n
