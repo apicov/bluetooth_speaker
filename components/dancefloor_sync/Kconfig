@@ -52,4 +52,23 @@ menu "Dancefloor diagnostics"
             Lives here (rather than the bridge's own Kconfig) because the symbol
             is shared through this component and both ends print it.
 
+    config DANCEFLOOR_WIFI_LOGS
+        bool "Forward logs + telemetry over WiFi to a collector"
+        default n
+        help
+          Ships every ESP_LOG line (MSG_LOG) and a structured HEALTH snapshot
+          (MSG_HEALTH) over the sync UDP socket to a laptop collector that has
+          joined the AP, for bench analysis. The hub relays its own and every
+          satellite's logs to whichever laptop sent MSG_LOG_SUB.
+
+          Off in production. The receive path must never block on a network
+          send -- a blocking log write in rx_task starves the UDP mailbox and
+          causes the very loss it was logging (satellite/main/main.c:286) --
+          so the shipper is a low-priority task fed by a non-blocking,
+          drop-on-full queue, and the whole feature compiles out when this is
+          unset: zero airtime, zero feedback-loop risk, no wifi_log symbols.
+
+          Enable for bench in the role's sdkconfig.defaults. The bridge is not
+          affected: it has no WiFi, and its logs reach the collector over USB.
+
 endmenu

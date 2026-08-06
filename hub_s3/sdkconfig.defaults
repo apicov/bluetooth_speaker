@@ -500,3 +500,10 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 #   CONFIG_SPIRAM=y
 #   CONFIG_SPIRAM_MODE_OCT=y
 #   CONFIG_SPIRAM_SPEED_80M=y
+
+# Forward this unit's logs and HEALTH snapshots over the sync socket to a
+# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
+# production flash, where the shipper compiles out entirely. The hub also
+# relays every satellite's logs to the collector, so this is the one unit that
+# must have it on for centralised capture to work.
+CONFIG_DANCEFLOOR_WIFI_LOGS=y

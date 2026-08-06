@@ -35,3 +35,8 @@ tools/pattern_lab/pattern_lab
 tools/pattern_lab/*.o
 tools/tuning/converge
 tools/tuning/*.o
+
+# Bench captures from tools/log_collector/collect.py -- one session directory
+# per run, holding that run's all.jsonl and health.csv.
+tools/log_collector/logs-*/
+logs-*/

@@ -37,6 +37,9 @@ typedef enum {
     MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
     MSG_TSF      = 7,   /* master -> satellite, measurement only, see tsf_msg_t */
     MSG_FRAME    = 8,   /* master -> listeners, one analysis frame */
+    MSG_LOG      = 9,   /* any wifi unit -> collector, one formatted log line */
+    MSG_HEALTH   = 10,  /* any wifi unit -> collector, the structured HEALTH snapshot */
+    MSG_LOG_SUB  = 11,  /* collector -> hub: "send logs here" (see log_sub_msg_t) */
 } msg_type_t;
 
 /*
@@ -281,6 +284,122 @@ typedef struct __attribute__((packed)) {
 
 /* The two definitions must not drift apart; sbc_link.h owns the fields. */
 _Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.payload");
+
+/*
+ * One formatted log line, shipped off-board for centralised analysis.
+ *
+ * The bench runs several boards at once and the interesting events -- a
+ * retune on one unit against a clean window on another, a heap dip that
+ * precedes an alloc-fail, two units' phase lines side by side -- only read
+ * across consoles. This carries each ESP_LOG line to a laptop collector so
+ * they land in one merged stream. The receive path never sends it: a blocking
+ * send there would close the same loss -> log -> mailbox-overflow -> loss loop
+ * that took the per-event ESP_LOGW calls out of handle_audio()
+ * (satellite/main/main.c:286). The hook that fills this runs in whichever
+ * task logged, but only enqueues (non-blocking, drop-on-full); a separate
+ * low-priority task drains the queue and does the sendto().
+ *
+ * Variable-length, like the audio and frame messages: only the first msg_len
+ * bytes of `msg` go on the wire (LOG_MSG_BYTES), so the 192-byte array is a
+ * ceiling, not a per-packet cost. The whole ceiling stays under a 1500-byte
+ * MTU so nothing fragments.
+ *
+ * The collector is the hub's funnel: every unit sends to the hub, and the hub
+ * forwards to whichever laptop registered with MSG_LOG_SUB. Every packet the
+ * collector receives therefore comes from the hub's 192.168.4.1, so the UDP
+ * source address is useless for telling units apart. `role` and `src_ip` are
+ * what split them: role distinguishes hub from satellite, and src_ip (in
+ * network byte order) is the satellite's own address, stamped by the hub on
+ * relay because the satellite does not know its DHCP lease. 0 means "the hub
+ * itself" on a hub-originated packet.
+ */
+#define LOG_ROLE_HUB 0
+#define LOG_ROLE_SAT 1
+
+#define LOG_TAG_MAX   16
+#define LOG_MSG_MAX   192
+
+typedef struct __attribute__((packed)) {
+    uint8_t  type;        /* MSG_LOG */
+    uint8_t  level;       /* the level char as printed: 'E','W','I','D' */
+    uint8_t  role;        /* LOG_ROLE_HUB / LOG_ROLE_SAT */
+    uint8_t  tag_len;
+    uint16_t msg_len;
+    uint32_t seq;
+    uint32_t src_ip;      /* network order; hub stamps on relay, 0 = self */
+    char     tag[LOG_TAG_MAX];
+    char     msg[LOG_MSG_MAX];
+} log_msg_t;
+
+/* Bytes to send for a message of m payload bytes. */
+#define LOG_MSG_BYTES(m) (sizeof(log_msg_t) - LOG_MSG_MAX + (size_t)(m))
+
+_Static_assert(sizeof(log_msg_t) <= 1500, "log_msg_t ceiling exceeds the MTU");
+
+/*
+ * The structured counterpart to the HEALTH line, shipped every ~60 s beside
+ * the ring_monitor_task (hub) / drift_task (satellite) narration that already
+ * holds every field in scope. A fixed layout, not a formatted string, so the
+ * collector writes one CSV row per snapshot and the numbers plot directly.
+ *
+ * The two units log different counters, so the fields past the common heap and
+ * stack set are a union: the name is the satellite's and the hub alias is in
+ * the comment. Both units fill every field -- a counter that does not exist on
+ * one role is left 0 -- so the collector unpacks one layout regardless of role.
+ * role/src_ip are as for log_msg_t: the hub stamps src_ip on relay.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t  type;          /* MSG_HEALTH */
+    uint8_t  role;          /* LOG_ROLE_HUB / LOG_ROLE_SAT */
+    uint8_t  clock_src;     /* satellite: 0 = probe estimator, 1 = TSF; hub: 0 */
+    uint8_t  _rsv;
+    uint32_t seq;
+    uint32_t src_ip;        /* network order; hub stamps on relay, 0 = self */
+    uint64_t uptime_s;
+    uint32_t heap_cur;
+    uint32_t heap_min;      /* since boot */
+    uint32_t heap_win;      /* lowest this minute, taken and cleared */
+    uint32_t heap_largest;  /* largest free block */
+    uint32_t hw_play;       /* stack headroom, play task */
+    uint32_t hw_mon;        /* hub: ring_monitor; satellite: drift task */
+    /* counters common to both roles, then the role-specific tail. */
+    uint32_t underruns;
+    uint32_t reanchors_or_restarts;        /* sat: reanchors, hub: restarts */
+    uint32_t splices;
+    uint32_t retunes;
+    uint32_t retunes_refused;              /* both: n_retunes_bad */
+    uint32_t gaps_or_sta_left;             /* sat: gaps, hub: sta-left */
+    uint32_t wifi_drops_or_oversize;       /* sat: wifi-drops, hub: wifi-over */
+    uint32_t alloc_fail;
+    uint32_t phase_drop;
+    uint32_t short_reads;
+    uint32_t short_frames;
+    uint32_t ring_full_or_sta_dropped;     /* sat: ring-full, hub: sta-dropped */
+    uint32_t upgrades_or_sta_nolease;      /* sat: anchor upgrades, hub: sta-nolease */
+    uint32_t anchors_refused_or_timeout;   /* sat: anchors-refused, hub: sta-timeout */
+    /*
+     * How faithful the capture itself is, from wifi_log. dropped counts lines
+     * the hook could not queue or the non-blocking send could not hand to the
+     * driver; no_dest counts those with no collector registered. Nonzero
+     * dropped means the merged stream has holes -- read it before concluding
+     * anything from a gap between two lines.
+     */
+    uint32_t log_dropped;
+    uint32_t log_no_dest;
+} health_msg_t;
+
+/*
+ * The collector's registration. Sent to the hub every few seconds; the hub
+ * forwards logs to the most recent sender for ~30 s after the last one. The
+ * magic stops a stray two-byte packet (an unknown type, or a truncated probe)
+ * from being read as a subscribe and pulling audio-bound traffic onto the
+ * laptop. "LOG1" in ASCII.
+ */
+#define LOG_SUB_MAGIC 0x4C4F4731u
+typedef struct __attribute__((packed)) {
+    uint8_t  type;        /* MSG_LOG_SUB */
+    uint32_t magic;       /* LOG_SUB_MAGIC */
+} log_sub_msg_t;
 
 /* Bytes to send for a payload of `n`. */
 #define AUDIO_MSG_BYTES(n) (sizeof(audio_msg_t) - AUDIO_MAX_PAYLOAD + (n))
