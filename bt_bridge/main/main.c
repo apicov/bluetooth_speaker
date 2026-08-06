@@ -94,10 +94,24 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             /* Copy out by value, not by pointer: sbc_info sits in a packed
              * union, and &member trips -Waddress-of-packed-member. */
             const esp_a2d_cie_sbc_t sbc = param->audio_cfg.mcc.cie.sbc_info;
-            ESP_LOGI(BT_AV_TAG, "audio cfg: bitpool %u..%u | samp_freq 0x%02x "
-                     "ch_mode 0x%02x block_len 0x%02x subbands 0x%02x alloc 0x%02x",
-                     sbc.min_bitpool, sbc.max_bitpool, sbc.samp_freq,
-                     sbc.ch_mode, sbc.block_len, sbc.num_subbands, sbc.alloc_mthd);
+            /* These are the phone's *selected* config -- one bit per field, not
+             * the capability mask we advertise -- so decode by name rather than
+             * raw hex. (0x01 ch_mode is joint stereo, not mono: in
+             * esp_a2dp_api.h MONO=0x8, JOINT_STEREO=0x1.) */
+            const char *sf = sbc.samp_freq & ESP_A2D_SBC_CIE_SF_48K ? "48k"
+                           : sbc.samp_freq & ESP_A2D_SBC_CIE_SF_44K ? "44.1k"
+                           : sbc.samp_freq & ESP_A2D_SBC_CIE_SF_32K ? "32k" : "16k";
+            const char *cm = sbc.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO         ? "mono"
+                           : sbc.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL ? "dual"
+                           : sbc.ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO       ? "stereo"
+                           : "joint";
+            const char *bl = sbc.block_len & ESP_A2D_SBC_CIE_BLOCK_LEN_16 ? "16"
+                           : sbc.block_len & ESP_A2D_SBC_CIE_BLOCK_LEN_12 ? "12"
+                           : sbc.block_len & ESP_A2D_SBC_CIE_BLOCK_LEN_8  ? "8"  : "4";
+            const char *ns = sbc.num_subbands & ESP_A2D_SBC_CIE_NUM_SUBBANDS_8 ? "8" : "4";
+            const char *am = sbc.alloc_mthd & ESP_A2D_SBC_CIE_ALLOC_MTHD_SNR ? "snr" : "loudness";
+            ESP_LOGI(BT_AV_TAG, "audio cfg: %s %s | block %s subbands %s %s | bitpool %u..%u",
+                     sf, cm, bl, ns, am, sbc.min_bitpool, sbc.max_bitpool);
         }
 #if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
         bt_app_work_dispatch(bt_a2d_evt_int_codec_hdl, event, param, sizeof(esp_a2d_cb_param_t), NULL);
