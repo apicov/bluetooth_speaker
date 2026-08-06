@@ -113,6 +113,52 @@ integrity) — in the second case drop the clock and reflash the bridge. Nothing
 arrives until a phone connects and plays, so `pkts 0` before that is expected
 rather than a fault.
 
+### Bridge status LEDs
+
+Two optional indicators on the bridge, so a box with no console attached still
+says what it is doing.
+
+| | pin | means |
+|---|---|---|
+| Connected | **GPIO 32** | solid on while a phone is connected over A2DP |
+| Streaming | **GPIO 33** | blinks at 0.5 Hz — a second on, a second off — while audio packets are arriving |
+
+```
+  GPIO 32 ──[330 Ω]──▶ LED ──▶ GND
+  GPIO 33 ──[330 Ω]──▶ LED ──▶ GND
+```
+
+Both are `menuconfig` values under *Bridge status LEDs*
+(`BRIDGE_LED_CONNECTED_GPIO`, `BRIDGE_LED_STREAMING_GPIO`); **-1 disables**
+either one, and nothing else changes if you leave them unwired.
+
+That is every pin the bridge uses, so the whole chip fits in one table:
+
+| GPIO | | |
+|---|---|---|
+| 13 | MOSI, out | the SPI link |
+| 14 | SCK, out | |
+| 15 | CS, out | 10 kΩ pull-up to 3V3 |
+| 25 | HANDSHAKE, in | |
+| 32 | Connected LED, out | |
+| 33 | Streaming LED, out | |
+
+Everything else is free. If you move an LED, keep off 34–39 — input-only on a
+classic ESP32, they cannot drive anything, and the Kconfig range stops at 33 for
+that reason — and off 6–11, which are the flash. GPIO 2 works but is worth
+avoiding here: it is a strapping pin, and it is already the default for
+`DANCEFLOOR_ENABLE_LED_MARKER` on the other builds, so pointing this at it too
+would give one light two meanings across the floor.
+
+**The blink follows the packets, not the phone's reported state.** It is driven
+from the A2DP audio callback and goes dark after 300 ms with nothing arriving,
+so a stream that stalls with the phone still calling itself "playing" shows as a
+dark LED next to a lit one. That pair — connected but not streaming — is the
+useful reading: it separates a pairing problem from a playback one before you
+reach for a console. What it does *not* say is whether the hub is receiving any
+of it; the LED is lit by packets leaving this chip, and `sbc_in` on the hub is
+still the only thing that reports what arrived.
+
 ### The PCM5102A DAC
 
 Every unit drives its own DAC — the hub is a full speaker, not a base station —

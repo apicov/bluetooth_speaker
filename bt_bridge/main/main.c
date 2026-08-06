@@ -24,6 +24,7 @@
 
 #include "sbc_spi.h"
 #include "avrcp_meta.h"
+#include "status_led.h"
 
 /* device name */
 static const char local_device_name[] = CONFIG_EXAMPLE_LOCAL_DEVICE_NAME;
@@ -85,6 +86,15 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     case ESP_A2D_AUDIO_STATE_EVT:
     case ESP_A2D_AUDIO_CFG_EVT:
     case ESP_A2D_SEP_REG_STATE_EVT: {
+        if (event == ESP_A2D_CONNECTION_STATE_EVT) {
+            /* Read here rather than in the work-queue handler: that one lives
+             * in the IDF example component, and the LED is the only thing this
+             * project wants out of the event. CONNECTING and DISCONNECTING both
+             * count as off -- the LED means "a phone is on the other end", not
+             * "something is happening". */
+            status_led_set_connected(param->conn_stat.state ==
+                                     ESP_A2D_CONNECTION_STATE_CONNECTED);
+        }
         if (event == ESP_A2D_AUDIO_CFG_EVT) {
             /* The codec the phone actually agreed to. max_bitpool here is the
              * negotiated ceiling -- min(what we advertised, the phone's own max)
@@ -129,6 +139,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 #if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
 static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
 {
+    status_led_note_audio();
     bt_a2d_data_hdl(data, len);
 }
 #else
@@ -136,6 +147,7 @@ static void bt_app_a2d_audio_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_
 {
     /* Undecoded SBC straight out to the hub -- no decode on this chip at all.
      * bt_a2d_audio_data_hdl() owns the buffer and frees it. */
+    status_led_note_audio();
     sbc_link_send(audio_buf->data, audio_buf->data_len);
     bt_a2d_audio_data_hdl(conn_hdl, audio_buf);
 }
@@ -234,6 +246,7 @@ void app_main(void)
     ESP_ERROR_CHECK(bredr_app_common_init());
 
     sbc_link_start();
+    status_led_start();
 
     bt_app_task_start_up();
     /* bluetooth device name, connection mode and profile set up */

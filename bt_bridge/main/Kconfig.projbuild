@@ -13,3 +13,30 @@ menu "A2DP Example Configuration"
             If enable, Bluedroid stack will not decode A2DP audio data, user need to decode it in application layer.
 
 endmenu
+
+menu "Bridge status LEDs"
+    config BRIDGE_LED_CONNECTED_GPIO
+        int "Connected LED GPIO (-1 to disable)"
+        range -1 33
+        default 32
+        help
+            Solid on while a phone is connected over A2DP, off otherwise.
+
+            Wire the LED from the pin through a resistor (330 ohm is fine) to
+            ground; the pin drives it high. Anything above GPIO 33 cannot be
+            used -- 34-39 on a classic ESP32 are input-only.
+
+            GPIO 13, 14, 15 and 25 belong to the SPI link to the hub and must
+            not be used here.
+
+    config BRIDGE_LED_STREAMING_GPIO
+        int "Streaming LED GPIO (-1 to disable)"
+        range -1 33
+        default 33
+        help
+            Blinks at 0.5 Hz while A2DP audio packets are arriving, dark
+            when the phone is paused or the stream has stopped. It follows the
+            packets themselves, not the reported stream state, so a stalled
+            stream goes dark even if the phone still calls itself playing.
+
+endmenu

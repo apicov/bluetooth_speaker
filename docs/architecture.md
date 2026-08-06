@@ -915,6 +915,14 @@ instrument on this board — it needs GPIO 4 and GPIO 5 both.
 longer receive anything from the bridge. See
 [`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
 
+**Two status LEDs on the bridge**, both optional and neither feeding back into
+anything — GPIO 32 solid while A2DP is connected, GPIO 33 blinking while audio
+packets arrive. Configurable under *Bridge status LEDs*, `-1` for absent. The
+blink is driven from the audio callback rather than from `ESP_A2D_AUDIO_STATE`,
+so it reports bytes actually leaving the chip; connected-lit-but-dark is a
+stalled stream, and the pair separates a pairing fault from a playback one
+without a console.
+
 **On the hub and each satellite:**
 
 | Function | GPIO | Note |
@@ -1201,6 +1209,7 @@ budget.
 | `components/sbc_decoder/` | Vendored OI SBC decoder from Bluedroid |
 | `bt_bridge/main/sbc_spi.c` | Frames SBC onto the SPI link as master, `seq` assigned at enqueue |
 | `bt_bridge/main/avrcp_meta.c` | Track metadata and change notifications |
+| `bt_bridge/main/status_led.c` | The two front-panel LEDs — connected solid, streaming blinking |
 | `hub/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
 | `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed. `hub/`'s copy is still the UART receiver and no longer has anything to listen to |
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
