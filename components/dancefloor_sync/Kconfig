@@ -27,7 +27,7 @@ menu "Dancefloor diagnostics"
 
     config DANCEFLOOR_SBC_LINK_SPI_HZ
         int "Bridge -> hub SPI clock (Hz)"
-        default 1000000
+        default 5000000
         range 100000 40000000
         help
             SCK frequency the bt_bridge master drives on the one-way SPI link to
@@ -41,6 +41,13 @@ menu "Dancefloor diagnostics"
             bundle, so expect signal integrity, not the protocol, to be the
             limit. If the sbc_in crc/hdr counters move at one speed, drop this
             and reflash the BRIDGE; the hub need not match unless its log should.
+
+            Default is 5 MHz: the 2048-payload frame (2060 bytes on the wire,
+            sized for the codec's bitpool 250) is clean at 5 MHz but fails at
+            10 MHz on these jumpers -- the hub's sbc_in reports short/gaps while
+            the bridge stays clean -- and at 1 MHz the 16.5 ms transfer would
+            eat most of the ~20 ms A2DP cadence. The smaller 1036-byte frame
+            (1024 payload) was clean at 10 MHz, should the ceiling ever drop.
 
             Lives here (rather than the bridge's own Kconfig) because the symbol
             is shared through this component and both ends print it.

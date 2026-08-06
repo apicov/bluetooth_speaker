@@ -13,9 +13,11 @@ phone ──A2DP/SBC──▶ bt_bridge ──SBC over SPI──▶ hub_s3 ─�
 (`0–2 bad sync, 0–1 CRC errors`), not zero. The bring-up's first fault was
 physical, exactly as step 3 below predicts: a marginal CS/data jumper that the
 `short` detector localised and reseating the wire cleared. `crc` is the counter
-that says when the wiring is outpaced as the clock is raised — and the wiring
-has since cleared it clean all the way to 10 MHz, so the bitpool cap of 53 (the
-UART's honest limit) is now the last ceiling to lift.
+that says when the wiring is outpaced as the clock is raised. At the smaller 1036-byte frame the wiring
+cleared it clean all the way to 10 MHz. The payload ceilings are up to 2048 and
+`max_bitpool` advertises 250 (the codec's own ceiling), but the bitpool turned
+out to be a phone question, not a wire one: the handset negotiates 53 back
+regardless. 250 is held as headroom, not a realised gain — step 4.
 
 > `hub/`, the classic ESP32 hub, still speaks the UART and **can no longer
 > receive anything from the bridge**. See
@@ -166,7 +168,7 @@ struct __attribute__((packed)) {
     uint32_t seq;         /* assigned at ENQUEUE, see below */
     uint16_t crc;         /* CRC-16/CCITT over header + payload, crc zeroed */
     uint16_t rsv2;
-} spi_link_hdr_t;         /* 12 bytes, then 1024 of payload */
+} spi_link_hdr_t;         /* 12 bytes, then 2048 of payload */
 ```
 
 Defined once in `components/dancefloor_sync/include/sbc_link.h`; both ends
@@ -178,13 +180,16 @@ stream has no boundaries of its own; the resync scan, the straddling-header
 case, the false-sync branch and the `sync` counter all existed to serve that,
 and all of them are gone. That is about eighty lines of receiver deleted.
 
-**Every transaction is a fixed 1036 bytes, padded.** Both ends then agree on the
+**Every transaction is a fixed 2060 bytes, padded.** Both ends then agree on the
 length *before* the transfer, so nothing depends on the slave reporting how many
 bits it actually received — a wrong `trans_len` is indistinguishable from
-corruption. It costs ~25% of the wire at bitpool 53, against 20–25× headroom.
-The size is also what satisfies the SPI slave's DMA rule that the buffer be
-4-byte aligned with a length that is a multiple of 4, which is why the header is
-12 bytes and not 11.
+corruption. The frame is sized for the codec's bitpool ceiling (250), not today's
+payloads, so much of it is padding at low bitpool — and the padding is cheap:
+even the full 2060 bytes is ~3.3 ms at the link's 5 MHz, far under the ~20 ms
+A2DP cadence, which is the point of sizing for the ceiling rather than the mean.
+The size is also what
+satisfies the SPI slave's DMA rule that the buffer be 4-byte aligned with a
+length that is a multiple of 4, which is why the header is 12 bytes and not 11.
 
 **CRC-16/CCITT replaces the XOR byte**, and the reason is the sync words
 leaving. On the UART a corrupt `len` was survivable because the scan would
@@ -296,15 +301,27 @@ The order matters, and each step is one variable.
    (jumpers / grounds / SCK edge rate), not code. Once a speed is clean, raise
    it — 2, 5, 10 MHz — confirming step 2 at each. These are the same breadboard
    jumpers that set the UART's ceiling, and SPI adds a clock line to the bundle.
-   Expect wiring to be the limit again, and keep every ground wire.
-4. **Only then raise `max_bitpool`** above 53 in `bt_bridge/main/main.c`. The
-   new constraint is `SBC_LINK_MAX_PAYLOAD` at 1024 bytes against ~830 today,
-   and `payload past the link ceiling` is the counter that says when packets
-   have outgrown it rather than the link outgrowing them.
+   Expect wiring to be the limit again, and keep every ground wire. The limit is
+   frame-size dependent: the 1036-byte frame (1024 ceiling) cleared 10 MHz, the
+   2060-byte frame (2048 ceiling) stops at 5 MHz — see step 4.
+4. **Raise `max_bitpool`** in `bt_bridge/main/main.c`. Done: both payload
+   ceilings (`SBC_LINK_MAX_PAYLOAD`, `AUDIO_MAX_PAYLOAD`) went to 2048 — sized
+   for the codec's `SBC_MAX_BITPOOL` (250) at any phone MTU — and `max_bitpool`
+   advertises 250. But the phone negotiated **53** back: the `audio cfg:` log
+   (fired by `ESP_A2D_AUDIO_CFG_EVT`) reads `bitpool 2..53` against our
+   advertised 250, so 53 is the handset's own ceiling and the raise bought this
+   phone nothing — the quality improvement heard was the 5 MHz wire fix, never
+   the bitpool. 250 is kept as headroom for a handset that supports more, and the
+   2060-byte frame it implies runs at **5 MHz** (it fails at 10 MHz on these
+   jumpers; the smaller 1036-byte frame was the one clean at 10 MHz). Two
+   counters guard the ceilings: `payload past the link ceiling` on the bridge
+   (SPI) and `wifi-over` in the hub's HEALTH line (WiFi hop to satellites). Both
+   should read 0; if either moves, a packet outgrew a ceiling.
 
-Changing the transport and the bitpool together would give any fault two
+Changing the transport and the bitpool together would have given any fault two
 candidate causes, which is how this project produced most of its confident wrong
-answers.
+answers — so the bitpool was held at 53 until the SPI link was proven clean, then
+raised on its own.
 
 ---
 

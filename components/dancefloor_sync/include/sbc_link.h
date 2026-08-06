@@ -40,8 +40,12 @@
 
 #include <stdint.h>
 
-/* One A2DP packet can hold several SBC frames. */
-#define SBC_LINK_MAX_PAYLOAD 1024
+/* One A2DP packet can hold several SBC frames. Sized for the codec's own
+ * SBC_MAX_BITPOOL (250) at any phone MTU, so the link never refuses a packet a
+ * handset can actually produce. AUDIO_MAX_PAYLOAD in sync_proto.h is the same
+ * ceiling on the WiFi hop to satellites and must stay >= this; test_sync_proto.c
+ * asserts it does not drift below. */
+#define SBC_LINK_MAX_PAYLOAD 2048
 
 /*
  * Link payload kinds. Audio dominates; metadata is occasional.
@@ -104,9 +108,10 @@ typedef struct __attribute__((packed)) {
  * A fixed size means both ends agree on the length BEFORE the transfer, so
  * nothing depends on the slave reporting how many bits it actually received --
  * a variable-length design has to trust trans_len, and a wrong answer there is
- * indistinguishable from corruption. It costs ~25% of the wire at bitpool 53
- * (~830 byte payloads in a 1036 byte frame), which against 20-25x headroom buys
- * the simpler failure mode for nothing.
+ * indistinguishable from corruption. The frame is sized for the codec's bitpool
+ * ceiling, not today's payloads, so most of it is padding at low bitpool; at
+ * 10 MHz that padding is free, and the fixed size is what makes a CS-split
+ * transfer an unambiguous fault rather than a guess.
  */
 #define SBC_LINK_FRAME_BYTES (sizeof(spi_link_hdr_t) + SBC_LINK_MAX_PAYLOAD)
 

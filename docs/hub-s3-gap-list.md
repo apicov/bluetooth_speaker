@@ -382,8 +382,12 @@ at zero, which reads exactly like a phone that stopped.
 The UART was 50 kB/s hard against a measured ~42 kB/s of payload — 84% of the
 wire — and 500000 baud was where breadboard jumpers began producing bad sync
 bytes, not where the protocol stopped. `max_bitpool` was capped at 53 for that
-reason and could not rise. SPI starts at 1 MHz (20×) and has 10 MHz (25×)
-available. See [`sbc-link.md`](sbc-link.md).
+reason and could not rise on the UART. SPI cleared the wire's capacity, the
+payload ceilings are up to 2048, and `max_bitpool` advertises 250 again — but
+the phone negotiates 53 back regardless, so on the current handset the raise is
+headroom, not a realised gain. The 2060-byte frame the 2048 ceiling implies is
+clean at 5 MHz (it fails at 10 MHz on these jumpers; the smaller 1036-byte frame
+was the one clean at 10 MHz). See [`sbc-link.md`](sbc-link.md).
 
 ### 7.2 What the port needs
 
@@ -398,7 +402,8 @@ only the pins.
 | handshake | an **output** on the hub, input on the bridge. Not optional — `spi_slave` loses any transfer clocked with nothing queued |
 | header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` keeps the old `sbc_link_hdr_t` purely so this firmware still compiles; it is dead the moment the port lands and should be deleted with it |
 | checksum | CRC-16 via `sbc_link_crc16()`, not the XOR byte |
-| framing | fixed 1036-byte transactions, two DMA buffers queued alternately |
+| framing | fixed 2060-byte transactions (12-byte header + 2048 payload, sized for the codec's bitpool 250), two DMA buffers queued alternately. **5 MHz**, not 10: the 2060-byte frame fails on breadboard jumpers at 10 MHz |
+| wifi hop | `AUDIO_MAX_PAYLOAD` rose to 2048 with the SPI ceiling (shared header, flows in automatically). `hub/main/streamer.c` still drops `len > AUDIO_MAX_PAYLOAD` **silently** — port the `wifi-over` counter from `hub_s3` so the ceiling has a tripwire there too |
 | log line | `sync` becomes `hdr`, and the SPI line gains two columns the UART one never had: `short` (a transfer that did not arrive whole -- CS split it) and `dcrc` (an SBC frame whose own CRC failed despite the link CRC passing). Both come along when the file is copied; only `dcrc` is meaningful on a UART, and the classic hub does not report it yet |
 | decode split | `dcrc` vs `dec` is told apart by `sbc_decoder_last_result()` in the shared `components/sbc_decoder/`. The classic hub already links it; only its `sbc_in.c` call site would need it, and only when it adopts the `dcrc` column. `short` is SPI-only -- a UART has no `trans_len` |
 | Kconfig | `DANCEFLOOR_SBC_UART_RX_PIN` → the four `DANCEFLOOR_SBC_SPI_*_PIN` symbols, plus `DANCEFLOOR_SBC_LINK_SPI_HZ` (shared through `dancefloor_sync`; only the bridge's value is on the wire) |

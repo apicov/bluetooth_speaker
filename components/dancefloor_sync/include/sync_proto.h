@@ -195,7 +195,15 @@ typedef enum {
     AUDIO_FMT_SBC = 1,   /* one or more back-to-back SBC frames */
 } audio_fmt_t;
 
-#define AUDIO_MAX_PAYLOAD 1024
+/*
+ * Sized to match SBC_LINK_MAX_PAYLOAD (sbc_link.h): the same max SBC payload, on
+ * the WiFi hop to satellites instead of the SPI hop from the bridge. It must
+ * stay >= SBC_LINK_MAX_PAYLOAD or the forwarder refuses what the link delivered
+ * -- test_sync_proto.c asserts it does not drift below. Only the first
+ * payload_len bytes go on the wire (AUDIO_MSG_BYTES), so the array is a ceiling,
+ * not a per-packet cost.
+ */
+#define AUDIO_MAX_PAYLOAD 2048
 
 /*
  * One chunk of audio. `play_at` is the master-clock instant the *first* sample

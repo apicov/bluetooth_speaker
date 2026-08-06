@@ -678,6 +678,11 @@ uint32_t streamer_take_dropped(void)
     return d;
 }
 
+/* SBC the SPI link delivered but the WiFi ceiling refused. Should be 0 while
+ * AUDIO_MAX_PAYLOAD tracks SBC_LINK_MAX_PAYLOAD; counted, not silent, because a
+ * ceiling drift here would otherwise read as satellite-side gaps. */
+static uint32_t n_wifi_oversize;
+
 /* Ring position and scheduled instant of the last packet sent, so the analysis
  * -- fed on arrival, before this packet's stamp exists -- can date what it is
  * given. See where they are set. */
@@ -818,7 +823,11 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     static uint32_t seq;
     static int64_t next_play_at;
 
-    if (sock < 0 || len == 0 || len > AUDIO_MAX_PAYLOAD || frames == 0) {
+    if (len > AUDIO_MAX_PAYLOAD) {
+        n_wifi_oversize++;
+        return;
+    }
+    if (sock < 0 || len == 0 || frames == 0) {
         return;
     }
 
@@ -2165,7 +2174,7 @@ static void ring_monitor_task(void *arg)
                           ") | sta-timeout %" PRIu32
                           " | alloc-fail %" PRIu32
                           " | phase-drop %" PRIu32 " short-reads %" PRIu32
-                          " (%" PRIu32 " frames)",
+                          " (%" PRIu32 " frames) | wifi-over %" PRIu32,
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      heap_win == UINT32_MAX ? 0 : heap_win,
@@ -2173,7 +2182,7 @@ static void ring_monitor_task(void *arg)
                      hw_play, hw_mon, n_underruns, n_restarts, n_splices,
                      n_retunes, n_retunes_bad, n_sta_left, n_sta_dropped,
                      n_sta_nolease, n_sta_timeout, n_alloc_fail,
-                     n_phase_drop, n_short_reads, n_short_frames);
+                     n_phase_drop, n_short_reads, n_short_frames, n_wifi_oversize);
         }
 
         if (local_start == 0 || rate_ema == 0) {

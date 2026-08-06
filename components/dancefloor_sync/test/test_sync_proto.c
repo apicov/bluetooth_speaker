@@ -329,6 +329,20 @@ int main(void)
     }
 
     /*
+     * The WiFi hop must accept at least what the SPI hop delivers. The two
+     * ceilings are independent literals that have to move together; if the WiFi
+     * one fell below the SPI one, the hub forwarder would refuse what the link
+     * just carried -- a silent drop on a different layer than the one above.
+     */
+    {
+        char d[80];
+        snprintf(d, sizeof d, "spi=%zu wifi=%zu",
+                 (size_t)SBC_LINK_MAX_PAYLOAD, (size_t)AUDIO_MAX_PAYLOAD);
+        check("the WiFi ceiling covers the SPI ceiling",
+              AUDIO_MAX_PAYLOAD >= SBC_LINK_MAX_PAYLOAD, d);
+    }
+
+    /*
      * 18. The CRC is CRC-16/CCITT-FALSE, checked against an independent
      *     implementation rather than against a number this file copied from
      *     the one under test.

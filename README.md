@@ -15,8 +15,8 @@ agreement rather than a replacement; see [`docs/architecture.md`](docs/architect
 ## The shape of it
 
 ```
-phone --A2DP/SBC--> bt_bridge --SBC over UART--> hub --SBC over WiFi--> satellites
-                    (chip A)       500 kbaud     (chip B)    unicast     (any number)
+phone --A2DP/SBC--> bt_bridge --SBC over SPI--> hub_s3 --SBC over WiFi--> satellites
+                    (chip A)     5 MHz, 4 wires   (chip B)   unicast      (any number)
                                                     |                        |
                                                  speaker                  speaker
                                                  + strip                  + strip
@@ -26,7 +26,7 @@ phone --A2DP/SBC--> bt_bridge --SBC over UART--> hub --SBC over WiFi--> satellit
 |---|---|
 | `bt_bridge/` | Chip A of the master. Bluetooth A2DP sink; forwards raw SBC. Nothing else. |
 | `hub/` | Chip B. SoftAP, the presentation timeline every unit obeys, its own speaker and strip. |
-| `hub_s3/` | The same hub firmware built for an ESP32-S3. Experimental, never run on hardware. |
+| `hub_s3/` | The same hub firmware built for an ESP32-S3 — the hub on the bench now. The classic `hub/` it superseded still speaks the UART the bridge no longer sends; see [`docs/hub-s3-gap-list.md`](docs/hub-s3-gap-list.md) §7. |
 | `satellite/` | Joins the hub's SoftAP, plays the stream, drives a strip. Any number of these. |
 | `components/dancefloor_sync/` | Wire format and the clock estimator. No ESP-IDF dependencies, host-testable. |
 | `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver. Shared by hub and satellites. |
@@ -49,55 +49,62 @@ and a spare classic ESP32 needs a rebuild to replace it.
 
 ## Wiring
 
-Everything below applies to a classic-ESP32 hub and an S3 hub alike; only the
-pin numbers move. A satellite is wired like a hub minus the bridge link.
+Most of what follows applies to a classic-ESP32 hub and an S3 hub alike, only
+the pin numbers moving — the bridge link is the exception, now SPI and S3-only.
+A satellite is wired like a hub minus the bridge link.
 
 ### Bridge to hub
 
-One signal wire and a common ground, whichever hub you are using. The bridge is
-always a classic ESP32 and its end never changes.
+Four signals, a handshake line and a common ground. The bridge is always a
+classic ESP32 and drives the link as SPI master; the hub is the slave clocked by
+it, one direction only — no MISO.
 
-| | bridge → | → classic hub | → S3 hub |
+| | bridge (ESP32) | S3 hub (XIAO ESP32-S3) | |
 |---|---|---|---|
-| Board | ESP32 | ESP32 | XIAO ESP32-S3 |
-| Signal | **GPIO 25** (TX) | **GPIO 23** (RX) | **GPIO 44** (RX), pad `D7` |
-| Ground | GND | GND | GND |
+| SCK | **GPIO 14** | **GPIO 44**, pad `D7` | HSPI IOMUX on the bridge |
+| MOSI | **GPIO 13** | **GPIO 6**, pad `D5` | the data |
+| CS | **GPIO 15** | **GPIO 5**, pad `D4` | the framing — one assertion is one packet |
+| HANDSHAKE | **GPIO 25** (in) | **GPIO 3**, pad `D2` (out) | hub says "buffer armed" |
+| Ground | GND ×4 | GND ×4 | keep them all |
 
-500 kbaud, SBC, one direction only. Wire the bridge's TX to the hub's RX and the
-grounds together; that is the whole link.
+The bridge's pins are literals in `bt_bridge/main/sbc_spi.c` — HSPI on its IOMUX
+pins, chosen once and not moved. The hub's are `menuconfig` values
+(`DANCEFLOOR_SBC_SPI_*_PIN` under *Dancefloor hub*), defaulting to the pads
+above. The one clock knob is `DANCEFLOOR_SBC_LINK_SPI_HZ` under *Dancefloor
+diagnostics*: the SCK the bridge drives, default **5 MHz**, changed by
+reflashing the bridge only.
 
-**There is no return wire.** The bridge talks and the hub listens, so neither
-chip configures a TX pin at its receiving end. The bridge does name GPIO 34 as
-its RX, an input-only pin it never reads.
+**The handshake is not optional.** ESP-IDF's `spi_slave` loses any transfer the
+master clocks with nothing queued, so the hub holds the line high while a buffer
+is armed and drops it for the transfer, and the bridge waits on a GPIO interrupt
+rather than a poll — that chip runs Bluetooth Classic, and a task spinning on a
+pin is what its budget cannot absorb. The line is pulled down on the bridge, so a
+hub that is off, reflashing or crashed reads as a stall rather than a stream
+clocked into nothing. [`docs/sbc-link.md`](docs/sbc-link.md) has the reasoning.
 
-**Use every ground you can.** `docs/architecture.md` §14 says GND ×4 and means
-it — this link will not run above 500 kbaud on thin breadboard leads, and the
-failure is progressive rather than obvious. At 750 kbaud it is 20–30 bad sync
-words and 15–20 CRC errors per 5 s; at 1 Mbaud, half the packets are corrupt.
-[`docs/sbc-link.md`](docs/sbc-link.md) has the ladder.
+**Use every ground you can** — GND ×4, the same lesson as the UART before it on
+the same breadboard jumpers. The 2060-byte frame (sized for the codec's bitpool
+ceiling) is clean at 5 MHz and fails at 10 MHz on thin leads; the failure is the
+hub's `short` counter moving while the bridge stays clean, so drop the clock, do
+not chase the code.
 
-The hub's end is a `menuconfig` value — `DANCEFLOOR_SBC_UART_RX_PIN` under
-**Dancefloor hub**, defaulting to 23 on the classic build and 44 on the S3 one.
-The bridge's is not: GPIO 25 is a literal in `bt_bridge/main/sbc_uart.c`, since
-that chip is always the same part on the same board.
+> The classic ESP32 `hub/` still listens on the UART this replaced, and the
+> bridge no longer sends it — a classic hub paired with the current bridge plays
+> silence, and no counter says why (`max gap` grows, everything else reads zero,
+> exactly like a phone that stopped). The S3 hub is the one on the bench;
+> [`docs/hub-s3-gap-list.md`](docs/hub-s3-gap-list.md) §7 has the port back.
 
-Be careful moving it on an S3: **GPIO 22–25 do not exist on that part** (its
-pins are 0–21 and 26–48), 26–32 are wired to the SPI flash and 33–37 to the
-PSRAM, and the XIAO breaks out only eleven pads in total. A pin the target does
-not have is rejected by `uart_set_pin()` inside `ESP_ERROR_CHECK`, so the board
-aborts at boot rather than failing to build. [`hub_s3/README.md`](hub_s3/README.md)
-has the full pad map.
-
-Verifying the link is up, from the hub's log either way:
+Verifying the link is up, from the S3 hub's log:
 
 ```
-I sbc_in:  SBC link listening on GPIO 23 at 500000 baud
-I sbc_in:  pkts 252 | 44100 Hz x2 | eff 44050 Hz | sync 0 crc 0 gaps 0 dec 0
+I sbc_in: pkts 252 | 44100 Hz x2 | eff 44050 Hz | hdr 0 crc 0 short 0 gaps 0
 ```
 
-`sync` and `crc` in single digits are fine; tens mean the wiring, not the code.
-Nothing arrives at all until a phone connects and plays, so `pkts 0` before that
-is expected rather than a fault.
+`crc` and `short` at zero mean the wiring is keeping up. `short` moving means CS
+is splitting transfers (framing); `crc` moving means SCK/MOSI bit errors (signal
+integrity) — in the second case drop the clock and reflash the bridge. Nothing
+arrives until a phone connects and plays, so `pkts 0` before that is expected
+rather than a fault.
 
 ### The PCM5102A DAC
 

@@ -70,6 +70,17 @@ static spi_device_handle_t s_spi;
 static TaskHandle_t s_tx_task;
 static uint8_t *s_frame;        /* DMA-capable, SBC_LINK_FRAME_BYTES */
 
+/*
+ * Staging for the ring item, file-scope rather than on the stack. The A2DP
+ * audio callback is the sole caller of sbc_link_send (the BT stack invokes it
+ * serially), so a static is safe; and keeping SBC_LINK_MAX_PAYLOAD off the
+ * callback's stack means raising the ceiling cannot grow the BT task frame.
+ */
+static struct {
+    spi_link_hdr_t hdr;
+    uint8_t payload[SBC_LINK_MAX_PAYLOAD];
+} s_pkt;
+
 static uint32_t s_seq;
 static uint32_t s_dropped;
 static uint32_t s_oversize;
@@ -85,12 +96,13 @@ void sbc_link_send(const uint8_t *sbc, uint16_t len)
      * Too big for the protocol to carry, and this used to return silently: the
      * one place in this file that loses audio without counting it.
      *
-     * It cannot fire at max_bitpool 53 -- A2DP packets measure ~830 bytes
-     * against a 1024 byte ceiling -- and that is exactly why it needs a counter
-     * rather than a comment. Raising the bitpool is what makes the packets
-     * grow, and this is the first thing that would give way. Silent, it would
-     * present as a hub-side gap: a link fault, investigated on the link, when
-     * the link was innocent and the ceiling was here.
+     * The ceiling is SBC_LINK_MAX_PAYLOAD (2048), sized for the codec's own
+     * SBC_MAX_BITPOOL at any phone MTU, so a handset should never produce a
+     * packet this refuses -- but "should" is exactly why it needs a counter
+     * rather than a comment. If it ever moves, the bitpool and the ceiling are
+     * out of step; silent, that would present as a hub-side gap: a link fault
+     * investigated on the link, when the link was innocent and the ceiling was
+     * here.
      */
     if (len > SBC_LINK_MAX_PAYLOAD) {
         s_oversize++;
@@ -104,20 +116,15 @@ void sbc_link_send(const uint8_t *sbc, uint16_t len)
      * reported no loss -- the drops were completely invisible. Numbering at
      * enqueue makes every drop show up as a gap at the far end.
      */
-    struct {
-        spi_link_hdr_t hdr;
-        uint8_t payload[SBC_LINK_MAX_PAYLOAD];
-    } pkt;
+    s_pkt.hdr.kind = LINK_KIND_SBC;
+    s_pkt.hdr.rsv = 0;
+    s_pkt.hdr.rsv2 = 0;
+    s_pkt.hdr.len = len;
+    s_pkt.hdr.seq = s_seq++;
+    s_pkt.hdr.crc = sbc_link_crc16(&s_pkt.hdr, sbc, len);
+    memcpy(s_pkt.payload, sbc, len);
 
-    pkt.hdr.kind = LINK_KIND_SBC;
-    pkt.hdr.rsv = 0;
-    pkt.hdr.rsv2 = 0;
-    pkt.hdr.len = len;
-    pkt.hdr.seq = s_seq++;
-    pkt.hdr.crc = sbc_link_crc16(&pkt.hdr, sbc, len);
-    memcpy(pkt.payload, sbc, len);
-
-    if (xRingbufferSend(s_ring, &pkt, sizeof(spi_link_hdr_t) + len, 0) != pdTRUE) {
+    if (xRingbufferSend(s_ring, &s_pkt, sizeof(spi_link_hdr_t) + len, 0) != pdTRUE) {
         s_dropped++;
     }
 }

@@ -85,6 +85,20 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     case ESP_A2D_AUDIO_STATE_EVT:
     case ESP_A2D_AUDIO_CFG_EVT:
     case ESP_A2D_SEP_REG_STATE_EVT: {
+        if (event == ESP_A2D_AUDIO_CFG_EVT) {
+            /* The codec the phone actually agreed to. max_bitpool here is the
+             * negotiated ceiling -- min(what we advertised, the phone's own max)
+             * -- so with our max at 250 it reads back the phone's real limit.
+             * That is the number that decides whether raising max_bitpool can
+             * ever buy quality, or whether the phone caps it regardless. */
+            /* Copy out by value, not by pointer: sbc_info sits in a packed
+             * union, and &member trips -Waddress-of-packed-member. */
+            const esp_a2d_cie_sbc_t sbc = param->audio_cfg.mcc.cie.sbc_info;
+            ESP_LOGI(BT_AV_TAG, "audio cfg: bitpool %u..%u | samp_freq 0x%02x "
+                     "ch_mode 0x%02x block_len 0x%02x subbands 0x%02x alloc 0x%02x",
+                     sbc.min_bitpool, sbc.max_bitpool, sbc.samp_freq,
+                     sbc.ch_mode, sbc.block_len, sbc.num_subbands, sbc.alloc_mthd);
+        }
 #if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
         bt_app_work_dispatch(bt_a2d_evt_int_codec_hdl, event, param, sizeof(esp_a2d_cb_param_t), NULL);
 #else
@@ -150,32 +164,31 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_4 | ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
         mcc.cie.sbc_info.alloc_mthd = ESP_A2D_SBC_CIE_ALLOC_MTHD_SNR | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
         /*
-         * The bitpool ceiling is a WIRE budget, not a quality preference.
+         * The bitpool was a WIRE budget on the UART: 53 was what 500 kbaud could
+         * carry, the standard A2DP "high quality" value. SPI cleared the wire
+         * bandwidth, so 250 (the codec's own SBC_MAX_BITPOOL) was tried with the
+         * payload ceilings at 2048 -- a 2060-byte frame.
          *
-         * 53 is what the UART link was measured carrying: the hub reported
-         * ~42 kB/s of SBC, which is bitpool 53 at 44.1 kHz joint stereo -- the
-         * standard A2DP "high quality" value, and 85% of that wire. 250 was
-         * here before, advertising about five times what the wire could take
-         * with nothing enforcing the difference, so a phone choosing bitpool 76
-         * asked for ~59 kB/s down a 50 kB/s link and the surplus was not slowed
-         * down, it was dropped. Whether that happened depended on which handset
-         * connected, which is a fine recipe for an intermittent fault nobody can
-         * reproduce.
+         * Two things bound it, and neither is the wire's raw capacity:
          *
-         * THE WIRE HAS MOVED AND THIS NUMBER HAS NOT, deliberately. The link is
-         * SPI now, 20-25x the headroom, and the whole reason for changing it was
-         * to let this go back up. But raising it is a separate experiment and
-         * belongs after the new link has been shown clean at the OLD rate:
-         * change the transport and the bitpool together and a fault has two
-         * candidate causes, which is how this project has produced most of its
-         * confident wrong answers.
+         *   The frame on the jumpers. The 2060-byte transfer fails at 10 MHz --
+         *   the hub's sbc_in reports `short`/`gaps` while the bridge stays clean
+         *   -- but is clean at 5 MHz (slower edges, ~3.3 ms/transfer against a
+         *   ~20 ms A2DP cadence). The smaller 1036-byte frame was clean at 10
+         *   MHz; the clock is a wire-reliability knob, not a quality one.
          *
-         * So raise it once sbc_in reports `hdr 0 crc 0` with gaps no worse than
-         * the UART's, and watch two things when you do. The link ceiling is no
-         * longer the constraint; SBC_LINK_MAX_PAYLOAD is, at 1024 bytes against
-         * ~830 today, and sbc_spi.c counts what it refuses. See docs/sbc-link.md.
+         *   The source. The AUDIO_CFG event reads the negotiated codec back, and
+         *   this phone returns bitpool 2..53 regardless of what we advertise
+         *   (the `audio cfg:` log). 53 is the handset's own ceiling, so raising
+         *   our max bought nothing for it -- the quality improvement heard was
+         *   the 5 MHz wire fix, never the bitpool.
+         *
+         * 250 is kept as HEADROOM. It costs this phone nothing -- it negotiates
+         * 53 either way -- and a handset that supports more would use it with no
+         * code change. The `payload past the link ceiling` counter (s_oversize)
+         * is the tripwire if a packet ever outgrows 2048. See docs/sbc-link.md.
          */
-        mcc.cie.sbc_info.max_bitpool = 53;
+        mcc.cie.sbc_info.max_bitpool = 250;
         mcc.cie.sbc_info.min_bitpool = 2;
         /* register stream end point, only support SBC currently */
         esp_a2d_sink_register_stream_endpoint(0, &mcc);
