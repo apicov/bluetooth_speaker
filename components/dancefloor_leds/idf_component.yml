@@ -1,3 +1,17 @@
 dependencies:
   espressif/led_strip: "^3"
   espressif/esp-dsp: "*"
+
+  # TensorFlow Lite Micro, for CONFIG_DANCEFLOOR_ML_TFLM.
+  #
+  # Commented rather than conditional on purpose. The component manager does
+  # support `rules: - if: "$CONFIG{...}"`, but this tree has no model yet, and a
+  # dependency rule that cannot be tested here is not worth risking a working
+  # build over. Uncomment these three lines when you turn the option on -- the
+  # `rules` form below then keeps every other build from fetching and compiling
+  # a large component it does not use.
+  #
+  # espressif/esp-tflite-micro:
+  #   version: "*"
+  #   rules:
+  #     - if: '$CONFIG{DANCEFLOOR_ML_TFLM}'

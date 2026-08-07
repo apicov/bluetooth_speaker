@@ -472,34 +472,57 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # Deliberately NOT set
 # ---------------------------------------------------------------------------
 #
-# PSRAM. The board has 8 MB of octal PSRAM and this build leaves it off.
+# PSRAM. Still not used for anything by default -- see the note below the
+# switches, which is the one that matters.
 #
-# It is tempting, because architecture.md S16 ends the burstiness wart at
-# "fixing it properly means a smaller lead or a larger ring". But PSRAM is the
-# wrong memory for a ring regardless, since the ring is touched from the
-# playback path and cache misses there are the one thing that loop cannot
-# absorb.
+# The old note here said "turn it on only with a specific allocation in mind".
+# There is now exactly one: a TFLM tensor arena, which is the one buffer in this
+# project that is large, touched only by a low-priority task on the other core,
+# and useless to shrink. Everything that note refused is still refused.
 #
-# And it is the wrong BOARD. The ring that bounds LEAD + RESYNC is the
-# satellite's, and the satellite is a classic ESP32 with no PSRAM at all -- so
-# no amount of memory on this unit buys the lead a single millisecond. That is
-# the whole answer to "the S3 has plenty of PSRAM, can we not have a 500 ms
-# lead": a 500 ms lead needs ~107 kB of satellite ring against a largest free
-# block of 106 kB, and it would fail to allocate on the board that has to hold
-# it.
+# It is NOT for the ring. PSRAM is the wrong memory for a ring regardless, since
+# the ring is touched from the playback path and cache misses there are the one
+# thing that loop cannot absorb.
+#
+# It is NOT for the lead. The ring that bounds LEAD + RESYNC is the SATELLITE's,
+# and the satellite is a classic ESP32 with no PSRAM at all -- so no amount of
+# memory on this unit buys the lead a single millisecond. That is the whole
+# answer to "the S3 has plenty of PSRAM, can we not have a 500 ms lead": a 500 ms
+# lead needs ~107 kB of satellite ring against a largest free block of 106 kB,
+# and it would fail to allocate on the board that has to hold it.
 #
 # The larger ring the wart actually wanted has since been taken, in the
 # satellite's internal SRAM, where it belongs: 64 -> 80 kB, which moved the
 # bound from 320 ms against 372 to 350 against 464 and let RESYNC_US go from
 # 120 to 150.
 #
-# Enabling it also costs: the octal interface eats GPIO 33-37 (not broken out,
-# so no loss) and adds cache-miss jitter to every task, including the ones being
-# measured. Turn it on only with a specific allocation in mind.
+# The octal interface eats GPIO 33-37, which are not broken out on the XIAO, so
+# that costs nothing here.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# THE line, and the reason enabling PSRAM at all is safe here.
 #
-#   CONFIG_SPIRAM=y
-#   CONFIG_SPIRAM_MODE_OCT=y
-#   CONFIG_SPIRAM_SPEED_80M=y
+# CAPS_ALLOC means ordinary malloc() NEVER returns PSRAM. Nothing that exists
+# today moves; the ring, the DMA buffers, the frame queue, the WiFi buffers and
+# every stack stay exactly where they are, in internal SRAM, with exactly the
+# timing they were measured with. PSRAM is reachable only by asking for it by
+# name -- heap_caps_malloc(n, MALLOC_CAP_SPIRAM) -- which in this tree is done
+# in one place, ml_arena.c, for the tensor arena and nothing else.
+#
+# The alternative, SPIRAM_USE_MALLOC, would let the allocator hand PSRAM to
+# anything above a threshold, which is precisely the "adds cache-miss jitter to
+# every task" the old note warned about. That warning was right and this setting
+# is how it is respected rather than overruled.
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# Read the vis `cost:` line and the HEALTH heap figures after flipping this on,
+# and compare against the numbers recorded above: analysis 3900/21000 us
+# mean/max, hub min heap ~68 kB, 0 audio gaps/min over 18 min. The old note
+# asked for exactly this measurement and recorded that nobody had made it on
+# this part. It is still worth making -- enabling the PSRAM controller changes
+# cache behaviour even when nothing allocates from it.
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
 # laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a

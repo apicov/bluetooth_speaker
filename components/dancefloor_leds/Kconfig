@@ -252,6 +252,51 @@ menu "Dancefloor LEDs"
 
     endchoice
 
+    config DANCEFLOOR_ML_TFLM
+        bool "Build the TensorFlow Lite Micro analyser base"
+        default n
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Compiles analyser_tflm.cpp, which removes the boilerplate every
+            TFLM-backed analyser would otherwise repeat: the arena, the schema
+            check, the interpreter, and failing cleanly enough that a unit which
+            cannot run the model still lights up from its neighbours.
+
+            Off by default because esp-tflite-micro is a large component and
+            nothing in this tree has a model yet. Turning this on also means
+            uncommenting the dependency in
+            components/dancefloor_leds/idf_component.yml -- the exact lines are
+            there.
+
+            Read the note at the top of analyser_tflm.hpp before converting a
+            model. The short version: quantise it to int8. On a floor where more
+            than one unit runs the model locally that is a CORRECTNESS
+            requirement, not a size optimisation -- the hub is an LX7, a
+            satellite is an LX6, esp-nn picks different kernels per target, and
+            two units disagreeing is the failure that takes an evening to find.
+
+    config DANCEFLOOR_ML_ARENA_KB
+        int "Tensor arena, in kB"
+        default 64
+        range 1 4096
+        depends on DANCEFLOOR_ML_TFLM
+        help
+            Working memory for the interpreter. Ask for too much once, read the
+            "N of M B used" line the analyser prints at startup, then set this
+            from N.
+
+            WHERE it comes from is decided at runtime and reported: PSRAM if the
+            board has it, internal SRAM otherwise. hub_s3 enables PSRAM with
+            CONFIG_SPIRAM_USE_CAPS_ALLOC, so the arena is the only thing in this
+            project that can reach it and nothing else moves.
+
+            A classic-ESP32 satellite has no PSRAM at all and about 52 kB free
+            while analysing, so an arena sized for the hub does not fail at the
+            allocation there -- it fails an hour later as an audio dropout. If
+            the startup line says "internal" and the margin looks thin, it is:
+            use a smaller model on that unit, or build it
+            DANCEFLOOR_ML_SOURCE_REMOTE and let the hub decide.
+
     config DANCEFLOOR_ML_SLOTS
         int "Pluggable analysers that may run at once"
         default 2
