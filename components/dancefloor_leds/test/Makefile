@@ -26,7 +26,8 @@ CFLAGS   += -DBEAT_HIST=$(HIST)
 CXXFLAGS += -DBEAT_HIST=$(HIST)
 endif
 
-BINS := test_align test_pattern test_beat_detect test_fft test_pattern_sync
+BINS := test_align test_pattern test_beat_detect test_fft test_pattern_sync \
+        test_result_latch
 
 test_align: test_align.c
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) $< -o $@
@@ -48,6 +49,11 @@ fft_host.o: ../fft_host.c
 
 beat_detect.o: ../beat_detect.c ../include/beat_detect.h
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) -c ../beat_detect.c -o $@
+
+# Header-only and dependency-free: ResultLatch touches no clock, no task and no
+# strip, which is what makes the sync property testable here at all.
+test_result_latch: test_result_latch.cpp ../include/result_latch.hpp ../include/analyser.hpp
+	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) test_result_latch.cpp -o $@
 
 test_pattern_sync: test_pattern_sync.cpp ../analysis.cpp ../patterns.cpp \
                    ../include/analysis.hpp ../include/patterns.hpp fft_host.o beat_detect.o
@@ -81,6 +87,8 @@ check: $(BINS)
 	@./test_fft
 	@echo
 	@./test_pattern_sync
+	@echo
+	@./test_result_latch
 
 clean:
 	rm -f $(BINS) fft_host.o beat_detect.o

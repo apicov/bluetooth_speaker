@@ -71,6 +71,38 @@
 #define DF_TAIL_N (DF_FFT_N - DF_HOP_N)
 
 /*
+ * How many pluggable analysers may run at once, and therefore how many Results
+ * every frame carries.
+ *
+ * One slot per registered analyser, indexed the same way, so a pattern reading
+ * f.ml[i] always gets analyser i whatever else is or is not enabled. That
+ * costs RAM in the frame queue and it is not free: a df::Result is 40 bytes,
+ * the queue holds 32 * (FFT_N / HOP_N) frames, so each slot is 2.5 kB at hop
+ * 512 and 5 kB at hop 256. Two slots is the default because the case this was
+ * built for is one fast analyser beside one slow one -- a per-hop detector and
+ * a model with a second of context, which is precisely the pair that could not
+ * share a lane.
+ *
+ * Set it to 1 on a unit that runs a single analyser and wants the 2.5 kB back.
+ *
+ * Here rather than in Kconfig alone for the same reason as DF_HOP_N above: the
+ * host harness and the unit tests compile with no sdkconfig.h at all, and a
+ * struct whose size differed between the laptop and the board would make every
+ * figure measured on the laptop describe a different pipeline.
+ */
+#ifndef DF_ML_SLOTS
+#  if defined(CONFIG_DANCEFLOOR_ML_SLOTS)
+#    define DF_ML_SLOTS CONFIG_DANCEFLOOR_ML_SLOTS
+#  else
+#    define DF_ML_SLOTS 2
+#  endif
+#endif
+
+#if DF_ML_SLOTS < 1
+#error "DF_ML_SLOTS must be at least 1 -- Frame::ml is a fixed array"
+#endif
+
+/*
  * Checked with #if rather than static_assert deliberately: these are macros, the
  * preprocessor evaluates all four, and it behaves identically in C and C++ with
  * no question about which standard the includer was compiled to. A bad hop then

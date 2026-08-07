@@ -26,6 +26,7 @@
 
 #include "analysis.hpp"
 #include "patterns.hpp"
+#include "result_latch.hpp"
 #include "led_strip_wrapper.hpp"
 
 namespace {
@@ -519,7 +520,7 @@ void from_wire(const vis_frame_t *w, df::Frame &f)
  * discard a frame about to be due in order to keep one that is not, so a strip
  * already behind skips forward instead of catching up.
  */
-bool enqueue(const df::Frame &f)
+bool enqueue(const df::Frame &f, const df::Result *fast_ml)
 {
     const uint32_t head = s_fq_head.load(std::memory_order_relaxed);
     const uint32_t tail = s_fq_tail.load(std::memory_order_acquire);
@@ -527,12 +528,40 @@ bool enqueue(const df::Frame &f)
         bump(s_overrun);
         return false;
     }
-    s_fq[head % FRAME_RING] = f;
+    df::Frame &dst = s_fq[head % FRAME_RING];
+    dst = f;
+    /*
+     * Fast-lane results belong to THIS frame -- their window is this frame's
+     * window and their presentation delay is zero -- so they are carried with
+     * it rather than latched. Slow-lane slots are left empty here and filled by
+     * the render task when their show_at_us comes round.
+     *
+     * Overwritten unconditionally, including with result_none(), because the
+     * queue slot is reused and whatever a previous frame left in it describes
+     * audio 740 ms ago.
+     */
+    for (int i = 0; i < df::ML_SLOTS; i++) {
+        dst.ml[i] = fast_ml ? fast_ml[i] : df::result_none();
+    }
     /* Release, against the acquire on the reader: the frame must be fully
      * written before the index that publishes it moves. */
     s_fq_head.store(head + 1, std::memory_order_release);
     return true;
 }
+
+/*
+ * Where a slow analyser's answer waits for the moment it describes, and the
+ * slots this unit fills itself rather than waiting for.
+ *
+ * The mechanism, and the argument for why it stays in step across units, is in
+ * result_latch.hpp -- it is pure logic and lives where the host tests can drive
+ * it, like the analysis it serves.
+ */
+df::ResultLatch s_latch;
+
+/* Results produced by this unit, for the log line. Unused on a unit that is
+ * given its results -- it produces none. */
+[[maybe_unused]] std::atomic<uint32_t> s_ml_results;
 
 /*
  * How early is close enough to draw now rather than sleep again.
@@ -593,10 +622,68 @@ void show(const uint8_t *rgb)
 /* Not built at all on a unit that is given its frames: there is no audio to
  * analyse there, and the FFT and detectors would be pure cost. */
 #if DF_ANALYSES_AUDIO
+
+/*
+ * Run every fast-lane analyser over the window just transformed.
+ *
+ * A fast analyser is one that fits inside a frame period with room to spare --
+ * at hop 512 that is 11.6 ms, of which the FFT and the two detectors have been
+ * measured taking up to 21 ms already, so "with room to spare" is a real bar
+ * and the slow lane exists for everything that does not clear it.
+ *
+ * Slots belonging to slow analysers are set to result_none() here and filled by
+ * the render task instead; leaving them untouched would carry the previous
+ * frame's stack contents into the queue.
+ */
+void run_fast_lane(const int16_t *stereo, int64_t index, int64_t due_us,
+                   df::Result out[df::ML_SLOTS])
+{
+    /* The mono window every Analyser is handed. Static, not stack: the analysis
+     * task has a 4 kB stack and this is 2 kB of it. Built once per frame and
+     * shared by every fast analyser, since they all want the same thing. */
+    static int16_t mono[FFT_N];
+    bool built = false;
+
+    for (int i = 0; i < df::ML_SLOTS; i++) {
+        out[i] = df::result_none();
+
+        df::Analyser *a = df::analyser_at(i);
+        if (!a || s_latch.latched(i)) {
+            continue;               /* absent, or this unit gets it elsewhere */
+        }
+
+        if (!built) {
+            built = true;
+            /* The same downmix Analysis::process does, and it must stay the
+             * same one: two front ends disagreeing about what mono means would
+             * be a difference nothing downstream could see. */
+            for (int n = 0; n < FFT_N; n++) {
+                mono[n] = static_cast<int16_t>(
+                    (static_cast<int32_t>(stereo[2 * n]) +
+                     static_cast<int32_t>(stereo[2 * n + 1])) / 2);
+            }
+        }
+
+        df::Result r{};
+        if (a->process(mono, index, due_us, &r)) {
+            const df::AnalyserSpec &sp = a->spec();
+            /* Filled by the lane, not the analyser: they are the lane's
+             * statement about where this answer belongs, and an analyser that
+             * could set them could date its own results. */
+            r.analyser   = static_cast<uint8_t>(i);
+            r.model_id   = sp.model_id;
+            r.show_at_us = due_us + sp.present_delay_us;
+            out[i] = r;
+            bump(s_ml_results);
+        }
+    }
+}
+
 void visualiser_task(void *arg)
 {
     (void)arg;
     static int16_t raw[FFT_N * CHANNELS];
+    df::Result fast_ml[df::ML_SLOTS];
     size_t   filled = 0;
     uint32_t recv_total = 0;
     uint32_t seen_gen = 0;
@@ -620,6 +707,10 @@ void visualiser_task(void *arg)
      */
     int64_t  cost_analysis = 0, cost_analysis_max = 0;
     uint32_t cost_n = 0;
+    /* The fast lane, kept apart from the FFT it runs beside. They share a task
+     * and a deadline, so the only useful question about a new analyser is how
+     * much of the frame period it took that the FFT was not already using. */
+    int64_t  cost_fast = 0, cost_fast_max = 0;
 
     while (true) {
         /*
@@ -632,6 +723,22 @@ void visualiser_task(void *arg)
         if (rate != seen_rate) {
             seen_rate = rate;
             analysis.init(static_cast<int>(rate));
+            /* Same argument one level up: an analyser's features were derived
+             * at the old rate and the state built from them describes different
+             * frequencies now. init() rather than reset() because the rate is
+             * the one thing an analyser is told about the stream. */
+            for (int i = 0; i < df::ML_SLOTS; i++) {
+                if (df::Analyser *a = df::analyser_at(i);
+                    a && !s_latch.latched(i) && !a->init(static_cast<int>(rate))) {
+                    /* Refused the new rate. Marking the slot latched retires it
+                     * cleanly -- the render task then reports result_none()
+                     * there rather than this unit publishing answers derived at
+                     * a rate the analyser has disowned. */
+                    s_latch.set_latched(i, true);
+                    ESP_LOGE(TAG, "analyser \"%s\" cannot run at %" PRIu32 " Hz -- retired",
+                             a->spec().name, rate);
+                }
+            }
             if (pattern) pattern->reset();
             filled = 0;
             ESP_LOGW(TAG, "analysing at %" PRIu32 " Hz", rate);
@@ -699,6 +806,21 @@ void visualiser_task(void *arg)
         const int64_t t_analysed = esp_timer_get_time();
 
         /*
+         * The fast lane.
+         *
+         * Runs on the window df::Analysis has just transformed, so it sees
+         * exactly the audio the FFT saw and its answer belongs to exactly this
+         * frame -- which is why a fast analyser's presentation delay is zero
+         * and why its result travels in the frame rather than through the latch.
+         *
+         * Mono, because that is what every Analyser is handed; Analysis does
+         * the same downmix internally on its own copy. Done once here rather
+         * than per analyser, and only when there is a fast analyser to want it.
+         */
+        run_fast_lane(raw, block_index, due_us, fast_ml);
+        const int64_t t_fast = esp_timer_get_time();
+
+        /*
          * Advance by one HOP, keeping the newest TAIL_BYTES.
          *
          * This was `filled = 0`, and it sat ABOVE process() -- which was safe
@@ -744,7 +866,7 @@ void visualiser_task(void *arg)
          * not keeping pace, and the honest response is to stop adding to its
          * backlog.
          */
-        enqueue(f);
+        enqueue(f, fast_ml);
 
         /*
          * Onward, if anything is listening. After the local queue, so this
@@ -761,6 +883,9 @@ void visualiser_task(void *arg)
             const int64_t a = t_analysed - t_in;
             cost_analysis += a;
             if (a > cost_analysis_max) cost_analysis_max = a;
+            const int64_t m = t_fast - t_analysed;
+            cost_fast += m;
+            if (m > cost_fast_max) cost_fast_max = m;
             cost_n++;
         }
 
@@ -800,6 +925,18 @@ void visualiser_task(void *arg)
             const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
             const uint32_t wn = take(s_wake_n), wsum = take(s_wake_sum);
             const uint32_t psum = take(s_pattern_sum), ssum = take(s_show_sum);
+            /*
+             * The pluggable analysers, on their own line for the same reason
+             * `cost:` is on its own: it must stay comparable with every log
+             * captured before analysers existed. `late` is the one that matters
+             * -- it counts results that missed the frame they named, and the
+             * only fix for it is a larger present_delay_us.
+             */
+            ESP_LOGI(TAG, "ml: fast %lld/%lld us (mean/max) | results %" PRIu32
+                          " | late %" PRIu32 " | overrun %" PRIu32,
+                     cost_n ? cost_fast / cost_n : 0, cost_fast_max,
+                     take(s_ml_results), s_latch.take_late(), s_latch.take_overrun());
+            cost_fast = cost_fast_max = 0;
             ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %" PRIu32
                           "/%" PRIu32 " us | pat %" PRIu32 "/%" PRIu32
                           " | show %" PRIu32 "/%" PRIu32
@@ -866,6 +1003,11 @@ void render_task(void *arg)
              * before rendering was deferred.
              */
             if (pattern) pattern->reset();
+            /* Same reason the queue is emptied: a show_at_us established before
+             * the restart names an instant on a timeline that no longer exists,
+             * and latching it would put a stale answer on the strip at the
+             * moment the new timeline starts. */
+            s_latch.flush();
             std::memset(pixels, 0, sizeof(pixels));
             show(pixels);
         }
@@ -963,6 +1105,27 @@ void render_task(void *arg)
          * frames ago. Null rather than dangling -- see Frame::mag. */
         f.mag = nullptr;
         s_fq_tail.store(tail + 1, std::memory_order_release);
+
+        /*
+         * Bring the slow slots up to this frame.
+         *
+         * Here, at the moment of drawing, and not where the frame was produced
+         * -- that is what gives a slow analyser the whole presentation lead to
+         * work in. See ResultLatch for why it stays in step across units.
+         *
+         * Slots this unit fills itself in the fast lane are already in the
+         * frame and are left alone.
+         */
+        {
+            /* One frame period, for the latch's own lateness check. Computed
+             * from the live rate rather than df::RATE: at 48 kHz a frame is
+             * 10.7 ms, not 11.6, and a check told the wrong period would report
+             * results as late that were not. */
+            const int64_t hop_us =
+                (int64_t)HOP_N * 1000000LL /
+                (int64_t)s_rate.load(std::memory_order_relaxed);
+            s_latch.take(f.due_us, hop_us, f.ml);
+        }
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
         /*
@@ -1092,7 +1255,9 @@ void visualiser_submit_frame(const vis_frame_t *f)
 
     df::Frame local;
     from_wire(f, local);
-    if (enqueue(local)) {
+    /* A frame off the wire carries no results: this unit's slots are all
+     * latched, and the results that fill them arrive as their own messages. */
+    if (enqueue(local, nullptr)) {
         bump(s_frames);
         if (local.onset) bump(s_onsets);
         if (local.boom) bump(s_booms);
@@ -1302,6 +1467,50 @@ void visualiser_start(void)
      * changes. */
     analysis.init(static_cast<int>(s_rate.load(std::memory_order_relaxed)));
 #endif
+
+    /*
+     * Decide once, here, which slots this unit fills itself and which it waits
+     * for -- see ResultLatch::set_latched().
+     *
+     * Every slot is latched by default, so a slot with no analyser behind it,
+     * and every slot on a unit that is given its results, reports result_none()
+     * forever rather than whatever the array happened to hold. Only a fast-lane
+     * analyser this unit actually runs is cleared.
+     *
+     * Printed, because an unintended mismatch across a floor is the expensive
+     * bug and this is half of what decides it -- the same reasoning that puts
+     * the source and the hop on the startup line below.
+     */
+    {
+        const int rate = static_cast<int>(s_rate.load(std::memory_order_relaxed));
+        for (int i = 0; i < df::ML_SLOTS; i++) {
+            s_latch.set_latched(i, true);
+            df::Analyser *a = df::analyser_at(i);
+            if (!a) {
+                continue;
+            }
+            const df::AnalyserSpec &sp = a->spec();
+#if DF_ANALYSES_AUDIO
+            if (sp.lane == df::Lane::Fast) {
+                if (a->init(rate)) {
+                    s_latch.set_latched(i, false);
+                } else {
+                    ESP_LOGE(TAG, "analyser \"%s\" refused to start -- slot %d idle",
+                             sp.name, i);
+                    continue;
+                }
+            }
+#endif
+            ESP_LOGI(TAG, "analyser %d: \"%s\" model %u | %s lane | %d-sample window, "
+                          "hop %d @ %d Hz | shown %lld us late | %s",
+                     i, sp.name, (unsigned)sp.model_id,
+                     sp.lane == df::Lane::Fast ? "fast" : "slow",
+                     sp.window_n, sp.hop_n,
+                     sp.rate_hz ? sp.rate_hz : rate,
+                     (long long)sp.present_delay_us,
+                     s_latch.latched(i) ? "given to this unit" : "computed here");
+        }
+    }
 
     /* Configured name if it resolves, first pattern otherwise. A typo should
      * cost a line in the log, not a dark floor. */

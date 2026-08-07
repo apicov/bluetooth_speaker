@@ -205,6 +205,35 @@ menu "Dancefloor LEDs"
             bool "256 -- 75% overlap, 172 frames/s"
     endchoice
 
+    config DANCEFLOOR_ML_SLOTS
+        int "Pluggable analysers that may run at once"
+        default 2
+        range 1 8
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            How many analysers can run beside the FFT, and therefore how many
+            results every frame carries. One slot per registered analyser, at
+            the same index, so a pattern reading f.ml[i] always gets analyser i
+            whatever else is or is not enabled.
+
+            It costs RAM in the frame queue and the cost is not trivial: a
+            result is 40 bytes and the queue holds 32 * (1024 / hop) frames, so
+            each slot is 2.5 kB at hop 512 and 5 kB at hop 256. A classic-ESP32
+            satellite analysing locally has about 52 kB free, so this is worth
+            setting to what is actually used.
+
+            2 is the default because the case this was built for is one fast
+            analyser beside one slow one -- a per-hop detector and a model with
+            a second of context, which is precisely the pair that cannot share
+            a lane.
+
+            This MUST match the fallback in analysis_config.h, which is what
+            tools/pattern_lab and the unit tests compile with -- they see no
+            sdkconfig.h at all, and a struct that differed in size between the
+            laptop and the board would make every figure measured on the laptop
+            describe a different pipeline. Raising it here means raising it
+            there.
+
     choice DANCEFLOOR_LED_SOURCE
         prompt "Where this unit's analysis frames come from"
         default DANCEFLOOR_LED_SOURCE_LOCAL
