@@ -1,12 +1,17 @@
 /*
  * The TFLM boilerplate. See analyser_tflm.hpp for how to add a model.
  *
- * NOT YET COMPILED BY ANY BUILD IN THIS TREE. DANCEFLOOR_ML_TFLM defaults to n
+ * NOT COMPILED BY ANY BUILD IN THIS TREE YET: DANCEFLOOR_ML_TFLM defaults to n
  * and the esp-tflite-micro dependency is commented out in idf_component.yml,
- * because nothing here has a model yet and the component is large. This file is
- * written against the TFLM API as it stands and has not been through a compiler
- * -- expect to fix a name or two on the first build that turns it on, and treat
- * the reasoning in the comments as the part worth keeping.
+ * because nothing here has a model and the component is large.
+ *
+ * It does compile. Checked against esp-tflite-micro 1.3.4 headers with the
+ * option forced on -- this file clean, and a throwaway subclass filling in all
+ * four hooks clean beside it, with every symbol it needed from here resolving
+ * including the vtable. So the API names below are real and the base class is
+ * usable as one; what has NOT been proved is that a model runs, because there
+ * is no model. The first build that turns this on is still the first build that
+ * links against the real component.
  */
 #include "analyser_tflm.hpp"
 
