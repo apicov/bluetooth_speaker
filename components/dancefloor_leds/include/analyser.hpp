@@ -291,4 +291,33 @@ int       analyser_count();
 Analyser *analyser_at(int i);
 Analyser *analyser_by_name(const char *name);
 
+/*
+ * Drive every fast-lane analyser over one window, and fill in the slots.
+ *
+ * Here rather than in the firmware because tools/pattern_lab must run the same
+ * code the boards do -- that is the whole claim the harness makes, and an
+ * analyser lane reimplemented on the laptop would quietly break it the first
+ * time one of the two was changed.
+ *
+ * `stereo` is `window_n` interleaved 16-bit frames -- the same window the FFT
+ * was handed. The downmix to mono happens here, once, and must stay the same
+ * one Analysis::process() does internally: two front ends disagreeing about
+ * what mono means would be a difference nothing downstream could see.
+ *
+ * `skip[i]` is true for a slot this unit does not compute itself -- a slow
+ * analyser, an absent one, or any slot at all on a unit that is given its
+ * results. Those are filled from the latch instead and are set to result_none()
+ * here, because the caller's buffer is reused and whatever a previous frame
+ * left in it describes audio long past.
+ *
+ * show_at_us, analyser and model_id are filled in from the spec rather than by
+ * the analyser, deliberately: an analyser that could set them could date its
+ * own results, which is the one thing the presentation-delay rule forbids.
+ *
+ * Not reentrant -- it keeps one mono scratch window. The firmware calls it from
+ * the analysis task only.
+ */
+void run_fast_lane(const int16_t *stereo, int window_n, int64_t index,
+                   int64_t due_us, const bool skip[ML_SLOTS], Result out[ML_SLOTS]);
+
 }  // namespace df

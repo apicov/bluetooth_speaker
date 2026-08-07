@@ -185,4 +185,45 @@ Analyser *analyser_by_name(const char *name)
     return nullptr;
 }
 
+void run_fast_lane(const int16_t *stereo, int window_n, int64_t index,
+                   int64_t due_us, const bool skip[ML_SLOTS], Result out[ML_SLOTS])
+{
+    /* Built once per call and shared by every fast analyser, since they all
+     * want the same thing. Static rather than automatic because the firmware's
+     * analysis task has a 4 kB stack and this is 2 kB of it. */
+    static int16_t mono[DF_FFT_N];
+    bool built = false;
+
+    if (window_n > DF_FFT_N) {
+        window_n = DF_FFT_N;             /* cannot happen: the spec is checked */
+    }
+
+    for (int i = 0; i < ML_SLOTS; i++) {
+        out[i] = result_none();
+
+        Analyser *a = analyser_at(i);
+        if (!a || (skip && skip[i])) {
+            continue;
+        }
+
+        if (!built) {
+            built = true;
+            for (int n = 0; n < window_n; n++) {
+                mono[n] = static_cast<int16_t>(
+                    (static_cast<int32_t>(stereo[2 * n]) +
+                     static_cast<int32_t>(stereo[2 * n + 1])) / 2);
+            }
+        }
+
+        Result r{};
+        if (a->process(mono, index, due_us, &r)) {
+            const AnalyserSpec &sp = a->spec();
+            r.analyser   = static_cast<uint8_t>(i);
+            r.model_id   = sp.model_id;
+            r.show_at_us = due_us + sp.present_delay_us;
+            out[i] = r;
+        }
+    }
+}
+
 }  // namespace df

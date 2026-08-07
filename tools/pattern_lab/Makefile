@@ -37,8 +37,11 @@ CXXFLAGS += -DBEAT_HIST=$(HIST)
 endif
 LDLIBS   := -lz -lm
 
-SRCS := main.cpp wav.cpp out_png.cpp out_tty.cpp $(LEDS)/analysis.cpp $(LEDS)/patterns.cpp
-HDRS := wav.hpp out_png.hpp out_tty.hpp $(LEDS)/include/analysis.hpp $(LEDS)/include/patterns.hpp
+SRCS := main.cpp wav.cpp out_png.cpp out_tty.cpp $(LEDS)/analysis.cpp $(LEDS)/patterns.cpp \
+        $(LEDS)/analysers.cpp
+HDRS := wav.hpp out_png.hpp out_tty.hpp $(LEDS)/include/analysis.hpp \
+        $(LEDS)/include/patterns.hpp $(LEDS)/include/analyser.hpp \
+        $(LEDS)/include/result_latch.hpp
 
 pattern_lab: $(SRCS) $(HDRS) fft_host.o beat_detect.o
 	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) $(SRCS) fft_host.o beat_detect.o -o $@ $(LDLIBS)

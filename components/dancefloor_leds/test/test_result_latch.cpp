@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "analyser.hpp"
 #include "result_latch.hpp"
 
 namespace {
@@ -259,6 +260,106 @@ void test_overrun_is_counted_not_hidden()
     check("results dropped by a full slot are counted", over == 5, d);
 }
 
+/* ------------------------------------------------------- the analyser itself */
+
+/*
+ * Right: the answer is a function of WHICH window this is.
+ *
+ * Two units handed the same window produce the same result whatever else they
+ * have or have not seen, which is what analyser.hpp requires.
+ */
+class WindowAnalyser final : public df::Analyser {
+public:
+    const df::AnalyserSpec &spec() const override { return spec_; }
+    bool init(int) override { return true; }
+    void reset() override {}
+    bool process(const int16_t *, int64_t index, int64_t, df::Result *out) override
+    {
+        out->index = index;
+        out->n = 1;
+        out->label[0] = (uint8_t)(index % 250);
+        out->score[0] = 100;
+        return true;
+    }
+private:
+    static constexpr df::AnalyserSpec spec_ = {
+        "window", 1, 0, DF_FFT_N, DF_HOP_N, 0, df::Lane::Fast };
+};
+
+/*
+ * Wrong on purpose: the answer counts how many times THIS unit has been called.
+ *
+ * It looks entirely reasonable in isolation -- plenty of real front ends keep a
+ * frame counter -- and it is the analyser-level version of DriftPattern in
+ * test_pattern_sync.cpp. A unit that joined late has been called fewer times
+ * and answers differently forever. The test REQUIRES this to be caught; a run
+ * where it passes means the check below has stopped being able to see the
+ * fault.
+ */
+class CountingAnalyser final : public df::Analyser {
+public:
+    const df::AnalyserSpec &spec() const override { return spec_; }
+    bool init(int) override { calls_ = 0; return true; }
+    void reset() override { calls_ = 0; }
+    bool process(const int16_t *, int64_t index, int64_t, df::Result *out) override
+    {
+        out->index = index;
+        out->n = 1;
+        out->label[0] = (uint8_t)(calls_++ % 250);
+        out->score[0] = 100;
+        return true;
+    }
+private:
+    static constexpr df::AnalyserSpec spec_ = {
+        "counting", 2, 0, DF_FFT_N, DF_HOP_N, 0, df::Lane::Fast };
+    int64_t calls_ = 0;
+};
+
+/* Every window from `join` to `frames`, as one unit would see them. */
+std::vector<int> run_analyser(df::Analyser &a, int64_t frames, int64_t join)
+{
+    a.init(RATE);
+    std::vector<int> labels;
+    const int16_t window[DF_FFT_N] = {};
+    for (int64_t n = join; n < frames; n++) {
+        df::Result r = df::result_none();
+        if (a.process(window, n, frame_due(n), &r)) {
+            labels.push_back(r.label[0]);
+        }
+    }
+    return labels;
+}
+
+/* Compare the overlapping tail -- what both units saw. */
+bool tails_agree(const std::vector<int> &a, const std::vector<int> &b)
+{
+    const size_t n = a.size() < b.size() ? a.size() : b.size();
+    for (size_t i = 0; i < n; i++) {
+        if (a[a.size() - n + i] != b[b.size() - n + i]) return false;
+    }
+    return n > 0;
+}
+
+void test_a_window_keyed_analyser_agrees()
+{
+    WindowAnalyser a, b;
+    const auto early = run_analyser(a, 900, 0);
+    const auto late  = run_analyser(b, 900, 300);
+    check("an analyser keyed on the window survives a late join",
+          tails_agree(early, late),
+          "same window in, same answer out, whatever came before");
+}
+
+void test_a_call_counting_analyser_is_caught()
+{
+    CountingAnalyser a, b;
+    const auto early = run_analyser(a, 900, 0);
+    const auto late  = run_analyser(b, 900, 300);
+    check("an analyser keyed on its call count is caught",
+          !tails_agree(early, late),
+          "never converges, as it must not");
+}
+
 }  // namespace
 
 int main()
@@ -273,6 +374,9 @@ int main()
     test_flush_drops_the_old_timeline();
     test_unlatched_slots_are_left_alone();
     test_overrun_is_counted_not_hidden();
+    std::printf("\n");
+    test_a_window_keyed_analyser_agrees();
+    test_a_call_counting_analyser_is_caught();
 
     std::printf("\n%s\n", failures ? "FAILURES" : "all tests passed");
     return failures ? 1 : 0;

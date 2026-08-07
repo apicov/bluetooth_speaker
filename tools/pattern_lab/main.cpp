@@ -27,7 +27,9 @@
 #include <string>
 #include <vector>
 
+#include "analyser.hpp"
 #include "analysis.hpp"
+#include "result_latch.hpp"
 #include "patterns.hpp"
 #include "wav.hpp"
 #include "out_png.hpp"
@@ -151,6 +153,31 @@ int main(int argc, char **argv)
     }
     pattern->reset();
 
+    /*
+     * The analyser lane, set up the way the firmware sets it up: a slot this
+     * unit computes itself is cleared, everything else stays latched and
+     * reports nothing. Only the fast lane exists on the host so far -- a slow
+     * analyser needs the resampler and its own cadence, and until then its slot
+     * simply stays empty here, which is exactly what a unit waiting for results
+     * off the wire sees.
+     */
+    df::ResultLatch latch;
+    bool ml_skip[df::ML_SLOTS];
+    for (int i = 0; i < df::ML_SLOTS; i++) {
+        df::Analyser *a = df::analyser_at(i);
+        const bool fast = a && a->spec().lane == df::Lane::Fast && a->init(wav.rate);
+        latch.set_latched(i, !fast);
+        ml_skip[i] = !fast;
+        if (a) {
+            const df::AnalyserSpec &sp = a->spec();
+            std::fprintf(stderr, "analyser %d: \"%s\" model %u | %s lane | shown %lld us late | %s\n",
+                         i, sp.name, unsigned(sp.model_id),
+                         sp.lane == df::Lane::Fast ? "fast" : "slow",
+                         (long long)sp.present_delay_us,
+                         fast ? "run here" : "not run here");
+        }
+    }
+
     std::vector<uint8_t> rgb(size_t(leds) * 3);
     std::vector<uint8_t> image;          /* blocks x leds, RGB */
     if (!png_path.empty()) image.reserve(blocks * size_t(leds) * 3);
@@ -164,14 +191,15 @@ int main(int argc, char **argv)
          * it, and nothing else in the file would say why. */
         std::fprintf(csv, "# window=%d hop=%d rate=%d\n", df::FFT_N, df::HOP_N, wav.rate);
         std::fprintf(csv, "block,time_s,band0,band1,band2,band3,flux,threshold,onset,strength,"
-                             "boom_flux,boom_threshold,boom,boom_strength\n");
+                             "boom_flux,boom_threshold,boom,boom_strength,"
+                             "ml0_label,ml0_score,ml0_show_s\n");
     }
 
     TtyRender tty_render;
     if (tty) tty_render.begin(leds, pattern->name());
 
     const float scale = brightness / 100.0f;
-    size_t onsets = 0, booms = 0;
+    size_t onsets = 0, booms = 0, ml_results = 0;
 
     for (size_t b = 0; b < blocks; b++) {
         const int16_t *chunk = &wav.samples[b * df::HOP_N * df::CHANNELS];
@@ -179,9 +207,22 @@ int main(int argc, char **argv)
          * stream's -- otherwise every time-based pattern runs at the wrong
          * speed here and looks right on the boards. */
         const int64_t due_us = int64_t(b) * df::HOP_N * 1000000LL / wav.rate;
-        const df::Frame &f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
+        /* Copied rather than referenced: the analyser slots are filled in
+         * below, exactly as the firmware fills them on the way into its frame
+         * queue. f.mag still points into `analysis`, which is fine -- it is
+         * read before the next process(). */
+        df::Frame f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
         if (f.onset) onsets++;
         if (f.boom)  booms++;
+
+        /* The same lane the boards run, from the same source file. */
+        df::run_fast_lane(chunk, df::FFT_N, int64_t(b), due_us, ml_skip, f.ml);
+        /* And the same latch, so a slot waiting on a result behaves here the
+         * way it behaves on a strip. */
+        latch.take(due_us, int64_t(df::HOP_N) * 1000000LL / wav.rate, f.ml);
+        for (int i = 0; i < df::ML_SLOTS; i++) {
+            if (df::result_valid(f.ml[i])) ml_results++;
+        }
 
         pattern->render(f, rgb.data(), uint32_t(leds));
 
@@ -194,10 +235,25 @@ int main(int argc, char **argv)
         }
         if (csv) {
             std::fprintf(csv, "%zu,%.3f,%.4f,%.4f,%.4f,%.4f,%.5f,%.5f,%d,%.3f,"
-                              "%.5f,%.5f,%d,%.3f\n",
+                              "%.5f,%.5f,%d,%.3f",
                          b, due_us / 1e6, f.band[0], f.band[1], f.band[2], f.band[3],
                          f.flux, f.threshold, f.onset ? 1 : 0, f.strength,
                          f.boom_flux, f.boom_threshold, f.boom ? 1 : 0, f.boom_strength);
+            /* Slot 0 only: a CSV with one column set per slot would change
+             * shape with DF_ML_SLOTS, and every consumer of this file reads it
+             * by column. The label is printed as its NAME where the analyser
+             * has one -- a bare class id is unreadable a week later. */
+            if (df::result_valid(f.ml[0])) {
+                df::Analyser *a0 = df::analyser_at(0);
+                const char *nm = a0 ? a0->label_name(f.ml[0].label[0]) : nullptr;
+                if (nm) std::fprintf(csv, ",%s,%u,%.3f", nm,
+                                     unsigned(f.ml[0].score[0]), f.ml[0].show_at_us / 1e6);
+                else    std::fprintf(csv, ",%u,%u,%.3f", unsigned(f.ml[0].label[0]),
+                                     unsigned(f.ml[0].score[0]), f.ml[0].show_at_us / 1e6);
+            } else {
+                std::fprintf(csv, ",,,");
+            }
+            std::fprintf(csv, "\n");
         }
         if (tty) tty_render.frame(rgb.data(), leds, f, speed);
     }

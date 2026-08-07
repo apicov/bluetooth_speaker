@@ -624,58 +624,25 @@ void show(const uint8_t *rgb)
 #if DF_ANALYSES_AUDIO
 
 /*
- * Run every fast-lane analyser over the window just transformed.
+ * Run every fast-lane analyser over the window just transformed, counting what
+ * came back.
  *
- * A fast analyser is one that fits inside a frame period with room to spare --
- * at hop 512 that is 11.6 ms, of which the FFT and the two detectors have been
- * measured taking up to 21 ms already, so "with room to spare" is a real bar
- * and the slow lane exists for everything that does not clear it.
- *
- * Slots belonging to slow analysers are set to result_none() here and filled by
- * the render task instead; leaving them untouched would carry the previous
- * frame's stack contents into the queue.
+ * The lane itself is df::run_fast_lane() in analysers.cpp, so tools/pattern_lab
+ * drives exactly this and not a copy of it. All that belongs here is which
+ * slots this unit computes -- which is firmware state -- and the counter.
  */
 void run_fast_lane(const int16_t *stereo, int64_t index, int64_t due_us,
                    df::Result out[df::ML_SLOTS])
 {
-    /* The mono window every Analyser is handed. Static, not stack: the analysis
-     * task has a 4 kB stack and this is 2 kB of it. Built once per frame and
-     * shared by every fast analyser, since they all want the same thing. */
-    static int16_t mono[FFT_N];
-    bool built = false;
+    bool skip[df::ML_SLOTS];
+    for (int i = 0; i < df::ML_SLOTS; i++) {
+        skip[i] = s_latch.latched(i);
+    }
+
+    df::run_fast_lane(stereo, FFT_N, index, due_us, skip, out);
 
     for (int i = 0; i < df::ML_SLOTS; i++) {
-        out[i] = df::result_none();
-
-        df::Analyser *a = df::analyser_at(i);
-        if (!a || s_latch.latched(i)) {
-            continue;               /* absent, or this unit gets it elsewhere */
-        }
-
-        if (!built) {
-            built = true;
-            /* The same downmix Analysis::process does, and it must stay the
-             * same one: two front ends disagreeing about what mono means would
-             * be a difference nothing downstream could see. */
-            for (int n = 0; n < FFT_N; n++) {
-                mono[n] = static_cast<int16_t>(
-                    (static_cast<int32_t>(stereo[2 * n]) +
-                     static_cast<int32_t>(stereo[2 * n + 1])) / 2);
-            }
-        }
-
-        df::Result r{};
-        if (a->process(mono, index, due_us, &r)) {
-            const df::AnalyserSpec &sp = a->spec();
-            /* Filled by the lane, not the analyser: they are the lane's
-             * statement about where this answer belongs, and an analyser that
-             * could set them could date its own results. */
-            r.analyser   = static_cast<uint8_t>(i);
-            r.model_id   = sp.model_id;
-            r.show_at_us = due_us + sp.present_delay_us;
-            out[i] = r;
-            bump(s_ml_results);
-        }
+        if (df::result_valid(out[i])) bump(s_ml_results);
     }
 }
 
