@@ -47,8 +47,12 @@ int ml_lane_slot();
  *
  * `stream_rate_hz` is the rate of the audio the feeder is about to resample
  * FROM -- the lane needs it only to report the ratio and its filter checksum.
+ *
+ * `on_result` is called after the latch has been given the result, so this
+ * unit's own strip never waits on whatever the callback does. May be null.
  */
-void ml_lane_start(ResultLatch *latch, int stream_rate_hz);
+void ml_lane_start(ResultLatch *latch, int stream_rate_hz,
+                   void (*on_result)(const Result &r));
 
 /*
  * Hand the lane audio, already at ml_lane_rate(), mono.

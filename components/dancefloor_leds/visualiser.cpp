@@ -62,6 +62,23 @@ constexpr const char *TAG = "vis";
 #define DF_TAKES_REMOTE_FRAMES 0
 #endif
 
+/*
+ * The same question for the pluggable analysers, and deliberately a SEPARATE
+ * answer.
+ *
+ * A unit may compute its own FFT frames and still be given a model's results:
+ * the FFT is cheap and deterministic, a model may be neither, and a satellite
+ * that cannot hold an arena can still light up in step with one that can. The
+ * reverse -- being given frames but running analysers locally -- cannot work,
+ * because a unit taking frames analyses no audio and there is nothing to run
+ * them on. Kconfig enforces that; this is only the derivation.
+ */
+#if CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE || CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
+#define DF_RUNS_ANALYSERS 0
+#else
+#define DF_RUNS_ANALYSERS 1
+#endif
+
 using df::FFT_N;
 using df::HOP_N;
 using df::TAIL_N;
@@ -457,6 +474,54 @@ std::atomic<int64_t (*)(int64_t)> s_to_local{nullptr};
 
 /* Set on a unit that sends its frames onward. Null publishes nothing. */
 std::atomic<void (*)(const vis_frame_t *)> s_publish{nullptr};
+/* The same, for analyser results. Written from two lanes, so atomic. */
+std::atomic<void (*)(const ml_result_t *)> s_ml_publish{nullptr};
+
+static_assert(VIS_RESULT_SCORES == df::RESULT_SCORES,
+              "the wire result and df::Result disagree about how many scores");
+
+/* df::Result -> the form that can leave this unit, and back. Plain copies:
+ * unlike a frame there is nothing here that cannot travel. */
+void to_wire(const df::Result &r, ml_result_t *w)
+{
+    w->show_at_us = r.show_at_us;
+    w->index      = r.index;
+    w->analyser   = r.analyser;
+    w->model_id   = r.model_id;
+    w->n          = r.n;
+    w->unit       = 0;                  /* the hub is the only publisher today */
+    std::memcpy(w->label, r.label, sizeof(w->label));
+    std::memcpy(w->score, r.score, sizeof(w->score));
+}
+
+[[maybe_unused]] void from_wire(const ml_result_t *w, df::Result &r)
+{
+    r = df::result_none();
+    r.show_at_us = w->show_at_us;
+    r.index      = w->index;
+    r.analyser   = w->analyser;
+    r.model_id   = w->model_id;
+    r.n          = w->n > df::RESULT_SCORES ? df::RESULT_SCORES : w->n;
+    std::memcpy(r.label, w->label, sizeof(r.label));
+    std::memcpy(r.score, w->score, sizeof(r.score));
+}
+
+/*
+ * Send a result onward, if anything is listening.
+ *
+ * Called from whichever lane produced it. Both lanes hand results to the local
+ * latch first and come here afterwards, so this unit's own strip never waits on
+ * a radio and a send that fails costs a neighbour a result rather than costing
+ * this unit one too -- the same ordering publish_frame() has.
+ */
+void publish_result(const df::Result &r)
+{
+    if (const auto publish = s_ml_publish.load(std::memory_order_relaxed)) {
+        ml_result_t w;
+        to_wire(r, &w);
+        publish(&w);
+    }
+}
 
 /* BEAT_BANDS is a macro from beat_detect.h, not a df:: member. */
 static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
@@ -644,7 +709,12 @@ void run_fast_lane(const int16_t *mono, int64_t index, int64_t due_us,
     df::run_fast_lane(mono, FFT_N, index, due_us, skip, out);
 
     for (int i = 0; i < df::ML_SLOTS; i++) {
-        if (df::result_valid(out[i])) bump(s_ml_results);
+        if (df::result_valid(out[i])) {
+            bump(s_ml_results);
+            /* After the frame it travels in has been filled, so a radio that is
+             * busy costs a neighbour a result and not this unit's own strip. */
+            publish_result(out[i]);
+        }
     }
 }
 
@@ -659,13 +729,20 @@ void visualiser_task(void *arg)
     df::Result fast_ml[df::ML_SLOTS];
 
     /*
-     * The feed to the slow lane. Absent, and costing nothing, in a build with no
-     * slow analyser -- the resampler table alone is 4 kB.
+     * The feed to the slow lane.
+     *
+     * Absent entirely on a unit that is given its results -- the resampler
+     * table alone is 4 kB and the decimation buffer another 2, which is real
+     * money on a satellite with ~52 kB free. Also absent, at runtime, in a
+     * build with no slow analyser: ml_lane_rate() returns 0 and nothing below
+     * runs.
      */
+#if DF_RUNS_ANALYSERS
     static resampler_t ml_rs;
     static int16_t     ml_dec[FFT_N + 8];   /* decimating only, so never more */
     int  ml_rate = df::ml_lane_rate();
     bool ml_restart = true;
+#endif
     size_t   filled = 0;
     uint32_t recv_total = 0;
     uint32_t seen_gen = 0;
@@ -721,6 +798,7 @@ void visualiser_task(void *arg)
                              a->spec().name, rate);
                 }
             }
+#if DF_RUNS_ANALYSERS
             if (ml_rate > 0) {
                 if (ml_rate > (int)rate) {
                     /* Upsampling into a model is not something this lane does,
@@ -740,6 +818,7 @@ void visualiser_task(void *arg)
                              rate, ml_rate, resample_table_checksum(&ml_rs));
                 }
             }
+#endif
             if (pattern) pattern->reset();
             filled = 0;
             ESP_LOGW(TAG, "analysing at %" PRIu32 " Hz", rate);
@@ -772,7 +851,9 @@ void visualiser_task(void *arg)
              * so the resampler's history would smear across the join and the
              * lane's window grid would keep counting from a dead origin. Both
              * are re-derived from the first frame of the new timeline below. */
+#if DF_RUNS_ANALYSERS
             ml_restart = true;
+#endif
             block_index = s_align_block_index.load(std::memory_order_relaxed);
             const size_t keep = static_cast<size_t>(ahead) < filled
                                 ? static_cast<size_t>(ahead) : filled;
@@ -840,6 +921,7 @@ void visualiser_task(void *arg)
          * COUNTING what it is given, so feeding a sample twice or missing one
          * moves every result after it against the timeline for good.
          */
+#if DF_RUNS_ANALYSERS
         if (ml_rate > 0) {
             const int16_t *src = mono + TAIL_N;
             int n = HOP_N;
@@ -859,6 +941,7 @@ void visualiser_task(void *arg)
                 ml_restart = true;
             }
         }
+#endif
         const int64_t t_fast = esp_timer_get_time();
 
         /*
@@ -1083,7 +1166,9 @@ void render_task(void *arg)
                               " | show %" PRIu32 "/%" PRIu32
                               " | wake +%" PRIu32 "/%" PRIu32 " us"
                               " | queued %" PRIu32 " | late %" PRIu32
-                              " | overrun %" PRIu32 " | dark %" PRIu32 " | %s",
+                              " | overrun %" PRIu32 " | dark %" PRIu32
+                              " | ml %" PRIu32 " (late %" PRIu32
+                              ", overrun %" PRIu32 ") | %s",
                          take(s_frames), take(s_onsets), take(s_booms),
                          rn ? rsum / rn : 0, take(s_render_max),
                          rn ? psum / rn : 0, take(s_pattern_max),
@@ -1092,6 +1177,8 @@ void render_task(void *arg)
                          s_fq_head.load(std::memory_order_relaxed) -
                              s_fq_tail.load(std::memory_order_relaxed),
                          take(s_late), take(s_overrun), take(s_idle_dark),
+                         take(s_ml_results), s_latch.take_late(),
+                         s_latch.take_overrun(),
                          pattern ? pattern->name() : "no pattern");
             }
         }
@@ -1247,6 +1334,68 @@ void visualiser_set_clock(int64_t (*master_to_local)(int64_t))
 void visualiser_set_publish(void (*publish)(const vis_frame_t *))
 {
     s_publish.store(publish, std::memory_order_relaxed);
+}
+
+void visualiser_set_ml_publish(void (*publish)(const ml_result_t *r))
+{
+    s_ml_publish.store(publish, std::memory_order_relaxed);
+}
+
+const char *visualiser_ml_source_name(void)
+{
+#if DF_RUNS_ANALYSERS
+    return "local";
+#else
+    return "remote";
+#endif
+}
+
+void visualiser_submit_ml(const ml_result_t *r)
+{
+#if DF_RUNS_ANALYSERS
+    /* This unit computes its own. Accepting somebody else's as well would put
+     * two answers to the same question in one slot, alternating by whichever
+     * arrived last -- the same reason visualiser_submit_frame() is a no-op on a
+     * unit doing its own analysis. */
+    (void)r;
+#else
+    if (!r || r->analyser >= df::ML_SLOTS) {
+        return;
+    }
+
+    /*
+     * Is this the model this unit expects in that slot?
+     *
+     * A result from a different model is the one difference that makes two
+     * strips disagree while every counter looks healthy, so it is said out loud
+     * -- once, because it is a property of the pair of builds and will not stop
+     * happening, and a complaint per result would bury everything else.
+     *
+     * Reported, not refused. A floor deliberately running a bigger model on the
+     * hub than a satellite could hold is a case this is meant to serve; what it
+     * must not be is a surprise.
+     */
+    if (df::Analyser *a = df::analyser_at(r->analyser)) {
+        if (a->spec().model_id != r->model_id) {
+            static bool told[df::ML_SLOTS];
+            if (!told[r->analyser]) {
+                told[r->analyser] = true;
+                ESP_LOGW(TAG, "slot %u carries model %u, this build expects %u "
+                              "(\"%s\") -- the strips will follow the sender",
+                         r->analyser, r->model_id, a->spec().model_id, a->spec().name);
+            }
+        }
+    }
+
+    df::Result local;
+    from_wire(r, local);
+    /* A failed publish is already counted as a latch overrun, which is where
+     * a reader would look for it -- it means the render stage is not draining,
+     * and that is the same fault whichever side filled the slot. */
+    if (s_latch.publish(r->analyser, local)) {
+        bump(s_ml_results);
+    }
+#endif
 }
 
 void visualiser_submit_frame(const vis_frame_t *f)
@@ -1537,7 +1686,7 @@ void visualiser_start(void)
                 continue;
             }
             const df::AnalyserSpec &sp = a->spec();
-#if DF_ANALYSES_AUDIO
+#if DF_ANALYSES_AUDIO && DF_RUNS_ANALYSERS
             if (sp.lane == df::Lane::Fast) {
                 if (a->init(rate)) {
                     s_latch.set_latched(i, false);
@@ -1555,16 +1704,16 @@ void visualiser_start(void)
                      sp.window_n, sp.hop_n,
                      sp.rate_hz ? sp.rate_hz : rate,
                      (long long)sp.present_delay_us,
-                     DF_ANALYSES_AUDIO
+                     DF_RUNS_ANALYSERS
                          ? (sp.lane == df::Lane::Fast ? "computed here, in the frame"
                                                       : "computed here, through the latch")
                          : "given to this unit");
         }
 
-#if DF_ANALYSES_AUDIO
+#if DF_ANALYSES_AUDIO && DF_RUNS_ANALYSERS
         /* Starts nothing if no analyser is slow, so a build without one pays no
          * task, no stack and no 4 kB filter table. */
-        df::ml_lane_start(&s_latch, rate);
+        df::ml_lane_start(&s_latch, rate, publish_result);
 #endif
     }
 

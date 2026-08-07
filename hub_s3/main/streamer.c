@@ -814,6 +814,47 @@ static void publish_frame(const vis_frame_t *f)
 }
 #endif
 
+/*
+ * The same, for one analyser result.
+ *
+ * Deliberately a copy of publish_frame() rather than a shared helper taking a
+ * type and a length. The two differ in the message they build and in nothing
+ * else today, but they are on different cadences and different budgets -- a
+ * frame goes out 86 times a second and a slow analyser's result once -- and the
+ * first thing either is likely to grow is its own rate limit. Sharing them now
+ * would have to be undone then.
+ *
+ * A failed send costs a satellite one result. Counted with the audio's own
+ * failures, like the frame path: the interesting question is whether the link
+ * is dropping things, not which kind.
+ */
+#if CONFIG_DANCEFLOOR_PUBLISH_ML
+static void publish_ml(const ml_result_t *r)
+{
+    if (sizeof(*r) > ML_PAYLOAD_MAX) {
+        return;                              /* refuse rather than truncate */
+    }
+    ml_msg_t msg = { .type = MSG_ML, .len = (uint8_t)sizeof(*r) };
+    memcpy(msg.payload, r, sizeof(*r));
+    const size_t bytes = ML_MSG_BYTES(sizeof(*r));
+
+    portENTER_CRITICAL(&s_clients_lock);
+    client_t snapshot[MAX_CLIENTS];
+    memcpy(snapshot, s_clients, sizeof(snapshot));
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!snapshot[i].last_seen) {
+            continue;
+        }
+        if (sendto(sock, &msg, bytes, 0,
+                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
+            s_tx_fail++;
+        }
+    }
+}
+#endif
+
 void streamer_begin_packet(void)
 {
     s_pending_pos = s_samples_in;
@@ -2470,6 +2511,9 @@ void streamer_start(void)
      */
 #if CONFIG_DANCEFLOOR_PUBLISH_FRAMES
     visualiser_set_publish(publish_frame);
+#endif
+#if CONFIG_DANCEFLOOR_PUBLISH_ML
+    visualiser_set_ml_publish(publish_ml);
 #endif
 #endif
     ESP_LOGI(TAG, "streaming on port %d, unicast to registered listeners", SYNC_PORT);

@@ -379,6 +379,8 @@ static volatile int64_t rejoined_at;      /* 0 = the next anchor is not the firs
 static volatile int64_t est_newest_at;    /* when the newest probe landed */
 static volatile uint32_t n_frames_rx;     /* analysis frames taken from the hub */
 static volatile uint32_t n_frames_bad;    /* ... and rejected, wrong size */
+static volatile uint32_t n_ml_rx;         /* analyser results taken from the hub */
+static volatile uint32_t n_ml_bad;        /* ... and rejected, wrong size */
 static volatile uint32_t hw_play;         /* stack headroom, sampled in-task */
 static volatile uint32_t hw_drift;
 
@@ -1170,6 +1172,36 @@ static void rx_task(void *arg)
                 n_frames_bad++;
             }
 #endif
+        } else if (buf[0] == MSG_ML && n >= (int)ML_MSG_BYTES(0)) {
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+            /*
+             * One analyser's result, computed by the hub. Shown at the instant
+             * it names, exactly like one this unit computed itself -- which is
+             * what lets the hub run a model no satellite could hold.
+             *
+             * Length-checked for the same reason a frame is, and complained
+             * about once for the same reason. The sharper mismatch -- the right
+             * SIZE carrying a different MODEL -- is checked inside
+             * visualiser_submit_ml(), which knows what this build expects.
+             */
+            const ml_msg_t *mm = (const ml_msg_t *)buf;
+            if (mm->len == sizeof(ml_result_t) &&
+                n >= (int)ML_MSG_BYTES(mm->len)) {
+                ml_result_t r;
+                memcpy(&r, mm->payload, sizeof(r));
+                visualiser_submit_ml(&r);
+                n_ml_rx++;
+            } else {
+                static bool told;
+                if (!told) {
+                    told = true;
+                    ESP_LOGE(TAG, "ml result of %u bytes, expected %u -- hub and "
+                                  "satellite are not the same build",
+                             mm->len, (unsigned)sizeof(ml_result_t));
+                }
+                n_ml_bad++;
+            }
+#endif
         } else if (buf[0] == MSG_TSF && n >= (int)sizeof(tsf_msg_t)) {
             /*
              * This is the CLOCK SOURCE, not a measurement. It was one, and this
@@ -1560,7 +1592,8 @@ static void drift_task(void *arg)
                           ", wide-span %" PRIu32 ")"
                           " | phase-drop %" PRIu32 " short-reads %" PRIu32
                           " (%" PRIu32 " frames)"
-                     " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")",
+                     " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")"
+                          " | ml %s (rx %" PRIu32 ", bad %" PRIu32 ")",
                      (unsigned long long)(esp_timer_get_time() / 1000000),
                      esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                      heap_win == UINT32_MAX ? 0 : heap_win,
@@ -1574,7 +1607,8 @@ static void drift_task(void *arg)
                      n_tsf_used, n_tsf_fallback, n_tsf_wide,
                      n_phase_drop, n_short_reads, n_short_frames,
                      visualiser_source_name(), visualiser_hop(),
-                     n_frames_rx, n_frames_bad);
+                     n_frames_rx, n_frames_bad,
+                     visualiser_ml_source_name(), n_ml_rx, n_ml_bad);
 
 #if CONFIG_DANCEFLOOR_WIFI_LOGS
             /* The structured twin of the line above, for the collector's CSV.

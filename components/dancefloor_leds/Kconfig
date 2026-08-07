@@ -205,6 +205,53 @@ menu "Dancefloor LEDs"
             bool "256 -- 75% overlap, 172 frames/s"
     endchoice
 
+    choice DANCEFLOOR_ML_SOURCE
+        prompt "Where this unit's analyser results come from"
+        default DANCEFLOOR_ML_SOURCE_LOCAL
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            The same question DANCEFLOOR_LED_SOURCE asks about analysis frames,
+            asked separately about the pluggable analysers -- and separately on
+            purpose.
+
+            A unit can compute its own FFT frames and still be GIVEN a model's
+            results. The FFT is cheap and provably identical everywhere; a model
+            is neither, and a classic-ESP32 satellite that cannot hold a tensor
+            arena can still light up in step with a hub that can. That
+            combination is the reason this is not one setting.
+
+            The reverse does not exist: a unit taking frames from the hub
+            analyses no audio at all, so there is nothing for an analyser to run
+            on. Choosing Local there is not offered.
+
+            WHAT IS GUARANTEED is the same narrow thing DANCEFLOOR_LED_SOURCE
+            promises: units taking results from the same source agree. Two units
+            both on Local agree only if they run the same analyser, built from
+            the same source, with the same model_id -- which across an LX6
+            satellite and an LX7 hub additionally requires the arithmetic to be
+            integer. A mismatch is detected from model_id and logged once.
+
+        config DANCEFLOOR_ML_SOURCE_LOCAL
+            bool "Local -- this unit runs the analysers"
+            depends on DANCEFLOOR_LED_SOURCE_LOCAL
+            help
+                Costs whatever the analysers cost. A fast one runs on the
+                analysis task beside the FFT; a slow one brings up its own task
+                on the other core, a resampler and its buffers -- about 25 kB
+                for the shipped example, against the ~52 kB a satellite has
+                free while analysing.
+
+        config DANCEFLOOR_ML_SOURCE_REMOTE
+            bool "Remote -- this unit is given the results"
+            help
+                No analyser runs here, no slow lane starts, and no resampler is
+                built. Results arrive as MSG_ML and are shown at the instant
+                they name, exactly like ones computed locally.
+
+                This is what lets the floor run a model only the hub can hold.
+
+    endchoice
+
     config DANCEFLOOR_ML_SLOTS
         int "Pluggable analysers that may run at once"
         default 2

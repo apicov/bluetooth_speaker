@@ -40,6 +40,7 @@ typedef enum {
     MSG_LOG      = 9,   /* any wifi unit -> collector, one formatted log line */
     MSG_HEALTH   = 10,  /* any wifi unit -> collector, the structured HEALTH snapshot */
     MSG_LOG_SUB  = 11,  /* collector -> hub: "send logs here" (see log_sub_msg_t) */
+    MSG_ML       = 12,  /* master -> listeners, one analyser result */
 } msg_type_t;
 
 /*
@@ -276,6 +277,36 @@ typedef struct __attribute__((packed)) {
 } frame_msg_t;
 
 #define FRAME_MSG_BYTES(n) (sizeof(frame_msg_t) - FRAME_PAYLOAD_MAX + (n))
+
+/*
+ * One pluggable analyser's result, for a unit that is given them rather than
+ * computing them.
+ *
+ * A separate message from MSG_FRAME rather than more bytes inside it, and the
+ * reason is cadence. Frames go out at the analysis rate -- 86 a second at hop
+ * 512 -- while an analyser with a second of context reports once a second.
+ * Carrying a result in every frame would multiply its cost by eighty and change
+ * the size of a struct both ends already agree about.
+ *
+ * The payload is an ml_result_t from components/dancefloor_leds, copied in as
+ * bytes for the same reason vis_frame_t is: that component does not depend on
+ * this one and must stay buildable alone. `len` is carried so the two ends can
+ * disagree about the size and say so rather than reading past it.
+ *
+ * Cost is whatever the analysers report. A slow one at 1 Hz is 36 bytes a
+ * second and beneath notice; a FAST one publishes at the frame rate and costs
+ * about what a vis_frame_t stream does, which is worth knowing before turning
+ * one on for a floor rather than a bench.
+ */
+#define ML_PAYLOAD_MAX 64
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;           /* MSG_ML */
+    uint8_t len;            /* bytes of payload that follow */
+    uint8_t payload[ML_PAYLOAD_MAX];
+} ml_msg_t;
+
+#define ML_MSG_BYTES(n) (sizeof(ml_msg_t) - ML_PAYLOAD_MAX + (n))
 
 typedef struct __attribute__((packed)) {
     uint8_t type;           /* MSG_META */

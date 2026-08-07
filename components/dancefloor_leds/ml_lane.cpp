@@ -24,6 +24,7 @@ constexpr const char *TAG = "mlan";
 Analyser   *s_slow = nullptr;
 int         s_slot = -1;
 ResultLatch *s_latch = nullptr;
+void (*s_on_result)(const Result &) = nullptr;
 
 StreamBufferHandle_t s_stream = nullptr;
 
@@ -90,6 +91,41 @@ void feed(SlowWindow &grid, const AnalyserSpec &sp, const int16_t *in, int n)
             r.show_at_us = due_us + sp.present_delay_us;
             s_latch->publish(s_slot, r);
             bump(s_results);
+            /* After the latch, so the local strip is served before the radio. */
+            if (s_on_result) s_on_result(r);
+
+            /*
+             * Say what changed, and only what changed.
+             *
+             * This is what reaches the laptop collector, which forwards
+             * ESP_LOG, so it is also the record you read afterwards against the
+             * audio. Logging every result would be one line a second per
+             * analyser -- five times the rate of the periodic lines already
+             * here, for a value that mostly repeats. Logging the TRANSITIONS
+             * gives a track's shape in a dozen lines and stays silent through a
+             * steady passage.
+             *
+             * The instant printed is show_at_us, not now: it is the moment the
+             * strips act on this, which is the only one worth lining up against
+             * a recording. The counts in the periodic `ml:` line cover the
+             * results this does not print.
+             */
+            static uint8_t last_label = 0xFF;
+            static bool    have_last;
+            if (!have_last || r.label[0] != last_label) {
+                have_last = true;
+                last_label = r.label[0];
+                const char *nm = s_slow->label_name(r.label[0]);
+                if (nm) {
+                    ESP_LOGI(TAG, "%s: %s (%u) at %lld us",
+                             sp.name, nm, (unsigned)r.score[0],
+                             (long long)r.show_at_us);
+                } else {
+                    ESP_LOGI(TAG, "%s: label %u (%u) at %lld us",
+                             sp.name, (unsigned)r.label[0], (unsigned)r.score[0],
+                             (long long)r.show_at_us);
+                }
+            }
         }
     });
 }
@@ -167,14 +203,16 @@ int ml_lane_slot()
     return -1;
 }
 
-void ml_lane_start(ResultLatch *latch, int stream_rate_hz)
+void ml_lane_start(ResultLatch *latch, int stream_rate_hz,
+                   void (*on_result)(const Result &r))
 {
     s_slot = ml_lane_slot();
     if (s_slot < 0) {
         return;                     /* no slow analyser in this build */
     }
-    s_slow  = analyser_at(s_slot);
-    s_latch = latch;
+    s_slow      = analyser_at(s_slot);
+    s_latch     = latch;
+    s_on_result = on_result;
 
     const AnalyserSpec &sp = s_slow->spec();
 
