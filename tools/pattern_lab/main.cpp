@@ -29,6 +29,8 @@
 
 #include "analyser.hpp"
 #include "analysis.hpp"
+#include "ml_window.hpp"
+#include "resample.h"
 #include "result_latch.hpp"
 #include "patterns.hpp"
 #include "wav.hpp"
@@ -155,11 +157,9 @@ int main(int argc, char **argv)
 
     /*
      * The analyser lane, set up the way the firmware sets it up: a slot this
-     * unit computes itself is cleared, everything else stays latched and
-     * reports nothing. Only the fast lane exists on the host so far -- a slow
-     * analyser needs the resampler and its own cadence, and until then its slot
-     * simply stays empty here, which is exactly what a unit waiting for results
-     * off the wire sees.
+     * unit computes itself in the fast lane is cleared, and everything else --
+     * slow slots included -- stays latched, because a slow result arrives
+     * through the latch here exactly as it does on a board.
      */
     df::ResultLatch latch;
     bool ml_skip[df::ML_SLOTS];
@@ -174,9 +174,42 @@ int main(int argc, char **argv)
                          i, sp.name, unsigned(sp.model_id),
                          sp.lane == df::Lane::Fast ? "fast" : "slow",
                          (long long)sp.present_delay_us,
-                         fast ? "run here" : "not run here");
+                         fast ? "in the frame"
+                              : (sp.lane == df::Lane::Slow ? "through the latch"
+                                                           : "not run"));
         }
     }
+
+    /*
+     * The slow lane, driven inline rather than on a task -- there is no audio
+     * clock here, so a window is processed the moment its samples exist. The
+     * GRID is the firmware's, from ml_window.hpp, and so is the resampler, so
+     * the windows cut here are the windows the boards cut.
+     */
+    df::SlowWindow  slow_grid;
+    resampler_t     slow_rs;
+    df::Analyser   *slow = nullptr;
+    int             slow_slot = -1;
+    for (int i = 0; i < df::ML_SLOTS; i++) {
+        df::Analyser *a = df::analyser_at(i);
+        if (a && a->spec().lane == df::Lane::Slow && a->spec().rate_hz <= wav.rate) {
+            slow = a;
+            slow_slot = i;
+            break;
+        }
+    }
+    if (slow) {
+        const df::AnalyserSpec &sp = slow->spec();
+        slow->init(wav.rate);
+        slow_grid.configure(sp.window_n, sp.hop_n, sp.rate_hz);
+        resample_init(&slow_rs, wav.rate, sp.rate_hz);
+        std::fprintf(stderr, "slow lane: \"%s\" %d -> %d Hz, filter 0x%08x\n",
+                     sp.name, wav.rate, sp.rate_hz,
+                     resample_table_checksum(&slow_rs));
+    }
+
+    std::vector<int16_t> mono(size_t(df::FFT_N));
+    std::vector<int16_t> dec(size_t(df::FFT_N) + 8);
 
     std::vector<uint8_t> rgb(size_t(leds) * 3);
     std::vector<uint8_t> image;          /* blocks x leds, RGB */
@@ -191,8 +224,18 @@ int main(int argc, char **argv)
          * it, and nothing else in the file would say why. */
         std::fprintf(csv, "# window=%d hop=%d rate=%d\n", df::FFT_N, df::HOP_N, wav.rate);
         std::fprintf(csv, "block,time_s,band0,band1,band2,band3,flux,threshold,onset,strength,"
-                             "boom_flux,boom_threshold,boom,boom_strength,"
-                             "ml0_label,ml0_score,ml0_show_s\n");
+                             "boom_flux,boom_threshold,boom,boom_strength");
+        /* One pair of columns per analyser slot, named after the analyser -- so
+         * the file says which model produced which column rather than leaving a
+         * reader to remember what slot 1 was on the day it was written. The
+         * shape follows DF_ML_SLOTS, which the provenance line above records. */
+        for (int i = 0; i < df::ML_SLOTS; i++) {
+            df::Analyser *a = df::analyser_at(i);
+            std::fprintf(csv, ",ml%d_%s_label,ml%d_%s_score",
+                         i, a ? a->spec().name : "none",
+                         i, a ? a->spec().name : "none");
+        }
+        std::fprintf(csv, "\n");
     }
 
     TtyRender tty_render;
@@ -215,8 +258,35 @@ int main(int argc, char **argv)
         if (f.onset) onsets++;
         if (f.boom)  booms++;
 
-        /* The same lane the boards run, from the same source file. */
-        df::run_fast_lane(chunk, df::FFT_N, int64_t(b), due_us, ml_skip, f.ml);
+        /* The same lanes the boards run, from the same source files. */
+        df::downmix(chunk, df::FFT_N, mono.data());
+        df::run_fast_lane(mono.data(), df::FFT_N, int64_t(b), due_us, ml_skip, f.ml);
+
+        if (slow) {
+            /* New audio only: window b overlaps window b-1 by TAIL_N, so after
+             * the first only the last hop is fresh. Feeding the overlap again
+             * would advance the lane's grid twice as fast as the boards'. */
+            const int16_t *src = mono.data() + (df::FFT_N - df::HOP_N);
+            int n = df::HOP_N;
+            if (b == 0) {
+                slow_grid.restart(due_us);
+                resample_reset(&slow_rs);
+                src = mono.data();
+                n = df::FFT_N;
+            }
+            const int m = resample_push(&slow_rs, src, n, dec.data(), int(dec.size()));
+            const df::AnalyserSpec &sp = slow->spec();
+            slow_grid.push(dec.data(), m,
+                [&](const int16_t *w, int64_t index, int64_t wdue) {
+                    df::Result r{};
+                    if (slow->process(w, index, wdue, &r)) {
+                        r.analyser   = uint8_t(slow_slot);
+                        r.model_id   = sp.model_id;
+                        r.show_at_us = wdue + sp.present_delay_us;
+                        latch.publish(slow_slot, r);
+                    }
+                });
+        }
         /* And the same latch, so a slot waiting on a result behaves here the
          * way it behaves on a strip. */
         latch.take(due_us, int64_t(df::HOP_N) * 1000000LL / wav.rate, f.ml);
@@ -239,19 +309,15 @@ int main(int argc, char **argv)
                          b, due_us / 1e6, f.band[0], f.band[1], f.band[2], f.band[3],
                          f.flux, f.threshold, f.onset ? 1 : 0, f.strength,
                          f.boom_flux, f.boom_threshold, f.boom ? 1 : 0, f.boom_strength);
-            /* Slot 0 only: a CSV with one column set per slot would change
-             * shape with DF_ML_SLOTS, and every consumer of this file reads it
-             * by column. The label is printed as its NAME where the analyser
-             * has one -- a bare class id is unreadable a week later. */
-            if (df::result_valid(f.ml[0])) {
-                df::Analyser *a0 = df::analyser_at(0);
-                const char *nm = a0 ? a0->label_name(f.ml[0].label[0]) : nullptr;
-                if (nm) std::fprintf(csv, ",%s,%u,%.3f", nm,
-                                     unsigned(f.ml[0].score[0]), f.ml[0].show_at_us / 1e6);
-                else    std::fprintf(csv, ",%u,%u,%.3f", unsigned(f.ml[0].label[0]),
-                                     unsigned(f.ml[0].score[0]), f.ml[0].show_at_us / 1e6);
-            } else {
-                std::fprintf(csv, ",,,");
+            /* The label is printed as its NAME where the analyser has one -- a
+             * bare class id is unreadable a week later. */
+            for (int i = 0; i < df::ML_SLOTS; i++) {
+                if (!df::result_valid(f.ml[i])) { std::fprintf(csv, ",,"); continue; }
+                df::Analyser *a = df::analyser_at(i);
+                const char *nm = a ? a->label_name(f.ml[i].label[0]) : nullptr;
+                if (nm) std::fprintf(csv, ",%s,%u", nm, unsigned(f.ml[i].score[0]));
+                else    std::fprintf(csv, ",%u,%u", unsigned(f.ml[i].label[0]),
+                                     unsigned(f.ml[i].score[0]));
             }
             std::fprintf(csv, "\n");
         }

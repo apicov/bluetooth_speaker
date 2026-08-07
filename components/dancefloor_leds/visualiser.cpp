@@ -26,6 +26,8 @@
 
 #include "analysis.hpp"
 #include "patterns.hpp"
+#include "ml_lane.hpp"
+#include "resample.h"
 #include "result_latch.hpp"
 #include "led_strip_wrapper.hpp"
 
@@ -631,7 +633,7 @@ void show(const uint8_t *rgb)
  * drives exactly this and not a copy of it. All that belongs here is which
  * slots this unit computes -- which is firmware state -- and the counter.
  */
-void run_fast_lane(const int16_t *stereo, int64_t index, int64_t due_us,
+void run_fast_lane(const int16_t *mono, int64_t index, int64_t due_us,
                    df::Result out[df::ML_SLOTS])
 {
     bool skip[df::ML_SLOTS];
@@ -639,7 +641,7 @@ void run_fast_lane(const int16_t *stereo, int64_t index, int64_t due_us,
         skip[i] = s_latch.latched(i);
     }
 
-    df::run_fast_lane(stereo, FFT_N, index, due_us, skip, out);
+    df::run_fast_lane(mono, FFT_N, index, due_us, skip, out);
 
     for (int i = 0; i < df::ML_SLOTS; i++) {
         if (df::result_valid(out[i])) bump(s_ml_results);
@@ -650,7 +652,20 @@ void visualiser_task(void *arg)
 {
     (void)arg;
     static int16_t raw[FFT_N * CHANNELS];
+    /* Downmixed once per frame and used twice: by the fast lane, which analyses
+     * exactly the window the FFT did, and by the resampler feeding the slow one.
+     * Static, not stack -- this task has 4 kB and this is 2 kB of it. */
+    static int16_t mono[FFT_N];
     df::Result fast_ml[df::ML_SLOTS];
+
+    /*
+     * The feed to the slow lane. Absent, and costing nothing, in a build with no
+     * slow analyser -- the resampler table alone is 4 kB.
+     */
+    static resampler_t ml_rs;
+    static int16_t     ml_dec[FFT_N + 8];   /* decimating only, so never more */
+    int  ml_rate = df::ml_lane_rate();
+    bool ml_restart = true;
     size_t   filled = 0;
     uint32_t recv_total = 0;
     uint32_t seen_gen = 0;
@@ -706,6 +721,25 @@ void visualiser_task(void *arg)
                              a->spec().name, rate);
                 }
             }
+            if (ml_rate > 0) {
+                if (ml_rate > (int)rate) {
+                    /* Upsampling into a model is not something this lane does,
+                     * and ml_dec is sized on the assumption it never happens.
+                     * Refusing loudly beats a buffer that overflows at 48 kHz. */
+                    ESP_LOGE(TAG, "slow analyser wants %d Hz from a %" PRIu32 " Hz "
+                                  "stream -- lane stopped", ml_rate, rate);
+                    ml_rate = 0;
+                } else if (resample_init(&ml_rs, (int)rate, ml_rate) != 0) {
+                    ESP_LOGE(TAG, "no resampler for %" PRIu32 " -> %d Hz -- lane stopped",
+                             rate, ml_rate);
+                    ml_rate = 0;
+                } else {
+                    ml_restart = true;
+                    ESP_LOGW(TAG, "slow lane resampling %" PRIu32 " -> %d Hz, "
+                                  "filter 0x%08" PRIx32,
+                             rate, ml_rate, resample_table_checksum(&ml_rs));
+                }
+            }
             if (pattern) pattern->reset();
             filled = 0;
             ESP_LOGW(TAG, "analysing at %" PRIu32 " Hz", rate);
@@ -734,6 +768,11 @@ void visualiser_task(void *arg)
                 continue;
             }
             seen_gen = gen;
+            /* The audio after this point does not continue the audio before it,
+             * so the resampler's history would smear across the join and the
+             * lane's window grid would keep counting from a dead origin. Both
+             * are re-derived from the first frame of the new timeline below. */
+            ml_restart = true;
             block_index = s_align_block_index.load(std::memory_order_relaxed);
             const size_t keep = static_cast<size_t>(ahead) < filled
                                 ? static_cast<size_t>(ahead) : filled;
@@ -784,7 +823,42 @@ void visualiser_task(void *arg)
          * the same downmix internally on its own copy. Done once here rather
          * than per analyser, and only when there is a fast analyser to want it.
          */
-        run_fast_lane(raw, block_index, due_us, fast_ml);
+        df::downmix(raw, FFT_N, mono);
+        run_fast_lane(mono, block_index, due_us, fast_ml);
+
+        /*
+         * Feed the slow lane the audio that is NEW in this window.
+         *
+         * Steady state that is the last HOP_N samples: window w covers
+         * [w*HOP_N, w*HOP_N+FFT_N) and window w-1 ended at w*HOP_N+TAIL_N, so
+         * the tail is what both saw and only the last hop is fresh. The first
+         * window after a restart has no predecessor, so all of it is fresh --
+         * and it is the one that establishes the origin, which is this window's
+         * due_us because its first sample is the first the lane will see.
+         *
+         * Contiguity matters more than it looks: the lane derives due_us by
+         * COUNTING what it is given, so feeding a sample twice or missing one
+         * moves every result after it against the timeline for good.
+         */
+        if (ml_rate > 0) {
+            const int16_t *src = mono + TAIL_N;
+            int n = HOP_N;
+            if (ml_restart) {
+                ml_restart = false;
+                resample_reset(&ml_rs);
+                df::ml_lane_restart(due_us);
+                src = mono;
+                n = FFT_N;
+            }
+            const int m = resample_push(&ml_rs, src, n, ml_dec,
+                                        (int)(sizeof(ml_dec) / sizeof(ml_dec[0])));
+            if (!df::ml_lane_feed(ml_dec, m)) {
+                /* The lane could not take it all, so its count no longer
+                 * describes the timeline. Re-anchor on the next frame rather
+                 * than carrying a grid that is wrong by the amount lost. */
+                ml_restart = true;
+            }
+        }
         const int64_t t_fast = esp_timer_get_time();
 
         /*
@@ -899,10 +973,16 @@ void visualiser_task(void *arg)
              * -- it counts results that missed the frame they named, and the
              * only fix for it is a larger present_delay_us.
              */
-            ESP_LOGI(TAG, "ml: fast %lld/%lld us (mean/max) | results %" PRIu32
-                          " | late %" PRIu32 " | overrun %" PRIu32,
+            const df::MlLaneStats ml = df::ml_lane_take_stats();
+            ESP_LOGI(TAG, "ml: fast %lld/%lld us (mean/max) | slow %" PRIu32 "/%" PRIu32
+                          " us | results %" PRIu32 "+%" PRIu32
+                          " | late %" PRIu32 " | overrun %" PRIu32
+                          " | lane drop %" PRIu32 " | restarts %" PRIu32,
                      cost_n ? cost_fast / cost_n : 0, cost_fast_max,
-                     take(s_ml_results), s_latch.take_late(), s_latch.take_overrun());
+                     ml.cost_mean_us, ml.cost_max_us,
+                     take(s_ml_results), ml.results,
+                     s_latch.take_late(), s_latch.take_overrun(),
+                     ml.dropped, ml.restarts);
             cost_fast = cost_fast_max = 0;
             ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %" PRIu32
                           "/%" PRIu32 " us | pat %" PRIu32 "/%" PRIu32
@@ -1475,8 +1555,17 @@ void visualiser_start(void)
                      sp.window_n, sp.hop_n,
                      sp.rate_hz ? sp.rate_hz : rate,
                      (long long)sp.present_delay_us,
-                     s_latch.latched(i) ? "given to this unit" : "computed here");
+                     DF_ANALYSES_AUDIO
+                         ? (sp.lane == df::Lane::Fast ? "computed here, in the frame"
+                                                      : "computed here, through the latch")
+                         : "given to this unit");
         }
+
+#if DF_ANALYSES_AUDIO
+        /* Starts nothing if no analyser is slow, so a build without one pays no
+         * task, no stack and no 4 kB filter table. */
+        df::ml_lane_start(&s_latch, rate);
+#endif
     }
 
     /* Configured name if it resolves, first pattern otherwise. A typo should

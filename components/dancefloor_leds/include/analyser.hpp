@@ -196,12 +196,24 @@ struct AnalyserSpec {
      * So a result is shown late on purpose, by exactly this much, and the
      * amount is DECLARED rather than measured. It must satisfy
      *
-     *     present_delay_us >= (window_n - hop_n) * 1e6 / rate_hz
+     *     present_delay_us >= window_n * 1e6 / rate_hz      (the window must arrive)
      *                         + worst_case_compute_us
      *                         + publish_latency_us
-     *                         - LEAD_US
+     *                         - LEAD_US                     (the audio arrives early)
      *
      * and it must be the same number on every unit running this analyser.
+     *
+     * The whole window, not the window minus the hop: nothing can be computed
+     * until the window's LAST sample has arrived, and that sample is heard
+     * `window_n / rate_hz` after the instant the window is labelled with.
+     *
+     * Worked, for the FFT: 1024 samples at 44.1 kHz is 23 ms against a 200 ms
+     * lead, so the bound is negative and zero is correct -- which is why the
+     * fast lane needs no delay and why this whole field could be ignored until
+     * something with a real context window arrived.
+     *
+     * Worked, for a one-second model at 16 kHz: 1000 - 200 = 800 ms before
+     * compute is counted at all.
      *
      * Using the MEASURED inference time instead is the trap. It is different on
      * an LX6 and an LX7, it is different on a busy board and an idle one, and
@@ -299,10 +311,9 @@ Analyser *analyser_by_name(const char *name);
  * analyser lane reimplemented on the laptop would quietly break it the first
  * time one of the two was changed.
  *
- * `stereo` is `window_n` interleaved 16-bit frames -- the same window the FFT
- * was handed. The downmix to mono happens here, once, and must stay the same
- * one Analysis::process() does internally: two front ends disagreeing about
- * what mono means would be a difference nothing downstream could see.
+ * `mono` is `window_n` samples -- the same window the FFT was handed, downmixed
+ * by df::downmix(). The caller does the downmix because the slow lane needs the
+ * same buffer and doing it twice per frame would be pure cost.
  *
  * `skip[i]` is true for a slot this unit does not compute itself -- a slow
  * analyser, an absent one, or any slot at all on a unit that is given its
@@ -314,10 +325,19 @@ Analyser *analyser_by_name(const char *name);
  * the analyser, deliberately: an analyser that could set them could date its
  * own results, which is the one thing the presentation-delay rule forbids.
  *
- * Not reentrant -- it keeps one mono scratch window. The firmware calls it from
- * the analysis task only.
+ * Called from one task only -- the analysis task in the firmware.
  */
-void run_fast_lane(const int16_t *stereo, int window_n, int64_t index,
+void run_fast_lane(const int16_t *mono, int window_n, int64_t index,
                    int64_t due_us, const bool skip[ML_SLOTS], Result out[ML_SLOTS]);
+
+/*
+ * Interleaved stereo to mono, for `n` frames.
+ *
+ * One definition, used by both lanes and by tools/pattern_lab, and it must stay
+ * the same downmix Analysis::process() does internally -- two front ends
+ * disagreeing about what mono means would be a difference nothing downstream
+ * could see.
+ */
+void downmix(const int16_t *stereo, int n, int16_t *mono);
 
 }  // namespace df

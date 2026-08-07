@@ -149,9 +149,170 @@ private:
     int rate_ = DF_RATE_FALLBACK;
 };
 
-ZcrRms s_zcr_rms;
+/*
+ * Texture over a second of music, on the slow lane.
+ *
+ * The point of this one is the SHAPE, which is the shape every real audio model
+ * uses and which the interface was built around:
+ *
+ *   it declares a SHORT window (25 ms) and a short hop (10 ms), and
+ *   accumulates its context internally, returning false until a second of them
+ *   has arrived.
+ *
+ * That matters for RAM, and it is the difference between fitting on a satellite
+ * and not. Declaring a one-second window would make the lane hold 16000 samples
+ * -- 32 kB against the ~52 kB a classic ESP32 has free while analysing. Holding
+ * a hundred four-byte summaries instead costs 400 bytes. A mel front end feeding
+ * a real model works exactly this way: short frames in, a rolling buffer of
+ * FEATURES, the model over those.
+ *
+ * It also shows why present_delay_us is small here despite the second of
+ * context. The result is labelled with the LAST window of that second, not the
+ * first, so the context is already behind us when the answer appears -- the
+ * audio for it arrived a presentation lead ago. An analyser that labelled by
+ * the START of its context would need the full delay the field describes.
+ *
+ * All-integer, so it is bit-identical on an LX6 and an LX7 by construction.
+ */
+class Mood final : public Analyser {
+public:
+    const AnalyserSpec &spec() const override { return spec_; }
 
-Analyser *const s_analysers[] = { &s_zcr_rms };
+    bool init(int) override { reset(); return true; }
+
+    void reset() override
+    {
+        n_ = 0;
+        next_ = 0;
+        since_report_ = 0;
+    }
+
+    bool process(const int16_t *in, int64_t index, int64_t due_us,
+                 Result *out) override
+    {
+        (void)due_us;
+
+        uint64_t sum_sq = 0;
+        uint32_t crossings = 0;
+        for (int i = 0; i < WINDOW_N; i++) {
+            const int32_t s = in[i];
+            sum_sq += static_cast<uint64_t>(s * s);
+            if (i > 0 && ((in[i - 1] < 0) != (s < 0))) {
+                crossings++;
+            }
+        }
+
+        hist_[next_].rms = static_cast<uint16_t>(isqrt64(sum_sq / WINDOW_N));
+        hist_[next_].zcr = static_cast<uint16_t>(crossings);
+        next_ = (next_ + 1) % CONTEXT_N;
+        if (n_ < CONTEXT_N) n_++;
+
+        /* One report per full context, and none until the first one is full --
+         * an answer from a partial second would describe less music than every
+         * later answer, and nothing downstream could tell. */
+        if (++since_report_ < CONTEXT_N || n_ < CONTEXT_N) {
+            return false;
+        }
+        since_report_ = 0;
+
+        /*
+         * Summed oldest-first from the write pointer rather than in array
+         * order, so the sum does not depend on where the ring happens to have
+         * wrapped. The same rotation-independence beat_detect.c needed, and for
+         * the same reason: two units that joined at different moments must add
+         * the same numbers in the same order.
+         */
+        uint64_t sum = 0, sum_sq_r = 0, sum_zcr = 0;
+        for (int k = 0; k < CONTEXT_N; k++) {
+            const uint32_t v = hist_[(next_ + k) % CONTEXT_N].rms;
+            sum      += v;
+            sum_sq_r += static_cast<uint64_t>(v) * v;
+            sum_zcr  += hist_[(next_ + k) % CONTEXT_N].zcr;
+        }
+
+        const uint32_t mean = static_cast<uint32_t>(sum / CONTEXT_N);
+        /* Population variance, integer: E[x^2] - E[x]^2, floored at zero
+         * against the rounding in the two means. */
+        const uint64_t mean_sq = sum_sq_r / CONTEXT_N;
+        const uint64_t sq_mean = static_cast<uint64_t>(mean) * mean;
+        const uint32_t sd = isqrt64(mean_sq > sq_mean ? mean_sq - sq_mean : 0);
+
+        /* Spread as a percentage of level, which is what makes it a statement
+         * about dynamics rather than about volume. */
+        const uint32_t dynamics = mean ? (sd * 100u) / mean : 0;
+        const uint32_t zcr_hz =
+            static_cast<uint32_t>(sum_zcr * RATE_HZ / (CONTEXT_N * WINDOW_N));
+
+        uint8_t label;
+        if (mean < QUIET_RMS)          label = LABEL_CALM;
+        else if (dynamics > DYNAMIC_PCT) label = LABEL_PEAK;
+        else if (zcr_hz > BUSY_HZ)     label = LABEL_BUSY;
+        else                           label = LABEL_GROOVE;
+
+        out->index = index;
+        out->n = 1;
+        out->label[0] = label;
+        out->score[0] = static_cast<uint8_t>(mean > 32767 ? 255u
+                                                          : (mean * 255u) / 32767u);
+        return true;
+    }
+
+    const char *label_name(uint8_t label) const override
+    {
+        switch (label) {
+        case LABEL_CALM:   return "calm";
+        case LABEL_GROOVE: return "groove";
+        case LABEL_BUSY:   return "busy";
+        case LABEL_PEAK:   return "peak";
+        default:           return nullptr;
+        }
+    }
+
+private:
+    enum : uint8_t { LABEL_CALM = 0, LABEL_GROOVE = 1, LABEL_BUSY = 2, LABEL_PEAK = 3 };
+
+    static constexpr int RATE_HZ   = 16000;
+    static constexpr int WINDOW_N  = 400;    /* 25 ms */
+    static constexpr int HOP_N     = 160;    /* 10 ms */
+    static constexpr int CONTEXT_N = 100;    /* 100 hops = 1 s of context */
+
+    static constexpr uint32_t QUIET_RMS   = 300;
+    static constexpr uint32_t DYNAMIC_PCT = 60;
+    static constexpr uint32_t BUSY_HZ     = 2500;
+
+    /*
+     * A hundred milliseconds of margin, not a hundred milliseconds of need.
+     *
+     * The bound in AnalyserSpec is satisfied by zero here: the context ends at
+     * the window this is labelled with, so its audio arrived a presentation lead
+     * ago and the answer is ready well before the frame is drawn. The margin
+     * exists because compute is not constant -- a board that stalls for 150 ms
+     * would otherwise miss the frame it named and differ from its neighbours
+     * for one -- and because 100 ms of lag on a texture readout is invisible.
+     *
+     * Confirm it against the lane's `late` counter rather than trusting it.
+     */
+    static constexpr int64_t PRESENT_DELAY_US = 100000;
+
+    static constexpr AnalyserSpec spec_ = {
+        /* name             */ "mood",
+        /* model_id         */ 2,
+        /* rate_hz          */ RATE_HZ,
+        /* window_n         */ WINDOW_N,
+        /* hop_n            */ HOP_N,
+        /* present_delay_us */ PRESENT_DELAY_US,
+        /* lane             */ Lane::Slow,
+    };
+
+    struct Sub { uint16_t rms, zcr; };
+    Sub hist_[CONTEXT_N];
+    int n_ = 0, next_ = 0, since_report_ = 0;
+};
+
+ZcrRms s_zcr_rms;
+Mood   s_mood;
+
+Analyser *const s_analysers[] = { &s_zcr_rms, &s_mood };
 
 /*
  * A registered analyser must have a slot in every Frame, because the slot index
@@ -185,18 +346,18 @@ Analyser *analyser_by_name(const char *name)
     return nullptr;
 }
 
-void run_fast_lane(const int16_t *stereo, int window_n, int64_t index,
+void downmix(const int16_t *stereo, int n, int16_t *mono)
+{
+    for (int i = 0; i < n; i++) {
+        mono[i] = static_cast<int16_t>((static_cast<int32_t>(stereo[2 * i]) +
+                                        static_cast<int32_t>(stereo[2 * i + 1])) / 2);
+    }
+}
+
+void run_fast_lane(const int16_t *mono, int window_n, int64_t index,
                    int64_t due_us, const bool skip[ML_SLOTS], Result out[ML_SLOTS])
 {
-    /* Built once per call and shared by every fast analyser, since they all
-     * want the same thing. Static rather than automatic because the firmware's
-     * analysis task has a 4 kB stack and this is 2 kB of it. */
-    static int16_t mono[DF_FFT_N];
-    bool built = false;
-
-    if (window_n > DF_FFT_N) {
-        window_n = DF_FFT_N;             /* cannot happen: the spec is checked */
-    }
+    (void)window_n;
 
     for (int i = 0; i < ML_SLOTS; i++) {
         out[i] = result_none();
@@ -204,15 +365,6 @@ void run_fast_lane(const int16_t *stereo, int window_n, int64_t index,
         Analyser *a = analyser_at(i);
         if (!a || (skip && skip[i])) {
             continue;
-        }
-
-        if (!built) {
-            built = true;
-            for (int n = 0; n < window_n; n++) {
-                mono[n] = static_cast<int16_t>(
-                    (static_cast<int32_t>(stereo[2 * n]) +
-                     static_cast<int32_t>(stereo[2 * n + 1])) / 2);
-            }
         }
 
         Result r{};
