@@ -1,7 +1,7 @@
 # Dancefloor hub, ESP32-S3 port — experimental
 
 The same hub firmware as [`../hub`](../hub), built for a **Seeed Studio XIAO
-ESP32-S3 (Sense)**. Same role: SBC in over UART from the `bt_bridge` chip, owns
+ESP32-S3 Plus**. Same role: SBC in over UART from the `bt_bridge` chip, owns
 the timeline the whole system plays to, unicasts that SBC to the satellites,
 decodes it for its own DAC and LED strip, publishes analysis frames.
 
@@ -76,21 +76,36 @@ marker it will read inverted against every other unit — one gap per second
 rather than one flash. It is off by default; left recorded rather than fixed,
 because a polarity flag in shared code wants a better reason than one board.
 
-## What the Sense part contributes
+## Which XIAO ESP32-S3, and why it barely matters
 
-Nothing. The camera and PDM microphone hang off the B2B connector on GPIOs that
-are not broken out (the mic is 42/41), so they take nothing from the map above.
-The **SD slot may be a different matter** — it is reportedly wired to the same
-`D8`/`D9`/`D10` SPI pads the I2S output uses here, plus GPIO 21 for CS. That is
-unverified against the schematic and costs nothing unless you want the card, but
-check it before assuming the two can coexist.
+This build ran on a **Sense** first and is on a **Plus** now. The move cost one
+line — the flash size — and not a single pin, because the plain XIAO, the Sense
+and the Plus are the same ESP32-S3R8 behind the same eleven-pad header with the
+same GPIO numbers on it. Anything in this directory that names a variant is
+describing the board on the bench, not a dependency.
 
-Either way there is no use here for a microphone: a hub analyses the
-synchronised stream and deliberately never listens to a room (§12). The plain
-XIAO ESP32-S3 is the same board for this purpose.
+| | plain | Sense | Plus |
+|---|---|---|---|
+| Flash | 8 MB | 8 MB | **16 MB** |
+| PSRAM | 8 MB octal | 8 MB octal | 8 MB octal |
+| D0–D10 header | same | same | same |
+| Extra GPIOs | — | — | ~9 on rear/SMD pads, D11–D15 = GPIO 38–42 confirmed |
+| Camera / PDM mic / SD | — | yes | — |
 
-The one piece of the board that *is* worth something: the u.FL connector and
-external antenna, on the unit that is the SoftAP in a field.
+**The Sense's sensors were never worth anything here.** A hub analyses the
+synchronised stream and deliberately never listens to a room (§12), so the
+microphone was dead weight; the camera more so. The one thing they did cost was
+a caveat — the SD slot is reportedly wired to the same `D8`/`D9`/`D10` SPI pads
+the I2S output uses, with GPIO 21 for CS — and the Plus has no card reader, so
+that caveat is now gone rather than merely unverified.
+
+**What the Plus adds is not used either**, but it is worth knowing about: the
+rear pads mean a pin taken by the SBC link is no longer gone for good. The
+marker/monitor instrument lost GPIO 5 to it and could be given GPIO 38–42
+instead, by anyone willing to solder to a pad rather than a header pin.
+
+The one piece of the board that *is* worth something on any of the three: the
+u.FL connector and external antenna, on the unit that is the SoftAP in a field.
 
 ## Build and flash
 
@@ -135,7 +150,7 @@ within a kilobyte of the classic build, as it should be — same code.
 The binary is *not* smaller in any meaningful way, and at ~901 kB against a
 1 MB single-app partition it is 14% from the ceiling. That is true of the
 classic hub too (903 kB) and is not something this port introduced, but this
-board has 8 MB of flash and could carry a larger app partition if it ever
+board has 16 MB of flash and could carry a much larger app partition if it ever
 matters.
 
 ## The measurement this port exists to make

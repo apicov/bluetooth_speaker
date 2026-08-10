@@ -142,9 +142,12 @@ which is a classic ESP32 with no PSRAM. A 500 ms lead would need ~107 kB of
 satellite ring against a 106 kB largest free block — it would fail to allocate on
 the board that has to hold it. **Memory on the hub buys the lead nothing.**
 
-### 2.5 8 MB flash (vs 4 MB)
+### 2.5 16 MB flash (vs 4 MB)
 
-Board difference. No use for it yet.
+Board difference. No use for it yet. This was 8 MB while the bench board was a
+XIAO ESP32-S3 Sense and is 16 on the Plus that replaced it; the app is ~901 kB
+against a 1 MB single-app partition either way, so the headroom has never been
+the constraint.
 
 ### 2.6 UART console instead of USB Serial/JTAG — S3-only *problem*, now solved
 
