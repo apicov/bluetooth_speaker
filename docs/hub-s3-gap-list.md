@@ -233,16 +233,46 @@ because the driver was draining them instead of backing up.
 
 ---
 
-## 4. Settled elsewhere — do not re-open on either hub
+## 4. Settled elsewhere — do not re-open without a new reason
 
-Recorded here so the porting work does not re-litigate them.
+Recorded here so the porting work does not re-litigate them. Two of these were
+re-opened, on a reason the original measurements did not have; the table gives
+what is in `hub_s3/sdkconfig.defaults` now, and the row below it says what it
+used to be and why it moved.
 
 | question | answer | evidence |
 |---|---|---|
-| PHY rate | **6 Mbps pinned** | 6: 1.2 gaps/min · 12: ~115 · 24: 23% loss · adaptive: 3.5–14 |
-| TX AMPDU | **off** | forced — `set_fix_rate` refuses to run with it enabled |
+| PHY rate | **unpinned (0, adaptive)** | paired with AMPDU below — see *the flip* |
+| TX AMPDU | **on**, `TX_BA_WIN 6` | ditto; the two are forced to move together |
 | TX buffers | **32** | 64 gave 329 vs 32's 420 — noise, and the heap wants the 32 |
 | PSRAM | **on, CAPS_ALLOC only** | §2.4 — one named allocation, the TFLM arena; `malloc()` never returns it |
+
+**The flip, and why the old answer was not wrong.** The rate was pinned at
+6 Mbps and aggregation off for most of this project, on measurements that still
+stand: 6 Mbps gave 1.2 gaps/min, 12 gave ~115, 24 measured 23% loss, and
+adaptive-plus-AMPDU gave 3.5–14. 6 Mbps is the most robust OFDM rate there is,
+and every step away from it cost more in steady-state margin than it returned.
+The two settings are welded together — `esp_wifi_internal_set_fix_rate` refuses
+to run with aggregation enabled — so they could only ever move as a pair.
+
+What changed is the *goal*, not the physics. Unicast fan-out makes downlink
+airtime scale with satellite count, and at 6 Mbps the duty-cycle wall arrives
+around 6–8 satellites. A-MPDU amortises the ~350 µs of per-frame
+DIFS/backoff/preamble across a burst and lets rate adaptation reach MCS7
+(~65 Mbps), which is roughly 10× the airtime headroom — that is what buys
+satellite count, and pinning 6 Mbps cannot.
+
+The 3.5–14 gaps/min that condemned adaptive+AMPDU was measured with a 16 kB
+I-cache and the USB-PHY mitigation off. **Both have since flipped** (§2.1, §2.6),
+so that number describes hardware that no longer exists. Re-measured on the
+current configuration: **0 audio gaps/min over 18 min at one satellite, tx-fail
+0, hub min heap ~68 kB** — clears the ~2.5 gaps/min bar the old number failed.
+The satellite needs no rebuild; AMPDU RX is already on with `RX_BA_WIN 6`.
+
+**Still unmeasured:** anything past one satellite. The airtime model predicts
+~30, and nobody has put more than one on the floor with this config. The
+satellite also logged 17 brief STA re-associations that the play buffer absorbed
+without an audible gap, which is unexplained rather than benign.
 
 ---
 
