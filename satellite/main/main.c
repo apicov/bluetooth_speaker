@@ -397,6 +397,15 @@ static volatile uint32_t hw_drift;
  * the same failure.
  */
 static volatile uint32_t heap_min_window = UINT32_MAX;
+/*
+ * The internal-SRAM pool, tracked here even though this board has no PSRAM and
+ * so cannot diverge from the figure above. That is exactly why it is worth
+ * printing: it is the control. If the hub's MEM line shows internal far below
+ * total and this one shows them equal, both units are reading a real pool. If
+ * this one ever diverges, someone has turned on PSRAM here and the ring's
+ * timing assumptions need re-reading before anything else is believed.
+ */
+static volatile uint32_t heap_int_window = UINT32_MAX;
 static volatile uint32_t n_alloc_fail;
 static volatile uint32_t alloc_fail_size;   /* the largest request that failed */
 static volatile uint32_t alloc_fail_caps;
@@ -1507,16 +1516,27 @@ static void drift_task(void *arg)
         if (heap_now < heap_min_window) {
             heap_min_window = heap_now;
         }
+        const uint32_t heap_int_now = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (heap_int_now < heap_int_window) {
+            heap_int_window = heap_int_now;
+        }
 
         /* Said once, and within 5 s of the fact rather than at the next soak
-         * line -- see the hub's copy. */
+         * line -- see the hub's copy, which also carries why this reports both
+         * pools and spells the caps out. */
         static uint32_t alloc_fail_told;
         if (n_alloc_fail != alloc_fail_told) {
             alloc_fail_told = n_alloc_fail;
             ESP_LOGE(TAG, "ALLOCATION FAILED %" PRIu32 " time(s): largest request %"
-                          PRIu32 " B (caps 0x%" PRIx32 "), heap %" PRIu32
-                          " free, largest block %u",
-                     n_alloc_fail, alloc_fail_size, alloc_fail_caps, heap_now,
+                          PRIu32 " B (caps 0x%" PRIx32 "%s%s%s) | internal %u free, "
+                          "largest %u | total %" PRIu32 " free, largest %u",
+                     n_alloc_fail, alloc_fail_size, alloc_fail_caps,
+                     (alloc_fail_caps & MALLOC_CAP_INTERNAL) ? " INTERNAL" : "",
+                     (alloc_fail_caps & MALLOC_CAP_DMA)      ? " DMA"      : "",
+                     (alloc_fail_caps & MALLOC_CAP_SPIRAM)   ? " SPIRAM"   : "",
+                     (unsigned)heap_int_now,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     heap_now,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         }
 
@@ -1580,6 +1600,8 @@ static void drift_task(void *arg)
              * never could. Taken and cleared, like every windowed counter. */
             const uint32_t heap_win = heap_min_window;
             heap_min_window = UINT32_MAX;
+            const uint32_t heap_int_win = heap_int_window;
+            heap_int_window = UINT32_MAX;
             ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32
                           ", window %" PRIu32 ", largest %u) | "
                           "stack play %" PRIu32 " drift %" PRIu32 " | underruns %" PRIu32
@@ -1610,8 +1632,21 @@ static void drift_task(void *arg)
                      n_frames_rx, n_frames_bad,
                      visualiser_ml_source_name(), n_ml_rx, n_ml_bad);
 
+            /* Its own line rather than four more fields above -- see the hub's
+             * copy for why, and for what the two pools mean. Here they should
+             * read the same: no PSRAM on this board. */
+            ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
+                          ", largest %u) | total %" PRIu32 " (largest %u)",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                     heap_int_win == UINT32_MAX ? 0 : heap_int_win,
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
 #if CONFIG_DANCEFLOOR_WIFI_LOGS
-            /* The structured twin of the line above, for the collector's CSV.
+            /* The structured twin of the HEALTH line, for the collector's CSV.
+             * The MEM figures are console-only -- see the hub's copy.
              * Every field is already in scope here; the role aliases are
              * documented on health_msg_t in sync_proto.h. */
             static uint32_t health_seq;
