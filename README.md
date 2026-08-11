@@ -124,13 +124,20 @@ says what it is doing.
 | Streaming | **GPIO 33** | blinks at 0.5 Hz — a second on, a second off — while audio packets are arriving |
 
 ```
-  GPIO 32 ──[330 Ω]──▶ LED ──▶ GND
-  GPIO 33 ──[330 Ω]──▶ LED ──▶ GND
+  3V3 ──[330 Ω]──▶ LED ──▶ GPIO 32
+  3V3 ──[330 Ω]──▶ LED ──▶ GPIO 33
 ```
 
-Both are `menuconfig` values under *Bridge status LEDs*
-(`BRIDGE_LED_CONNECTED_GPIO`, `BRIDGE_LED_STREAMING_GPIO`); **-1 disables**
-either one, and nothing else changes if you leave them unwired.
+**Both LEDs are wired to 3V3, not to ground** — the pin sinks the current, so a
+*low* level lights them. `BRIDGE_LED_ACTIVE_LOW` says so and defaults to `y`. If
+you wire them the other way round (pin → resistor → LED → GND) set it to `n`,
+because getting it wrong does not give you a dark LED, it gives you an inverted
+one: the connected LED solid whenever *no* phone is connected.
+
+All three are `menuconfig` values under *Bridge status LEDs*
+(`BRIDGE_LED_CONNECTED_GPIO`, `BRIDGE_LED_STREAMING_GPIO`,
+`BRIDGE_LED_ACTIVE_LOW`); **-1 disables** either LED, and nothing else changes
+if you leave them unwired.
 
 That is every pin the bridge uses, so the whole chip fits in one table:
 
@@ -311,14 +318,19 @@ point it at something you can watch on a scope.
 
 **On the XIAO, wire an external one.** Its onboard LED is documented as GPIO 21
 and does not light when pointed at, cause unresolved — the pin may differ by
-board revision, and it is active low regardless, so even working it would read
-inverted against every other unit.
-Pad `D1` is free and is GPIO 2, which is already this setting's default, so
-nothing needs configuring:
+board revision. Pad `D1` is free and is GPIO 2, which is already this setting's
+default, so nothing needs configuring:
 
 ```
-  GPIO 2 (D1) ──[330 Ω]──▶ LED ──▶ GND
+  3V3 ──[330 Ω]──▶ LED ──▶ GPIO 2 (D1)
 ```
+
+**The LED goes to 3V3, not to ground** — the pin sinks it low to light it, which
+is `DANCEFLOOR_LED_MARKER_ACTIVE_LOW` and defaults to `y`. Wire it the other way
+(pin → resistor → LED → GND) and set that to `n`. The two must not be mixed
+across a floor: a unit with the setting wrong is lit for the 960 ms *between*
+flashes and dark for the flash, which looks like a sync fault rather than a
+wiring mistake.
 
 The other free pads are `D2` (GPIO 3, a strapping pin — JTAG source select),
 `D5` (GPIO 6) and `D6` (GPIO 43, the ROM UART0 TX, which can glitch at boot).

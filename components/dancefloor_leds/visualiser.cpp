@@ -171,6 +171,29 @@ constexpr int64_t LED_MARKER_HIGH_US = 40000;
 constexpr int64_t LED_MARKER_HOP_US  = (int64_t)HOP_N * 1000000 / RATE;
 constexpr int LED_MARKER_BLOCKS_HIGH =
     (int)((LED_MARKER_HIGH_US + LED_MARKER_HOP_US - 1) / LED_MARKER_HOP_US);
+
+/*
+ * Which level lights the LED, which is a property of the wiring and not of the
+ * marker.
+ *
+ * With the LED's anode on 3V3 and its cathode on the pin, the pin sinks the
+ * current and a LOW level lights it. Everything below is written in terms of ON
+ * and OFF rather than 1 and 0 so that the timing above -- fire on the second
+ * boundary, hold for LED_MARKER_BLOCKS_HIGH -- reads the same either way, and
+ * so that a rewired board is a Kconfig change rather than a code change.
+ *
+ * Getting this wrong shows as an INVERTED marker rather than a dark one: lit
+ * for the 960 ms between flashes, dark for the 40 ms of the flash. That looks
+ * like a working LED until you count, and against a correctly wired unit beside
+ * it, it looks like a sync fault.
+ */
+#if CONFIG_DANCEFLOOR_LED_MARKER_ACTIVE_LOW
+constexpr int LED_MARKER_ON  = 0;
+constexpr int LED_MARKER_OFF = 1;
+#else
+constexpr int LED_MARKER_ON  = 1;
+constexpr int LED_MARKER_OFF = 0;
+#endif
 #endif
 
 /* Applied to the pattern's output on the way to the strip. A device concern,
@@ -1275,7 +1298,8 @@ void render_task(void *arg)
         if (sec != last_sec) {
             last_sec = sec;
             lower_in = LED_MARKER_BLOCKS_HIGH;
-            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 1);
+            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
+                           LED_MARKER_ON);
             /*
              * Say so for the first few, then go quiet.
              *
@@ -1295,7 +1319,8 @@ void render_task(void *arg)
                          CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
             }
         } else if (lower_in > 0 && --lower_in == 0) {
-            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), 0);
+            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
+                           LED_MARKER_OFF);
         }
 #endif
 
@@ -1651,9 +1676,21 @@ void visualiser_start(void)
         m.pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_LED_MARKER_GPIO;
         m.mode = GPIO_MODE_OUTPUT;
         ESP_ERROR_CHECK(gpio_config(&m));
-        ESP_LOGW(TAG, "LED marker on GPIO %d, one flash per master-clock second "
-                      "-- every unit flashes together; nothing corrects on it",
-                 CONFIG_DANCEFLOOR_LED_MARKER_GPIO);
+        /*
+         * Drive it dark before anything else can look at it. gpio_config()
+         * leaves an output at 0, which on an active-low LED is LIT -- so
+         * without this the marker glows from boot and stays glowing until the
+         * first frame arrives to lower it. On a unit that never receives audio
+         * it would glow forever, which is the one state this LED must not have:
+         * a solid LED is what "no timeline" is supposed to look like.
+         */
+        gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
+                       LED_MARKER_OFF);
+        ESP_LOGW(TAG, "LED marker on GPIO %d, active %s, one flash per "
+                      "master-clock second -- every unit flashes together; "
+                      "nothing corrects on it",
+                 CONFIG_DANCEFLOOR_LED_MARKER_GPIO,
+                 LED_MARKER_ON == 0 ? "low" : "high");
     }
 #endif
 

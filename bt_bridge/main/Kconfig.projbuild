@@ -22,8 +22,9 @@ menu "Bridge status LEDs"
         help
             Solid on while a phone is connected over A2DP, off otherwise.
 
-            Wire the LED from the pin through a resistor (330 ohm is fine) to
-            ground; the pin drives it high. Anything above GPIO 33 cannot be
+            Wire the LED between 3V3 and the pin through a resistor (330 ohm is
+            fine); the pin sinks it low to light it. See BRIDGE_LED_ACTIVE_LOW
+            below for the other way round. Anything above GPIO 33 cannot be
             used -- 34-39 on a classic ESP32 are input-only.
 
             GPIO 13, 14, 15 and 25 belong to the SPI link to the hub and must
@@ -38,5 +39,32 @@ menu "Bridge status LEDs"
             when the phone is paused or the stream has stopped. It follows the
             packets themselves, not the reported stream state, so a stalled
             stream goes dark even if the phone still calls itself playing.
+
+    config BRIDGE_LED_ACTIVE_LOW
+        bool "Status LEDs are wired to VCC (active low)"
+        default y
+        help
+            Which way round both status LEDs are wired, which decides which
+            level lights them. Set this and the driver writes 0 to light and 1
+            to darken.
+
+              y  anode to 3V3, cathode through a resistor to the pin. The pin
+                 SINKS the current, so a LOW level lights it. This is how this
+                 bridge is wired.
+
+              n  anode from the pin through a resistor, cathode to ground. The
+                 pin SOURCES the current and a HIGH level lights it. This is
+                 what the GPIO help text above describes and what the firmware
+                 assumed before this option existed.
+
+            It covers BOTH LEDs, because they are on one board and one wiring
+            convention; there is no case here for lighting one each way.
+
+            Getting it wrong inverts rather than disables. The connected LED
+            reads backwards -- lit when no phone is connected -- and the
+            streaming LED still blinks, just in antiphase, which is invisible
+            unless something else is blinking beside it. Neither failure looks
+            like a wiring fault, which is why this is a setting rather than
+            something to discover.
 
 endmenu

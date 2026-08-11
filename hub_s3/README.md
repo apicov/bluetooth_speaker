@@ -70,11 +70,18 @@ The **74AHCT125 is still required**. The S3 drives 3.3 V exactly as the classic
 ESP32 does, so nothing about the level-shifting argument in
 `../docs/architecture.md` §12 changes.
 
-`CONFIG_DANCEFLOOR_LED_MARKER_GPIO=21` is the board's onboard LED and is
-**active low**, which the driver does not know. If you ever enable the LED
-marker it will read inverted against every other unit — one gap per second
-rather than one flash. It is off by default; left recorded rather than fixed,
-because a polarity flag in shared code wants a better reason than one board.
+**The LED sync marker is active low here**, as it now is on every unit on this
+floor: the LED goes from 3V3 through a resistor to the pin, and the pin sinks it
+to light it. `CONFIG_DANCEFLOOR_LED_MARKER_ACTIVE_LOW` carries that and defaults
+to `y`.
+
+This paragraph used to say the opposite — that GPIO 21's active-low onboard LED
+would read inverted "which the driver does not know", left unfixed "because a
+polarity flag in shared code wants a better reason than one board". Three boards
+rewired to VCC is that better reason, and the flag exists. What has *not* changed
+is the advice about GPIO 21 itself: it did not light when pointed at, on a Sense
+or on the Plus, and the reason was never found. Use an external LED on `D1`
+(GPIO 2), the default.
 
 ## Which XIAO ESP32-S3, and why it barely matters
 

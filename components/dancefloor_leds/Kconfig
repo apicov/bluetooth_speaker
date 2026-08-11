@@ -104,12 +104,13 @@ menu "Dancefloor LEDs"
                        The link is one-way and the hub names no TX pin.
               none     official Espressif ESP32-DevKitC has only a power LED
               none     XIAO ESP32-S3 in practice. Its onboard LED is documented
-                       as GPIO 21 and did not light when pointed at. Unresolved:
-                       the pin may differ by board revision, and it is active low
-                       anyway -- so even working it would read inverted against
-                       every other unit, one gap per second rather than one
-                       flash. Wire an external LED to pad D1, which is GPIO 2 and
-                       so already this default.
+                       as GPIO 21 and did not light when pointed at. Unresolved,
+                       and the pin may simply differ by board revision. It is
+                       also active low, which used to be a second reason to
+                       avoid it and is no longer one -- see
+                       DANCEFLOOR_LED_MARKER_ACTIVE_LOW below. Wire an external
+                       LED to pad D1, which is GPIO 2 and so already this
+                       default.
 
             With no usable onboard LED, wire one to any free pin through a
             resistor, or point this at a pin you can watch on a scope. Taken
@@ -124,6 +125,36 @@ menu "Dancefloor LEDs"
             The eye resolves maybe 10-20 ms and a 240 fps phone camera about
             4 ms, so this answers "are they together" rather than "by how much"
             -- the numbers are in AUDIO SYNC and TRACK DIVERGENCE.
+
+    config DANCEFLOOR_LED_MARKER_ACTIVE_LOW
+        bool "The LED sync marker is wired to VCC (active low)"
+        default y
+        depends on DANCEFLOOR_ENABLE_LED_MARKER
+        help
+            Which way round the LED is wired, which decides which level lights
+            it. Set this and the driver writes 0 to light and 1 to darken.
+
+              y  LED anode to 3V3, cathode through a resistor to the pin. The
+                 pin SINKS the current, so a LOW level lights it. This is how
+                 every board on this floor is wired, and it is what an onboard
+                 LED almost always is.
+
+              n  LED anode from the pin through a resistor, cathode to ground.
+                 The pin SOURCES the current and a HIGH level lights it.
+
+            IT MATTERS MORE THAN IT LOOKS, because getting it wrong does not
+            produce a dark LED -- it produces an INVERTED one, lit for the 960
+            ms between flashes and dark for the 40 ms of the flash itself. That
+            reads as a working marker until you notice every unit is showing one
+            gap per second rather than one flash, and two units disagreeing
+            about this look exactly like a sync fault.
+
+            The default is y because this floor is wired that way. A unit whose
+            LED is wired the other way needs this set to n, and BOTH ends of a
+            side-by-side comparison must agree or the comparison is nonsense.
+
+            This changes the sense of the pin only. It does not change when the
+            marker fires, and nothing corrects on it either way.
 
     config DANCEFLOOR_LED_PATTERN
         string "Pattern to start with"

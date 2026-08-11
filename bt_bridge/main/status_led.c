@@ -26,6 +26,27 @@
 #define HAVE_STREAMING (PIN_STREAMING >= 0)
 
 /*
+ * Which level lights an LED, which is a property of the wiring and not of
+ * anything this file decides.
+ *
+ * Both LEDs have their anodes on 3V3 and their cathodes on the pins, so the pin
+ * sinks the current and a LOW level lights it. Everything below is written as
+ * LED_ON and LED_OFF rather than 1 and 0, so the logic reads the same either
+ * way and a rewired board is a menuconfig change rather than a patch.
+ *
+ * Getting it wrong does not produce a dark LED, which is the trap. The
+ * connected LED reads BACKWARDS -- solid whenever no phone is connected -- and
+ * the streaming LED blinks in antiphase, which is undetectable on its own.
+ */
+#if CONFIG_BRIDGE_LED_ACTIVE_LOW
+#define LED_ON  0
+#define LED_OFF 1
+#else
+#define LED_ON  1
+#define LED_OFF 0
+#endif
+
+/*
  * Tick period, and the blink built on top of it.
  *
  * The tick stays fast because the connected LED and the silence check below
@@ -81,7 +102,7 @@ static void led_task(void *arg)
 
     while (1) {
 #if HAVE_CONNECTED
-        gpio_set_level(PIN_CONNECTED, s_connected);
+        gpio_set_level(PIN_CONNECTED, s_connected ? LED_ON : LED_OFF);
 #endif
 #if HAVE_STREAMING
         const bool streaming =
@@ -105,7 +126,7 @@ static void led_task(void *arg)
         }
         was_streaming = streaming;
 
-        gpio_set_level(PIN_STREAMING, blink);
+        gpio_set_level(PIN_STREAMING, blink ? LED_ON : LED_OFF);
 #endif
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
     }
@@ -129,11 +150,24 @@ void status_led_start(void)
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
 
+    /* Drive both dark before the task exists. gpio_config() leaves an output at
+     * 0, which on an active-low LED is LIT -- so without this both LEDs come up
+     * solid at boot and stay that way until the first tick. It is only 100 ms,
+     * but "both LEDs solid" is what a hung bridge looks like, and the boot is
+     * exactly when someone is watching for that. */
+#if HAVE_CONNECTED
+    gpio_set_level(PIN_CONNECTED, LED_OFF);
+#endif
+#if HAVE_STREAMING
+    gpio_set_level(PIN_STREAMING, LED_OFF);
+#endif
+
     /* Lowest priority in the system: a missed tick shows as a slightly uneven
      * blink and nothing else, which is the right thing to give up first. */
     xTaskCreate(led_task, "status_led", 2048, NULL, 1, NULL);
 
-    ESP_LOGI(TAG, "status LEDs: connected on %d, streaming on %d (-1 = none)",
-             PIN_CONNECTED, PIN_STREAMING);
+    ESP_LOGI(TAG, "status LEDs: connected on %d, streaming on %d (-1 = none), "
+                  "active %s",
+             PIN_CONNECTED, PIN_STREAMING, LED_ON == 0 ? "low" : "high");
 #endif
 }

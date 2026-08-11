@@ -453,17 +453,23 @@ CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=y
 #
 # DANCEFLOOR_LED_MARKER_GPIO lives in the shared components/dancefloor_leds/
 # Kconfig and needs nothing here either. Its default is 2, which on this board
-# is pad D1 -- free, not a strapping pin, and in range. Wire an LED and a 330 R
-# resistor to ground there.
+# is pad D1 -- free, not a strapping pin, and in range. Wire an LED from 3V3
+# through a 330 R resistor to that pad; the pin sinks it to light it.
+#
+# DANCEFLOOR_LED_MARKER_ACTIVE_LOW is what makes that wiring correct rather than
+# inverted, and it defaults to y in the shared Kconfig, so it needs nothing here
+# either. It is named here only because the failure is deceptive: wrong setting
+# means lit for the 960 ms between flashes and dark for the flash, which reads
+# as a sync fault beside a correctly wired unit rather than as a wiring error.
 #
 # Do NOT point it at 21. Seeed documents it as the onboard user LED on every
 # variant in the series and this file used to recommend it; it has since been
 # seen not to light at all, and the reason was never confirmed -- the LED may
 # simply not be on 21 on every board revision. (The other suspect, that the
 # Sense's SD slot used 21 for CS, dies with the move to a Plus, which has no card
-# reader. The LED still did not light.) It is active low as well, so even working
-# it would read inverted against every other unit. An external LED on D1 avoids
-# the question entirely.
+# reader. The LED still did not light.) Its being active low used to be a second
+# reason to avoid it and no longer is. An external LED on D1 avoids the question
+# entirely.
 
 # ---------------------------------------------------------------------------
 # Carried over, but NOT carried over on evidence
