@@ -22,6 +22,13 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # No WiFi on this chip at all -- that is the entire point of the split. With
 # Bluedroid alone there is ~200 kB of DRAM spare instead of 164 bytes.
 
-# Forward undecoded SBC to the hub instead of decoding here. Both callbacks are
-# already wired in main.c; this selects the undecoded one.
-CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC=y
+# Forward undecoded SBC to the hub instead of decoding here -- the bridge never
+# decodes, the hub and the satellites do.
+#
+# This is not optional and there is no code path for the other setting: with it
+# unset Bluedroid decodes SBC itself and the audio data callback in main.c stops
+# being fed, so the hub goes silent with nothing failing loudly. It used to be
+# selected by a project Kconfig option that offered an internal-codec build; that
+# build could never work here (its I2S data pin is the SPI handshake line, GPIO
+# 25) and it was removed, so the stack option is set directly.
+CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=y

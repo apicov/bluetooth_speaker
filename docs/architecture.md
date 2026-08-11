@@ -837,7 +837,7 @@ paid for.
 | Setting | Value | Why |
 |---|---|---|
 | `BTDM_CTRL_MODE_BR_EDR_ONLY` | `y` | No BLE — A2DP is Classic, and BLE support costs memory for nothing |
-| `EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC` | `y` | Selects the **undecoded** A2DP callback. This chip forwards SBC and never decodes |
+| `BT_A2DP_USE_EXTERNAL_CODEC` | `y` | Selects the **undecoded** A2DP callback. This chip forwards SBC and never decodes. Not a choice: unset, Bluedroid decodes internally and the callback goes unfed, so the hub silently gets nothing |
 | `ESPTOOLPY_FLASHSIZE_4MB` + custom partitions | | Bluedroid alone is ~950 kB; the stock 1 MB factory partition leaves 10% free |
 | No WiFi at all | | The entire point of the split |
 | `BT_ACL_CONNECTIONS` | **left at 4** | See below |

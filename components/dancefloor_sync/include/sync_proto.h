@@ -195,7 +195,17 @@ typedef struct __attribute__((packed)) {
 
 
 typedef enum {
-    AUDIO_FMT_PCM = 0,   /* interleaved 16-bit stereo */
+    /*
+     * 0 was AUDIO_FMT_PCM, interleaved 16-bit stereo, from when the master
+     * decoded for everyone and sent samples. Satellites decode their own SBC
+     * now -- it costs a quarter of the airtime -- so nothing produces this
+     * format and satellite rejects any packet not marked SBC.
+     *
+     * Kept as a burned number for the same reason as MSG_BLINK above: a board
+     * still running the old firmware would put a 0 here and mean PCM by it, and
+     * a format byte silently reinterpreted as something else is worse than one
+     * that is simply unknown.
+     */
     AUDIO_FMT_SBC = 1,   /* one or more back-to-back SBC frames */
 } audio_fmt_t;
 

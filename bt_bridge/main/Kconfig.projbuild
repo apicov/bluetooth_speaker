@@ -14,12 +14,6 @@ menu "Bluetooth bridge"
             A phone that has already paired usually keeps the old name in its
             own cache. To see a new one, forget the device on the phone and
             pair again.
-    config EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC
-        bool "Use External Codec Instead of Internal"
-        default n
-        select BT_A2DP_USE_EXTERNAL_CODEC
-        help
-            If enable, Bluedroid stack will not decode A2DP audio data, user need to decode it in application layer.
 
 endmenu
 

@@ -16,11 +16,7 @@
 #include "bredr_app_common_utils.h"
 #include "a2dp_sink_common_utils.h"
 #include "a2dp_utils_tags.h"
-#if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
-#include "a2dp_sink_int_codec_utils.h"
-#else
 #include "a2dp_sink_ext_codec_utils.h"
-#endif
 
 #include "sbc_spi.h"
 #include "avrcp_meta.h"
@@ -47,13 +43,8 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
 /* callback function for A2DP sink */
 static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
 
-#if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
-/* callback function for A2DP sink audio data stream */
-static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len);
-#else
 /* callback function for A2DP sink undecoded audio data */
 static void bt_app_a2d_audio_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_t *audio_buf);
-#endif
 
 /* handler for bluetooth stack enabled events */
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
@@ -123,11 +114,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             ESP_LOGI(BT_AV_TAG, "audio cfg: %s %s | block %s subbands %s %s | bitpool %u..%u",
                      sf, cm, bl, ns, am, sbc.min_bitpool, sbc.max_bitpool);
         }
-#if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
-        bt_app_work_dispatch(bt_a2d_evt_int_codec_hdl, event, param, sizeof(esp_a2d_cb_param_t), NULL);
-#else
         bt_app_work_dispatch(bt_a2d_evt_ext_codec_hdl, event, param, sizeof(esp_a2d_cb_param_t), NULL);
-#endif
         break;
     }
     default:
@@ -136,13 +123,6 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     }
 }
 
-#if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
-static void bt_app_a2d_data_cb(const uint8_t *data, uint32_t len)
-{
-    status_led_note_audio();
-    bt_a2d_data_hdl(data, len);
-}
-#else
 static void bt_app_a2d_audio_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_t *audio_buf)
 {
     /* Undecoded SBC straight out to the hub -- no decode on this chip at all.
@@ -151,7 +131,6 @@ static void bt_app_a2d_audio_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_
     sbc_link_send(audio_buf->data, audio_buf->data_len);
     bt_a2d_audio_data_hdl(conn_hdl, audio_buf);
 }
-#endif
 
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
 {
@@ -170,9 +149,6 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         avrcp_meta_start();
         assert(esp_a2d_sink_init() == ESP_OK);
 
-#if CONFIG_EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC == FALSE
-        esp_a2d_sink_register_data_callback(bt_app_a2d_data_cb);
-#else
         esp_a2d_mcc_t mcc = {0};
         mcc.type = ESP_A2D_MCT_SBC;
         mcc.cie.sbc_info.samp_freq = ESP_A2D_SBC_CIE_SF_16K |
@@ -219,7 +195,6 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
         /* register stream end point, only support SBC currently */
         esp_a2d_sink_register_stream_endpoint(0, &mcc);
         esp_a2d_sink_register_audio_data_callback(bt_app_a2d_audio_data_cb);
-#endif
 
         /* Get the default value of the delay value */
         esp_a2d_sink_get_delay_value();
