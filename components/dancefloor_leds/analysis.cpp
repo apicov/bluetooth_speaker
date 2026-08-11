@@ -72,6 +72,21 @@ void Analysis::init(int sample_rate)
     if (sample_rate <= 0) {
         sample_rate = RATE;
     }
+
+    /*
+     * Nothing here fills Frame::ml -- the analysers are a separate stage and
+     * their answers are put in by whoever runs them. But a frame handed
+     * straight to a pattern, which is what tools/pattern_lab does, never passes
+     * through the firmware's enqueue() that would otherwise set every slot. So
+     * an untouched slot would arrive holding whatever the object was born with,
+     * and zero happens to read as "analyser 0 said something" rather than as
+     * "nothing has been said" -- a plausible-looking result no consumer could
+     * distinguish from a real one.
+     */
+    for (int i = 0; i < ML_SLOTS; i++) {
+        frame_.ml[i] = result_none();
+    }
+
     for (int b = 0; b < BEAT_BANDS; b++) {
         int lo = band_bin(BAND_EDGE_HZ[b], sample_rate);
         if (lo < 1) lo = 1;                          /* never DC */

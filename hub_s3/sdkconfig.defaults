@@ -2,8 +2,13 @@ CONFIG_IDF_TARGET="esp32s3"
 
 CONFIG_FREERTOS_HZ=1000
 
-# The XIAO ESP32-S3 carries 8 MB of flash, against the classic hub's 4.
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# The XIAO ESP32-S3 Plus carries 16 MB of flash, against the classic hub's 4 and
+# the plain/Sense XIAO's 8. Nothing here needs it -- the app is far under 8 MB
+# and the partition table is SINGLE_APP -- so this line is about the image header
+# describing the part it is on rather than about capacity. An 8 MB setting on a
+# 16 MB board boots and runs; it just understates the flash and caps anything
+# later that wants a bigger app partition.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
 # QIO, up from the DIO this build inherited from the classic hub.
 #
@@ -20,9 +25,9 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 #
 # Octal is not available here and never will be: it needs eight data lines and
 # a module built for them, and CONFIG_ESPTOOLPY_OCT_FLASH is unset because this
-# board's flash is quad. (The 8 MB of PSRAM on the XIAO IS octal, which is where
-# GPIO 33-37 would go if it were ever enabled -- see the note at the end of this
-# file for why it is not.) So QIO at 80 MHz STR is this board's ceiling.
+# board's flash is quad -- 16 MB of it on the Plus, and still quad. (The 8 MB of
+# PSRAM on the XIAO IS octal, which is where GPIO 33-37 go -- see the note at the
+# end of this file.) So QIO at 80 MHz STR is this board's ceiling.
 #
 # DO NOT "FIX" THE `dio` YOU WILL SEE WHEN FLASHING. `idf.py flash` prints
 # `--flash-mode dio` and build/flash_args says the same, with this set to QIO.
@@ -329,31 +334,40 @@ CONFIG_DANCEFLOOR_LED_HOP_512=y
 CONFIG_DANCEFLOOR_LED_PATTERN="boom"
 
 # ---------------------------------------------------------------------------
-# Pin map: Seeed Studio XIAO ESP32-S3 (Sense)
+# Pin map: Seeed Studio XIAO ESP32-S3 Plus
 # ---------------------------------------------------------------------------
 #
-# The board breaks out eleven GPIOs, D0-D10, and nothing else:
+# The header breaks out eleven GPIOs, D0-D10, and every number below is one of
+# them:
 #
 #   D0=1  D1=2  D2=3  D3=4  D4=5  D5=6  D6=43(TX)  D7=44(RX)
 #   D8=7(SCK)  D9=8(MISO)  D10=9(MOSI)
 #
-# The hub wants seven of them, so the map below is not one arrangement among
-# many -- it is close to the only one. D6 is the console UART TX (see the top of
-# this file); what is left over after that is D1, D2 and D5.
+# That map is IDENTICAL on the plain XIAO ESP32-S3, the Sense and the Plus, which
+# is why moving this build from a Sense to a Plus changed one line in this file
+# (the flash size at the top) and no pin at all. Same ESP32-S3R8, same header.
+#
+# The hub wants seven of the eleven, so the map below is not one arrangement
+# among many -- it is close to the only one. D6 is the console UART TX (see the
+# top of this file); what is left over after that is D1, D2 and D5.
 #
 # None of the classic hub's numbers carry over except the marker. 23 and 25 do
 # not exist on this part; 26 and 27 do, but are wired to the SPI flash.
 #
-# On the Sense variant the camera and PDM microphone hang off the B2B connector
-# on GPIOs that are not broken out (the mic is 42/41), so they take nothing from
-# this list. The SD slot may: it is reportedly on the same D8/D9/D10 SPI pads
-# the I2S output uses below, with GPIO 21 for CS. Unverified against the
-# schematic, and irrelevant unless you want the card -- but do not assume the
-# two coexist without checking.
+# WHAT THE PLUS ADDS, and why nothing below uses it. Beyond the header it brings
+# out roughly nine more GPIOs on SMD castellations and rear pads -- D11-D15 =
+# GPIO 38-42 are the confirmed ones. They are solder pads, not header pins, so
+# they are not free the way a header pin is, and this firmware needs none of
+# them. What they DO undo is the "for good" in the D4 paragraph further down: the
+# marker/monitor instrument lost GPIO 5 to the SBC link and there is now
+# somewhere else for a monitor pin to go, for anyone willing to solder to a pad.
 #
-# None of it gives anything either. Every one of them is dead weight for a hub,
-# which analyses the synchronised stream and deliberately never listens to a
-# room (architecture.md S12).
+# It also drops what the Sense had. No camera, no PDM microphone, no SD slot --
+# so the Sense-era warning that the card reader might contend for the D8/D9/D10
+# pads used by I2S below is simply gone, and GPIO 41/42 are ordinary pads here
+# rather than a microphone's. Nothing is lost with them: a hub analyses the
+# synchronised stream and deliberately never listens to a room
+# (architecture.md S12), so the Sense's sensors were always dead weight.
 
 # I2S to the PCM5102A, on the three SPI-labelled pads so the DAC is one ribbon
 # off the end of the header. This chip is the I2S master.
@@ -368,12 +382,17 @@ CONFIG_DANCEFLOOR_I2S_DATA_PIN=9
 # genuinely spare, and D4 was not.
 #
 # D4 = GPIO 5 was DANCEFLOOR_MONITOR_GPIO, and taking it ends the marker/monitor
-# instrument for good, because that needs GPIO 4 AND GPIO 5 and only one of them
-# survives. Four pads had to come from somewhere and this was the cheapest of
-# them: the instrument is off (DANCEFLOOR_ENABLE_MARKER defaults to n), it needs
-# a wire between two boards that a deployed floor cannot have, and nothing in
-# either firmware corrects on it. TRACK DIVERGENCE over WiFi is untouched and
-# covers every satellite rather than the one on the bench.
+# instrument on the header, because that needs GPIO 4 AND GPIO 5 and only one of
+# them survives out here. Four pads had to come from somewhere and this was the
+# cheapest of them: the instrument is off (DANCEFLOOR_ENABLE_MARKER defaults to
+# n), it needs a wire between two boards that a deployed floor cannot have, and
+# nothing in either firmware corrects on it. TRACK DIVERGENCE over WiFi is
+# untouched and covers every satellite rather than the one on the bench.
+#
+# This said "for good" while the board was a Sense and eleven pads was the whole
+# of it. On the Plus a monitor pin could go to one of the rear pads (D11-D15 =
+# GPIO 38-42) instead, so the instrument is recoverable with a soldering iron.
+# Nobody has wanted it enough to do that.
 #
 # The alternative was D1 = GPIO 2, the LED sync marker, which is enabled in this
 # build and is the check that needs no console at all. Keeping a working
@@ -437,12 +456,14 @@ CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=y
 # is pad D1 -- free, not a strapping pin, and in range. Wire an LED and a 330 R
 # resistor to ground there.
 #
-# Do NOT point it at 21. That is documented as the onboard user LED and this
-# file used to recommend it; it has since been seen not to light at all. Two
-# candidate reasons, neither confirmed: the LED may not be on 21 on every board
-# revision, and 21 is also the pin the Sense's SD slot reportedly uses for CS.
-# It is active low as well, so even working it would read inverted against every
-# other unit. An external LED on D1 avoids all three questions.
+# Do NOT point it at 21. Seeed documents it as the onboard user LED on every
+# variant in the series and this file used to recommend it; it has since been
+# seen not to light at all, and the reason was never confirmed -- the LED may
+# simply not be on 21 on every board revision. (The other suspect, that the
+# Sense's SD slot used 21 for CS, dies with the move to a Plus, which has no card
+# reader. The LED still did not light.) It is active low as well, so even working
+# it would read inverted against every other unit. An external LED on D1 avoids
+# the question entirely.
 
 # ---------------------------------------------------------------------------
 # Carried over, but NOT carried over on evidence
@@ -472,34 +493,61 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # Deliberately NOT set
 # ---------------------------------------------------------------------------
 #
-# PSRAM. The board has 8 MB of octal PSRAM and this build leaves it off.
+# PSRAM. Still not used for anything by default -- see the note below the
+# switches, which is the one that matters.
 #
-# It is tempting, because architecture.md S16 ends the burstiness wart at
-# "fixing it properly means a smaller lead or a larger ring". But PSRAM is the
-# wrong memory for a ring regardless, since the ring is touched from the
-# playback path and cache misses there are the one thing that loop cannot
-# absorb.
+# The old note here said "turn it on only with a specific allocation in mind".
+# There is now exactly one: a TFLM tensor arena, which is the one buffer in this
+# project that is large, touched only by a low-priority task on the other core,
+# and useless to shrink. Everything that note refused is still refused.
 #
-# And it is the wrong BOARD. The ring that bounds LEAD + RESYNC is the
-# satellite's, and the satellite is a classic ESP32 with no PSRAM at all -- so
-# no amount of memory on this unit buys the lead a single millisecond. That is
-# the whole answer to "the S3 has plenty of PSRAM, can we not have a 500 ms
-# lead": a 500 ms lead needs ~107 kB of satellite ring against a largest free
-# block of 106 kB, and it would fail to allocate on the board that has to hold
-# it.
+# It is NOT for the ring. PSRAM is the wrong memory for a ring regardless, since
+# the ring is touched from the playback path and cache misses there are the one
+# thing that loop cannot absorb.
+#
+# It is NOT for the lead. The ring that bounds LEAD + RESYNC is the SATELLITE's,
+# and the satellite is a classic ESP32 with no PSRAM at all -- so no amount of
+# memory on this unit buys the lead a single millisecond. That is the whole
+# answer to "the S3 has plenty of PSRAM, can we not have a 500 ms lead": a 500 ms
+# lead needs ~107 kB of satellite ring against a largest free block of 106 kB,
+# and it would fail to allocate on the board that has to hold it.
 #
 # The larger ring the wart actually wanted has since been taken, in the
 # satellite's internal SRAM, where it belongs: 64 -> 80 kB, which moved the
 # bound from 320 ms against 372 to 350 against 464 and let RESYNC_US go from
 # 120 to 150.
 #
-# Enabling it also costs: the octal interface eats GPIO 33-37 (not broken out,
-# so no loss) and adds cache-miss jitter to every task, including the ones being
-# measured. Turn it on only with a specific allocation in mind.
+# The octal interface eats GPIO 33-37. On the Sense this cost nothing at all --
+# those pins are not broken out anywhere on that board. On the Plus it MAY cost
+# something: the extra rear pads are around nine GPIOs, of which 38-42 are the
+# confirmed ones, and whether 33-37 are among the rest has not been checked
+# against the schematic. It is still free as this build stands, because nothing
+# here uses a rear pad; check before designing anything that does.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# THE line, and the reason enabling PSRAM at all is safe here.
 #
-#   CONFIG_SPIRAM=y
-#   CONFIG_SPIRAM_MODE_OCT=y
-#   CONFIG_SPIRAM_SPEED_80M=y
+# CAPS_ALLOC means ordinary malloc() NEVER returns PSRAM. Nothing that exists
+# today moves; the ring, the DMA buffers, the frame queue, the WiFi buffers and
+# every stack stay exactly where they are, in internal SRAM, with exactly the
+# timing they were measured with. PSRAM is reachable only by asking for it by
+# name -- heap_caps_malloc(n, MALLOC_CAP_SPIRAM) -- which in this tree is done
+# in one place, ml_arena.c, for the tensor arena and nothing else.
+#
+# The alternative, SPIRAM_USE_MALLOC, would let the allocator hand PSRAM to
+# anything above a threshold, which is precisely the "adds cache-miss jitter to
+# every task" the old note warned about. That warning was right and this setting
+# is how it is respected rather than overruled.
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# Read the vis `cost:` line and the HEALTH heap figures after flipping this on,
+# and compare against the numbers recorded above: analysis 3900/21000 us
+# mean/max, hub min heap ~68 kB, 0 audio gaps/min over 18 min. The old note
+# asked for exactly this measurement and recorded that nobody had made it on
+# this part. It is still worth making -- enabling the PSRAM controller changes
+# cache behaviour even when nothing allocates from it.
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
 # laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a

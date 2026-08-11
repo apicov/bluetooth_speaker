@@ -35,6 +35,7 @@
 
 #include <stdint.h>
 
+#include "analyser.hpp"
 #include "analysis_config.h"
 #include "beat_detect.h"
 
@@ -207,6 +208,38 @@ struct Frame {
     float        boom_strength;
     float        boom_flux;      /* for tuning: what the low band actually did */
     float        boom_threshold;
+
+    /*
+     * What each pluggable analyser last said, as of this frame.
+     *
+     * One slot per registered analyser, at the same index, so f.ml[i] is
+     * always analyser i whatever else is enabled -- see DF_ML_SLOTS in
+     * analysis_config.h for what a slot costs.
+     *
+     * Not computed here and not filled by Analysis::process(). A fast-lane
+     * analyser's result is written when the frame is produced, because its
+     * window IS this frame's window and there is nothing to wait for. A
+     * slow-lane one is latched in by the render stage, which takes the newest
+     * Result whose show_at_us has arrived by this frame's due_us. See
+     * ResultLatch in visualiser.cpp.
+     *
+     * It is in Frame rather than reaching patterns by some other route so that
+     * a Pattern stays what it was: a pure function of the Frames it is given.
+     * A pattern reading f.ml is still obeying the rule at the top of this file,
+     * because show_at_us and due_us are both derived by counting from a shared
+     * origin -- so every unit latches the same Result into the same frame index
+     * regardless of when its own inference happened to finish.
+     *
+     * Check result_valid() before reading it. RESULT_NONE is what a unit sees
+     * at startup, after a flush, and for as long as a slow analyser is still
+     * filling its first context -- which for a one-second model is a second of
+     * music, not an edge case.
+     *
+     * It does NOT travel in vis_frame_t. Results go on the wire separately, at
+     * their own much lower cadence; a unit taking remote frames latches them
+     * from there into the frames it is given, so the two paths agree.
+     */
+    Result       ml[ML_SLOTS];
 };
 
 /* Implement this to make a new pattern. See the rule at the top of the file. */

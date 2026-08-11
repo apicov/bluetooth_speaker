@@ -14,6 +14,9 @@ components/dancefloor_leds/test/test_pattern
 components/dancefloor_leds/test/test_beat_detect
 components/dancefloor_leds/test/test_fft
 components/dancefloor_leds/test/test_pattern_sync
+components/dancefloor_leds/test/test_result_latch
+components/dancefloor_leds/test/test_resample
+components/dancefloor_leds/test/test_ml_window
 components/dancefloor_leds/test/*.o
 
 # Python bytecode from running tools/

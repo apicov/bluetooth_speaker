@@ -311,8 +311,8 @@ point it at something you can watch on a scope.
 
 **On the XIAO, wire an external one.** Its onboard LED is documented as GPIO 21
 and does not light when pointed at, cause unresolved — the pin may differ by
-board revision, the Sense's SD slot reportedly uses 21 for CS, and it is active
-low regardless, so even working it would read inverted against every other unit.
+board revision, and it is active low regardless, so even working it would read
+inverted against every other unit.
 Pad `D1` is free and is GPIO 2, which is already this setting's default, so
 nothing needs configuring:
 

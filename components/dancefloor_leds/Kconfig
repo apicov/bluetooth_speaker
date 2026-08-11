@@ -104,13 +104,12 @@ menu "Dancefloor LEDs"
                        The link is one-way and the hub names no TX pin.
               none     official Espressif ESP32-DevKitC has only a power LED
               none     XIAO ESP32-S3 in practice. Its onboard LED is documented
-                       as GPIO 21 and did not light when pointed at. Unresolved,
-                       and there are three candidate reasons: the pin may differ
-                       by board revision, the Sense's SD slot reportedly uses 21
-                       for CS, and it is active low anyway -- so even working it
-                       would read inverted against every other unit, one gap per
-                       second rather than one flash. Wire an external LED to pad
-                       D1, which is GPIO 2 and so already this default.
+                       as GPIO 21 and did not light when pointed at. Unresolved:
+                       the pin may differ by board revision, and it is active low
+                       anyway -- so even working it would read inverted against
+                       every other unit, one gap per second rather than one
+                       flash. Wire an external LED to pad D1, which is GPIO 2 and
+                       so already this default.
 
             With no usable onboard LED, wire one to any free pin through a
             resistor, or point this at a pin you can watch on a scope. Taken
@@ -204,6 +203,127 @@ menu "Dancefloor LEDs"
         config DANCEFLOOR_LED_HOP_256
             bool "256 -- 75% overlap, 172 frames/s"
     endchoice
+
+    choice DANCEFLOOR_ML_SOURCE
+        prompt "Where this unit's analyser results come from"
+        default DANCEFLOOR_ML_SOURCE_LOCAL
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            The same question DANCEFLOOR_LED_SOURCE asks about analysis frames,
+            asked separately about the pluggable analysers -- and separately on
+            purpose.
+
+            A unit can compute its own FFT frames and still be GIVEN a model's
+            results. The FFT is cheap and provably identical everywhere; a model
+            is neither, and a classic-ESP32 satellite that cannot hold a tensor
+            arena can still light up in step with a hub that can. That
+            combination is the reason this is not one setting.
+
+            The reverse does not exist: a unit taking frames from the hub
+            analyses no audio at all, so there is nothing for an analyser to run
+            on. Choosing Local there is not offered.
+
+            WHAT IS GUARANTEED is the same narrow thing DANCEFLOOR_LED_SOURCE
+            promises: units taking results from the same source agree. Two units
+            both on Local agree only if they run the same analyser, built from
+            the same source, with the same model_id -- which across an LX6
+            satellite and an LX7 hub additionally requires the arithmetic to be
+            integer. A mismatch is detected from model_id and logged once.
+
+        config DANCEFLOOR_ML_SOURCE_LOCAL
+            bool "Local -- this unit runs the analysers"
+            depends on DANCEFLOOR_LED_SOURCE_LOCAL
+            help
+                Costs whatever the analysers cost. A fast one runs on the
+                analysis task beside the FFT; a slow one brings up its own task
+                on the other core, a resampler and its buffers -- about 25 kB
+                for the shipped example, against the ~52 kB a satellite has
+                free while analysing.
+
+        config DANCEFLOOR_ML_SOURCE_REMOTE
+            bool "Remote -- this unit is given the results"
+            help
+                No analyser runs here, no slow lane starts, and no resampler is
+                built. Results arrive as MSG_ML and are shown at the instant
+                they name, exactly like ones computed locally.
+
+                This is what lets the floor run a model only the hub can hold.
+
+    endchoice
+
+    config DANCEFLOOR_ML_TFLM
+        bool "Build the TensorFlow Lite Micro analyser base"
+        default n
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            Compiles analyser_tflm.cpp, which removes the boilerplate every
+            TFLM-backed analyser would otherwise repeat: the arena, the schema
+            check, the interpreter, and failing cleanly enough that a unit which
+            cannot run the model still lights up from its neighbours.
+
+            Off by default because esp-tflite-micro is a large component and
+            nothing in this tree has a model yet. Turning this on also means
+            uncommenting the dependency in
+            components/dancefloor_leds/idf_component.yml -- the exact lines are
+            there.
+
+            Read the note at the top of analyser_tflm.hpp before converting a
+            model. The short version: quantise it to int8. On a floor where more
+            than one unit runs the model locally that is a CORRECTNESS
+            requirement, not a size optimisation -- the hub is an LX7, a
+            satellite is an LX6, esp-nn picks different kernels per target, and
+            two units disagreeing is the failure that takes an evening to find.
+
+    config DANCEFLOOR_ML_ARENA_KB
+        int "Tensor arena, in kB"
+        default 64
+        range 1 4096
+        depends on DANCEFLOOR_ML_TFLM
+        help
+            Working memory for the interpreter. Ask for too much once, read the
+            "N of M B used" line the analyser prints at startup, then set this
+            from N.
+
+            WHERE it comes from is decided at runtime and reported: PSRAM if the
+            board has it, internal SRAM otherwise. hub_s3 enables PSRAM with
+            CONFIG_SPIRAM_USE_CAPS_ALLOC, so the arena is the only thing in this
+            project that can reach it and nothing else moves.
+
+            A classic-ESP32 satellite has no PSRAM at all and about 52 kB free
+            while analysing, so an arena sized for the hub does not fail at the
+            allocation there -- it fails an hour later as an audio dropout. If
+            the startup line says "internal" and the margin looks thin, it is:
+            use a smaller model on that unit, or build it
+            DANCEFLOOR_ML_SOURCE_REMOTE and let the hub decide.
+
+    config DANCEFLOOR_ML_SLOTS
+        int "Pluggable analysers that may run at once"
+        default 2
+        range 1 8
+        depends on DANCEFLOOR_ENABLE_VISUALISER
+        help
+            How many analysers can run beside the FFT, and therefore how many
+            results every frame carries. One slot per registered analyser, at
+            the same index, so a pattern reading f.ml[i] always gets analyser i
+            whatever else is or is not enabled.
+
+            It costs RAM in the frame queue and the cost is not trivial: a
+            result is 40 bytes and the queue holds 32 * (1024 / hop) frames, so
+            each slot is 2.5 kB at hop 512 and 5 kB at hop 256. A classic-ESP32
+            satellite analysing locally has about 52 kB free, so this is worth
+            setting to what is actually used.
+
+            2 is the default because the case this was built for is one fast
+            analyser beside one slow one -- a per-hop detector and a model with
+            a second of context, which is precisely the pair that cannot share
+            a lane.
+
+            This MUST match the fallback in analysis_config.h, which is what
+            tools/pattern_lab and the unit tests compile with -- they see no
+            sdkconfig.h at all, and a struct that differed in size between the
+            laptop and the board would make every figure measured on the laptop
+            describe a different pipeline. Raising it here means raising it
+            there.
 
     choice DANCEFLOOR_LED_SOURCE
         prompt "Where this unit's analysis frames come from"
