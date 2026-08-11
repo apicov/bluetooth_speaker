@@ -135,12 +135,38 @@ not.
 
 ### 2.4 Octal PSRAM, 8 MB
 
-**Deliberately off, and should stay off.** The ring is touched from the playback
-path and PSRAM cache-miss jitter is the one thing that loop cannot absorb. Also
-the wrong board: the ring that bounds `LEAD + RESYNC` belongs to the *satellite*,
-which is a classic ESP32 with no PSRAM. A 500 ms lead would need ~107 kB of
-satellite ring against a 106 kB largest free block — it would fail to allocate on
-the board that has to hold it. **Memory on the hub buys the lead nothing.**
+**On, for exactly one allocation.** This section said "deliberately off, and
+should stay off" for most of the port's life, and the reasoning that made it say
+so is intact — what changed is that a buffer finally turned up which that
+reasoning does not refuse.
+
+The buffer is the TFLM tensor arena: large, touched only by a low-priority task
+on the other core, and useless to shrink. `CONFIG_SPIRAM_USE_CAPS_ALLOC` is the
+line that makes turning PSRAM on safe rather than merely possible — ordinary
+`malloc()` never returns PSRAM, so the ring, the DMA buffers, the frame queue,
+the WiFi buffers and every stack stay in internal SRAM with the timing they were
+measured with. PSRAM is reachable only by asking for it by name, and in this tree
+`heap_caps_malloc(n, MALLOC_CAP_SPIRAM)` appears in one file, `ml_arena.c`. The
+alternative, `SPIRAM_USE_MALLOC`, would hand PSRAM to anything above a threshold
+— that is the "cache-miss jitter in every task" the old note warned about, and
+CAPS_ALLOC is how the warning is respected rather than overruled.
+
+Still refused, and the refusals are the durable part of this section:
+
+- **Not for the ring.** It is touched from the playback path, and PSRAM
+  cache-miss jitter is the one thing that loop cannot absorb.
+- **Not for the lead.** The ring that bounds `LEAD + RESYNC` belongs to the
+  *satellite*, a classic ESP32 with no PSRAM at all. A 500 ms lead would need
+  ~107 kB of satellite ring against a 106 kB largest free block — it would fail
+  to allocate on the board that has to hold it. **Memory on the hub buys the lead
+  nothing**, which is the whole answer to "the S3 has plenty of PSRAM, can we not
+  have a 500 ms lead". The larger ring that argument wanted was taken later in
+  the satellite's own internal SRAM, 64 → 80 kB.
+
+Unmeasured, and worth measuring: enabling the PSRAM controller changes cache
+behaviour even when nothing allocates from it. Read the vis `cost:` line and the
+HEALTH heap figures against the recorded baseline — analysis 3900/21000 µs
+mean/max, hub min heap ~68 kB, 0 audio gaps/min over 18 min.
 
 ### 2.5 16 MB flash (vs 4 MB)
 
@@ -216,7 +242,7 @@ Recorded here so the porting work does not re-litigate them.
 | PHY rate | **6 Mbps pinned** | 6: 1.2 gaps/min · 12: ~115 · 24: 23% loss · adaptive: 3.5–14 |
 | TX AMPDU | **off** | forced — `set_fix_rate` refuses to run with it enabled |
 | TX buffers | **32** | 64 gave 329 vs 32's 420 — noise, and the heap wants the 32 |
-| PSRAM | **off** | §2.4 |
+| PSRAM | **on, CAPS_ALLOC only** | §2.4 — one named allocation, the TFLM arena; `malloc()` never returns it |
 
 ---
 
