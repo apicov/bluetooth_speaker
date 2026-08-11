@@ -1534,6 +1534,13 @@ static void i2s_start(uint32_t rate)
      * standing offsets.
      */
     chan_cfg.dma_frame_num = AUDIO_FRAMES;
+    /*
+     * A starved channel must go SILENT, not repeat itself. Without this, the
+     * circular TX descriptors replay the last 34.8 ms forever once
+     * local_play_task takes the underrun branch and parks -- see the
+     * satellite's copy for the full mechanism. Both units must carry it.
+     */
+    chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -1554,7 +1561,7 @@ static void i2s_start(uint32_t rate)
      * chunk is written, not when it is heard, so unequal output buffering shows
      * up as a fixed offset unrelated to clock sync. */
     ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms, "
-                  "channels=%s",
+                  "channels=%s, silence on starve",
              chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
              (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate),
              AUDIO_CHANNEL_MODE_NAME);
