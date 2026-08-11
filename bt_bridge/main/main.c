@@ -27,7 +27,7 @@
 #include "status_led.h"
 
 /* device name */
-static const char local_device_name[] = CONFIG_EXAMPLE_LOCAL_DEVICE_NAME;
+static const char local_device_name[] = CONFIG_BRIDGE_BT_DEVICE_NAME;
 
 /* event for stack up */
 enum {

@@ -1,10 +1,19 @@
-menu "A2DP Example Configuration"
-    config EXAMPLE_LOCAL_DEVICE_NAME
-        string "Local Device Name"
-        default "ESP_SPEAKER"
+menu "Bluetooth bridge"
+    config BRIDGE_BT_DEVICE_NAME
+        string "Bluetooth device name"
+        default "Dancefloor"
         help
-            Use this option to set local device name.
+            The name this bridge advertises, i.e. what your phone lists it as
+            when you go looking for something to pair with. It is set on the
+            stack once at startup, so changing it means a rebuild and a flash.
 
+            Bluetooth carries the name as UTF-8 and the stack caps it at 32
+            bytes, so a plain ASCII name has 32 characters to play with and
+            anything accented or emoji has fewer.
+
+            A phone that has already paired usually keeps the old name in its
+            own cache. To see a new one, forget the device on the phone and
+            pair again.
     config EXAMPLE_A2DP_SINK_USE_EXTERNAL_CODEC
         bool "Use External Codec Instead of Internal"
         default n

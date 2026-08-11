@@ -6,7 +6,7 @@ CONFIG_BT_A2DP_ENABLE=y
 CONFIG_DAC_DMA_AUTO_16BIT_ALIGN=n
 
 # Name the phone sees when pairing.
-CONFIG_EXAMPLE_LOCAL_DEVICE_NAME="Dancefloor"
+CONFIG_BRIDGE_BT_DEVICE_NAME="Dancefloor"
 
 # BT stack alone is ~950 kB; the stock 1 MB factory partition leaves 10% free.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
