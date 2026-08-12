@@ -544,3 +544,94 @@ Two things in the run are worth chasing but belong to the hub, not this work:
 work through two calls instead of inline, which costs a frame. 1128 bytes of
 3072 is not a problem; it is worth a glance on a longer run before assuming it
 has levelled off.
+
+---
+
+## 7.6 The second run, 2026-08-12 17:09 — and a negative result
+
+Hub reflashed with the merged WiFi-in-PSRAM config; satellite left on its 16:33
+build. Four minutes. It is a markedly better run than §7.5, and **the merge is
+not why** — which is the more useful finding of the two.
+
+### The negative result: reflashing the hub changed nothing functional
+
+| | 16:39 | 17:09 |
+|---|---|---|
+| hub internal free | 7824 | 7812 |
+| min watermark | 5944 | 5928 |
+| largest block | 3584 | 3584 |
+
+Identical. Had WiFi's buffers just left internal SRAM, those figures would have
+moved. Three things explain why they did not, and together they are conclusive:
+
+1. Deleting `hub_s3/sdkconfig` and regenerating it from the merged defaults
+   produced a **byte-identical file** — so the bench board was already running
+   `SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` before either run.
+2. The branch's only change to `hub_s3/main/streamer.c` is the `ALLOCATION
+   FAILED` line format and its comment. No behaviour.
+3. `alloc-fail 0` in both runs.
+
+The fix is real and is working — the wip commit's pre-fix watermark was **1520
+bytes** with a 1700-byte WiFi TX buffer failing to allocate, against 5928 now —
+but it has been working since before this audit began. What the merge bought was
+putting a load-bearing config under version control instead of leaving it in a
+gitignored file. That was worth doing and is invisible in a log.
+
+**The trap this closes is worth naming.** A config that only exists in
+`sdkconfig` looks exactly like a config that is committed, right up until
+someone deletes the file or clones the repo. This project has hit that before —
+the pattern and hop comments in `satellite/sdkconfig.defaults` were written after
+`hub_s3` came up cycling a 28-second hue against its neighbours' fixed amber.
+Here the same trap was holding the hub's memory fix.
+
+### What did improve, and why it cannot be credited
+
+**Sync converged, which §7.5's run never did.** Satellite smoothed phase walked
+−28346 → −22683 → −16573 → −12569 → −8526 → −6206 → −3689 → −1173 → +150 → +582
+→ **+997 µs**, crossing zero and holding inside ~1 ms. The 16:39 run reached
+−12100 and then took an underrun back to −30594.
+
+**A clean four minutes**: `underruns 0`, `gaps 0`, `splices 0`, `alloc-fail 0`,
+`leds remote hop 512 (rx 15769, bad 0)`. Previously 1 underrun and 4 gaps.
+
+**`tx-fail`**: one spike of 142 at association, then zero across the remaining
+twelve samples (a single 1 at the end). Previously recurring — 4, 17, 67.
+
+None of that is attributable. The satellite is at a different address (`.2`
+against `.3`, with `sta-left 1 (dropped 1)` on the hub), the radio environment is
+uncontrolled, and two runs is not a comparison. Recorded as observation, not as
+a result.
+
+### Provisionally answered: PSRAM contention
+
+The question behind the arena/WiFi discussion — does sharing PSRAM cost the
+analysis path anything?
+
+| | 16:39 | 17:09 |
+|---|---|---|
+| `vis: cost: analysis` mean | 1264–1328 µs | 1213–1262 µs |
+| `vis: ml: fast` mean | 748–779 µs | 752–818 µs |
+
+No measurable cost, and if anything slightly better. **Caveat that matters:** the
+current analysers are cheap and the slow lane reads `0/0 us`. This says nothing
+about a real TFLM model streaming a large arena, which is the case the arena
+Kconfig help warns about. It does establish that WiFi in PSRAM is not, by
+itself, a problem.
+
+### Resolved
+
+`drift` stack free settled at **956 bytes** and stayed there across the 65 s,
+125 s, 185 s and 245 s lines. §7.3 flagged it as possibly still falling after the
+telemetry/servo split added a call frame; it levelled off. 956 of 3072 is thin
+but stable.
+
+### Getting worse
+
+`wide-span` reached **64 by 185 s** — about 18/min, the same rate as §7.5, but
+the reported `span max` hit **649, 673, 499 and 371 µs** against 121–247 in the
+earlier run. `TSF_SPAN_MAX_US` is 100. This is the second run in a row to move
+against the "enforcing it would be free" conclusion that §7.5 already retracted,
+and the spans are now an order of magnitude past the threshold rather than
+twice it. Worth understanding before TSF is filtered on span — and worth noting
+that the reported figure is a running maximum cleared per log line, so these are
+individual samples, not a drift in the typical case, which stays at 73–99 µs.
