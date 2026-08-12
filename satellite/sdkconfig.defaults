@@ -49,6 +49,47 @@ CONFIG_DANCEFLOOR_LED_HOP_512=y
 # config difference.
 CONFIG_DANCEFLOOR_LED_PATTERN="boom"
 
+# Where this unit's frames and analyser results come from: the hub, not itself.
+#
+# THIS IS A MEMORY DECISION before it is anything else, and it is pinned here
+# because the satellite did not fit without it. A satellite analysing locally
+# holds the 80 kB audio ring, a ~33 kB analysis stream, and -- with the slow lane
+# local as well -- a further ~13 kB buffer and two more task stacks. On a classic
+# ESP32 that does not fit, and the way it does not fit is silent:
+#
+#   E ALLOCATION FAILED 177 time(s): largest request 4096 B (caps 0x804 INTERNAL)
+#   W HEALTH: up 5 s | heap 396 (min 92, window 396, largest 208) | stack play 0
+#
+# 396 bytes free. The 4096-byte requests are task stacks: probe, rx and play all
+# failed to start and only drift fitted, at 3072. `stack play 0` is the play
+# task's high-water mark never having been written, because the task does not
+# exist. A unit in that state still associates, still takes a DHCP lease, still
+# looks healthy from the hub -- and produces no audio, no LEDs and no anchors.
+# It reads exactly like a satellite waiting for a stream that never came, which
+# is how it was read for an evening. The Kconfig help for ML_SOURCE_LOCAL had
+# already priced it: "about 25 kB ... against the ~52 kB a satellite has free
+# while analysing." That margin was spent.
+#
+# REMOTE costs the floor nothing it can see. Frames are drawn at the instant they
+# name, so a unit given them stays in step with the unit that made them -- more
+# tightly than two units analysing separately, because there is only one copy of
+# the decision. The hub already runs both analyses locally and publishes them
+# (MSG_FRAME, MSG_ML). The only thing that does not travel is Frame::mag, and no
+# pattern can use it anyway: it is gone before a queued frame is drawn, which
+# analysis.hpp says outright.
+#
+# The second line is implied by the first -- ML_SOURCE_LOCAL depends on
+# LED_SOURCE_LOCAL, so choosing remote frames leaves remote results as the only
+# option -- and is written out because a config that states its intent is worth
+# one redundant line.
+#
+# Floor-wide agreements, like the pattern and hop above: a unit analysing locally
+# may run a different algorithm, so what is guaranteed is only that units taking
+# frames from the same source render identically. The live source is printed at
+# startup and carried on the HEALTH line, so an unintended mismatch is visible.
+CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE=y
+CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
+
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
 # laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
 # production flash, where the shipper compiles out entirely. Each satellite
