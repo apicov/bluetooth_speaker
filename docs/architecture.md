@@ -1101,7 +1101,23 @@ line: if `internal` is the larger of the two, the mask is wrong again.
 
 `ALLOCATION FAILED` reports both pools for the same reason, and spells out the
 capability bits: `caps 0x1800 INTERNAL` rather than the bare hex it used to
-print, which had to be decoded by hand while a floor was down.
+print, which had to be decoded by hand while a floor was down. Read its `min`
+first — the live figures beside it are sampled by the monitor task up to 5 s
+later, so on a transient they describe a condition that has already passed. The
+first capture printed `internal 21912 free, largest 11776` next to a failed
+1700-byte request, which disproves the failure it accompanies; `min 1520` is what
+explained it. The hook cannot sample the live figures itself: the heap-statistics
+functions live in flash, and the hook is `IRAM_ATTR` because an allocation can
+fail from an ISR with the flash cache disabled.
+
+**The internal budget is smaller than the datasheet headline.** The S3 has 512 kB
+of SRAM but only ~268 kB is ever a registered heap — ~102 kB is DRAM shadowed by
+IRAM code (`.dram0.dummy`), ~96 kB is static `.data`/`.bss`, ~33 kB is
+ROM-reserved. Of that, ~246 kB is live in a running hub: ~53 kB of task stacks
+and ~122 kB of this app's own buffers, the largest being `local_ring` at 64 kB
+and the visualiser's analysis stream at 33 kB. What remains has to absorb WiFi's
+transient buffer demand, which is why `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is
+on — see `hub_s3/sdkconfig.defaults` for the measurement that turned it on.
 
 `sta-left N (dropped M, no-lease K) | sta-timeout T` is how a satellite left.
 `dropped` is a clean disassociation, resolved to an IP through the DHCP lease

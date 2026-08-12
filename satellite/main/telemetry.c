@@ -75,21 +75,22 @@ void telemetry_tick(void)
 
     /* Said once, and within 5 s of the fact rather than at the next soak
      * line -- see the hub's copy, which also carries why this reports both
-     * pools and spells the caps out. */
+     * pools, why `min` is the figure that explains a failure when the live
+     * ones no longer can, and why the hook cannot sample them itself. */
     static uint32_t alloc_fail_told;
     if (n_alloc_fail != alloc_fail_told) {
         alloc_fail_told = n_alloc_fail;
         ESP_LOGE(TAG, "ALLOCATION FAILED %" PRIu32 " time(s): largest request %"
-                      PRIu32 " B (caps 0x%" PRIx32 "%s%s%s) | internal %u free, "
-                      "largest %u | total %" PRIu32 " free, largest %u",
+                      PRIu32 " B (caps 0x%" PRIx32 "%s%s%s) | internal %u free "
+                      "(min %u), largest %u | total %" PRIu32 " free",
                  n_alloc_fail, alloc_fail_size, alloc_fail_caps,
                  (alloc_fail_caps & MALLOC_CAP_INTERNAL) ? " INTERNAL" : "",
                  (alloc_fail_caps & MALLOC_CAP_DMA)      ? " DMA"      : "",
                  (alloc_fail_caps & MALLOC_CAP_SPIRAM)   ? " SPIRAM"   : "",
                  (unsigned)heap_int_now,
+                 (unsigned)heap_caps_get_minimum_free_size(CAP_USABLE_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(CAP_USABLE_INTERNAL),
-                 heap_now,
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+                 heap_now);
     }
 
     /*

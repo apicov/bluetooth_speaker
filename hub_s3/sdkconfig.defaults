@@ -535,12 +535,15 @@ CONFIG_SPIRAM_SPEED_80M=y
 
 # THE line, and the reason enabling PSRAM at all is safe here.
 #
-# CAPS_ALLOC means ordinary malloc() NEVER returns PSRAM. Nothing that exists
-# today moves; the ring, the DMA buffers, the frame queue, the WiFi buffers and
-# every stack stay exactly where they are, in internal SRAM, with exactly the
-# timing they were measured with. PSRAM is reachable only by asking for it by
-# name -- heap_caps_malloc(n, MALLOC_CAP_SPIRAM) -- which in this tree is done
-# in one place, ml_arena.c, for the tensor arena and nothing else.
+# CAPS_ALLOC means ordinary malloc() NEVER returns PSRAM. The ring, the DMA
+# buffers, the frame queue and every stack stay exactly where they are, in
+# internal SRAM, with exactly the timing they were measured with. PSRAM is
+# reachable only by asking for it by name -- heap_caps_malloc(n,
+# MALLOC_CAP_SPIRAM), which in this tree is ml_arena.c and nothing else -- or
+# via the one narrow exemption below, which moves WiFi and lwIP only.
+#
+# This paragraph used to say the WiFi buffers stayed internal too. They do not
+# any more, and the measurement that changed it is recorded below.
 #
 # The alternative, SPIRAM_USE_MALLOC, would let the allocator hand PSRAM to
 # anything above a threshold, which is precisely the "adds cache-miss jitter to
@@ -554,6 +557,82 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 # asked for exactly this measurement and recorded that nobody had made it on
 # this part. It is still worth making -- enabling the PSRAM controller changes
 # cache behaviour even when nothing allocates from it.
+#
+# UPDATE: the `hub min heap ~68 kB` in that paragraph is a CLASSIC-HUB figure
+# and cannot be compared against this board. On the classic ESP32 there was one
+# pool, so esp_get_free_heap_size() was the internal figure. Turning PSRAM on
+# here silently moved that field to an 8 MB pool nothing on the audio path can
+# use, and no internal figure replaced it until the MEM line existed. The first
+# real internal baseline on this part, taken with that line:
+#
+#   MEM: internal 22056 free (min 5808, window 20676, largest 11776)
+#   MEM: internal 21912 free (min 1520, window 20512, largest 11776)
+#
+# 1520 bytes. The hub had been running that close to the floor for as long as
+# PSRAM has been on, and every figure on HEALTH said 8 MB free.
+
+# The narrow exemption: WiFi and lwIP allocate from PSRAM first, internal second.
+#
+# WHY. The registered internal heap on this part is ~268 kB, not the 512 kB the
+# datasheet headline suggests -- ~102 kB is DRAM shadowed by IRAM code
+# (.dram0.dummy), ~96 kB is static .data/.bss, ~33 kB is ROM-reserved. Of that
+# ~268 kB, ~246 kB is live: ~53 kB of task stacks and ~122 kB of this app's own
+# buffers (local_ring 64 kB, the visualiser's pcm_stream 32.8 kB, the ML lane
+# 12.8 kB, I2S DMA 6 kB, SPI frames 4.1 kB). What is left has to absorb WiFi's
+# 32 dynamic TX and 32 dynamic RX buffers, whose transient ceiling is ~105 kB.
+# It cannot, and the 1520-byte watermark above is the collision.
+#
+# The failure was caught in the act:
+#
+#   E ALLOCATION FAILED 2 time(s): largest request 1700 B (caps 0x1800 INTERNAL)
+#
+# and the chain to those caps is exact. With this symbol off, wifi_malloc() is
+# plain malloc() (esp_wifi/esp32s3/esp_adapter.c), and heap_caps_malloc_default()
+# ANDs in MALLOC_CAP_INTERNAL because CAPS_ALLOC leaves malloc_alwaysinternal_
+# limit at MALLOC_DISABLE_EXTERNAL_ALLOCS -- giving DEFAULT|INTERNAL = 0x1800,
+# the caps in the log. The 1700 bytes is one dynamic TX buffer.
+#
+# WHAT MOVES, AND WHAT DOES NOT. Only WiFi and lwIP. wifi_malloc() becomes
+# heap_caps_malloc_prefer(size, 2, DEFAULT|SPIRAM, DEFAULT|INTERNAL) -- PSRAM
+# first, internal fallback RETAINED, so nothing that succeeds today can start
+# failing. The audio ring, the I2S DMA buffers, the frame queue and every task
+# stack are untouched: the playback loop, which is the one thing that cannot
+# absorb cache-miss jitter, never sees PSRAM. WiFi is both the pool that spikes
+# and the one furthest from that loop, which is what makes it the right thing to
+# move and the ring the wrong thing.
+#
+# RISK, and how to falsify it: WiFi buffers now sit behind the PSRAM cache. Read
+# the vis `cost:` mean/max, `sbc_in ... max gap`, and tx-fail against a capture
+# from the previous flash on the same track. If any of them move, this comes out
+# -- the diagnostic half of this branch stands on its own.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# The three below are PINNED AT THEIR CURRENT VALUES, not tuned. Enabling the
+# symbol above would otherwise move all three, and this has to stay a single-
+# variable experiment for the same reason the TX buffer count was returned to 32
+# further up: the only question being asked here is WHERE WiFi memory comes
+# from, and an answer confounded by three other changes is not an answer.
+#
+# STATIC_RX_BUFFER_NUM would go 10 -> 16, RX_BA_WIN 6 -> 16 (both in
+# esp_wifi/Kconfig, defaulted per SPIRAM_TRY_ALLOCATE_WIFI_LWIP). The BA window
+# matters on the air, not just in RAM: the satellite is built with 6, and moving
+# only this end changes what the two negotiate.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# CACHE_TX_BUFFER_NUM only exists when the symbol above is set, and defaults to
+# 32. Pinned to 0 DELIBERATELY, and not as conservatism.
+#
+# It queues upper-layer packets the driver could not buffer instead of rejecting
+# them, which is the wrong trade twice over here. A late audio packet is refused
+# at anchor time anyway (ANCHOR_MIN_LEAD_US) -- so the queue buys nothing but
+# latency for the thing it delays. And it converts tx-fail, the visible counter
+# the whole tuning log at the top of this file is written around, into silence:
+# the storm that measured 1016 rejections in 20 s would have shown up as a
+# healthy zero with a 32-deep cache in front of it.
+#
+# Worth trying on its own once the fan-out work needs it. Not smuggled in here.
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
 # laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
