@@ -1059,6 +1059,36 @@ comfortable. `alloc-fail` counts allocations that actually failed; it records
 rather than logs, and lives in IRAM, because a hook in flash would fault in the
 one condition it exists to observe.
 
+**On `hub_s3` those four terms describe the wrong pool**, and the `MEM:` line
+beside them exists for that reason. PSRAM is on there with
+`CONFIG_SPIRAM_USE_CAPS_ALLOC`, so ordinary `malloc()` never returns PSRAM and
+the ring, the DMA buffers, the WiFi buffers and every stack stay in internal
+SRAM — while `esp_get_free_heap_size()` reports the 8 MB PSRAM pool, which
+nothing on the audio path can use. The gap is not academic: this unit has
+printed `heap 8407580 free` in the same second that a 1700-byte internal request
+failed. `MEM:` prints the internal pool with the same four questions asked of it,
+plus the whole-heap pair for comparison.
+
+**The mask is `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`, and the `8BIT` half is
+load-bearing.** `MALLOC_CAP_INTERNAL` on its own also matches memory that is
+internal but 32-bit-access-only — on the classic ESP32 the IRAM heap is
+registered `INTERNAL|EXEC|32BIT` (`heap/port/esp32/memory_layout.c`), and nothing
+needing byte access can touch it: not `malloc()`, not a task stack. The first
+version of this line used the bare mask and printed
+
+```
+MEM: internal 31760 free (min 31424, window 31760, largest 30720) | total 396 (largest 208)
+```
+
+on a satellite whose real usable heap was **396 bytes**, and which had already
+failed 177 allocations of 4096 bytes — three of its four tasks never started. The
+31 kB was real and entirely unusable. Read `total` against `internal` on that
+line: if `internal` is the larger of the two, the mask is wrong again.
+
+`ALLOCATION FAILED` reports both pools for the same reason, and spells out the
+capability bits: `caps 0x1800 INTERNAL` rather than the bare hex it used to
+print, which had to be decoded by hand while a floor was down.
+
 `sta-left N (dropped M, no-lease K) | sta-timeout T` is how a satellite left.
 `dropped` is a clean disassociation, resolved to an IP through the DHCP lease
 table, ~11 ms after the event. `no-lease` is the event arriving when the lease had
@@ -1191,7 +1221,9 @@ are still to be wired.
 The soak is the cheapest of these and blocks the least: it needs no parts, only
 time. Both units print a `HEALTH` line every 60 s with uptime, four heap figures,
 per-task stack headroom, failed allocations, and cumulative counts of underruns,
-re-anchors, splices, retunes, lost-packet gaps and WiFi drops. Over ten minutes
+re-anchors, splices, retunes, lost-packet gaps and WiFi drops, plus a `MEM:` line
+carrying the internal-SRAM pool — the one that constrains the hub, and the one
+the `HEALTH` figures stopped describing when PSRAM went on (§15). Over ten minutes
 heap was flat and every counter stayed near zero, which is encouraging and is not
 evidence.
 

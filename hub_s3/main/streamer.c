@@ -356,6 +356,33 @@ static volatile uint32_t hw_mon;
 static volatile uint32_t heap_min_window = UINT32_MAX;
 
 /*
+ * The pool that actually says yes or no to a WiFi buffer.
+ *
+ * Everything above measures the whole heap, and on this board that is mostly
+ * PSRAM. CONFIG_SPIRAM_USE_CAPS_ALLOC means ordinary malloc() never returns
+ * PSRAM, so the ring, the DMA buffers, the frame queue, the WiFi buffers and
+ * every stack live in internal SRAM -- and internal SRAM is what runs out. The
+ * whole-heap figure cannot see it: this unit has reported 8407580 bytes free in
+ * the same second that a 1700-byte MALLOC_CAP_INTERNAL request failed.
+ *
+ * Same window discipline as heap_min_window above. No since-boot twin is needed
+ * because heap_caps_get_minimum_free_size() already keeps a per-capability
+ * watermark, which esp_get_minimum_free_heap_size() does not.
+ *
+ * 8BIT is part of the mask and is not decoration. MALLOC_CAP_INTERNAL alone also
+ * matches regions that are internal but 32-bit-access-only, which nothing that
+ * needs byte access -- malloc(), a task stack -- can use. It costs nothing here,
+ * because the S3 registers no IRAM-only region with this build's cache setting,
+ * but it cost an evening on the satellite, where the IRAM heap is registered as
+ * INTERNAL|EXEC|32BIT and this figure read 31 kB free while the pool a stack
+ * comes from had 396 bytes. The satellite's copy carries that story in full.
+ * It is also exactly the mask of the requests that fail: caps 0x804.
+ */
+#define CAP_USABLE_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
+static volatile uint32_t heap_int_window = UINT32_MAX;
+
+/*
  * Allocation failures, which until now were silent.
  *
  * At 2040 bytes free something very likely failed to allocate, and nothing said
@@ -2224,18 +2251,40 @@ static void ring_monitor_task(void *arg)
         if (heap_now < heap_min_window) {
             heap_min_window = heap_now;
         }
+        const uint32_t heap_int_now = (uint32_t)heap_caps_get_free_size(CAP_USABLE_INTERNAL);
+        if (heap_int_now < heap_int_window) {
+            heap_int_window = heap_int_now;
+        }
 
         /* Said once, and within 5 s of the fact rather than at the next soak
          * line -- an allocation failure is the thing you want to see next to
          * whatever else the console was saying at the time. The running count
-         * stays on HEALTH. */
+         * stays on HEALTH.
+         *
+         * Both pools, and the caps spelled out. This line used to report the
+         * whole heap only, which on a PSRAM board reads 8 MB free beside a
+         * failed 1700-byte request -- true, useless, and actively misleading:
+         * it says the unit is fine at the one moment it is not. The caps were
+         * raw hex and nothing decoded them, so 0x1800 had to be looked up by
+         * hand while a floor was down.
+         *
+         * Near the wire limit: 188 bytes with every field saturated against a
+         * LOG_MSG_MAX of 192, ~149 with realistic values. Anything added here
+         * has to come out of the `total` pair, which is the half this line can
+         * afford to lose. */
         static uint32_t alloc_fail_told;
         if (n_alloc_fail != alloc_fail_told) {
             alloc_fail_told = n_alloc_fail;
             ESP_LOGE(TAG, "ALLOCATION FAILED %" PRIu32 " time(s): largest request %"
-                          PRIu32 " B (caps 0x%" PRIx32 "), heap %" PRIu32
-                          " free, largest block %u",
-                     n_alloc_fail, alloc_fail_size, alloc_fail_caps, heap_now,
+                          PRIu32 " B (caps 0x%" PRIx32 "%s%s%s) | internal %u free, "
+                          "largest %u | total %" PRIu32 " free, largest %u",
+                     n_alloc_fail, alloc_fail_size, alloc_fail_caps,
+                     (alloc_fail_caps & MALLOC_CAP_INTERNAL) ? " INTERNAL" : "",
+                     (alloc_fail_caps & MALLOC_CAP_DMA)      ? " DMA"      : "",
+                     (alloc_fail_caps & MALLOC_CAP_SPIRAM)   ? " SPIRAM"   : "",
+                     (unsigned)heap_int_now,
+                     (unsigned)heap_caps_get_largest_free_block(CAP_USABLE_INTERNAL),
+                     heap_now,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         }
 
@@ -2259,6 +2308,8 @@ static void ring_monitor_task(void *arg)
              * could. Taken and cleared, like every other windowed counter. */
             const uint32_t heap_win = heap_min_window;
             heap_min_window = UINT32_MAX;
+            const uint32_t heap_int_win = heap_int_window;
+            heap_int_window = UINT32_MAX;
             ESP_LOGW(TAG, "HEALTH: up %llu s | heap %" PRIu32 " (min %" PRIu32
                           ", window %" PRIu32 ", largest %u) | "
                           "stack play %" PRIu32 " mon %" PRIu32 " | underruns %" PRIu32
@@ -2278,8 +2329,37 @@ static void ring_monitor_task(void *arg)
                      n_sta_nolease, n_sta_timeout, n_alloc_fail,
                      n_phase_drop, n_short_reads, n_short_frames, n_wifi_oversize);
 
+            /*
+             * Its own line, not four more fields above. The HEALTH line already
+             * runs past LOG_MSG_MAX and arrives at the collector cut off
+             * mid-word, so anything appended there would be read on this
+             * console and nowhere else.
+             *
+             * The heap figure above is whole-heap, which on this board is mostly
+             * PSRAM and cannot refuse a WiFi buffer. This is the pool that can.
+             * On a board without PSRAM the two agree, and that agreement is
+             * itself worth being able to see -- it is how the satellite's copy
+             * of this line proves the figures are reading a real pool rather
+             * than printing a constant.
+             */
+            ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
+                          ", largest %u) | total %" PRIu32 " (largest %u)",
+                     (unsigned)heap_caps_get_free_size(CAP_USABLE_INTERNAL),
+                     (unsigned)heap_caps_get_minimum_free_size(CAP_USABLE_INTERNAL),
+                     heap_int_win == UINT32_MAX ? 0 : heap_int_win,
+                     (unsigned)heap_caps_get_largest_free_block(CAP_USABLE_INTERNAL),
+                     esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
 #if CONFIG_DANCEFLOOR_WIFI_LOGS
-            /* The structured twin of the line above, for the collector's CSV.
+            /* The structured twin of the HEALTH line, for the collector's CSV.
+             * It does not carry the MEM figures: growing health_msg_t past its
+             * pinned 108 bytes means editing the size assertion in
+             * test_sync_proto.c and the struct format in collect.py in lockstep,
+             * and the hub relays satellite health with sizeof(*m) rather than
+             * the received length, so a version skew between units would be
+             * silent. Read MEM on the console; revisit if a slow leak ever needs
+             * plotting.
              * The role-aliased fields carry this unit's counters: reanchors_or_
              * restarts = restarts, gaps_or_sta_left = sta-left, wifi_drops_or_
              * oversize = wifi-over, and the tail three are sta-dropped /
