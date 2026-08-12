@@ -1065,12 +1065,25 @@ beside them exists for that reason. PSRAM is on there with
 the ring, the DMA buffers, the WiFi buffers and every stack stay in internal
 SRAM — while `esp_get_free_heap_size()` reports the 8 MB PSRAM pool, which
 nothing on the audio path can use. The gap is not academic: this unit has
-printed `heap 8407580 free` in the same second that a 1700-byte
-`MALLOC_CAP_INTERNAL` request failed, and a satellite went silent because the
-hub could not find a WiFi buffer. `MEM:` prints the internal pool with the same
-four questions asked of it, plus the whole-heap pair for comparison. On the
-satellite, which has no PSRAM, the two halves read the same — that agreement is
-the control that says both figures are reading a real pool.
+printed `heap 8407580 free` in the same second that a 1700-byte internal request
+failed. `MEM:` prints the internal pool with the same four questions asked of it,
+plus the whole-heap pair for comparison.
+
+**The mask is `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`, and the `8BIT` half is
+load-bearing.** `MALLOC_CAP_INTERNAL` on its own also matches memory that is
+internal but 32-bit-access-only — on the classic ESP32 the IRAM heap is
+registered `INTERNAL|EXEC|32BIT` (`heap/port/esp32/memory_layout.c`), and nothing
+needing byte access can touch it: not `malloc()`, not a task stack. The first
+version of this line used the bare mask and printed
+
+```
+MEM: internal 31760 free (min 31424, window 31760, largest 30720) | total 396 (largest 208)
+```
+
+on a satellite whose real usable heap was **396 bytes**, and which had already
+failed 177 allocations of 4096 bytes — three of its four tasks never started. The
+31 kB was real and entirely unusable. Read `total` against `internal` on that
+line: if `internal` is the larger of the two, the mask is wrong again.
 
 `ALLOCATION FAILED` reports both pools for the same reason, and spells out the
 capability bits: `caps 0x1800 INTERNAL` rather than the bare hex it used to

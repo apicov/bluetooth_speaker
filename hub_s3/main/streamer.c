@@ -368,7 +368,18 @@ static volatile uint32_t heap_min_window = UINT32_MAX;
  * Same window discipline as heap_min_window above. No since-boot twin is needed
  * because heap_caps_get_minimum_free_size() already keeps a per-capability
  * watermark, which esp_get_minimum_free_heap_size() does not.
+ *
+ * 8BIT is part of the mask and is not decoration. MALLOC_CAP_INTERNAL alone also
+ * matches regions that are internal but 32-bit-access-only, which nothing that
+ * needs byte access -- malloc(), a task stack -- can use. It costs nothing here,
+ * because the S3 registers no IRAM-only region with this build's cache setting,
+ * but it cost an evening on the satellite, where the IRAM heap is registered as
+ * INTERNAL|EXEC|32BIT and this figure read 31 kB free while the pool a stack
+ * comes from had 396 bytes. The satellite's copy carries that story in full.
+ * It is also exactly the mask of the requests that fail: caps 0x804.
  */
+#define CAP_USABLE_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+
 static volatile uint32_t heap_int_window = UINT32_MAX;
 
 /*
@@ -2240,7 +2251,7 @@ static void ring_monitor_task(void *arg)
         if (heap_now < heap_min_window) {
             heap_min_window = heap_now;
         }
-        const uint32_t heap_int_now = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const uint32_t heap_int_now = (uint32_t)heap_caps_get_free_size(CAP_USABLE_INTERNAL);
         if (heap_int_now < heap_int_window) {
             heap_int_window = heap_int_now;
         }
@@ -2272,7 +2283,7 @@ static void ring_monitor_task(void *arg)
                      (alloc_fail_caps & MALLOC_CAP_DMA)      ? " DMA"      : "",
                      (alloc_fail_caps & MALLOC_CAP_SPIRAM)   ? " SPIRAM"   : "",
                      (unsigned)heap_int_now,
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(CAP_USABLE_INTERNAL),
                      heap_now,
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         }
@@ -2333,10 +2344,10 @@ static void ring_monitor_task(void *arg)
              */
             ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
                           ", largest %u) | total %" PRIu32 " (largest %u)",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(CAP_USABLE_INTERNAL),
+                     (unsigned)heap_caps_get_minimum_free_size(CAP_USABLE_INTERNAL),
                      heap_int_win == UINT32_MAX ? 0 : heap_int_win,
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(CAP_USABLE_INTERNAL),
                      esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
