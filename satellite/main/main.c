@@ -656,6 +656,28 @@ static void i2s_start(uint32_t rate)
      * mechanism; both units must carry it, because this also sets the output
      * pipeline latency the servo absorbs at startup. */
     chan_cfg.dma_frame_num = AUDIO_FRAMES;
+    /*
+     * A starved channel must go SILENT, not repeat itself.
+     *
+     * The TX descriptors are a circular list, so a channel left enabled with
+     * nobody writing replays its last dma_desc_num x AUDIO_FRAMES -- 34.8 ms --
+     * forever, at 28.7 Hz. That is what the room heard when Bluetooth dropped
+     * mid-track: play_task takes the underrun branch, parks, and stops writing,
+     * but nothing disables the channel, so the DMA carries on with whatever it
+     * was holding until the phone comes back.
+     *
+     * This makes the driver zero each buffer at its own EOF -- after it has
+     * played, before the writer is handed it back -- so a stall drains to
+     * digital zero within one traversal and stays there. It cannot race the
+     * writer: the clear happens before the pointer reaches the queue
+     * i2s_channel_write() pops from.
+     *
+     * No sync cost, and it must be on BOTH units. The number of buffers in
+     * flight is unchanged, so the pipeline latency the servo absorbs at startup
+     * is unchanged, and so is the REFILL figure that measures it. What would be
+     * unequal, if only one unit carried it, is what the floor sounds like.
+     */
+    chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
 
     i2s_std_config_t std_cfg = {
@@ -672,7 +694,7 @@ static void i2s_start(uint32_t rate)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
     ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms, "
-                  "channels=%s",
+                  "channels=%s, silence on starve",
              chan_cfg.dma_desc_num, chan_cfg.dma_frame_num,
              (int)(chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 1000 / rate),
              AUDIO_CHANNEL_MODE_NAME);

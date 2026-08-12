@@ -196,6 +196,19 @@ I2S peripheral fetches samples straight from memory without waking the CPU. The
 CPU refills a buffer every few milliseconds; the hardware does the rest. Without
 it, every interrupt anywhere in the system becomes an audible click.
 
+The descriptors are a **circular list**, and that has a consequence worth knowing
+before you meet it: a channel left enabled with nobody writing does not fall
+silent — it replays the buffers it already holds, forever. At 6 descriptors of
+`AUDIO_FRAMES` that is the last 34.8 ms looping at 28.7 Hz, which is far louder
+and more unpleasant than the music it came from. Both playback tasks park without
+disabling the channel when their ring starves, so every stall used to end in that
+buzz: pull the Bluetooth link mid-track and the floor howled until the phone came
+back. The fix is one flag, `auto_clear` on the channel config, which has the
+driver zero each buffer at its own EOF — after it has played, before the writer
+is handed it back, so it cannot race the writer. A stall now drains to digital
+zero within one traversal and stays there. Both units set it; the boot line says
+`silence on starve` when they do.
+
 The ESP32 has built-in DACs, but they are **8-bit** — 48 dB of dynamic range
 against 96 dB for 16-bit. Audibly bad: quiet passages sit in obvious hiss. They
 are useful for bring-up when you have no hardware, and the satellite has a build
@@ -1134,7 +1147,9 @@ throws away audio the playback task counted as played and fed to the LEDs. The
 LED half is handled (`visualiser_realign()`); the audio half cannot be seen from
 inside the firmware at all, because every reading derived from `samples_played`
 agrees those frames were played. Only the marker GPIO can measure it, and nobody
-has.
+has. Since `auto_clear` (§5), whichever of those buffers had already played comes
+back as silence rather than a repeat — the same frames are still lost, so the
+figure is unchanged, but the artifact is quieter.
 
 **The LED drift check bounds the error, it does not remove it.** `ALIGN_DRIFT_US`
 is 2 ms, so holes smaller than that accumulate until they add up to something
