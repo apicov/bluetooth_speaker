@@ -11,10 +11,10 @@ human reviewer follow it, is it modular, and what will extending it cost.
 > Each finding now carries a **DONE** / **PARTLY DONE** / **DELIBERATELY NOT
 > DONE** note. §7 is the record of what changed.
 >
-> **Both targets build and link**, classic ESP32 and ESP32-S3, from this one
-> source tree. The split was also verified statement-by-statement against the
-> original. Nothing has been **run on hardware** — a build is not a floor — so
-> §7.3 says what to watch on the first flash.
+> **Both targets build and link**, and the classic build has now been **run on
+> hardware** — hub plus one satellite, 16:39 on 2026-08-12, about two and a half
+> minutes. §7.5 records what that run showed, including the one thing it
+> contradicted. No S3 board has been flashed.
 
 > **The verdict up front.** The substance of this firmware is unusually strong
 > and its structure is not. Almost every non-obvious constant carries the run
@@ -233,8 +233,9 @@ concrete thing F1's one-source arrangement needs.
 > already assumed. The other three stay, each with what the logs now say written
 > into its comment: the retune tail reaches **further** than the one withheld
 > reading covers (78 crossings, 17–74 ms after, median 43), the splice median
-> shadow agreed with the raw value 3 times out of 3, and `wide-span` has read 0
-> on every HEALTH line so far.
+> shadow agreed with the raw value 3 times out of 3, and `wide-span` had read 0
+> on every HEALTH line — which the 16:39 run then contradicted outright, see
+> §7.5.
 
 
 **Evidence.** Each is individually well justified and collectively unowned:
@@ -468,3 +469,78 @@ show, in the order it would show:
 - No S3 satellite has been **run**. The target builds and the image fits; the
   board has not been on a bench, and the S3 pin choices are inherited from
   `hub_s3` rather than confirmed against a wired satellite.
+
+---
+
+## 7.5 The first hardware run, 2026-08-12 16:39
+
+Hub plus one satellite (192.168.4.3), classic ESP32, about two and a half
+minutes. Both concerns §7.3 raised are answered, and one claim written into a
+comment the day before turned out to be wrong.
+
+### Confirmed working
+
+**The TSF sequence lock is not demoting.** This was the change with real
+behaviour behind it and the failure would have been silent. `clock TSF (tsf
+1/probe 0)` at 5 s and again at 65 s — one anchor, taken on TSF, no fallback to
+the estimator at any point. Both stream starts read `[TSF]`, and both reported
+`playback started: scheduled X, actual X (+0 us)`.
+
+**The servo's state survives between windows.** The other silent failure: with
+`err_ema`, `err_ema_valid` and `cooldown` moved from `drift_task` locals to file
+scope in `servo.c`, a mistake would have made every window behave like the
+first. It does not — the smoothed value evolves continuously across windows
+(−32254 → −29651 → −24645 → −19992 → −15324 → −12100 µs) and retunes are spaced
+~40 s apart, which is the cooldown holding. A servo that had lost its state
+would have retuned every window and never smoothed.
+
+Also clean: `alloc-fail 0`, `phase-drop 0`, `short-reads 0`, `leds remote hop
+512 (rx 5506, bad 0)`, `ml remote (rx 5508, bad 0)` — so the split did not
+disturb the frame path either.
+
+### Contradicted: `wide-span` is not zero
+
+The comment on `n_tsf_wide` said every HEALTH line so far reported `wide-span
+0`, and concluded that enforcing `TSF_SPAN_MAX_US` at 100 µs would be free. This
+run read **1 at five seconds and 21 by 65 s**, against roughly 240 samples a
+minute — about 9% — with `span max` reaching 210 and 214 µs in ordinary windows.
+
+Acting on the old reading would have demoted TSF to the probe estimator for one
+sample in eleven, silently. That is precisely the failure the counter exists to
+prevent, so the instrument worked; the conclusion drawn from it was premature.
+What changed between runs is not established. Worth ruling out before choosing
+any threshold, because it decides whether 100 µs is too tight or the wide spans
+are themselves the symptom.
+
+### Sharpened: the withheld retune reading is sometimes the wrong one
+
+Two of the three satellite retunes logged `crossed -3414 us` and `crossed -392
+us` after the retune — **negative**, meaning the crossing being withheld from
+the servo happened *before* the retune completed. In those cases the one reading
+held back is a pre-retune reading and the actual post-retune transient goes
+straight to the servo unfiltered.
+
+This strengthens what F6 already said from the log corpus. Not only does the
+tail reach further than one reading covers; sometimes that one reading is not
+even measuring the retune.
+
+### Not ours
+
+Two things in the run are worth chasing but belong to the hub, not this work:
+
+- **`tx-fail` climbing on the hub** — 4, then 17, then 67. The satellite's
+  underrun at 16:41:48 follows it directly: `gaps 1 (182 ms silence)`, `too big
+  to fill 1`, so `GAP_RESYNC_MS` refused to paper over a 182 ms hole and asked
+  for a clean re-anchor, which it got, at `+0 us`. That is the gap policy
+  behaving exactly as designed on a link that dropped a burst.
+- **The hub's internal memory** — `MEM: internal 7824 free (min 5944, largest
+  3584)`. The satellite has 85 kB free; the hub has under 8 kB with a largest
+  block of 3.5 kB, and a task stack cannot be cut from that.
+
+### Watch next
+
+`stack free` on `drift_task` fell from 2632 to 1128 bytes between the 5 s and
+65 s lines. The task is unchanged in what it does, but it now reaches the same
+work through two calls instead of inline, which costs a frame. 1128 bytes of
+3072 is not a problem; it is worth a glance on a longer run before assuming it
+has levelled off.

@@ -481,10 +481,20 @@ extern volatile uint32_t n_short_frames;
  * -- that is a regression wearing no log line. This says what the reject rate
  * WOULD be, so the threshold can be chosen from the distribution instead.
  *
- * Every HEALTH line collected so far reports `wide-span 0`, so at 100 us the
- * threshold would reject nothing and enforcing it would be free. That is one
- * unit over one session and not yet a distribution -- but it is the direction
- * that would let this become a real filter rather than a counter.
+ * ENFORCING IT AT 100 us WOULD NOT BE FREE, which is the opposite of what the
+ * earlier logs suggested. Those all read `wide-span 0`; the run of 2026-08-12
+ * 16:39 read 1 in the first five seconds and 21 by 65 s, against roughly 240
+ * samples a minute -- call it 9% -- with the reported `span max` reaching 210
+ * and 214 us in ordinary windows.
+ *
+ * So the counter did its job: a threshold picked from the old logs would have
+ * looked free and then quietly demoted TSF to the probe estimator for one
+ * sample in eleven, which is exactly the regression-wearing-no-log-line this
+ * was written to prevent. What changed between the runs is not known -- more
+ * traffic, a different board, the split moving where the read pair sits
+ * relative to other work in rx_task -- and that is worth establishing before
+ * any threshold is chosen, because it decides whether 100 us is too tight or
+ * the spans are a symptom.
  */
 #define TSF_SPAN_MAX_US 100
 extern volatile uint32_t n_tsf_wide;
