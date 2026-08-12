@@ -11,6 +11,34 @@ listens on WiFi. Any ESP32 variant would work for this role, but the project
 standardises on the classic ESP32 so every unit is interchangeable with the
 master, which does need Bluetooth Classic.
 
+> [`../docs/satellite-audit.md`](../docs/satellite-audit.md) reads this firmware
+> for clarity, modularity and what a second target costs. Its findings were
+> acted on over 2026-08-12: the firmware is nine files rather than one, the
+> internal-DAC path is gone, and the S3 is a target rather than a fork. §2 of
+> the audit records what was done and what was deliberately left.
+
+## How the source is laid out
+
+One 2437-line `main.c` until 2026-08-12. The split changed no behaviour — every
+function body moved verbatim.
+
+| file | what it owns |
+|---|---|
+| `main.c` | `app_main`, task creation, and the 5 s loop the two slow ticks share |
+| `sat.h` | shared state, **and which task is allowed to write each field** |
+| `sat_state.c` | the definitions for it, nothing else |
+| `net.c` | joining the SoftAP, the reconnect handler, the UDP socket |
+| `clock.c` | the probe task, TSF-or-estimator, the offset slew |
+| `rx.c` | datagram demux, then one function per policy: anchor, gap, decode |
+| `play.c` | the playback timeline: the scheduled start, phase, splice, marker |
+| `out.c` | the I2S channel, the write path, retuning the output clock |
+| `servo.c` | one 5 s window of rate control |
+| `telemetry.c` | the heap windows, the allocation report, HEALTH and MEM |
+
+`sat.h` is the one to read first. It is where the ownership rules live, and
+where the analysis of which shared values can be torn by a concurrent read now
+sits — including the three it says are **not** fixed, and why.
+
 Run as many of these as you like. Registration is implicit: the hub sends audio
 to whatever has sent it a time probe in the last **2 seconds**, so a unit that is
 keeping its clock synchronised is by definition alive and listening. In practice
@@ -25,9 +53,32 @@ until it gives up.
 
 ```sh
 . ~/.espressif/v6.0.1/esp-idf/export.sh
-idf.py set-target esp32
+idf.py set-target esp32          # or: idf.py set-target esp32s3
 idf.py -p /dev/ttyUSB2 flash monitor
 ```
+
+**One source, two targets.** `set-target` is the whole difference between a
+classic-ESP32 satellite and a Seeed XIAO ESP32-S3 one. Pins, PSRAM, flash size
+and the console route come from `sdkconfig.defaults.esp32s3`, which IDF reads
+after `sdkconfig.defaults` when the target is the S3; the pin *defaults* are
+also keyed on `IDF_TARGET_ESP32S3` in `main/Kconfig.projbuild`, so a bare
+`set-target` build is already correct. There is deliberately no `satellite_s3/`
+directory — see [`../docs/satellite-audit.md`](../docs/satellite-audit.md) §F1
+for what the equivalent fork cost on the hub.
+
+Changing target rewrites `sdkconfig` from the defaults, so re-check anything you
+had set by hand in `menuconfig`.
+
+Between edits, without a full build:
+
+```sh
+../tools/syntax_check.py satellite
+```
+
+It reuses the compile flags from the last real build and runs the compiler
+`-fsyntax-only`, so it catches unbalanced `#if` nesting, missing symbols and bad
+format strings in a second. It only sees the branches the last build's
+`sdkconfig` selected; `--with` / `--without` force the others.
 
 Pins, LED count, brightness, pattern and the bench instruments are under
 `idf.py menuconfig` -> **Dancefloor satellite** and **Dancefloor LEDs**.

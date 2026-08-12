@@ -3,6 +3,16 @@ build/
 sdkconfig
 sdkconfig.old
 
+# A second target built side by side, which is how satellite/ is checked for
+# both the classic ESP32 and the S3 without one clobbering the other's config:
+#
+#   idf.py -B build.s3 -DIDF_TARGET=esp32s3 -DSDKCONFIG=sdkconfig.s3 build
+#
+# sdkconfig.defaults and sdkconfig.defaults.<target> are the tracked inputs and
+# are deliberately NOT matched here -- only the generated per-target output is.
+build.*/
+sdkconfig.s3
+
 # Fetched by the component manager from idf_component.yml
 managed_components/
 dependencies.lock

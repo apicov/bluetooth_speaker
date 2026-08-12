@@ -1,12 +1,13 @@
 /*
  * Bridge -> hub link, carrying undecoded SBC.
  *
- * Two links are described in this file and only one of them is live.
+ * SPI, from bt_bridge (master) to hub_s3 (slave). One link, and the only one.
  *
- *   SPI  -- bt_bridge (master) to hub_s3 (slave). What the wire is now.
- *   UART -- superseded. Still spoken by hub/, the classic hub, which has not
- *           been ported and can no longer receive anything from the bridge.
- *           See docs/hub-s3-gap-list.md S7 for what it owes.
+ * A UART link came first and was described here beside it, kept alive because
+ * the classic `hub/` still spoke it. That project was retired on 2026-08-12 and
+ * the UART declarations went with it. The comparisons below still argue against
+ * the UART because that is where the SPI design's reasons come from -- read them
+ * as history, not as a second option.
  *
  * Both ends share this header and must agree; change it here only.
  *
@@ -129,51 +130,7 @@ typedef struct __attribute__((packed)) {
 uint16_t sbc_link_crc16(const void *hdr, const void *payload, uint16_t len);
 
 /* ------------------------------------------------------------------------- */
-/* The UART link -- superseded, kept because hub/ still speaks it             */
-/* ------------------------------------------------------------------------- */
-
-/*
- * 500 kbaud 8N1 = 50 kB/s against ~42 kB/s of measured payload (50 packets/s of
- * ~830 bytes) -- 84% utilisation, which is tighter than anyone would choose.
- *
- * It was chosen because these leads would not carry more. Measured per 5 s:
- *
- *     1000 k : ~50% of packets corrupt
- *      750 k : ~20-30 bad sync, 15-20 CRC errors
- *      500 k : 2-3 bad sync, 0-1 CRC errors
- *
- * That ceiling is a property of the wiring, not the protocol, and it is the
- * whole reason the link moved to SPI: there was no headroom left to advertise
- * a bitpool above 53 into.
- */
-#define SBC_LINK_BAUD      500000
-
-/* Two sync bytes chosen to be unlikely in SBC payload and asymmetric, so a
- * resync cannot lock onto a reversed pair. */
-#define SBC_LINK_SYNC0     0xA5
-#define SBC_LINK_SYNC1     0x5A
-
-typedef struct __attribute__((packed)) {
-    uint8_t  sync0;
-    uint8_t  sync1;
-    uint8_t  kind;        /* link_kind_t */
-    uint8_t  pad;
-    uint16_t len;         /* payload bytes following the header */
-    uint32_t seq;         /* detects loss without needing a timer */
-    uint8_t  checksum;    /* XOR of payload; cheap, and enough to spot corruption */
-} sbc_link_hdr_t;
-
-static inline uint8_t sbc_link_checksum(const uint8_t *p, uint16_t n)
-{
-    uint8_t c = 0;
-    for (uint16_t i = 0; i < n; i++) {
-        c ^= p[i];
-    }
-    return c;
-}
-
-/* ------------------------------------------------------------------------- */
-/* Carried by both                                                           */
+/* Carried by the link                                                       */
 /* ------------------------------------------------------------------------- */
 
 /*

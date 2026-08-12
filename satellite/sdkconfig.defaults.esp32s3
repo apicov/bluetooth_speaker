@@ -1,0 +1,65 @@
+# Satellite on an ESP32-S3 (Seeed XIAO ESP32-S3).
+#
+# ESP-IDF reads this IN ADDITION to sdkconfig.defaults when the target is
+# esp32s3, and after it, so anything here wins. Everything portable -- the tick
+# rate, the UDP mailbox depth, the LED hop and pattern, the remote frame source,
+# 240 MHz, QIO flash -- stays in sdkconfig.defaults and applies to both targets.
+# Only what is genuinely S3-specific belongs in this file.
+#
+# THIS IS A TARGET, NOT A FORK. The satellite is one source tree built two ways:
+#
+#     idf.py set-target esp32     && idf.py build     # classic, this floor
+#     idf.py set-target esp32s3   && idf.py build     # XIAO S3
+#
+# The project deliberately does not have a satellite_s3/ directory. hub_s3/ was
+# made that way -- a copy of hub/ -- and the two shared ~1983 of ~2024 lines,
+# drifted apart in both directions, and needed a 481-line document
+# (docs/hub-s3-gap-list.md) to track what each owed the other. The classic hub
+# was eventually retired rather than reconciled. See docs/satellite-audit.md F1;
+# this file is the alternative that finding argues for.
+
+# The XIAO ESP32-S3's D8/D9/D10. These match hub_s3, so a satellite and a hub on
+# that board are wired identically.
+#
+# Pin DEFAULTS for the S3 already live in main/Kconfig.projbuild, keyed on
+# IDF_TARGET_ESP32S3, so a set-target build is correct with this file absent.
+# They are repeated here for the same reason the pattern and the hop are pinned
+# in sdkconfig.defaults: sdkconfig is gitignored, and a value that exists only
+# as a Kconfig default is one menuconfig away from being silently different on
+# one board. Keep the two in step.
+CONFIG_DANCEFLOOR_I2S_BCK_PIN=7
+CONFIG_DANCEFLOOR_I2S_LRCK_PIN=8
+CONFIG_DANCEFLOOR_I2S_DATA_PIN=9
+
+# WS2812 data. GPIO 1 is the XIAO's D0; the classic default of 18 is not a pin
+# this board brings out.
+CONFIG_DANCEFLOOR_LED_GPIO=1
+
+# The LED sync marker. The classic default is GPIO 2, which on the XIAO S3 is
+# D1 and not the onboard LED -- that is GPIO 21, and it is active-low, which the
+# shared default already is. Set explicitly because a marker that flashes an
+# unconnected pin looks exactly like a marker that is not firing.
+CONFIG_DANCEFLOOR_LED_MARKER_GPIO=21
+
+# 8 MB octal PSRAM, as on the XIAO S3.
+#
+# Nothing in the satellite asks for it today: the audio ring is
+# DANCEFLOOR_RING_KB of internal SRAM by choice, since a StreamBuffer the DMA
+# path feeds from wants internal memory, and the analysis is remote on this
+# floor. It is enabled because leaving it off is not neutral -- the heap figures
+# on the HEALTH line would then describe a board configured smaller than it is,
+# and the internal-vs-total split that MEM prints is only informative when both
+# pools exist. See CAP_USABLE_INTERNAL in sat.h for why that distinction has
+# already cost an evening once.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+
+# 8 MB flash on the XIAO S3, against the classic boards' 4.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# The S3 reaches the console over the built-in USB Serial/JTAG, not a UART
+# bridge -- there is no CP2102 on this board. Without this the boot log goes to
+# pins nobody has wired and the unit looks dead on the bench.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

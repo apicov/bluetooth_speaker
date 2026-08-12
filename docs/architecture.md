@@ -209,11 +209,12 @@ is handed it back, so it cannot race the writer. A stall now drains to digital
 zero within one traversal and stays there. Both units set it; the boot line says
 `silence on starve` when they do.
 
-The ESP32 has built-in DACs, but they are **8-bit** — 48 dB of dynamic range
-against 96 dB for 16-bit. Audibly bad: quiet passages sit in obvious hiss. They
-are useful for bring-up when you have no hardware, and the satellite has a build
-option for exactly that, but the real output is an external **PCM5102A** I2S
-DAC.
+The classic ESP32 has built-in DACs, but they are **8-bit** — 48 dB of dynamic
+range against 96 dB for 16-bit. Audibly bad: quiet passages sit in obvious hiss.
+The satellite carried a build option to use them for bring-up with no hardware
+wired; it was removed on 2026-08-12, having outlived its purpose and being
+classic-only in a project acquiring an S3 satellite. The output is an external
+**PCM5102A** I2S DAC.
 
 ### 6. Serial links, and the difference between two kinds of clock
 
@@ -275,7 +276,7 @@ client that lives elsewhere:
 | Project | Role |
 |---|---|
 | `bt_bridge/` | Chip A. Bluetooth only. Receives A2DP, forwards raw SBC over SPI |
-| `hub/` | Chip B. WiFi SoftAP, clock master, decoder, DAC, LEDs, streamer |
+| `hub_s3/` | Chip B, an ESP32-S3. WiFi SoftAP, clock master, decoder, DAC, LEDs, streamer. The classic-ESP32 `hub/` was retired 2026-08-12 |
 | `satellite/` | Every additional speaker. Receives, decodes, plays, lights |
 | `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources |
 | `tools/tuning/` | The detector's sweep harness, behind [`tuning-corpus.md`](tuning-corpus.md) |
@@ -320,7 +321,7 @@ moved it rather than removing it.
 
 What the split did buy is real — memory, no radio contention, and a decode that
 is not competing with Bluedroid — but the timeline still oscillates by ±130 ms
-with the burst pattern, and `hub/main/streamer.c` had to be taught to slew rather
+with the burst pattern, and the hub's streamer had to be taught to slew rather
 than jump because of it. See clock-sync.md §9.
 
 Cost: about $5 and one wire, on the master only.
@@ -903,7 +904,7 @@ paid for.
 | `PROBE_PERIOD_MS` | 250 | Min-RTT *holds* its best sample, so a 10-probe window at 1 s meant up to 10 s of staleness — visible as a dead-straight −22 µs-per-announcement ramp. Same ten samples over 2.5 s instead |
 | `RING_TARGET_MS` | 200 | Matches the hub's lead |
 | `MAX_SPLICE_MS` | 150 | Ceiling on a track-boundary correction; anything larger is a bug, not drift |
-| `DANCEFLOOR_USE_INTERNAL_DAC` | `n` | Build option for testing with no DAC wired. 8-bit, audibly poor |
+| ~~`DANCEFLOOR_USE_INTERNAL_DAC`~~ | — | Was a build option for testing with no DAC wired: 8-bit, audibly poor. Removed 2026-08-12; see §5 |
 | `DANCEFLOOR_LED_SOURCE` | `LOCAL` | Analyse the audio this unit holds, rather than draw frames the hub sends. See §12 |
 
 ### 14. Pins and wiring
@@ -924,9 +925,9 @@ GPIO 25 and GPIO 44 were the UART's TX and RX, so two leads were already run.
 GPIO 5 was the sync monitor input, and taking it ends the marker/monitor
 instrument on this board — it needs GPIO 4 and GPIO 5 both.
 
-`hub/`, the classic ESP32 hub, still expects the old UART on GPIO 23 and can no
-longer receive anything from the bridge. See
-[`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
+`hub/`, the classic ESP32 hub, expected the old UART on GPIO 23 and could no
+longer receive anything from the bridge. It was retired on 2026-08-12 rather
+than ported. See [`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
 
 **Two status LEDs on the bridge**, both optional and neither feeding back into
 anything — GPIO 32 solid while A2DP is connected, GPIO 33 blinking while audio
@@ -1100,7 +1101,23 @@ line: if `internal` is the larger of the two, the mask is wrong again.
 
 `ALLOCATION FAILED` reports both pools for the same reason, and spells out the
 capability bits: `caps 0x1800 INTERNAL` rather than the bare hex it used to
-print, which had to be decoded by hand while a floor was down.
+print, which had to be decoded by hand while a floor was down. Read its `min`
+first — the live figures beside it are sampled by the monitor task up to 5 s
+later, so on a transient they describe a condition that has already passed. The
+first capture printed `internal 21912 free, largest 11776` next to a failed
+1700-byte request, which disproves the failure it accompanies; `min 1520` is what
+explained it. The hook cannot sample the live figures itself: the heap-statistics
+functions live in flash, and the hook is `IRAM_ATTR` because an allocation can
+fail from an ISR with the flash cache disabled.
+
+**The internal budget is smaller than the datasheet headline.** The S3 has 512 kB
+of SRAM but only ~268 kB is ever a registered heap — ~102 kB is DRAM shadowed by
+IRAM code (`.dram0.dummy`), ~96 kB is static `.data`/`.bss`, ~33 kB is
+ROM-reserved. Of that, ~246 kB is live in a running hub: ~53 kB of task stacks
+and ~122 kB of this app's own buffers, the largest being `local_ring` at 64 kB
+and the visualiser's analysis stream at 33 kB. What remains has to absorb WiFi's
+transient buffer demand, which is why `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is
+on — see `hub_s3/sdkconfig.defaults` for the measurement that turned it on.
 
 `sta-left N (dropped M, no-lease K) | sta-timeout T` is how a satellite left.
 `dropped` is a clean disassociation, resolved to an IP through the DHCP lease
@@ -1257,8 +1274,8 @@ budget.
 | `bt_bridge/main/sbc_spi.c` | Frames SBC onto the SPI link as master, `seq` assigned at enqueue |
 | `bt_bridge/main/avrcp_meta.c` | Track metadata and change notifications |
 | `bt_bridge/main/status_led.c` | The two front-panel LEDs — connected solid, streaming blinking |
-| `hub/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
-| `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed. `hub/`'s copy is still the UART receiver and no longer has anything to listen to |
+| `hub_s3/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
+| `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed |
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
 | `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
 | `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |

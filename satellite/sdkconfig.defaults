@@ -2,6 +2,52 @@
 # tick makes vTaskDelay granularity 10 ms.
 CONFIG_FREERTOS_HZ=1000
 
+# 240 MHz, not the 160 MHz IDF default.
+#
+# Carried over from the S3 hub, where it was half of a change that cut analysis
+# cost in half -- see docs/hub-s3-gap-list.md S1.1. Both parts support 240; 160
+# is simply the default nobody changed, and this unit had never changed it
+# either. It was listed there as "portable, the classic hub could have this
+# today" and the classic hub is gone, so the satellite is now the only classic
+# ESP32 left in the project and the only place that item can still be claimed.
+#
+# Costs power and heat, and shifts timing across every task. On a unit that
+# analyses locally the win is the analysis; on one taking remote frames (as this
+# floor's satellites do) it is headroom in rx_task, which is the task that must
+# drain the UDP mailbox and decode SBC without falling behind.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Flash in QIO at 80 MHz, up from DIO at 40 MHz -- 4x the bandwidth on both axes
+# combined. docs/hub-s3-gap-list.md S1.2 has the reasoning: the application is
+# mapped from flash and pulled through the instruction cache a line at a time,
+# so this sets what every cache miss costs.
+#
+# THREE TRAPS, all of which have caught someone already:
+#
+#   1. `idf.py flash` prints `--flash-mode dio` even with QIO selected. That is
+#      correct -- IDF stamps the image header DIO so the ROM can read it, and the
+#      second-stage bootloader raises the flash to quad during init. Do not
+#      "fix" it.
+#   2. It must be a full `idf.py flash`, never `app-flash`. The bootloader
+#      performs the upgrade, so a stale bootloader leaves the app in DIO.
+#   3. Whether a board tolerates this depends on its flash part and wiring. QIO
+#      repurposes the WP and HOLD pins (IO2, IO3) as data lines.
+#
+# If a board will not boot: hold BOOT, tap RESET for ROM download mode, set
+# CONFIG_ESPTOOLPY_FLASHMODE_DIO back, reflash. The ROM downloader is in silicon
+# and cannot be lost, so this is recoverable on every board.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# HT20 is NOT set here, and that is deliberate.
+#
+# gap-list S1.3 records forcing HT20 as the single biggest radio win of the S3
+# session -- tx-fail from 1016 to roughly 400 -- but that call is
+# esp_wifi_set_bandwidth(WIFI_IF_AP, ...) on the HUB, and hub_s3 already makes
+# it (streamer.c). A station follows the BSS it joins, so every satellite is
+# already on HT20 and there is nothing here to claim. Setting it station-side
+# would be a no-op that reads like a second, independent fix.
+
 # The socket's receive queue, in datagrams. The IDF default is 6, and the boot
 # banner prints it as `udp mbox: 6`.
 #

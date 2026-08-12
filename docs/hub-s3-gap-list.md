@@ -13,6 +13,21 @@ The list below is the porting backlog. It is deliberately split by whether the
 classic hub *can* have the thing, because two of the biggest wins are
 chip-specific and three are just settings nobody has copied across yet.
 
+> **The classic `hub/` was retired on 2026-08-12 and deleted from the tree.**
+> `hub_s3/` is the only hub. That resolves this document's backlog by removing
+> the thing it was a backlog *for*, so read it accordingly:
+>
+> - **§6 and §7 are closed, not done.** They described work the classic hub owed
+>   — the sync features it never received, and the SPI link it never learned to
+>   speak. Nothing owes them now. §7.2's instruction to delete `sbc_link_hdr_t`
+>   "the moment the port lands" was carried out on retirement instead; the UART
+>   declarations are gone from `sbc_link.h`.
+> - **§1 is still live, and its audience changed.** Those four are portable wins
+>   that were never taken up on a classic ESP32 — and the *satellite* is still a
+>   classic ESP32. 240 MHz, QIO flash at 80 MHz, HT20 and the `RESYNC_US` value
+>   are unclaimed there. See [`satellite-audit.md`](satellite-audit.md) §4.
+> - **§2–§5 are unaffected**: they describe the S3 hub itself.
+
 ---
 
 ## 1. Portable — the classic hub could have these today
@@ -135,21 +150,38 @@ not.
 
 ### 2.4 Octal PSRAM, 8 MB
 
-**On, for exactly one allocation.** This section said "deliberately off, and
-should stay off" for most of the port's life, and the reasoning that made it say
-so is intact — what changed is that a buffer finally turned up which that
-reasoning does not refuse.
+**On, for two things by name: the tensor arena and the WiFi/lwIP buffers.** This
+section said "deliberately off, and should stay off" for most of the port's
+life, then "for exactly one allocation" once the arena arrived. The second is no
+longer true either — see the exemption below — but the reasoning that produced
+both is intact, and what it refuses is still refused.
 
 The buffer is the TFLM tensor arena: large, touched only by a low-priority task
 on the other core, and useless to shrink. `CONFIG_SPIRAM_USE_CAPS_ALLOC` is the
 line that makes turning PSRAM on safe rather than merely possible — ordinary
-`malloc()` never returns PSRAM, so the ring, the DMA buffers, the frame queue,
-the WiFi buffers and every stack stay in internal SRAM with the timing they were
-measured with. PSRAM is reachable only by asking for it by name, and in this tree
-`heap_caps_malloc(n, MALLOC_CAP_SPIRAM)` appears in one file, `ml_arena.c`. The
+`malloc()` never returns PSRAM, so the ring, the DMA buffers, the frame queue and
+every stack stay in internal SRAM with the timing they were
+measured with. PSRAM is reachable only by asking for it by name: in this tree
+that is `heap_caps_aligned_alloc(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` in
+`ml_arena.c`, plus `wifi_malloc()` once the symbol below is set. The
 alternative, `SPIRAM_USE_MALLOC`, would hand PSRAM to anything above a threshold
 — that is the "cache-miss jitter in every task" the old note warned about, and
 CAPS_ALLOC is how the warning is respected rather than overruled.
+
+**One exemption has since been added: WiFi and lwIP.** That sentence used to
+include "the WiFi buffers" in the list above, and it stopped being true when
+`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` went on. The reason is a measurement that
+could not be taken before the `MEM:` line existed: **the registered internal heap
+on this part is ~268 kB, not 512 kB** — ~102 kB is DRAM shadowed by IRAM code,
+~96 kB is static `.data`/`.bss`, ~33 kB is ROM-reserved — and ~246 kB of that is
+live, leaving ~22 kB for WiFi's 32 dynamic TX and 32 dynamic RX buffers to spike
+into. Their ceiling is ~105 kB. The internal watermark reached **1520 bytes**,
+and a 1700-byte dynamic TX buffer failed to allocate. `wifi_malloc()` now prefers
+PSRAM with internal fallback retained, so nothing that succeeded before can fail.
+
+The refusals below are unchanged by that, and the distinction is the point: WiFi
+is the pool that spikes *and* the one furthest from the playback loop. The ring
+is neither.
 
 Still refused, and the refusals are the durable part of this section:
 
@@ -167,6 +199,22 @@ Unmeasured, and worth measuring: enabling the PSRAM controller changes cache
 behaviour even when nothing allocates from it. Read the vis `cost:` line and the
 HEALTH heap figures against the recorded baseline — analysis 3900/21000 µs
 mean/max, hub min heap ~68 kB, 0 audio gaps/min over 18 min.
+
+**`hub min heap ~68 kB` in that baseline cannot be compared against this board,**
+and the trap is worth naming because it hid a real fault for as long as PSRAM has
+been on. That figure is a *classic-hub* number. The classic ESP32 has one pool, so
+`esp_get_free_heap_size()` was the internal figure; on this part the same call
+reports the 8 MB PSRAM pool, which nothing on the audio path can use. The field
+did not change meaning loudly — it changed pools silently, and every `HEALTH` line
+since has read ~8.4 MB free while internal SRAM went to 1.5 kB. The `MEM:` line
+exists to replace it, and the first real internal baseline on this part is:
+
+```
+MEM: internal 22056 free (min 5808, window 20676, largest 11776) | total 8407688
+MEM: internal 21912 free (min 1520, window 20512, largest 11776) | total 8407544
+```
+
+Compare `MEM:` against that, not `HEALTH`'s heap terms.
 
 ### 2.5 16 MB flash (vs 4 MB)
 
@@ -459,10 +507,10 @@ only the pins.
 | bus | **VSPI / `SPI3_HOST`**. `SPI2_HOST` is the LED strip on this hub too |
 | pins | four, and the classic part has them to spare, unlike the XIAO. SCK can keep GPIO 23, the pin the UART arrived on. Avoid 16/17 (PSRAM die on WROVER), 5 and 12 (strapping), and 34–39 (input only, so no handshake output there) |
 | handshake | an **output** on the hub, input on the bridge. Not optional — `spi_slave` loses any transfer clocked with nothing queued |
-| header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` keeps the old `sbc_link_hdr_t` purely so this firmware still compiles; it is dead the moment the port lands and should be deleted with it |
+| header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` kept the old `sbc_link_hdr_t` purely so the classic firmware still compiled; **it was deleted on retirement, 2026-08-12**, along with `SBC_LINK_BAUD`, the sync bytes and `sbc_link_checksum()` |
 | checksum | CRC-16 via `sbc_link_crc16()`, not the XOR byte |
 | framing | fixed 2060-byte transactions (12-byte header + 2048 payload, sized for the codec's bitpool 250), two DMA buffers queued alternately. **5 MHz**, not 10: the 2060-byte frame fails on breadboard jumpers at 10 MHz |
-| wifi hop | `AUDIO_MAX_PAYLOAD` rose to 2048 with the SPI ceiling (shared header, flows in automatically). `hub/main/streamer.c` still drops `len > AUDIO_MAX_PAYLOAD` **silently** — port the `wifi-over` counter from `hub_s3` so the ceiling has a tripwire there too |
+| wifi hop | `AUDIO_MAX_PAYLOAD` rose to 2048 with the SPI ceiling (shared header, flows in automatically). The classic hub dropped `len > AUDIO_MAX_PAYLOAD` **silently**; `hub_s3` has the `wifi-over` counter, so the surviving hub has the tripwire |
 | log line | `sync` becomes `hdr`, and the SPI line gains two columns the UART one never had: `short` (a transfer that did not arrive whole -- CS split it) and `dcrc` (an SBC frame whose own CRC failed despite the link CRC passing). Both come along when the file is copied; only `dcrc` is meaningful on a UART, and the classic hub does not report it yet |
 | decode split | `dcrc` vs `dec` is told apart by `sbc_decoder_last_result()` in the shared `components/sbc_decoder/`. The classic hub already links it; only its `sbc_in.c` call site would need it, and only when it adopts the `dcrc` column. `short` is SPI-only -- a UART has no `trans_len` |
 | Kconfig | `DANCEFLOOR_SBC_UART_RX_PIN` → the four `DANCEFLOOR_SBC_SPI_*_PIN` symbols, plus `DANCEFLOOR_SBC_LINK_SPI_HZ` (shared through `dancefloor_sync`; only the bridge's value is on the wire) |

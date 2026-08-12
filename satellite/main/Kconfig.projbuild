@@ -1,53 +1,61 @@
 menu "Dancefloor satellite"
 
+    # Pin defaults per target, so `idf.py set-target esp32s3` produces a
+    # buildable unit without anyone remembering an override. The S3 numbers are
+    # the XIAO ESP32-S3's D8/D9/D10 and match what hub_s3 already runs, so a
+    # satellite and a hub on that board are wired the same way. The classic
+    # numbers are this floor's existing boards and have not moved.
+    #
+    # GPIO 25/26/27 do not exist as usable pins on an S3: 26-32 are taken by the
+    # SPI flash and PSRAM on the modules used here, which is why this cannot be
+    # one number with a note.
+
     config DANCEFLOOR_I2S_LRCK_PIN
         int "I2S LRCK (WS) GPIO"
+        default 8 if IDF_TARGET_ESP32S3
         default 27
 
     config DANCEFLOOR_I2S_BCK_PIN
         int "I2S BCK GPIO"
+        default 7 if IDF_TARGET_ESP32S3
         default 26
 
     config DANCEFLOOR_I2S_DATA_PIN
         int "I2S DATA GPIO"
+        default 9 if IDF_TARGET_ESP32S3
         default 25
 
-    choice DANCEFLOOR_OUTPUT_CHANNELS
-        prompt "Which channels this unit plays"
-        default DANCEFLOOR_OUT_STEREO
+    config DANCEFLOOR_RING_KB
+        int "Playback ring buffer (kB)"
+        default 80
+        range 32 512
         help
-            Every unit receives the same stereo stream. This picks what this
-            unit's own speaker does with it, so a floor can be laid out as a
-            stereo pair -- one box left, one box right -- rather than every box
-            playing everything.
+            How much decoded audio this unit will hold between arrival and the
+            speaker. It must cover the hub's lead time plus headroom for
+            delivery jitter -- LEAD_US + RESYNC_US -- which is how far the hub's
+            timeline can legitimately be from real time when a chunk is stamped.
 
-            A selected channel is written to BOTH output slots, not left in one
-            with the other muted. Which slot an amp latches is a hardware strap
-            (the MAX98357A's SD pin, a PCM5102A's mono wiring), so muting the
-            other one is a coin flip between the intended channel and silence.
-            Duplicating is right whatever the amp does, and loses no loudness.
-            It applies to the internal-DAC build too, where the two channels
-            are GPIO 25 and 26.
+            80 kB is 464 ms at 44.1 kHz stereo, and the number is a classic-ESP32
+            constraint: that board has ~117 kB free with a largest block of
+            106 kB, so 80 fits and 107 (what a 500 ms lead would need) will not
+            allocate at all.
 
-            Build-time, per image. A left box and a right box are two builds:
-            check the OUTPUT line at boot to see which one a board is running.
+            THAT CEILING IS THE CLASSIC PART'S, NOT THE PROTOCOL'S. An S3
+            satellite has 512 kB of internal SRAM and can afford considerably
+            more, which is what would let the hub's lead grow -- the buffer a
+            lead has to fit in is on the receiving board, and until now every
+            receiving board was a classic ESP32.
 
-        config DANCEFLOOR_OUT_STEREO
-            bool "Stereo -- both channels, as received"
+            Left at 80 on both targets deliberately. Raising it on one unit and
+            not another changes only that unit's tolerance for a delivery
+            stall, not its sync, but it has not been measured and a floor whose
+            units differ is harder to reason about than one that does not.
 
-        config DANCEFLOOR_OUT_LEFT
-            bool "Left channel only"
-
-        config DANCEFLOOR_OUT_RIGHT
-            bool "Right channel only"
-
-        config DANCEFLOOR_OUT_MONO
-            bool "Mono -- (L+R)/2"
-            help
-                For a single speaker that should not lose whatever is panned
-                hard, which is what a one-box mix does if it takes one channel.
-
-    endchoice
+    # Which channels this unit plays lives in components/dancefloor_sync/Kconfig,
+    # under "Dancefloor audio output" -- audio_out.h is what reads it, and a
+    # shared header must not depend on each project remembering to declare the
+    # symbols it consumes. It was declared here and in hub_s3 separately, and the
+    # retired classic hub declared it nowhere and silently played stereo.
 
     config DANCEFLOOR_ENABLE_MARKER
         bool "Sync marker GPIO (bench instrument)"
@@ -80,18 +88,6 @@ menu "Dancefloor satellite"
             hub reports how far this unit's audio is from its own. That is the
             end-to-end sync error, measured on the audio rather than inferred
             from clock estimates.
-
-    config DANCEFLOOR_USE_INTERNAL_DAC
-        bool "Play through the ESP32's built-in 8-bit DACs (no hardware needed)"
-        default n
-        help
-            Outputs on GPIO 25 (left) and GPIO 26 (right) using the two DACs
-            built into the ESP32, instead of I2S to an external chip.
-
-            8-bit and noisy -- nothing like the PCM5102A -- but it needs no parts
-            beyond a resistor and a cheap speaker, and it answers the questions
-            that matter before a real DAC arrives: does audio come out, is it the
-            right speed, and is it in sync with the hub?
 
     config DANCEFLOOR_AP_OPEN
         bool "Hub SoftAP has no password (must match the hub)"

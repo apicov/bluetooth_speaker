@@ -317,8 +317,24 @@ menu "Dancefloor LEDs"
 
             WHERE it comes from is decided at runtime and reported: PSRAM if the
             board has it, internal SRAM otherwise. hub_s3 enables PSRAM with
-            CONFIG_SPIRAM_USE_CAPS_ALLOC, so the arena is the only thing in this
-            project that can reach it and nothing else moves.
+            CONFIG_SPIRAM_USE_CAPS_ALLOC, so ordinary malloc() never returns it
+            and the ring, the DMA buffers, the frame queue and every task stack
+            stay internal with the timing they were measured with.
+
+            The arena WAS the only thing that could reach PSRAM. It is not any
+            more: CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP now lets the WiFi and
+            lwIP buffers prefer it too, because internal SRAM on that board had
+            reached a 1520-byte watermark and a 1700-byte WiFi TX buffer was
+            failing to allocate. See docs/hub-s3-gap-list.md S2.4.
+
+            That is not a competition for space -- 8 MB against an arena capped
+            at 4096 kB and a WiFi ceiling near 105 kB -- but it does mean the
+            arena is no longer alone on the PSRAM bus or in the cache. TFLM
+            streams its arena, so it is the heavier user of both by far; WiFi
+            moves perhaps 135 kB/s. If inference and the radio ever appear to
+            interact, `vis: ml:`, `vis: cost:`, `sbc_in max gap` and the hub's
+            `tx-fail` are the four numbers that would show it, and enabling the
+            two one at a time is what makes the answer attributable.
 
             A classic-ESP32 satellite has no PSRAM at all and about 52 kB free
             while analysing, so an arena sized for the hub does not fail at the

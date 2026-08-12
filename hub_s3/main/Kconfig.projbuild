@@ -67,40 +67,10 @@ menu "Dancefloor hub"
         int "I2S DATA GPIO"
         default 25
 
-    choice DANCEFLOOR_OUTPUT_CHANNELS
-        prompt "Which channels this unit plays"
-        default DANCEFLOOR_OUT_STEREO
-        help
-            Every unit receives the same stereo stream. This picks what this
-            unit's own speaker does with it, so a floor can be laid out as a
-            stereo pair -- one box left, one box right -- rather than every box
-            playing everything.
-
-            A selected channel is written to BOTH I2S slots, not left in one
-            with the other muted. Which slot an amp latches is a hardware strap
-            (the MAX98357A's SD pin, a PCM5102A's mono wiring), so muting the
-            other one is a coin flip between the intended channel and silence.
-            Duplicating is right whatever the amp does, and loses no loudness.
-
-            Build-time, per image. A left box and a right box are two builds:
-            check the OUTPUT line at boot to see which one a board is running.
-
-        config DANCEFLOOR_OUT_STEREO
-            bool "Stereo -- both channels, as received"
-
-        config DANCEFLOOR_OUT_LEFT
-            bool "Left channel only"
-
-        config DANCEFLOOR_OUT_RIGHT
-            bool "Right channel only"
-
-        config DANCEFLOOR_OUT_MONO
-            bool "Mono -- (L+R)/2"
-            help
-                For a single speaker that should not lose whatever is panned
-                hard, which is what a one-box mix does if it takes one channel.
-
-    endchoice
+    # Which channels this unit plays lives in components/dancefloor_sync/Kconfig,
+    # under "Dancefloor audio output". See the note in satellite's copy: this was
+    # declared here and there independently, and audio_out.h -- the shared header
+    # that reads it -- had no way to insist either project did so.
 
     config DANCEFLOOR_WIFI_CHANNEL
         int "SoftAP channel (1-13)"

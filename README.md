@@ -25,8 +25,7 @@ phone --A2DP/SBC--> bt_bridge --SBC over SPI--> hub_s3 --SBC over WiFi--> satell
 | Directory | What it is |
 |---|---|
 | `bt_bridge/` | Chip A of the master. Bluetooth A2DP sink; forwards raw SBC. Nothing else. |
-| `hub/` | Chip B. SoftAP, the presentation timeline every unit obeys, its own speaker and strip. |
-| `hub_s3/` | The same hub firmware built for an ESP32-S3 — the hub on the bench now. The classic `hub/` it superseded still speaks the UART the bridge no longer sends; see [`docs/hub-s3-gap-list.md`](docs/hub-s3-gap-list.md) §7. |
+| `hub_s3/` | Chip B, on an ESP32-S3. SoftAP, the presentation timeline every unit obeys, its own speaker and strip. The only hub; the classic-ESP32 `hub/` it superseded was retired on 2026-08-12. |
 | `satellite/` | Joins the hub's SoftAP, plays the stream, drives a strip. Any number of these. |
 | `components/dancefloor_sync/` | Wire format and the clock estimator. No ESP-IDF dependencies, host-testable. |
 | `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver. Shared by hub and satellites. |
@@ -95,11 +94,10 @@ ceiling) is clean at 5 MHz and fails at 10 MHz on thin leads; the failure is the
 hub's `short` counter moving while the bridge stays clean, so drop the clock, do
 not chase the code.
 
-> The classic ESP32 `hub/` still listens on the UART this replaced, and the
-> bridge no longer sends it — a classic hub paired with the current bridge plays
-> silence, and no counter says why (`max gap` grows, everything else reads zero,
-> exactly like a phone that stopped). The S3 hub is the one on the bench;
-> [`docs/hub-s3-gap-list.md`](docs/hub-s3-gap-list.md) §7 has the port back.
+> The classic ESP32 `hub/` listened on the UART this replaced and was never
+> ported to SPI, so it had been unable to receive anything from the bridge for
+> some time. It was retired on 2026-08-12 rather than ported, and the UART
+> declarations in `sbc_link.h` went with it.
 
 Verifying the link is up, from the S3 hub's log:
 
@@ -206,12 +204,12 @@ which one a board is running. The selected channel goes into *both* I2S slots
 rather than the other being muted, because which slot an amp latches is a
 hardware strap and muting the wrong one gives silence.
 
-A satellite can run with **no DAC at all** for bring-up:
-`DANCEFLOOR_USE_INTERNAL_DAC` plays through the ESP32's built-in converters on
-GPIO 25 (left) and 26 (right). They are 8-bit — 48 dB of dynamic range against
-96 — so quiet passages sit in obvious hiss, and it is a way to test a board with
-nothing wired rather than a way to listen. It is also **classic-ESP32 only**:
-the S3 has no internal DAC hardware, so an S3 unit needs the PCM5102A.
+A satellite could once run with **no DAC at all** for bring-up, through the
+classic ESP32's built-in 8-bit converters on GPIO 25 and 26. That option was
+removed on 2026-08-12: it was a bring-up aid nobody had used since real DACs
+arrived, it was classic-ESP32 only (the S3 has no DAC hardware), and it cost
+seven preprocessor branches through the playback and servo paths that every
+future target would have had to carry. A unit needs a PCM5102A.
 
 > Nothing in this project has been heard through a real PCM5102A yet. M1–M3 were
 > marked complete on log output and on the desktop client's audio; the boards are
@@ -447,6 +445,8 @@ you looked.
 | [`docs/sbc-link.md`](docs/sbc-link.md) | The wire between the two master chips. |
 | [`docs/two-chip-master.md`](docs/two-chip-master.md) | Why the master is split, with memory numbers. |
 | [`docs/tuning-corpus.md`](docs/tuning-corpus.md) | What the beat detector was tuned against, and the commands to do it again. |
+| [`docs/satellite-audit.md`](docs/satellite-audit.md) | The satellite read for clarity, modularity and what a second target will cost. |
+| [`docs/hub-s3-gap-list.md`](docs/hub-s3-gap-list.md) | What the S3 hub has, what was portable, and what the retired classic hub never got. |
 
 Both long documents end with the pattern that recurred at every level of this
 project: **every real fault was invisible until something counted it.** Several
