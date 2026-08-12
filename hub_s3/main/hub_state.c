@@ -34,6 +34,8 @@ bool s_slew_told;
 int64_t s_slew_since;
 volatile bool retuning;
 volatile int64_t local_start;
+volatile uint32_t local_epoch;
+volatile bool s_playing;
 volatile uint32_t s_feed_dropped;
 volatile uint32_t s_tx_fail;
 volatile uint32_t n_underruns;

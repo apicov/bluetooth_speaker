@@ -16,13 +16,14 @@
  *                      _send_sbc / _send_meta / _request_restart, so it writes
  *                      s_samples_in, s_pending_pos, s_marker_sample,
  *                      s_restart_pending, s_restart_pos, the phase queue HEAD,
- *                      the s_vis_anchor pair, local_start, the slew trio and
+ *                      the s_vis_anchor pair, local_start + local_epoch, the
+ *                      slew trio and
  *                      n_restarts / n_phase_drop / n_wifi_oversize.
  *   local_play_task    writes what playback has reached: the phase queue TAIL,
  *                      s_phase_err_us, s_phase_valid, s_phase_stepped,
  *                      s_phase_hist, the s_hub_splice_* set, the refill trio,
  *                      s_marker_at, n_underruns, n_splices, n_short_*, hw_play.
- *                      It also zeroes local_start on an underrun -- see below.
+ *                      and s_playing. It no longer writes local_start.
  *   ring_monitor_task  writes the servo's own state, the retune_* set and the
  *                      windowed heap figures, and READS everything else in order
  *                      to report it. retune_dac() runs on this task.
@@ -40,15 +41,16 @@
  * microsecond clock that happens once per 71.6 minutes; for anything set to 0,
  * or crossing zero, every time.
  *
- *   local_start   THE SHARP ONE, and NOT fixed, because the honest fix is not a
- *                 lock. It has TWO writers -- streamer_send_sbc() assigns it at
- *                 a timeline start, local_play_task() zeroes it on an underrun
- *                 -- and a seqlock with two writers is silently broken. The
- *                 `== 0` park test is immune either way, since both halves of
- *                 zero are zero; the exposure is a torn NON-ZERO read producing
- *                 a wild wait instant, once, at a start. The satellite reached
- *                 the same conclusion about stream_start_local. Single
- *                 ownership is the fix when someone wants it.
+ *   local_start   FIXED, by single ownership rather than by a lock. It had TWO
+ *                 writers -- streamer_send_sbc() assigned the instant,
+ *                 local_play_task() zeroed it to park -- and a seqlock with two
+ *                 writers is silently broken, so the exposure was accepted for
+ *                 as long as that was true. The play task now parks on
+ *                 local_epoch and writes neither, leaving one writer and a
+ *                 32-bit handshake that cannot tear. See the declaration.
+ *
+ *                 The satellite's stream_start_local is the same shape and still
+ *                 has two writers; this is the worked example for fixing it.
  *
  *                 Worth knowing that this part is DUAL-CORE and "play" is pinned
  *                 to core 1 while the others float, so these tasks genuinely run
@@ -345,7 +347,41 @@ extern bool s_slew_told;   /* whether this episode has been announced */
 extern int64_t s_slew_since;   /* when it started, for the 5 s filter */
 
 extern volatile bool retuning;
-extern volatile int64_t local_start;   /* master-clock instant local playback begins */
+/*
+ * The instant local playback begins, and the handshake that publishes it.
+ *
+ * ONE WRITER: the timeline path, at a start. That is the fix H2 named and it is
+ * why the pair below can be read safely at all.
+ *
+ * It used to have two -- streamer_send_sbc() assigned the instant, and
+ * local_play_task() zeroed it on an underrun to make itself park. Two writers is
+ * what made a seqlock impossible, so the 64-bit tearing exposure was documented
+ * and accepted rather than fixed. The play task now parks on the EPOCH instead
+ * and writes neither, which removes the second writer and the exposure together.
+ *
+ * local_epoch is incremented AFTER local_start is written, and the play task
+ * reads it BEFORE reading local_start. A reader that sees a new epoch therefore
+ * sees the value that belongs to it: both are volatile, so the compiler may not
+ * reorder the two stores or the two loads, and this core orders stores in
+ * program order. 32-bit, so the epoch itself cannot tear -- the same rule
+ * s_marker_sample and s_samples_in are written down for.
+ *
+ * The epoch wrapping after 2^32 starts is harmless: the test is inequality
+ * against the last one seen, not ordering.
+ */
+extern volatile int64_t local_start;
+extern volatile uint32_t local_epoch;
+
+/*
+ * Whether the play task is actually playing.
+ *
+ * Written only by the play task. The servo used to ask `local_start == 0` and
+ * that stopped being the question the moment local_start gained a single owner:
+ * it now holds the last start instant for ever rather than being zeroed at an
+ * underrun, so it can no longer answer "is anything playing". This can, and it
+ * is owned by the task that knows.
+ */
+extern volatile bool s_playing;
 
 /* Bytes dropped because pcm_stream was full. Silent loss here looks exactly
  * like a starving ring, which is why it needs a counter. */

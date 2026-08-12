@@ -529,6 +529,10 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
      */
     if (started) {
         local_start = next_play_at;
+        /* Published AFTER the instant, and it is what the play task waits on.
+         * Writing the value first is the whole of the ordering guarantee -- see
+         * the declaration in hub.h. */
+        local_epoch++;
     }
 }
 

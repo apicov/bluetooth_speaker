@@ -32,6 +32,9 @@
 static int32_t s_samples_played;   /* position in the ring stream */
 static int64_t s_wrote_at;         /* when the DAC last accepted a chunk */
 static bool    s_was_retuning;     /* armed by the park, see s_refill_active */
+/* The timeline generation this task last started on. Compared against
+ * local_epoch to decide whether a new origin has been published. */
+static uint32_t s_play_epoch;
 
 typedef enum {
     CHUNK_OK,        /* a chunk is in the buffer, play it */
@@ -74,7 +77,10 @@ static chunk_result_t read_chunk(uint8_t *chunk, uint32_t *got_frames)
     if (got == 0) {
         n_underruns++;
         ESP_LOGW(TAG, "local underrun, restarting timeline");
-        local_start = 0;
+        /* Does NOT zero local_start any more: it has one owner now, and it is
+         * not this task. s_underrun_recover is how the timeline is told, which it
+         * always was; parking is handled by the epoch test in the outer loop,
+         * which will not fire again until a new origin is published. */
         s_underrun_recover = true;
         return CHUNK_UNDERRUN;
     }
@@ -523,22 +529,35 @@ void local_play_task(void *arg)
     static uint8_t chunk[AUDIO_CHUNK_BYTES];
 
     while (1) {
-        if (local_start == 0) {
+        /*
+         * Park until the timeline publishes a NEW origin.
+         *
+         * The test used to be `local_start == 0`, which worked because this task
+         * zeroed it itself on an underrun -- and that second writer is exactly
+         * what made local_start's 64-bit tearing unfixable. Waiting on the epoch
+         * instead leaves the timeline as the only writer of both, and reading the
+         * epoch BEFORE the instant is what makes the pair safe. See hub.h.
+         */
+        if (local_epoch == s_play_epoch) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        int64_t wait = local_start - esp_timer_get_time();
+        s_play_epoch = local_epoch;
+        const int64_t start_at = local_start;
+
+        int64_t wait = start_at - esp_timer_get_time();
         if (wait > 2000) {
             vTaskDelay(pdMS_TO_TICKS((wait - 2000) / 1000));
         }
-        while (esp_timer_get_time() < local_start) {
+        while (esp_timer_get_time() < start_at) {
             /* spin the last stretch */
         }
         /* On the hub local time IS master time, so this is directly comparable
          * with the satellite's figure. A difference here is a difference in the
          * audio each unit is playing, which no amount of clock accuracy fixes. */
         ESP_LOGI(TAG, "local playback started: scheduled %lld, actual %lld (%+lld us)",
-                 local_start, esp_timer_get_time(), esp_timer_get_time() - local_start);
+                 start_at, esp_timer_get_time(), esp_timer_get_time() - start_at);
+        s_playing = true;
         begin_playback();
 
         while (1) {
@@ -559,5 +578,8 @@ void local_play_task(void *arg)
             s_samples_played += (int32_t)got_frames;
             write_chunk(chunk);
         }
+        /* The inner loop only ends on an underrun, and the servo should stop
+         * treating this unit as playing the moment it does. */
+        s_playing = false;
     }
 }

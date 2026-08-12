@@ -31,7 +31,10 @@
 
 void servo_tick(void)
 {
-    if (local_start == 0 || rate_ema == 0) {
+    /* s_playing, not `local_start == 0`: local_start has a single owner now and
+     * keeps the last start instant rather than being zeroed at an underrun, so it
+     * can no longer answer this. See hub.h. */
+    if (!s_playing || rate_ema == 0) {
         return;
     }
 
