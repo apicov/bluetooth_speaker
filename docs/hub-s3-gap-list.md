@@ -143,13 +143,28 @@ reasoning does not refuse.
 The buffer is the TFLM tensor arena: large, touched only by a low-priority task
 on the other core, and useless to shrink. `CONFIG_SPIRAM_USE_CAPS_ALLOC` is the
 line that makes turning PSRAM on safe rather than merely possible — ordinary
-`malloc()` never returns PSRAM, so the ring, the DMA buffers, the frame queue,
-the WiFi buffers and every stack stay in internal SRAM with the timing they were
+`malloc()` never returns PSRAM, so the ring, the DMA buffers, the frame queue and
+every stack stay in internal SRAM with the timing they were
 measured with. PSRAM is reachable only by asking for it by name, and in this tree
 `heap_caps_malloc(n, MALLOC_CAP_SPIRAM)` appears in one file, `ml_arena.c`. The
 alternative, `SPIRAM_USE_MALLOC`, would hand PSRAM to anything above a threshold
 — that is the "cache-miss jitter in every task" the old note warned about, and
 CAPS_ALLOC is how the warning is respected rather than overruled.
+
+**One exemption has since been added: WiFi and lwIP.** That sentence used to
+include "the WiFi buffers" in the list above, and it stopped being true when
+`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` went on. The reason is a measurement that
+could not be taken before the `MEM:` line existed: **the registered internal heap
+on this part is ~268 kB, not 512 kB** — ~102 kB is DRAM shadowed by IRAM code,
+~96 kB is static `.data`/`.bss`, ~33 kB is ROM-reserved — and ~246 kB of that is
+live, leaving ~22 kB for WiFi's 32 dynamic TX and 32 dynamic RX buffers to spike
+into. Their ceiling is ~105 kB. The internal watermark reached **1520 bytes**,
+and a 1700-byte dynamic TX buffer failed to allocate. `wifi_malloc()` now prefers
+PSRAM with internal fallback retained, so nothing that succeeded before can fail.
+
+The refusals below are unchanged by that, and the distinction is the point: WiFi
+is the pool that spikes *and* the one furthest from the playback loop. The ring
+is neither.
 
 Still refused, and the refusals are the durable part of this section:
 
@@ -167,6 +182,22 @@ Unmeasured, and worth measuring: enabling the PSRAM controller changes cache
 behaviour even when nothing allocates from it. Read the vis `cost:` line and the
 HEALTH heap figures against the recorded baseline — analysis 3900/21000 µs
 mean/max, hub min heap ~68 kB, 0 audio gaps/min over 18 min.
+
+**`hub min heap ~68 kB` in that baseline cannot be compared against this board,**
+and the trap is worth naming because it hid a real fault for as long as PSRAM has
+been on. That figure is a *classic-hub* number. The classic ESP32 has one pool, so
+`esp_get_free_heap_size()` was the internal figure; on this part the same call
+reports the 8 MB PSRAM pool, which nothing on the audio path can use. The field
+did not change meaning loudly — it changed pools silently, and every `HEALTH` line
+since has read ~8.4 MB free while internal SRAM went to 1.5 kB. The `MEM:` line
+exists to replace it, and the first real internal baseline on this part is:
+
+```
+MEM: internal 22056 free (min 5808, window 20676, largest 11776) | total 8407688
+MEM: internal 21912 free (min 1520, window 20512, largest 11776) | total 8407544
+```
+
+Compare `MEM:` against that, not `HEALTH`'s heap terms.
 
 ### 2.5 16 MB flash (vs 4 MB)
 

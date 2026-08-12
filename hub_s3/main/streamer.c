@@ -2329,24 +2329,41 @@ static void ring_monitor_task(void *arg)
          * raw hex and nothing decoded them, so 0x1800 had to be looked up by
          * hand while a floor was down.
          *
-         * Near the wire limit: 188 bytes with every field saturated against a
-         * LOG_MSG_MAX of 192, ~149 with realistic values. Anything added here
-         * has to come out of the `total` pair, which is the half this line can
-         * afford to lose. */
+         * `min` is the load-bearing figure, and the reason the rest of the line
+         * cannot be trusted on its own. These numbers are sampled HERE, up to
+         * 5 s after the failure, by which time the condition has passed: the
+         * first capture printed "internal 21912 free, largest 11776" beside a
+         * failed 1700-byte request, which disproves the failure it accompanies.
+         * The watermark is the one thing the allocator maintains continuously,
+         * so it still holds the dip -- 1520 bytes, in that same capture.
+         *
+         * Do not try to snapshot the live figures inside the hook instead. The
+         * obstacle is not locking: heap_caps_alloc_failed() runs after the
+         * allocator has returned, holding nothing. It is that
+         * heap_caps_get_free_size, _get_info and _get_largest_free_block carry
+         * no HEAP_IRAM_ATTR and are absent from the heap component's linker.lf,
+         * so all three live in flash -- and the hook is IRAM_ATTR precisely
+         * because an allocation can fail from an ISR running with the flash
+         * cache disabled. Calling them there is a panic, not a stall.
+         *
+         * Near the wire limit: 185 bytes with every field saturated against a
+         * LOG_MSG_MAX of 192. `total` lost its largest-block figure to make
+         * room for `min`, which is the right trade -- that pair is context, and
+         * MEM carries it every 60 s anyway. */
         static uint32_t alloc_fail_told;
         if (n_alloc_fail != alloc_fail_told) {
             alloc_fail_told = n_alloc_fail;
             ESP_LOGE(TAG, "ALLOCATION FAILED %" PRIu32 " time(s): largest request %"
-                          PRIu32 " B (caps 0x%" PRIx32 "%s%s%s) | internal %u free, "
-                          "largest %u | total %" PRIu32 " free, largest %u",
+                          PRIu32 " B (caps 0x%" PRIx32 "%s%s%s) | internal %u free "
+                          "(min %u), largest %u | total %" PRIu32 " free",
                      n_alloc_fail, alloc_fail_size, alloc_fail_caps,
                      (alloc_fail_caps & MALLOC_CAP_INTERNAL) ? " INTERNAL" : "",
                      (alloc_fail_caps & MALLOC_CAP_DMA)      ? " DMA"      : "",
                      (alloc_fail_caps & MALLOC_CAP_SPIRAM)   ? " SPIRAM"   : "",
                      (unsigned)heap_int_now,
+                     (unsigned)heap_caps_get_minimum_free_size(CAP_USABLE_INTERNAL),
                      (unsigned)heap_caps_get_largest_free_block(CAP_USABLE_INTERNAL),
-                     heap_now,
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+                     heap_now);
         }
 
         /*
