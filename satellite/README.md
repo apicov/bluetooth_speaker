@@ -29,7 +29,7 @@ function body moved verbatim.
 | `sat_state.c` | the definitions for it, nothing else |
 | `net.c` | joining the SoftAP, the reconnect handler, the UDP socket |
 | `clock.c` | the probe task, TSF-or-estimator, the offset slew |
-| `rx.c` | datagram demux, anchor policy, gap policy, SBC decode, ring feed |
+| `rx.c` | datagram demux, then one function per policy: anchor, gap, decode |
 | `play.c` | the playback timeline: the scheduled start, phase, splice, marker |
 | `out.c` | the I2S channel, the write path, retuning the output clock |
 | `servo.c` | one 5 s window of rate control |

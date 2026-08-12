@@ -93,7 +93,7 @@ one-source arrangement is currently harder than it needs to be.*
 
 ### F2 — One translation unit, six concerns
 
-> **DONE.** Nine files; largest is `rx.c` at 620 lines. Every body moved
+> **DONE.** Nine files; largest is `rx.c` at 682 lines. Every body moved
 > verbatim — the only semantic edits were three `continue;` → `return;` where
 > the servo's loop body became a function, and three loop locals becoming
 > zero-initialised file statics. Verified by normalising both versions and
@@ -127,6 +127,17 @@ decode, ring feed), `play.c` (timeline, splice, marker), `servo.c` (rate
 control), `telemetry.c` (all periodic reporting). Medium and mechanical. Doing
 this *before* the S3 port is what makes F1's one-source arrangement reviewable;
 doing it after means doing it twice.
+
+**Follow-up, done separately.** Moving `handle_audio()` into `rx.c` made that
+file coherent but left the function itself at 371 lines, still interleaving four
+policies. It was then broken into one function per decision — `anchor_stream`
+(152), `absorb_sequence_gap` (98), `decode_into_ring` (49),
+`record_packet_positions` (22), `upgrade_provisional_anchor` (11) — with a
+29-line `handle_audio` that is just the order those are taken in. Unlike the
+file split this changed control flow rather than moving it: eight bare `return`
+statements became typed results, six `return false` and three `return true`,
+which the statement-multiset diff accounts for exactly. Anchor policy can now be
+read without reading the decoder.
 
 ### F3 — 60 `volatile` globals are the cross-task interface, and the file's own tearing rule is applied unevenly
 
@@ -383,7 +394,8 @@ All on branch `docs/satellite-audit-drop-classic-hub`, in §6's order.
 | | before | after |
 |---|---|---|
 | files in `satellite/main/` | 1 `.c` | 9 `.c` + `sat.h` |
-| largest file | 2437 lines | `rx.c`, 620 |
+| largest file | 2437 lines | `rx.c`, 682 |
+| largest function | `handle_audio`, 371 lines | `rx_task`, 209 |
 | preprocessor directives | 43 | 25 |
 | declaration sites for `DANCEFLOOR_OUT_*` | 2 (+1 project missing it) | 1 |
 | targets buildable from this source | 1 | 2, both verified |

@@ -34,213 +34,222 @@
 
 #include "sat.h"
 
-static void handle_audio(const audio_msg_t *msg)
+/*
+ * expect_seq and have_seq were locals of handle_audio(), which is now several
+ * functions. File scope, not shared state: rx_task is the only caller of any of
+ * them, so nothing new can write these and they stay out of sat.h. The wider
+ * scope is the whole cost of the split.
+ */
+static uint32_t expect_seq;
+static bool have_seq;
+
+/*
+ * Decide whether this packet can start a stream, and start it if so.
+ *
+ * Returns false when the packet is refused and there is nothing more to do with
+ * it -- the estimator has not settled, a reset is already pending, or the lead
+ * is wrong. Every one of those was a bare `return` in the middle of a 371-line
+ * function; they are the same refusals, and the comments on each are the runs
+ * that produced them.
+ */
+static bool anchor_stream(const audio_msg_t *msg, int64_t offset, bool by_tsf)
 {
-    static uint32_t expect_seq;
-    static bool have_seq;
-    static int16_t pcm[SBC_MAX_PCM_SAMPLES];
-
-    int64_t offset;
-    bool by_tsf = false;
-    if (!clock_offset(&offset, &by_tsf)) {
-        return;                              /* clock not trusted yet, discard */
-    }
-    if (msg->format != AUDIO_FMT_SBC) {
-        ESP_LOGW(TAG, "unexpected audio format %u -- hub and satellite disagree",
-                 msg->format);
-        return;
-    }
-
-    if (!have_seq || stream_start_local == 0) {
-        /*
-         * First chunk of a stream: the only moment playback timing is decided,
-         * so it must use a clock that can be trusted. Any error here is baked
-         * in for the life of the stream.
-         *
-         * The settling wait applies to the ESTIMATOR only. Three probes produce
-         * an offset but not a good one -- minimum-RTT selection needs a full
-         * window to find a genuinely uncongested round trip, which costs 2.5 s
-         * of silence at every stream start. TSF needs no such wait: it is not
-         * built from round trips, so there is no congested sample to average
-         * away, and one beacon is as good as ten.
-         */
-        if (!by_tsf && !sync_est_settled(&est)) {
-            static bool told;
-            if (!told) {
-                told = true;
-                ESP_LOGI(TAG, "holding playback until the clock estimate settles");
-            }
-            return;
+    /*
+     * First chunk of a stream: the only moment playback timing is decided,
+     * so it must use a clock that can be trusted. Any error here is baked
+     * in for the life of the stream.
+     *
+     * The settling wait applies to the ESTIMATOR only. Three probes produce
+     * an offset but not a good one -- minimum-RTT selection needs a full
+     * window to find a genuinely uncongested round trip, which costs 2.5 s
+     * of silence at every stream start. TSF needs no such wait: it is not
+     * built from round trips, so there is no congested sample to average
+     * away, and one beacon is as good as ten.
+     */
+    if (!by_tsf && !sync_est_settled(&est)) {
+        static bool told;
+        if (!told) {
+            told = true;
+            ESP_LOGI(TAG, "holding playback until the clock estimate settles");
         }
-
-        /*
-         * Two refusals, both learned from one run where this loop anchored
-         * eighteen times in three seconds and every one of them was doomed
-         * before playback started.
-         *
-         * FIRST: a packet whose play_at has already passed cannot be anchored
-         * to. The scheduled wait below is what buys the ring its prefill --
-         * ~200 ms of audio accumulates while playback holds for its instant --
-         * and a negative wait skips it entirely. The run started at "in -90 ms"
-         * with `buffer 29 ms`, and every re-anchor after it read worse: -871,
-         * -1022, -1234 ms. Anchoring on those produced phase readings of one to
-         * 1.25 seconds, which tripped PHASE_INSANE_US, which re-anchored, which
-         * reset the ring and threw away the only audio that could have fixed it.
-         *
-         * The cause was upstream -- the hub's transmit path was refusing sends
-         * and what arrived was late and sparse -- and nothing here could have
-         * fixed that. But nothing here should have amplified it either. A packet
-         * that is already late is evidence about the link, not a timeline.
-         *
-         * SECOND: one anchor per second. A re-anchor that does not stick is
-         * worse than no re-anchor, because xStreamBufferReset() below discards
-         * the buffer each time. Refusing for a second parks playback for a
-         * second; the alternative measured six seconds of noise.
-         *
-         * Both are bounded. If every packet is late for ANCHOR_GIVE_UP_US the
-         * refusal itself becomes the fault -- a hub whose lead is genuinely
-         * shorter than the path, or a clock offset wrong in a way TSF agrees
-         * with -- and a satellite that stays silent forever on a stream it could
-         * have played badly is not the better failure. Take the packet, say so
-         * at ERROR, and let the servo do what it can.
-         */
-        /*
-         * Wait for the playback task to park before touching the ring.
-         *
-         * A gap-triggered resync sets have_seq false immediately, so the very
-         * next packet reaches here -- possibly ~20 ms later, while playback is
-         * still draining the ring this is about to reset. xStreamBufferReset()
-         * refuses while a task is blocked on the buffer, so the reset would
-         * silently not happen while samples_in went to zero underneath it: a
-         * stale ring measured against a fresh count, which reads as an insane
-         * phase and costs another re-anchor to clear.
-         *
-         * Bounded, and cannot deadlock: the flag is cleared when the play task
-         * parks, which it does within one chunk on seeing the flag, within
-         * 500 ms if it is blocked on an empty ring, and unconditionally in the
-         * outer loop above whichever route it took.
-         */
-        if (resync_request) {
-            return;
-        }
-
-        const int64_t now_local = esp_timer_get_time();
-        const int64_t start_local = sync_to_local(msg->play_at, offset);
-        static int64_t refuse_since;         /* first refusal of this streak */
-        static int64_t last_anchor;
-
-        if (start_local - now_local < ANCHOR_MIN_LEAD_US ||
-            (last_anchor && now_local - last_anchor < ANCHOR_MIN_INTERVAL_US)) {
-            const bool late = start_local - now_local < ANCHOR_MIN_LEAD_US;
-            if (late) n_anchor_late++; else n_anchor_soon++;
-            if (refuse_since == 0) {
-                refuse_since = now_local;
-            }
-            if (now_local - refuse_since < ANCHOR_GIVE_UP_US) {
-                return;
-            }
-            ESP_LOGE(TAG, "no anchorable packet for %lld ms (lead %+lld ms) -- "
-                          "anchoring on a bad one rather than staying silent",
-                     (now_local - refuse_since) / 1000,
-                     (start_local - now_local) / 1000);
-            anchor_provisional = true;
-        } else {
-            anchor_provisional = false;   /* this one had the lead it needed */
-        }
-        refuse_since = 0;
-        last_anchor = now_local;
-        anchor_at = now_local;
-        resync_request = false;   /* may have been set while playback was parked */
-
-        stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-        /* Same number the playback task dates its audio with below. The LEDs
-         * convert that back to a sample position, so a different rate there
-         * would separate the count from the timeline at the difference -- 8.8%
-         * for a 48 kHz source against the 44.1 kHz this used to assume. */
-        visualiser_set_rate(stream_rate);
-        /* A new origin: stream_offset is about to be re-seeded, so any frame
-         * already computed and waiting to be drawn is dated against a timeline
-         * that stops existing on the next line. */
-        visualiser_flush();
-#endif
-        sbc_decoder_init();
-        stream_start_local = start_local;
-        stream_offset = offset;
-        offset_slew_last = 0;                /* re-seed the slew for this stream */
-        /* The visualiser is told nothing here. Anything of its that advances on
-         * its own keys off the scheduled instant carried by each chunk, which is
-         * already master-clock time and identical on every unit -- so there is
-         * no offset for it to be given. */
-        samples_in = 0;
-        marker_sample = -1;
-        phase_head = phase_tail = 0;
-        phase_valid = false;
-        restart_pos = -1;
-        expect_seq = msg->seq;
-        have_seq = true;
-        xStreamBufferReset(ring);
-        n_reanchors++;
-        if (by_tsf) n_tsf_used++; else n_tsf_fallback++;
-        ESP_LOGI(TAG, "stream start: play_at %lld -> local %lld (in %lld ms) [%s]",
-                 msg->play_at, stream_start_local,
-                 (stream_start_local - esp_timer_get_time()) / 1000,
-                 by_tsf ? "TSF" : "probe estimator");
-        /*
-         * The first anchor after a rejoin, which is the one that can be built on
-         * a clock estimate measured before the outage -- see wifi_down_at. The
-         * age is of the NEWEST sample in the estimator's window; if it exceeds
-         * the outage then every sample min-RTT selection can choose from
-         * predates the drop, and this anchor is as stale as it looks.
-         */
-        if (rejoined_at) {
-            const int64_t age = est_newest_at ? (now_local - est_newest_at) / 1000 : -1;
-            ESP_LOGW(TAG, "first anchor after a rejoin: %s, %lld ms since the "
-                          "rejoin, newest probe %lld ms old",
-                     by_tsf ? "TSF" : "PROBE ESTIMATOR",
-                     (now_local - rejoined_at) / 1000, age);
-            rejoined_at = 0;
-        }
+        return false;
     }
 
     /*
-     * Playback is running on an anchor we already know was bad. Take the first
-     * packet that could have been anchored on properly and start again.
+     * Two refusals, both learned from one run where this loop anchored
+     * eighteen times in three seconds and every one of them was doomed
+     * before playback started.
      *
-     * A give-up anchor is the least-bad answer to "nothing anchorable for five
-     * seconds", but it is permanent as it stands: a run anchored at -317 ms
-     * lead, read phase +331 ms, and nothing ever re-anchored because that is
-     * comfortably inside PHASE_INSANE_US. So the two servos were left to argue
-     * about it -- the phase servo pulling the rate up to catch up, the depth net
-     * pulling it down because catching up drains the ring -- and the speaker sat
-     * a third of a second behind the floor for minutes.
+     * FIRST: a packet whose play_at has already passed cannot be anchored
+     * to. The scheduled wait below is what buys the ring its prefill --
+     * ~200 ms of audio accumulates while playback holds for its instant --
+     * and a negative wait skips it entirely. The run started at "in -90 ms"
+     * with `buffer 29 ms`, and every re-anchor after it read worse: -871,
+     * -1022, -1234 ms. Anchoring on those produced phase readings of one to
+     * 1.25 seconds, which tripped PHASE_INSANE_US, which re-anchored, which
+     * reset the ring and threw away the only audio that could have fixed it.
      *
-     * None of that is drift, and no rate fixes it. The lateness came from the
-     * hub's timeline being displaced, and the moment the hub recovers there is a
-     * packet with proper lead in front of it. Re-anchoring on that erases the
-     * error in one step instead of asking a 1 ms/s loop to walk it off.
+     * The cause was upstream -- the hub's transmit path was refusing sends
+     * and what arrived was late and sparse -- and nothing here could have
+     * fixed that. But nothing here should have amplified it either. A packet
+     * that is already late is evidence about the link, not a timeline.
      *
-     * The flag is cleared here rather than when the new anchor lands, so one
-     * provisional anchor buys exactly one upgrade attempt. If the attempt runs
-     * into the give-up path again it sets the flag again, and ANCHOR_MIN_INTERVAL_US
-     * bounds how fast that can cycle.
+     * SECOND: one anchor per second. A re-anchor that does not stick is
+     * worse than no re-anchor, because xStreamBufferReset() below discards
+     * the buffer each time. Refusing for a second parks playback for a
+     * second; the alternative measured six seconds of noise.
+     *
+     * Both are bounded. If every packet is late for ANCHOR_GIVE_UP_US the
+     * refusal itself becomes the fault -- a hub whose lead is genuinely
+     * shorter than the path, or a clock offset wrong in a way TSF agrees
+     * with -- and a satellite that stays silent forever on a stream it could
+     * have played badly is not the better failure. Take the packet, say so
+     * at ERROR, and let the servo do what it can.
      */
+    /*
+     * Wait for the playback task to park before touching the ring.
+     *
+     * A gap-triggered resync sets have_seq false immediately, so the very
+     * next packet reaches here -- possibly ~20 ms later, while playback is
+     * still draining the ring this is about to reset. xStreamBufferReset()
+     * refuses while a task is blocked on the buffer, so the reset would
+     * silently not happen while samples_in went to zero underneath it: a
+     * stale ring measured against a fresh count, which reads as an insane
+     * phase and costs another re-anchor to clear.
+     *
+     * Bounded, and cannot deadlock: the flag is cleared when the play task
+     * parks, which it does within one chunk on seeing the flag, within
+     * 500 ms if it is blocked on an empty ring, and unconditionally in the
+     * outer loop above whichever route it took.
+     */
+    if (resync_request) {
+        return false;
+    }
+
+    const int64_t now_local = esp_timer_get_time();
+    const int64_t start_local = sync_to_local(msg->play_at, offset);
+    static int64_t refuse_since;         /* first refusal of this streak */
+    static int64_t last_anchor;
+
+    if (start_local - now_local < ANCHOR_MIN_LEAD_US ||
+        (last_anchor && now_local - last_anchor < ANCHOR_MIN_INTERVAL_US)) {
+        const bool late = start_local - now_local < ANCHOR_MIN_LEAD_US;
+        if (late) n_anchor_late++; else n_anchor_soon++;
+        if (refuse_since == 0) {
+            refuse_since = now_local;
+        }
+        if (now_local - refuse_since < ANCHOR_GIVE_UP_US) {
+            return false;
+        }
+        ESP_LOGE(TAG, "no anchorable packet for %lld ms (lead %+lld ms) -- "
+                      "anchoring on a bad one rather than staying silent",
+                 (now_local - refuse_since) / 1000,
+                 (start_local - now_local) / 1000);
+        anchor_provisional = true;
+    } else {
+        anchor_provisional = false;   /* this one had the lead it needed */
+    }
+    refuse_since = 0;
+    last_anchor = now_local;
+    anchor_at = now_local;
+    resync_request = false;   /* may have been set while playback was parked */
+
+    stream_rate = msg->sample_rate ? msg->sample_rate : 44100;
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /* Same number the playback task dates its audio with below. The LEDs
+     * convert that back to a sample position, so a different rate there
+     * would separate the count from the timeline at the difference -- 8.8%
+     * for a 48 kHz source against the 44.1 kHz this used to assume. */
+    visualiser_set_rate(stream_rate);
+    /* A new origin: stream_offset is about to be re-seeded, so any frame
+     * already computed and waiting to be drawn is dated against a timeline
+     * that stops existing on the next line. */
+    visualiser_flush();
+#endif
+    sbc_decoder_init();
+    stream_start_local = start_local;
+    stream_offset = offset;
+    offset_slew_last = 0;                /* re-seed the slew for this stream */
+    /* The visualiser is told nothing here. Anything of its that advances on
+     * its own keys off the scheduled instant carried by each chunk, which is
+     * already master-clock time and identical on every unit -- so there is
+     * no offset for it to be given. */
+    samples_in = 0;
+    marker_sample = -1;
+    phase_head = phase_tail = 0;
+    phase_valid = false;
+    restart_pos = -1;
+    expect_seq = msg->seq;
+    have_seq = true;
+    xStreamBufferReset(ring);
+    n_reanchors++;
+    if (by_tsf) n_tsf_used++; else n_tsf_fallback++;
+    ESP_LOGI(TAG, "stream start: play_at %lld -> local %lld (in %lld ms) [%s]",
+             msg->play_at, stream_start_local,
+             (stream_start_local - esp_timer_get_time()) / 1000,
+             by_tsf ? "TSF" : "probe estimator");
+    /*
+     * The first anchor after a rejoin, which is the one that can be built on
+     * a clock estimate measured before the outage -- see wifi_down_at. The
+     * age is of the NEWEST sample in the estimator's window; if it exceeds
+     * the outage then every sample min-RTT selection can choose from
+     * predates the drop, and this anchor is as stale as it looks.
+     */
+    if (rejoined_at) {
+        const int64_t age = est_newest_at ? (now_local - est_newest_at) / 1000 : -1;
+        ESP_LOGW(TAG, "first anchor after a rejoin: %s, %lld ms since the "
+                      "rejoin, newest probe %lld ms old",
+                 by_tsf ? "TSF" : "PROBE ESTIMATOR",
+                 (now_local - rejoined_at) / 1000, age);
+        rejoined_at = 0;
+    }
+    return true;
+}
+
+/*
+ * Playback is running on an anchor we already know was bad. Take the first
+ * packet that could have been anchored on properly and start again.
+ *
+ * A give-up anchor is the least-bad answer to "nothing anchorable for five
+ * seconds", but it is permanent as it stands: a run anchored at -317 ms
+ * lead, read phase +331 ms, and nothing ever re-anchored because that is
+ * comfortably inside PHASE_INSANE_US. So the two servos were left to argue
+ * about it -- the phase servo pulling the rate up to catch up, the depth net
+ * pulling it down because catching up drains the ring -- and the speaker sat
+ * a third of a second behind the floor for minutes.
+ *
+ * None of that is drift, and no rate fixes it. The lateness came from the
+ * hub's timeline being displaced, and the moment the hub recovers there is a
+ * packet with proper lead in front of it. Re-anchoring on that erases the
+ * error in one step instead of asking a 1 ms/s loop to walk it off.
+ *
+ * The flag is cleared here rather than when the new anchor lands, so one
+ * provisional anchor buys exactly one upgrade attempt. If the attempt runs
+ * into the give-up path again it sets the flag again, and ANCHOR_MIN_INTERVAL_US
+ * bounds how fast that can cycle.
+ */
+static bool upgrade_provisional_anchor(const audio_msg_t *msg, int64_t offset)
+{
     if (anchor_provisional &&
         sync_to_local(msg->play_at, offset) - esp_timer_get_time() >= ANCHOR_MIN_LEAD_US) {
         anchor_provisional = false;
         n_anchor_upgrades++;
         resync_request = true;
         have_seq = false;
-        return;
+        return true;
     }
+    return false;
+}
 
-    /*
-     * A lost packet must become silence of exactly the right length. Skipping it
-     * would pull every later frame earlier and slide the whole stream against
-     * the master -- a permanent error, not a momentary glitch. `frames` tells us
-     * how much audio a packet was worth, so a gap can be filled accurately even
-     * though SBC packets vary in size.
-     */
+/*
+ * A lost packet must become silence of exactly the right length. Skipping it
+ * would pull every later frame earlier and slide the whole stream against
+ * the master -- a permanent error, not a momentary glitch. `frames` tells us
+ * how much audio a packet was worth, so a gap can be filled accurately even
+ * though SBC packets vary in size.
+ */
+static bool absorb_sequence_gap(const audio_msg_t *msg)
+{
     if (have_seq && msg->seq > expect_seq) {
         uint32_t missing = msg->seq - expect_seq;
         static const int16_t silence[128 * AUDIO_CHANNELS] = {0};
@@ -280,7 +289,7 @@ static void handle_audio(const audio_msg_t *msg)
             n_gap_resyncs++;
             resync_request = true;
             have_seq = false;
-            return;
+            return false;
         }
         /*
          * samples_in must count this silence, and the old loop did not.
@@ -334,11 +343,19 @@ static void handle_audio(const audio_msg_t *msg)
             frames_missing -= n;
         }
     } else if (have_seq && msg->seq < expect_seq) {
-        return;                              /* duplicate or reorder, drop */
+        return false;                              /* duplicate or reorder, drop */
     }
-    expect_seq = msg->seq + 1;
-    have_seq = true;
+    return true;
+}
 
+/*
+ * Where this packet's audio lands, and when it is due.
+ *
+ * All three of these record a position against samples_in and must run before
+ * the decode below moves it.
+ */
+static void record_packet_positions(const audio_msg_t *msg)
+{
     /* Tag before queuing, so the mark lands at the start of this packet's
      * audio and travels through the buffer with it. */
     if (msg->marker && marker_sample < 0) {
@@ -359,6 +376,12 @@ static void handle_audio(const audio_msg_t *msg)
     } else {
         n_phase_drop++;      /* see the counter: this used to be silent */
     }
+}
+
+/* Turn the packet's SBC into PCM and hand it to the ring. */
+static void decode_into_ring(const audio_msg_t *msg)
+{
+    static int16_t pcm[SBC_MAX_PCM_SAMPLES];
 
     /* Decode here rather than at the hub: that is the entire point of sending
      * SBC, and it costs a quarter of the airtime. */
@@ -406,6 +429,46 @@ static void handle_audio(const audio_msg_t *msg)
         samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
     }
 }
+
+/*
+ * One audio packet, in the order the decisions have to be taken.
+ *
+ * Each step either finishes the packet or hands it on. That sequence was the
+ * shape of the 371-line original too -- it was just spelled as early returns
+ * between four screens of commentary, so the order could not be read without
+ * reading all of it.
+ */
+static void handle_audio(const audio_msg_t *msg)
+{
+    int64_t offset;
+    bool by_tsf = false;
+    if (!clock_offset(&offset, &by_tsf)) {
+        return;                              /* clock not trusted yet, discard */
+    }
+    if (msg->format != AUDIO_FMT_SBC) {
+        ESP_LOGW(TAG, "unexpected audio format %u -- hub and satellite disagree",
+                 msg->format);
+        return;
+    }
+
+    if ((!have_seq || stream_start_local == 0) &&
+        !anchor_stream(msg, offset, by_tsf)) {
+        return;
+    }
+    if (upgrade_provisional_anchor(msg, offset)) {
+        return;
+    }
+    if (!absorb_sequence_gap(msg)) {
+        return;
+    }
+
+    expect_seq = msg->seq + 1;
+    have_seq = true;
+
+    record_packet_positions(msg);
+    decode_into_ring(msg);
+}
+
 
 void rx_task(void *arg)
 {
