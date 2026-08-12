@@ -85,6 +85,10 @@ to extend this. Each says what it is, where it is, and what it costs.
 > function, and four open-coded client snapshots becoming one helper (H5).
 > Verified by normalising both versions and diffing statement multisets: §9.2
 > accounts for every difference.
+>
+> **Followed up separately** (§12), as the satellite did for `handle_audio`: the
+> two functions the split left long are now one function per decision --
+> `local_play_task` 363 -> 44 lines, `streamer_send_sbc` 313 -> 83.
 
 
 **Evidence.** `streamer.c` holds, with nothing but banner comments between them:
@@ -121,13 +125,15 @@ anchor and the unicast fan-out — seven decisions in one function.
 
 ### H2 — 47 `volatile` globals are the cross-task interface, and the file's own tearing rule is applied unevenly
 
-> **PARTLY DONE, and the part not done is deliberate.** `hub.h` now carries the
-> ownership statement and a per-value analysis of what tearing actually costs.
-> `local_start` was **not** converted, for the reason the satellite did not
-> convert `stream_start_local`: it has two writers (`streamer_send_sbc` assigns,
-> `local_play_task` zeroes), and a seqlock with two writers is silently broken.
-> The honest fix is single ownership and that is a behaviour change, not a
-> restructure. The other eight are documented as accepted, with why.
+> **DONE, in two passes.** `hub.h` first carried the ownership statement and a
+> per-value analysis of what tearing costs; `local_start` was left alone because
+> it had two writers and a seqlock with two writers is silently broken. **Single
+> ownership was then taken** (§12): the play task parks on a 32-bit `local_epoch`
+> the timeline publishes after the instant, and writes neither, so the timeline
+> is the only writer of both and the pair reads safely without a lock. The servo
+> asks the new `s_playing` rather than `local_start == 0`, which stopped being
+> the question once the value survived an underrun. The other eight remain
+> documented as accepted, with why.
 
 
 **Evidence.** `streamer.c:200–205` states the rule explicitly and correctly:
@@ -280,10 +286,11 @@ translation unit.
 
 ### H7 — Six live experiments are indistinguishable from load-bearing code
 
-> **DELIBERATELY NOT DONE.** No code change was proposed and none was made. The
-> table is the deliverable and it is above. Retiring any of the six needs the
-> bench logs under `tools/log_collector/`, not an opinion formed during a
-> restructure -- which is exactly how the satellite retired its one.
+> **PARTLY DONE, and on the logs rather than on opinion.** Nothing was retired
+> during the restructure, which is the discipline this finding asks for. The
+> 18:09 run then answered two of the six and **both were retired** (§12): the
+> SERVO DIVERGES raw/EMA shadow, and the refill probe's retune arm. Four remain
+> live and the table above is still their record.
 
 
 **Evidence.** Each is individually well justified and collectively unowned:
@@ -940,3 +947,109 @@ catch the case this decision assumes away.
 4. **An underrun**, if one can be provoked: the `timeline restart flagged at seq`
    line should now actually appear, and satellites should re-splice.
 5. **Both units reflashed together.** Fix 5 changes what `applied_alt_us` means.
+
+---
+
+## 12. The follow-ups §9.4 owed — 2026-08-12
+
+Three items §9.4 listed as still open, taken after the split's hardware run
+rather than mixed into it. All build; the 23-case host suite passes; five Kconfig
+permutations syntax-check. **Not yet run on hardware.**
+
+### 12.1 One function per decision
+
+The split left two functions long because breaking them alters control flow
+rather than moving it, and doing that inside a behaviour-neutral change would
+have made the bench run ambiguous. Same reason the satellite did `handle_audio`
+as its own commit.
+
+| | before | after | largest extracted |
+|---|---|---|---|
+| `local_play_task` | 363 | **44** | `absorb_phase_crossings`, 154 |
+| `streamer_send_sbc` | 313 | **83** | `steer_timeline`, 85 |
+
+Both are now the order their decisions are taken in, and nothing else.
+`local_play_task` reads: park for a retune, read a chunk, absorb phase crossings,
+apply a track boundary, pulse the marker, write to the DAC. `streamer_send_sbc`
+reads: note the arrival, start or steer the timeline, flag boundaries, record the
+phase point, fan out, advance. **Splice policy can now be read without reading
+the crossing loop**, which is what H1 said it cost.
+
+The extracted functions are mostly comment — `absorb_phase_crossings` is 154
+lines of which the argument for why one phase reading is trustworthy is the bulk.
+That is the point: the reasoning stayed with the decision it justifies.
+
+**Verified by statement-multiset diff, both files.** `timeline.c`'s "only in
+before" set is **empty** — nothing was lost at all, because the function's own
+statics moved to file scope keeping their names, so no body text was rewritten.
+`play.c` shows exactly the intended changes and nothing else: three loop locals
+became file statics because the loop body became functions, the underrun `break`
+became a typed result, and `got_frames` became an out-parameter.
+
+### 12.2 `local_start` has one owner
+
+H2's named fix, finally takeable because the split made the ownership visible.
+
+It had two writers: `streamer_send_sbc()` assigned the start instant and
+`local_play_task()` zeroed it to make its outer loop park. **Two writers is what
+made a seqlock silently broken**, so the 64-bit tearing exposure was documented
+and accepted instead.
+
+The play task now parks on **`local_epoch`**, a 32-bit generation the timeline
+increments *after* writing `local_start`, and reads the epoch *before* the
+instant. That leaves one writer for both and makes the pair safe without a lock:
+a reader seeing a new epoch sees the value belonging to it, since both are
+volatile — the compiler may not reorder either pair — and this core orders stores
+in program order. A 32-bit epoch cannot tear, which is the rule
+`s_marker_sample` and `s_samples_in` were already written down for. Wrapping
+after 2^32 starts is harmless: the test is inequality, not ordering.
+
+One consequence worth knowing: **`local_start == 0` stopped being able to mean
+"is anything playing"**, because the value now survives an underrun. The servo
+asks the new `s_playing`, which the play task owns and which is what it actually
+wanted.
+
+> **`stream_start_local` on the satellite is the same shape and still has two
+> writers.** This is the worked example for it, and the reason to expect the fix
+> to be cheap there too.
+
+### 12.3 Two experiments retired, on the logs
+
+H7's discipline is that these are retired from the bench corpus, not by opinion
+formed during a restructure. Two of the six now have logs behind them.
+
+**The `SERVO DIVERGES` shadow.** It computed what the raw phase reading would
+have asked for and logged every disagreement with the average. Its question was
+whether smoothing the servo's input declines retunes the raw value would make.
+The 18:09 run fired it repeatedly and **every firing was the same way round** —
+raw would retune, smoothed held — while phase converged from −26.9 ms to −1.9 ms
+with retunes 30 and 45 s apart. That is the averaging doing exactly what it was
+added for; a shadow that only ever says so has nothing left to find. The raw
+value still prints beside the smoothed one on the servo line, so the two remain
+comparable at every retune.
+
+**The refill probe's retune arm.** It re-armed on the assumption that
+`i2s_channel_disable()` discards the DMA descriptors. It drains them. The
+satellite retired its copy on 25 of 26 samples reading `0 frames`; the hub read
+`0 frames` on all three of its retunes independently. There is no window there to
+measure and none to withhold readings inside — `s_retune_watch` already withholds
+the single reading the step needs, which §11.2 established is the right number.
+`s_refill_why` goes with it, having only one thing left to say.
+
+**The start arm stays and is load-bearing** — the channel really is empty there,
+because the task was parked and it drained. That is live defect 4's guard.
+
+**Four experiments remain live**: the median splice shadow (now inverted, and
+carrying the revert condition for §11.1's fix 5), the REFILL instrument at start,
+the `RETUNE TAIL` narration, and the TSF probe. The §2 H7 table is still their
+record.
+
+### 12.4 What is left
+
+- **Nothing from §9.4 is now open except hardware.** The splice path still has
+  not executed in any run, so §11's fixes 2, 5 and 7 remain unproven, and 12.1
+  and 12.2 have not been run at all.
+- **Watch on the next run**, beyond §11.3's list: `local playback started`
+  appearing once per timeline start and not repeating (the epoch handshake), and
+  the servo continuing to hold off while parked (`s_playing`).
+- The satellite's `stream_start_local` (12.2).
