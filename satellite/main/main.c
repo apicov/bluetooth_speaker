@@ -424,6 +424,22 @@ static volatile uint32_t alloc_fail_size;   /* the largest request that failed *
 static volatile uint32_t alloc_fail_caps;
 
 /*
+ * Tasks that did not start, which used to be unsayable.
+ *
+ * Every xTaskCreate here passed NULL for the handle and threw the return value
+ * away, so a unit that could not start its play task ran on without one and
+ * looked from the outside exactly like a satellite that had gone quiet: still
+ * associated, still holding a lease, no audio, no LEDs, and -- because the
+ * missing task was often drift_task -- no HEALTH line to say otherwise. That is
+ * the same silent-failure class the allocation hook above exists to end, left in
+ * the one place it could take the whole unit down.
+ *
+ * Reported on the join line rather than only where it happens: see task_start().
+ */
+static volatile uint32_t n_task_fail;
+static char s_task_fail_names[64];
+
+/*
  * Records only, and in IRAM. IDF marks heap_caps_alloc_failed() HEAP_IRAM_ATTR
  * because the heap is usable with the flash cache disabled, so a hook in flash
  * would fault when reached from an ISR or during a flash write -- a diagnostic
@@ -505,6 +521,26 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             rejoined_at = esp_timer_get_time();
         }
         ESP_LOGI(TAG, "joined \"%s\", IP " IPSTR, AP_SSID, IP2STR(&e->ip_info.ip));
+        /*
+         * Said here, not where it happened. task_start() logs the failure at
+         * boot, roughly a second before this unit has a route, so wifi_log drops
+         * that line for want of a destination and the collector never sees it.
+         * This is the first moment the radio can carry the news.
+         *
+         * Silent on a healthy unit, like every other counter here. If it ever
+         * prints, nothing else in this log means what it usually means.
+         *
+         * Ordering is assumed, not enforced: wifi_start_sta() runs about a
+         * second before the tasks are created, so a DHCP lease arriving that
+         * fast would find n_task_fail still zero and say nothing. The console
+         * line in task_start() is unconditional, and this one repeats on every
+         * rejoin, so the news is only lost if both the console is dead AND the
+         * unit never reconnects. Worth knowing before trusting a silent join.
+         */
+        if (n_task_fail) {
+            ESP_LOGE(TAG, "CRIPPLED: %" PRIu32 " task(s) failed to start: %s",
+                     n_task_fail, s_task_fail_names);
+        }
     }
 }
 
@@ -2271,6 +2307,50 @@ static void log_build_stamp(const char *tag)
     ESP_LOGW(tag, "BUILD %s %s  elf:%s", d->date, d->time, sha);
 }
 
+#define TASK_ANY_CORE (-1)
+
+/*
+ * xTaskCreate, with the return value actually read. See n_task_fail above for
+ * what discarding it cost.
+ *
+ * Not a panic, for the same reason CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS is
+ * off: a reboot loop on a dance floor is worse than a unit that comes up
+ * crippled and says so. A satellite missing its play task can still join, still
+ * answer probes, and still tell the collector what is wrong with it -- which is
+ * strictly more than a board stuck in the bootloader can do.
+ *
+ * The failure is logged here for the console AND recorded for the join line,
+ * because on this unit the console is the channel most likely to be missing.
+ * app_main runs about a second before DHCP completes, so anything logged here
+ * is dropped by wifi_log for want of a route (s_no_dest) and never reaches the
+ * collector. The names are kept so the GOT_IP handler can say them once the
+ * radio can carry them.
+ */
+static void task_start(TaskFunction_t fn, const char *name, uint32_t stack,
+                       UBaseType_t prio, int core)
+{
+    TaskHandle_t h = NULL;
+    const BaseType_t ok = (core == TASK_ANY_CORE)
+        ? xTaskCreate(fn, name, stack, NULL, prio, &h)
+        : xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, &h, core);
+
+    if (ok == pdPASS && h != NULL) {
+        return;
+    }
+    n_task_fail++;
+    if (strlen(s_task_fail_names) + strlen(name) + 2 < sizeof s_task_fail_names) {
+        if (s_task_fail_names[0]) {
+            strcat(s_task_fail_names, " ");
+        }
+        strcat(s_task_fail_names, name);
+    }
+    ESP_LOGE(TAG, "TASK \"%s\" FAILED TO START (%" PRIu32 " B stack) -- internal "
+                  "heap %u free, largest block %u. This unit is crippled.",
+             name, stack,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -2325,10 +2405,10 @@ void app_main(void)
     ESP_LOGW(TAG, "visualiser DISABLED (menuconfig) -- LEDs will stay dark");
 #endif
 
-    xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
-    xTaskCreate(rx_task, "rx", 4096, NULL, 7, NULL);
-    xTaskCreatePinnedToCore(play_task, "play", 4096, NULL, 8, NULL, 1);
-    xTaskCreate(drift_task, "drift", 3072, NULL, 3, NULL);
+    task_start(probe_task, "probe", 4096, 6, TASK_ANY_CORE);
+    task_start(rx_task, "rx", 4096, 7, TASK_ANY_CORE);
+    task_start(play_task, "play", 4096, 8, 1);
+    task_start(drift_task, "drift", 3072, 3, TASK_ANY_CORE);
 
     log_build_stamp(TAG);
     ESP_LOGI(TAG, "satellite up, joining \"%s\"", AP_SSID);

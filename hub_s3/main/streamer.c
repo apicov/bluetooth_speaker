@@ -398,6 +398,60 @@ static volatile uint32_t alloc_fail_size;   /* the largest request that failed *
 static volatile uint32_t alloc_fail_caps;
 
 /*
+ * Tasks that did not start, which used to be unsayable.
+ *
+ * Every xTaskCreate in this tree passed NULL for the handle and discarded the
+ * return value, so a unit that could not start a task ran on without it and
+ * looked like one that had simply gone quiet. On this unit that would cost the
+ * timeline, the local speaker or the monitor line depending on which one lost;
+ * on the satellite it cost all three at once and there was no HEALTH line left
+ * to say so. Same silent-failure class as the allocation hook above, left in the
+ * one place that can take a whole unit down.
+ */
+static volatile uint32_t n_task_fail;
+static char s_task_fail_names[64];
+
+#define TASK_ANY_CORE (-1)
+
+/*
+ * xTaskCreate with the return value actually read.
+ *
+ * Not a panic, for the same reason CONFIG_HEAP_ABORT_WHEN_ALLOCATION_FAILS is
+ * off above: a reboot loop on a dance floor is worse than a unit that comes up
+ * crippled and says which part is missing.
+ *
+ * This unit needs no equivalent of the satellite's join-line repeat. Its console
+ * is a dedicated UART wire at 921600 rather than a shared USB bridge -- see the
+ * long note in sdkconfig.defaults -- so a boot-time ESP_LOGE here actually gets
+ * out. The satellite's does not, which is why its copy defers the news to
+ * GOT_IP.
+ */
+static void task_start(TaskFunction_t fn, const char *name, uint32_t stack,
+                       UBaseType_t prio, int core)
+{
+    TaskHandle_t h = NULL;
+    const BaseType_t ok = (core == TASK_ANY_CORE)
+        ? xTaskCreate(fn, name, stack, NULL, prio, &h)
+        : xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, &h, core);
+
+    if (ok == pdPASS && h != NULL) {
+        return;
+    }
+    n_task_fail++;
+    if (strlen(s_task_fail_names) + strlen(name) + 2 < sizeof s_task_fail_names) {
+        if (s_task_fail_names[0]) {
+            strcat(s_task_fail_names, " ");
+        }
+        strcat(s_task_fail_names, name);
+    }
+    ESP_LOGE(TAG, "TASK \"%s\" FAILED TO START (%" PRIu32 " B stack) -- internal "
+                  "heap %u free, largest block %u. This unit is crippled.",
+             name, stack,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+/*
  * Phase points dropped because s_phase_q was full -- the only loss path in this
  * file with no counter. It is worth one, because a wedged phase queue is not a
  * degradation here but a stop: the ring servo runs on nothing but points coming
@@ -1531,7 +1585,7 @@ static void marker_start(void)
     assert(s_edge_q);
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(CONFIG_DANCEFLOOR_MONITOR_GPIO, monitor_isr, NULL));
-    xTaskCreate(monitor_task, "syncmon", 3072, NULL, 9, NULL);
+    task_start(monitor_task, "syncmon", 3072, 9, TASK_ANY_CORE);
 
     ESP_LOGI(TAG, "sync markers on GPIO %d, watching GPIO %d -- bench instrument, "
                   "nothing corrects on it",
@@ -2574,9 +2628,9 @@ void streamer_start(void)
 
     ESP_LOGI(TAG, "free heap after WiFi init: %" PRIu32 " bytes", esp_get_free_heap_size());
 
-    xTaskCreate(probe_task, "probe", 4096, NULL, 6, NULL);
-    xTaskCreatePinnedToCore(local_play_task, "play", 4096, NULL, 8, NULL, 1);
-    xTaskCreate(ring_monitor_task, "ringmon", 3072, NULL, 3, NULL);
+    task_start(probe_task, "probe", 4096, 6, TASK_ANY_CORE);
+    task_start(local_play_task, "play", 4096, 8, 1);
+    task_start(ring_monitor_task, "ringmon", 3072, 3, TASK_ANY_CORE);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
     /*
      * Safe before visualiser_start(): this only stores a pointer the analysis

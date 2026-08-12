@@ -1788,10 +1788,18 @@ void visualiser_start(void)
      * busy, a frame drawn on time from slightly stale analysis beats a frame
      * drawn late from fresh analysis, and only one of the two is visible.
      */
+    /* Checked. A strip that stays dark because a task never started looks
+     * exactly like a strip that is being fed silence, and the `started:` line
+     * below would claim everything was fine either way. */
 #if DF_ANALYSES_AUDIO
-    xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1);
+    if (xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1) != pdPASS) {
+        ESP_LOGE(TAG, "TASK \"vis\" FAILED TO START -- no analysis, the strip "
+                      "will not react to audio");
+    }
 #endif
-    xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1);
+    if (xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1) != pdPASS) {
+        ESP_LOGE(TAG, "TASK \"vis-draw\" FAILED TO START -- the strip will stay dark");
+    }
     /* The source and the hop are on this line because an unintended mismatch
      * across a floor is the expensive bug, and two consoles side by side should
      * settle it. The frame rate is spelled out rather than left to be divided,

@@ -284,7 +284,21 @@ void sbc_link_start(void)
 
     s_ring = xRingbufferCreate(QUEUE_BYTES, RINGBUF_TYPE_NOSPLIT);
     assert(s_ring);
-    xTaskCreate(tx_task, "sbc_tx", 3072, NULL, 10, &s_tx_task);
+    /*
+     * Checked, and the early return is load-bearing rather than tidy: the
+     * handshake ISR below notifies s_tx_task by handle, so installing it after a
+     * failed create would hand an interrupt a NULL task to wake. Better to leave
+     * the link unarmed and say so -- a bridge that never clocks a frame is a
+     * stall count on the hub, which is at least a symptom somebody can read.
+     */
+    if (xTaskCreate(tx_task, "sbc_tx", 3072, NULL, 10, &s_tx_task) != pdPASS) {
+        s_tx_task = NULL;
+        ESP_LOGE(TAG, "TASK \"sbc_tx\" FAILED TO START -- the SBC link is DOWN, "
+                      "no audio will reach the hub. Heap %u free, largest %u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return;
+    }
 
     /* After the task exists, because the ISR notifies it by handle. */
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
