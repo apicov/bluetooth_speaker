@@ -164,7 +164,13 @@ void status_led_start(void)
 
     /* Lowest priority in the system: a missed tick shows as a slightly uneven
      * blink and nothing else, which is the right thing to give up first. */
-    xTaskCreate(led_task, "status_led", 2048, NULL, 1, NULL);
+    if (xTaskCreate(led_task, "status_led", 2048, NULL, 1, NULL) != pdPASS) {
+        /* Checked like the rest, though this is the one whose loss costs
+         * nothing but the panel: dark LEDs would otherwise read as "no phone
+         * connected", which is a wrong answer rather than a missing one. */
+        ESP_LOGE(TAG, "TASK \"status_led\" FAILED TO START -- the front panel "
+                      "will stay dark and does NOT mean the link is down");
+    }
 
     ESP_LOGI(TAG, "status LEDs: connected on %d, streaming on %d (-1 = none), "
                   "active %s",

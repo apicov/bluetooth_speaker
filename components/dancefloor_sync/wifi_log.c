@@ -252,7 +252,17 @@ void wifi_log_init(uint8_t role, const char *dest_ip)
      * any line can reach the hook. */
     s_prev = esp_log_set_vprintf(wifi_log_hook);
 
-    xTaskCreate(shipper_task, "wifi_log", 3072, NULL, 3, NULL);
+    /*
+     * Checked, and this one is the worst of the set to lose silently: without
+     * the shipper nothing drains s_queue, so every captured line is dropped at
+     * the hook and the unit goes quiet over the air while its console carries on
+     * normally. A remote unit would look dead. The console still works, so this
+     * line reaches somebody.
+     */
+    if (xTaskCreate(shipper_task, "wifi_log", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE("wifi_log", "TASK \"wifi_log\" FAILED TO START -- this unit's "
+                             "logs will not leave it over WiFi");
+    }
 }
 
 void wifi_log_set_dest(const char *dest_ip)

@@ -265,7 +265,13 @@ void ml_lane_start(ResultLatch *latch, int stream_rate_hz,
      * Core 0 carries lwIP at 18 on the hub, which is bursty and far above this.
      * 4 kB of stack because a model's working set is in its arena, not here.
      */
-    xTaskCreatePinnedToCore(ml_task, "mlan", 4096, nullptr, 3, nullptr, 0);
+    if (xTaskCreatePinnedToCore(ml_task, "mlan", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
+        /* Checked: without it the lane's stream buffer fills once and every
+         * feed is refused from then on, which reads as a starved model rather
+         * than a missing one. */
+        ESP_LOGE(TAG, "TASK \"mlan\" FAILED TO START -- the slow lane will "
+                      "report nothing");
+    }
 }
 
 bool ml_lane_feed(const int16_t *mono, int n)

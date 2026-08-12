@@ -388,7 +388,15 @@ void sbc_in_start(void)
     if (!sbc_decoder_init()) {
         ESP_LOGE(TAG, "SBC decoder init failed");
     }
-    xTaskCreatePinnedToCore(rx_task, "sbc_in", 4096, NULL, 9, NULL, 1);
+    /* Checked, unlike every xTaskCreate in this tree used to be: without this
+     * task the SPI link is wired, logged as listening, and silently receiving
+     * nothing. */
+    if (xTaskCreatePinnedToCore(rx_task, "sbc_in", 4096, NULL, 9, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "TASK \"sbc_in\" FAILED TO START -- no audio will arrive "
+                      "from the bridge. Internal heap %u free, largest block %u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
     ESP_LOGI(TAG, "SBC link listening: SPI slave at %d Hz, sck %d mosi %d cs %d, "
                   "handshake out on %d", SBC_LINK_SPI_HZ, PIN_SCK, PIN_MOSI,
              PIN_CS, PIN_HS);
