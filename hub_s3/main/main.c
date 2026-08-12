@@ -1,7 +1,7 @@
 /*
  * Dancefloor hub -- chip B of the two-chip master.
  *
- *   phone --A2DP--> [bt_bridge ESP32] --UART--> [this chip] --WiFi--> satellites
+ *   phone --A2DP--> [bt_bridge ESP32] --SPI---> [this chip] --WiFi--> satellites
  *                                     raw SBC              --I2S---> its own DAC
  *                                                          --SPI---> its own LEDs
  *

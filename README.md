@@ -446,7 +446,7 @@ you looked.
 | [`docs/two-chip-master.md`](docs/two-chip-master.md) | Why the master is split, with memory numbers. |
 | [`docs/tuning-corpus.md`](docs/tuning-corpus.md) | What the beat detector was tuned against, and the commands to do it again. |
 | [`docs/satellite-audit.md`](docs/satellite-audit.md) | The satellite read for clarity, modularity and what a second target will cost. |
-| [`docs/hub-s3-gap-list.md`](docs/hub-s3-gap-list.md) | What the S3 hub has, what was portable, and what the retired classic hub never got. |
+| [`docs/hub-audit.md`](docs/hub-audit.md) | The hub read for clarity, modularity and expandability — plus the PSRAM and radio settings that must not be re-litigated. |
 
 Both long documents end with the pattern that recurred at every level of this
 project: **every real fault was invisible until something counted it.** Several

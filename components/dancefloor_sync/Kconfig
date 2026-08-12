@@ -46,6 +46,78 @@ menu "Dancefloor audio output"
 
 endmenu
 
+menu "Dancefloor radio pairing"
+
+    comment "These four are one link seen from both ends -- the hub is the AP,"
+    comment "the satellite is the STA. A mismatch is not a degraded link, it is"
+    comment "no link, and it reports as the wrong thing. Declared here so the"
+    comment "two firmwares cannot disagree."
+
+    config DANCEFLOOR_AP_SSID
+        string "SoftAP SSID"
+        default "dancefloor"
+        help
+            The hub creates this network; every satellite joins it.
+
+            Was a #define in hub_s3/main/streamer.c and another in
+            satellite/main/sat.h, with nothing checking they agreed. They are one
+            value -- an SSID only means anything if both ends say the same thing
+            -- so it is declared once, here, beside the component both firmwares
+            already require.
+
+    config DANCEFLOOR_AP_PASS
+        string "SoftAP password (WPA2-PSK)"
+        default "dancefloor"
+        help
+            Ignored on both units when DANCEFLOOR_AP_OPEN is set.
+
+            WPA2-PSK requires 8 to 63 characters. Kconfig cannot check that, and
+            neither end reports a too-short password as a password problem: the
+            AP simply fails to come up with the credentials it was given, and the
+            satellite reports a failure to associate.
+
+            This is a closed floor with a shared secret in a public git
+            repository. It keeps a passer-by off the network; it is not a
+            security boundary, and nothing here should be treated as one.
+
+    config DANCEFLOOR_AP_OPEN
+        bool "Run the SoftAP with no password (diagnostic)"
+        default n
+        help
+            Isolates the WPA2 handshake. If clients associate with this on but
+            not off, the problem is the security config; if they fail either way,
+            the AP itself is not coming up properly and the credentials are a red
+            herring.
+
+            BOTH UNITS MUST MATCH. This used to be declared once per project,
+            and the satellite's prompt said "must match the hub" while nothing
+            checked it -- two independently-maintained defaults that happened to
+            agree. A mismatch surfaces as a station that will not associate,
+            which wifi_start_ap()'s own note records presenting as "incorrect
+            password rather than anything that points at the real cause".
+
+    config DANCEFLOOR_DISABLE_PMF
+        bool "Disable Protected Management Frames (see help)"
+        default y
+        help
+            PMF's Secure Association teardown is disconnecting our own
+            satellite. Measured on this hardware: the AP starts an SA Query, the
+            satellite fails to answer six attempts, and the AP disassociates it
+            with reason 209 -- 1.7 s off the network, twice in the first 65
+            seconds of a run, and the satellite did not even notice.
+
+            Both units must have this set the same way, since the capability is
+            negotiated. pmf_cfg.capable cannot be used to opt out: it is
+            deprecated in IDF 6 and forced true internally.
+
+            What is given up is protection of management frames against spoofed
+            deauth and disassoc. Data stays encrypted under WPA2-PSK and the
+            password is unchanged. Turn it back on if you would rather have that
+            protection than a stable link, and watch sta-left in the hub's
+            HEALTH line to see what it costs.
+
+endmenu
+
 menu "Dancefloor diagnostics"
 
     config DANCEFLOOR_LOG_PERIOD_S

@@ -61,7 +61,7 @@ void probe_task(void *arg)
                 .type = MSG_SPLICE,
                 .applied_us = splice_report_us,
                 .phase_us = splice_report_phase,
-                .applied_med_us = splice_report_med,
+                .applied_alt_us = splice_report_alt,
             };
             sendto(sock, &s, sizeof(s), 0, (struct sockaddr *)&dest, sizeof(dest));
         }

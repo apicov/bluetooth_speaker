@@ -119,19 +119,27 @@ typedef struct __attribute__((packed)) {
     int32_t applied_us;   /* + = skipped content (was late), - = inserted silence */
     int32_t phase_us;     /* the phase error it was correcting */
     /*
-     * The correction this unit WOULD have applied had the splice run on
-     * sync_phase_median() instead of on the newest reading. Same units and same
-     * clamp as applied_us, so the two subtract meaningfully -- that is the whole
-     * reason it is the correction rather than the median phase itself.
+     * The correction this unit WOULD have applied on the OTHER estimator. Same
+     * units and same clamp as applied_us, so the two subtract meaningfully --
+     * that is the whole reason it is the correction rather than a phase value.
      *
-     * Carried so the hub can print the counterfactual divergence beside the real
-     * one on a single line, both measured at the same boundary. Comparing two
-     * builds' log windows instead is what produced three wrong diagnoses here.
+     * The roles have swapped, and the field was renamed when they did. It used to
+     * be `applied_med_us`: the splice ran on the newest raw reading and this
+     * carried what the median would have asked for. The median won -- the raw
+     * reading carries ~15.7 ms of scatter, and two units splicing on independent
+     * noisy samples land in different places, which is why a track change
+     * sometimes improved cross-unit sync and sometimes degraded it. Both units
+     * now splice on sync_phase_median() and this carries the RAW counterfactual.
      *
-     * Reported, not acted on: the splice still ran on phase_us. Once the shadow
-     * has said which number is better on hardware, the splice moves to it.
+     * Kept rather than deleted so the comparison that justified the change
+     * survives it, and so a revert has something to check itself against.
+     *
+     * WIRE COMPATIBILITY: the layout is unchanged -- same offset, same width,
+     * same clamp -- so a unit on either build parses the other's message. Only
+     * the meaning of the number flips, and both firmwares must be reflashed
+     * together for the printed comparison to mean anything.
      */
-    int32_t applied_med_us;
+    int32_t applied_alt_us;
 } splice_msg_t;
 
 /*
@@ -519,7 +527,7 @@ static inline int64_t sync_to_local(int64_t master_us, int64_t offset)
  *
  * MEDIAN, not mean. What is left after the overshoot and wrote_at corrections
  * (see either unit's crossing loop) is preemption latency on a board also
- * running a SoftAP, SBC decode and the bridge UART: bounded below, long-tailed
+ * running a SoftAP, SBC decode and the bridge SPI link: bounded below, long-tailed
  * to the right. There is a minimum latency and no mechanism that makes a
  * reading early. The mean is dragged by that tail; the median sits on the mode.
  * If the noise is symmetric after all, the median merely costs ~1.25x in

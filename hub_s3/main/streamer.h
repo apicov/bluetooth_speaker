@@ -15,7 +15,25 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 void streamer_start(void);
+
+/*
+ * xTaskCreate with the return value actually read. Defined in streamer.c.
+ *
+ * Here rather than in hub.h because sbc_in.c is the other caller and has its own
+ * `TAG`, which hub.h's extern would collide with. Every task in this firmware
+ * goes through this: it counts failures into n_task_fail, names them, and says
+ * so, which is what turns "a unit came up missing a task" from silence into a
+ * CRIPPLED line. sbc_in.c open-coded its own check before this was reachable,
+ * and so was the one task whose failure nothing counted.
+ */
+#define TASK_ANY_CORE (-1)
+
+void task_start(TaskFunction_t fn, const char *name, uint32_t stack,
+                UBaseType_t prio, int core);
 
 /* Decoded PCM for THIS unit's own speaker. Non-blocking. */
 void streamer_feed(const uint8_t *pcm, uint32_t len);

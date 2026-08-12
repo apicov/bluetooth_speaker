@@ -1,4 +1,16 @@
-idf_component_register(SRCS "main.c" "sbc_in.c" "streamer.c"
+idf_component_register(SRCS "main.c"
+                            "streamer.c"
+                            "hub_state.c"
+                            "net.c"
+                            "clients.c"
+                            "timeline.c"
+                            "play.c"
+                            "out.c"
+                            "servo.c"
+                            "telemetry.c"
+                            "probe.c"
+                            "marker.c"
+                            "sbc_in.c"
                        INCLUDE_DIRS "."
                        REQUIRES dancefloor_sync dancefloor_leds sbc_decoder esp_driver_spi esp_wifi esp_netif nvs_flash esp_app_format
                                 esp_driver_i2s esp_driver_gpio esp_timer)

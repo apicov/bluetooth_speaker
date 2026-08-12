@@ -1,0 +1,195 @@
+/*
+ * The output-rate servo, and the 5 s task that drives it.
+ *
+ * The comment below is the original from streamer.c, where it sat -- orphaned --
+ * immediately above the allocation-failure hook rather than above the loop it
+ * describes. It is back where it belongs.
+ */
+#include "hub.h"
+
+/*
+ * Servo the DAC clock on the buffer level, not on the measured rate.
+ *
+ * Chasing the measured rate cannot work: it carries ~0.3% noise, and whatever
+ * error is left integrates straight into this buffer until it overflows or
+ * empties. The level itself IS that integral, so nulling it removes the
+ * accumulated error rather than the instantaneous one. Correction is spread over
+ * ~40 s, well below the ~1% pitch shift a listener would notice.
+ */
+
+/*
+ * NOTE for anyone comparing this against the pre-split file: s_err_ema,
+ * s_err_ema_valid, status_left, cooldown and bench_left are still declared where
+ * they always were, as function-local statics inside the loop body below. They
+ * were static in ring_monitor_task too, so moving that body into a function
+ * called once per tick preserves their storage, their zero-initialisation and
+ * their lifetime exactly. They MUST survive between 5 s windows -- s_err_ema is
+ * the smoothed phase the loop runs on and cooldown is what stops it retuning
+ * every window and chasing its own last correction -- and nothing here changes
+ * whether they do.
+ */
+
+void servo_tick(void)
+{
+    if (local_start == 0 || rate_ema == 0) {
+        return;
+    }
+
+#if CONFIG_DANCEFLOOR_RETUNE_BENCH_S > 0
+    /* Bench: retune to the rate already set, so the RETUNE COST line below
+     * reports the cost of retuning and nothing else. One unit at a time. */
+    static int bench_left;
+    if (--bench_left <= 0) {
+        bench_left = (CONFIG_DANCEFLOOR_RETUNE_BENCH_S + 4) / 5;
+        ESP_LOGW(TAG, "BENCH: forcing a same-rate retune at %" PRIu32 " Hz", tx_rate);
+        retune_dac(tx_rate);
+        return;
+    }
+#endif
+
+    /*
+     * The servo input, matching the satellite: a 4-sample EMA of the phase,
+     * forgotten after a splice because the average from before it describes
+     * a situation that no longer exists.
+     *
+     * This unit used to act on the raw reading, and the raw reading is far
+     * noisier than anyone had established. Measured here, two reads of
+     * s_phase_err_us one millisecond apart:
+     *
+     *   local ring ... | phase +26786 us (smoothed +8996 us)
+     *   servo: phase +11108 us (smoothed +8996), ...
+     *
+     * 15.7 ms of swing between consecutive samples, with the average
+     * sitting still at +9 ms through it. That is the "hub absolute phase
+     * does not settle" wart in docs/clock-sync.md, quantified: the servo was
+     * substantially triggering on measurement noise. A shadow run put two
+     * of six retunes at the deadband edge, both of which the average would
+     * have held.
+     *
+     * Honest caveat: cross-unit audio measured 0.5 to 2.5 ms with the raw
+     * input, which is already the best this project has recorded, so this
+     * is expected to reduce pointless retunes rather than to move that
+     * number. If it moves it the wrong way, revert this commit -- the raw
+     * value is still computed below and still logged.
+     */
+    static int32_t s_err_ema;
+    static bool    s_err_ema_valid;
+    if (s_phase_stepped || !s_phase_valid) {
+        s_phase_stepped = false;
+        s_err_ema_valid = false;   /* history describes a different world */
+    }
+    s_err_ema = s_err_ema_valid ? (s_err_ema * 3 + s_phase_err_us) / 4
+                                : s_phase_err_us;
+    s_err_ema_valid = true;
+
+    size_t filled = LOCAL_RING_BYTES - xStreamBufferSpacesAvailable(local_ring);
+    /* Printed once per log period, not every window. tx-fail accumulates
+     * across the quiet windows so nothing is lost by not printing it. */
+    static int status_left;
+    if (--status_left <= 0) {
+        status_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
+        ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
+                      "tx-fail %" PRIu32,
+                 (unsigned)filled,
+                 (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
+                 (long)s_phase_err_us, (long)s_err_ema, s_tx_fail);
+        s_tx_fail = 0;
+    }
+
+    const int32_t target = (int32_t)(LEAD_US / 1000) *
+                           (int32_t)(rate_ema * AUDIO_CHANNELS * 2 / 1000);
+    int32_t err_frames = ((int32_t)filled - target) / (AUDIO_CHANNELS * 2);
+    int32_t depth_ms = err_frames * 1000 / (int32_t)rate_ema;
+
+    if (!s_phase_valid) {
+        return;
+    }
+    /*
+     * Phase drives the correction; buffer depth is only a guard against
+     * running empty or overflowing, which phase control would not see
+     * coming. Late means behind the timeline, so play faster.
+     *
+     * Spread over ~100 s: at 40 s the loop was still correcting after the
+     * error had gone and overshot to +8 ms. Real drift is ~0.8 ms/minute,
+     * far slower than the correction needs to be.
+     */
+    int32_t adj = (int32_t)((int64_t)s_err_ema * rate_ema / 100000000LL);
+    /* The drift correction is small by nature -- real drift is ~14 ppm.
+     * Anything larger is a bad phase reading, not a rate error. */
+    if (adj >  RATE_TRIM_MAX_HZ) adj =  RATE_TRIM_MAX_HZ;
+    if (adj < -RATE_TRIM_MAX_HZ) adj = -RATE_TRIM_MAX_HZ;
+    if (depth_ms < -120) {
+        adj = -20;
+    } else if (depth_ms > 120) {
+        adj = 20;
+    }
+    uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
+
+    /*
+     * Deadband in phase error, not in rate -- see PHASE_DEADBAND_US. The
+     * old tx_rate/5000 was documented as ~8 ms and is really ~20 ms. This
+     * unit has always parked its playback across a retune, so its retunes
+     * were never the expensive kind; the satellite's were, until it got the
+     * same guard.
+     */
+    int32_t deadband = (int32_t)((int64_t)PHASE_DEADBAND_US * rate_ema / 100000000LL);
+    if (deadband < 1) {
+        deadband = 1;
+    }
+
+    /* Wait for the buffer to respond before correcting again -- the hub
+     * had no cooldown at all, so it retuned every window and chased its own
+     * previous correction. */
+    /* The raw input is the shadow now. Kept so the comparison survives the
+     * change, and so a revert has something to check itself against. */
+    int32_t adj_raw = (int32_t)((int64_t)s_phase_err_us * rate_ema / 100000000LL);
+    if (adj_raw >  RATE_TRIM_MAX_HZ) adj_raw =  RATE_TRIM_MAX_HZ;
+    if (adj_raw < -RATE_TRIM_MAX_HZ) adj_raw = -RATE_TRIM_MAX_HZ;
+    const uint32_t desired_raw = (uint32_t)((int32_t)rate_ema + adj_raw);
+
+    static int cooldown;
+    if (cooldown > 0) {
+        cooldown--;
+    } else {
+        const bool ema_would = desired     > tx_rate + (uint32_t)deadband ||
+                               desired     < tx_rate - (uint32_t)deadband;
+        const bool raw_would = desired_raw > tx_rate + (uint32_t)deadband ||
+                               desired_raw < tx_rate - (uint32_t)deadband;
+        /*
+         * Still logged, with the roles swapped: each of these is now a
+         * retune the raw input would have made and the average declined, or
+         * the reverse. If these become common AND the cross-unit figure
+         * degrades, this commit is the thing to revert.
+         */
+        if (raw_would != ema_would) {
+            ESP_LOGW(TAG, "SERVO DIVERGES: smoothed %+ld us -> %" PRIu32 " Hz (%s), "
+                          "raw %+ld us -> %" PRIu32 " Hz (%s)",
+                     (long)s_err_ema,      desired,     ema_would ? "retune" : "hold",
+                     (long)s_phase_err_us, desired_raw, raw_would ? "retune" : "hold");
+        }
+        if (ema_would) {
+            ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
+                          "-> DAC %" PRIu32 " Hz",
+                     (long)s_err_ema, (long)s_phase_err_us, (long)depth_ms, desired);
+            retune_dac(desired);
+            cooldown = 4;          /* ~20 s against a 100 s correction */
+        }
+    }
+}
+
+/*
+ * The 5 s tick both halves hang off.
+ *
+ * telemetry_tick() first, then servo_tick(), which is the order they ran in as
+ * one function -- the reporting deliberately preceded the "is anything playing"
+ * check, because a stopped stream is when the counters matter most.
+ */
+void ring_monitor_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        telemetry_tick();
+        servo_tick();
+    }
+}
