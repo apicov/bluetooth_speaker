@@ -143,33 +143,28 @@ void servo_tick(void)
     /* Wait for the buffer to respond before correcting again -- the hub
      * had no cooldown at all, so it retuned every window and chased its own
      * previous correction. */
-    /* The raw input is the shadow now. Kept so the comparison survives the
-     * change, and so a revert has something to check itself against. */
-    int32_t adj_raw = (int32_t)((int64_t)s_phase_err_us * rate_ema / 100000000LL);
-    if (adj_raw >  RATE_TRIM_MAX_HZ) adj_raw =  RATE_TRIM_MAX_HZ;
-    if (adj_raw < -RATE_TRIM_MAX_HZ) adj_raw = -RATE_TRIM_MAX_HZ;
-    const uint32_t desired_raw = (uint32_t)((int32_t)rate_ema + adj_raw);
-
+    /*
+     * RETIRED 2026-08-12, on the bench logs rather than on opinion.
+     *
+     * A shadow used to compute what the RAW phase reading would have asked for,
+     * and log SERVO DIVERGES whenever it disagreed with the average. Its question
+     * was whether smoothing the servo's input declines retunes that the raw value
+     * would have made. The 18:09 run answered it: SERVO DIVERGES fired repeatedly
+     * across the session and EVERY firing was the same way round -- raw would
+     * retune, smoothed held -- while phase converged from -26.9 ms to -1.9 ms
+     * with retunes 30 and 45 s apart.
+     *
+     * That is the averaging doing exactly what it was added for, and a shadow
+     * that only ever says so is an instrument with nothing left to find. The raw
+     * value is still printed on the servo line beside the smoothed one, so the
+     * two remain comparable at every retune.
+     */
     static int cooldown;
     if (cooldown > 0) {
         cooldown--;
     } else {
-        const bool ema_would = desired     > tx_rate + (uint32_t)deadband ||
-                               desired     < tx_rate - (uint32_t)deadband;
-        const bool raw_would = desired_raw > tx_rate + (uint32_t)deadband ||
-                               desired_raw < tx_rate - (uint32_t)deadband;
-        /*
-         * Still logged, with the roles swapped: each of these is now a
-         * retune the raw input would have made and the average declined, or
-         * the reverse. If these become common AND the cross-unit figure
-         * degrades, this commit is the thing to revert.
-         */
-        if (raw_would != ema_would) {
-            ESP_LOGW(TAG, "SERVO DIVERGES: smoothed %+ld us -> %" PRIu32 " Hz (%s), "
-                          "raw %+ld us -> %" PRIu32 " Hz (%s)",
-                     (long)s_err_ema,      desired,     ema_would ? "retune" : "hold",
-                     (long)s_phase_err_us, desired_raw, raw_would ? "retune" : "hold");
-        }
+        const bool ema_would = desired > tx_rate + (uint32_t)deadband ||
+                               desired < tx_rate - (uint32_t)deadband;
         if (ema_would) {
             ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
                           "-> DAC %" PRIu32 " Hz",

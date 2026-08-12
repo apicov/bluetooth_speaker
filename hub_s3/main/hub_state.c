@@ -59,7 +59,6 @@ volatile uint32_t n_short_reads;
 volatile uint32_t n_short_frames;
 bool s_refill_active;
 int32_t s_refill_frames;
-const char *s_refill_why = "start";
 client_t s_clients[MAX_CLIENTS];
 portMUX_TYPE s_clients_lock = portMUX_INITIALIZER_UNLOCKED;
 esp_netif_t *s_ap_netif;

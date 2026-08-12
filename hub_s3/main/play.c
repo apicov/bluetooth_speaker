@@ -31,7 +31,6 @@
  */
 static int32_t s_samples_played;   /* position in the ring stream */
 static int64_t s_wrote_at;         /* when the DAC last accepted a chunk */
-static bool    s_was_retuning;     /* armed by the park, see s_refill_active */
 /* The timeline generation this task last started on. Compared against
  * local_epoch to decide whether a new origin has been published. */
 static uint32_t s_play_epoch;
@@ -55,16 +54,26 @@ static bool park_for_retune(void)
     if (retuning) {
         /* Do not pull from the ring while the channel is down -- writes
          * would return instantly and drain it. */
-        s_was_retuning = true;
         vTaskDelay(pdMS_TO_TICKS(2));
         return true;
     }
-    if (s_was_retuning) {
-        s_was_retuning = false;
-        s_refill_active = true;
-        s_refill_frames = 0;
-        s_refill_why = "retune";
-    }
+    /*
+     * The RETUNE arm of the refill probe is RETIRED, 2026-08-12, on measurement.
+     *
+     * Re-arming here assumed the DMA is empty after a retune, on the reasoning
+     * that i2s_channel_disable() discards the descriptors. It does not -- it
+     * drains them. The satellite retired its copy of this probe on 25 of 26
+     * samples reading `0 frames`, and the hub's 18:09 run read `0 frames` on all
+     * three of its retunes independently. There is no refill window here to
+     * measure or to withhold readings inside.
+     *
+     * The transient a retune DOES cause is a step, not a fill, and s_retune_watch
+     * already withholds exactly one reading for it -- which the same run showed
+     * is the right number, the tail being flat across ~70 ms rather than decaying.
+     *
+     * The START arm is untouched and is load-bearing: the channel really is empty
+     * there, because this task was parked and it drained.
+     */
     return false;
 }
 
@@ -478,10 +487,10 @@ static void write_chunk(uint8_t *chunk)
             s_refill_frames += (int32_t)(written / (AUDIO_CHANNELS * sizeof(int16_t)));
         } else {
             s_refill_active = false;
-            ESP_LOGW(TAG, "REFILL after %s: %ld frames (%ld ms) before a "
+            ESP_LOGW(TAG, "REFILL after start: %ld frames (%ld ms) before a "
                           "write blocked -- phase readings inside this "
                           "window are not DAC-paced",
-                     s_refill_why, (long)s_refill_frames,
+                     (long)s_refill_frames,
                      (long)(s_refill_frames * 1000 / (int32_t)sample_rate));
         }
     }
@@ -505,7 +514,6 @@ static void begin_playback(void)
  * counters therefore share an origin -- do NOT reset s_samples_in here,
  * it has legitimately been counting the audio buffered during the wait. */
 s_samples_played = 0;
-    s_was_retuning = false;   /* was a fresh loop local at every start */
 /* Every reading in it was measured against the timeline this start
  * replaces, so none of them describes where this unit now is. */
 sync_phase_reset(&s_phase_hist);
@@ -513,7 +521,6 @@ sync_phase_reset(&s_phase_hist);
  * for the same reason it is empty after a disable. See s_refill_active. */
 s_refill_active = true;
 s_refill_frames = 0;
-s_refill_why = "start";
 /*
  * When the DAC last accepted a chunk -- the reference the phase reading
  * is dated against. See the note in the phase loop for why it is not a

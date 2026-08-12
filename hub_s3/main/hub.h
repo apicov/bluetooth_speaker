@@ -538,7 +538,8 @@ extern volatile uint32_t n_short_frames;
 #define REFILL_FAST_US 1000     /* below this, the write did not block */
 extern bool s_refill_active;
 extern int32_t s_refill_frames;
-extern const char *s_refill_why;
+/* s_refill_why is gone with the probe's retune arm: the window only ever
+ * happens at a start now, so nothing needs to say which. */
 
 /*
  * Satellites are sent audio by UNICAST, not multicast.
