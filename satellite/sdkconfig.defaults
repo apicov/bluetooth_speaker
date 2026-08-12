@@ -90,6 +90,22 @@ CONFIG_DANCEFLOOR_LED_PATTERN="boom"
 CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE=y
 CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
 
+# The LED sync marker, on by default on this unit.
+#
+# One flash per master-clock second, on every unit at the same instant: put two
+# boards side by side and a floor that agrees is visible with no console and no
+# wiring. The Kconfig default is n because it is a bench instrument; a floor made
+# mostly of satellites is exactly where it earns its keep, so it is pinned on
+# here rather than set by hand on each board and lost with the next sdkconfig.
+#
+# Nothing corrects on it -- it is an indicator, not a feedback path.
+#
+# GPIO and polarity are not repeated here: the Kconfig defaults are already
+# GPIO 2 and active-low, which is what the boards on this floor are. If the log
+# says the marker fired and the LED stays dark, DANCEFLOOR_LED_MARKER_GPIO is the
+# setting to change -- the onboard LED pin varies by board.
+CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=y
+
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
 # laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
 # production flash, where the shipper compiles out entirely. Each satellite
