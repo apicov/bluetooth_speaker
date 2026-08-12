@@ -1,3 +1,51 @@
+menu "Dancefloor audio output"
+
+    choice DANCEFLOOR_OUTPUT_CHANNELS
+        prompt "Which channels this unit plays"
+        default DANCEFLOOR_OUT_STEREO
+        help
+            Every unit receives the same stereo stream. This picks what this
+            unit's own speaker does with it, so a floor can be laid out as a
+            stereo pair -- one box left, one box right -- rather than every box
+            playing everything.
+
+            A selected channel is written to BOTH I2S slots, not left in one
+            with the other muted. Which slot an amp latches is a hardware strap
+            (the MAX98357A's SD pin, a PCM5102A's mono wiring), so muting the
+            other one is a coin flip between the intended channel and silence.
+            Duplicating is right whatever the amp does, and loses no loudness.
+
+            Build-time, per image. A left box and a right box are two builds:
+            check the OUTPUT line at boot to see which one a board is running.
+
+            Lives in this component, not in each project's own Kconfig, because
+            audio_out.h is what reads these symbols and audio_out.h lives here.
+            It was declared separately in the satellite's Kconfig and the S3
+            hub's, and the classic hub -- which built the same shared header --
+            declared it nowhere at all, so it took the #else branch and played
+            stereo by omission rather than by choice. A shared header cannot
+            require each project to remember to declare what it consumes; the
+            declaration belongs beside the code that reads it.
+
+        config DANCEFLOOR_OUT_STEREO
+            bool "Stereo -- both channels, as received"
+
+        config DANCEFLOOR_OUT_LEFT
+            bool "Left channel only"
+
+        config DANCEFLOOR_OUT_RIGHT
+            bool "Right channel only"
+
+        config DANCEFLOOR_OUT_MONO
+            bool "Mono -- (L+R)/2"
+            help
+                For a single speaker that should not lose whatever is panned
+                hard, which is what a one-box mix does if it takes one channel.
+
+    endchoice
+
+endmenu
+
 menu "Dancefloor diagnostics"
 
     config DANCEFLOOR_LOG_PERIOD_S

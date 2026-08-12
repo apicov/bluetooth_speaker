@@ -392,10 +392,14 @@ int main(void)
      *
      * Flip the same bit in two payload bytes and the XOR is unchanged -- it is
      * a parity per bit position, so any even number of flips in one column is
-     * invisible to it. Run this against sbc_link_checksum() and the first half
-     * passes, which is the point of writing it: the UART link would have
-     * accepted this frame, and on a wire running 20x faster there is no resync
-     * scan behind it to notice.
+     * invisible to it. The first half passes, which is the point of writing it:
+     * the UART link would have accepted this frame, and on a wire running 20x
+     * faster there is no resync scan behind it to notice.
+     *
+     * The XOR is reproduced here rather than called. sbc_link_checksum() went
+     * with the UART declarations when the classic hub was retired, and this test
+     * is the reason the byte is still worth describing -- it says what the CRC
+     * was chosen over, so it has to keep computing the thing it argues against.
      */
     {
         uint8_t good[64], bad[64];
@@ -404,9 +408,15 @@ int main(void)
         bad[0] ^= 0x01;
         bad[1] ^= 0x01;
 
+        uint8_t xor_good = 0, xor_bad = 0;
+        for (int i = 0; i < 64; i++) {
+            xor_good ^= good[i];
+            xor_bad  ^= bad[i];
+        }
+
         spi_link_hdr_t h = { .kind = LINK_KIND_SBC, .len = 64, .seq = 99, .crc = 0 };
         check("the XOR the link used to carry misses this",
-              sbc_link_checksum(good, 64) == sbc_link_checksum(bad, 64), NULL);
+              xor_good == xor_bad, NULL);
         check("the CRC catches it",
               sbc_link_crc16(&h, good, 64) != sbc_link_crc16(&h, bad, 64), NULL);
     }

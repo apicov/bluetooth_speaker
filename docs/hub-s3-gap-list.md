@@ -13,6 +13,21 @@ The list below is the porting backlog. It is deliberately split by whether the
 classic hub *can* have the thing, because two of the biggest wins are
 chip-specific and three are just settings nobody has copied across yet.
 
+> **The classic `hub/` was retired on 2026-08-12 and deleted from the tree.**
+> `hub_s3/` is the only hub. That resolves this document's backlog by removing
+> the thing it was a backlog *for*, so read it accordingly:
+>
+> - **§6 and §7 are closed, not done.** They described work the classic hub owed
+>   — the sync features it never received, and the SPI link it never learned to
+>   speak. Nothing owes them now. §7.2's instruction to delete `sbc_link_hdr_t`
+>   "the moment the port lands" was carried out on retirement instead; the UART
+>   declarations are gone from `sbc_link.h`.
+> - **§1 is still live, and its audience changed.** Those four are portable wins
+>   that were never taken up on a classic ESP32 — and the *satellite* is still a
+>   classic ESP32. 240 MHz, QIO flash at 80 MHz, HT20 and the `RESYNC_US` value
+>   are unclaimed there. See [`satellite-audit.md`](satellite-audit.md) §4.
+> - **§2–§5 are unaffected**: they describe the S3 hub itself.
+
 ---
 
 ## 1. Portable — the classic hub could have these today
@@ -459,10 +474,10 @@ only the pins.
 | bus | **VSPI / `SPI3_HOST`**. `SPI2_HOST` is the LED strip on this hub too |
 | pins | four, and the classic part has them to spare, unlike the XIAO. SCK can keep GPIO 23, the pin the UART arrived on. Avoid 16/17 (PSRAM die on WROVER), 5 and 12 (strapping), and 34–39 (input only, so no handshake output there) |
 | handshake | an **output** on the hub, input on the bridge. Not optional — `spi_slave` loses any transfer clocked with nothing queued |
-| header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` keeps the old `sbc_link_hdr_t` purely so this firmware still compiles; it is dead the moment the port lands and should be deleted with it |
+| header | `spi_link_hdr_t`, 12 bytes, no sync words. `sbc_link.h` kept the old `sbc_link_hdr_t` purely so the classic firmware still compiled; **it was deleted on retirement, 2026-08-12**, along with `SBC_LINK_BAUD`, the sync bytes and `sbc_link_checksum()` |
 | checksum | CRC-16 via `sbc_link_crc16()`, not the XOR byte |
 | framing | fixed 2060-byte transactions (12-byte header + 2048 payload, sized for the codec's bitpool 250), two DMA buffers queued alternately. **5 MHz**, not 10: the 2060-byte frame fails on breadboard jumpers at 10 MHz |
-| wifi hop | `AUDIO_MAX_PAYLOAD` rose to 2048 with the SPI ceiling (shared header, flows in automatically). `hub/main/streamer.c` still drops `len > AUDIO_MAX_PAYLOAD` **silently** — port the `wifi-over` counter from `hub_s3` so the ceiling has a tripwire there too |
+| wifi hop | `AUDIO_MAX_PAYLOAD` rose to 2048 with the SPI ceiling (shared header, flows in automatically). The classic hub dropped `len > AUDIO_MAX_PAYLOAD` **silently**; `hub_s3` has the `wifi-over` counter, so the surviving hub has the tripwire |
 | log line | `sync` becomes `hdr`, and the SPI line gains two columns the UART one never had: `short` (a transfer that did not arrive whole -- CS split it) and `dcrc` (an SBC frame whose own CRC failed despite the link CRC passing). Both come along when the file is copied; only `dcrc` is meaningful on a UART, and the classic hub does not report it yet |
 | decode split | `dcrc` vs `dec` is told apart by `sbc_decoder_last_result()` in the shared `components/sbc_decoder/`. The classic hub already links it; only its `sbc_in.c` call site would need it, and only when it adopts the `dcrc` column. `short` is SPI-only -- a UART has no `trans_len` |
 | Kconfig | `DANCEFLOOR_SBC_UART_RX_PIN` → the four `DANCEFLOOR_SBC_SPI_*_PIN` symbols, plus `DANCEFLOOR_SBC_LINK_SPI_HZ` (shared through `dancefloor_sync`; only the bridge's value is on the wire) |

@@ -19,9 +19,9 @@ cleared it clean all the way to 10 MHz. The payload ceilings are up to 2048 and
 out to be a phone question, not a wire one: the handset negotiates 53 back
 regardless. 250 is held as headroom, not a realised gain — step 4.
 
-> `hub/`, the classic ESP32 hub, still speaks the UART and **can no longer
-> receive anything from the bridge**. See
-> [`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
+> `hub/`, the classic ESP32 hub, spoke the UART and could no longer receive
+> anything from the bridge. It was **retired on 2026-08-12** rather than ported;
+> `hub_s3/` is the only hub. See [`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
 
 ---
 
@@ -31,7 +31,7 @@ Not quality, and not corruption. Capacity.
 
 | | |
 |---|---|
-| UART at `SBC_LINK_BAUD` = 500000 8N1 | **50 kB/s, hard, no flow control** |
+| UART at 500000 8N1 (was `SBC_LINK_BAUD`, now deleted) | **50 kB/s, hard, no flow control** |
 | Measured payload | **~42 kB/s** — 50 packets/s of ~830 bytes |
 | Utilisation | **84%** |
 
