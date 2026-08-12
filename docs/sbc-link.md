@@ -21,7 +21,7 @@ regardless. 250 is held as headroom, not a realised gain — step 4.
 
 > `hub/`, the classic ESP32 hub, spoke the UART and could no longer receive
 > anything from the bridge. It was **retired on 2026-08-12** rather than ported;
-> `hub_s3/` is the only hub. See [`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
+> `hub_s3/` is the only hub.
 
 ---
 
@@ -133,9 +133,7 @@ instrument needs GPIO 4 *and* GPIO 5, so it is finished on this board — the fo
 SPI signals took all but one free pad on an eleven-pad module. It was the
 cheapest of the available prices: the instrument is off by default, needs a wire
 between two boards that a deployed floor cannot have, and nothing corrects on
-it. `TRACK DIVERGENCE` over WiFi still covers every satellite. The classic hub
-would not have to pay this, having pins to spare — see
-[`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.3.
+it. `TRACK DIVERGENCE` over WiFi still covers every satellite.
 
 **Not GPIO 43.** The console lives there, moved off USB deliberately so
 `ESP_PHY_ENABLE_USB` could be disabled: the S3's USB and WiFi PHYs interfere and

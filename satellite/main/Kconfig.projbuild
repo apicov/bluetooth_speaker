@@ -89,29 +89,11 @@ menu "Dancefloor satellite"
             end-to-end sync error, measured on the audio rather than inferred
             from clock estimates.
 
-    config DANCEFLOOR_AP_OPEN
-        bool "Hub SoftAP has no password (must match the hub)"
-        default n
-
-    config DANCEFLOOR_DISABLE_PMF
-        bool "Disable Protected Management Frames (see help)"
-        default y
-        help
-            PMF's Secure Association teardown is disconnecting our own
-            satellite. Measured on this hardware: the AP starts an SA Query, the
-            satellite fails to answer six attempts, and the AP disassociates it
-            with reason 209 -- 1.7 s off the network, twice in the first 65
-            seconds of a run, and the satellite did not even notice.
-
-            Both units must have this set the same way, since the capability is
-            negotiated. pmf_cfg.capable cannot be used to opt out: it is
-            deprecated in IDF 6 and forced true internally.
-
-            What is given up is protection of management frames against spoofed
-            deauth and disassoc. Data stays encrypted under WPA2-PSK and the
-            password is unchanged. Turn it back on if you would rather have that
-            protection than a stable link, and watch sta-left in the hub's
-            HEALTH line to see what it costs.
+    # The SSID, the password, DANCEFLOOR_AP_OPEN and DANCEFLOOR_DISABLE_PMF live
+    # in components/dancefloor_sync/Kconfig, under "Dancefloor radio pairing".
+    # They describe one link seen from both ends and were previously declared
+    # here and in the hub independently -- this file's AP_OPEN prompt said "must
+    # match the hub" and nothing enforced it.
 
     config DANCEFLOOR_RETUNE_BENCH_S
         int "Bench only: force a same-rate retune every N seconds (0 = off)"

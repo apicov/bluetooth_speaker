@@ -1,95 +1,91 @@
-# Dancefloor hub, ESP32-S3 port — experimental
+# Dancefloor hub — ESP32-S3
 
-The same hub firmware as [`../hub`](../hub), built for a **Seeed Studio XIAO
-ESP32-S3 Plus**. Same role: SBC in over UART from the `bt_bridge` chip, owns
-the timeline the whole system plays to, unicasts that SBC to the satellites,
-decodes it for its own DAC and LED strip, publishes analysis frames.
+The hub. There is one, and this is it.
 
-**Nothing here has been run on hardware.** It compiles and links; that is the
-whole of the evidence so far.
+Undecoded SBC in **over SPI** from the `bt_bridge` chip; owns the timeline the
+whole system plays to; unicasts that SBC on to the satellites over WiFi; decodes
+it for its own DAC and LED strip; publishes analysis frames. It runs a SoftAP,
+answers satellite time probes, and is a full speaker in its own right.
 
-## Why the hub is the one role that can move
+Built for a **Seeed Studio XIAO ESP32-S3 Plus**.
+
+> This directory used to be `hub_s3/`, an experimental port sitting beside a
+> classic-ESP32 `hub/`. **`hub/` was retired on 2026-08-12 and deleted**, along
+> with the UART link it was the last thing still speaking. Nothing here is a port
+> any more, and there is no other hub to stay diffable against.
+
+**Run on hardware**, two sessions on 2026-08-12 — see `../docs/satellite-audit.md`
+§7.5 and §7.6 for what they showed, including four clean minutes with sync
+converging inside ~1 ms and `tx-fail` at zero after association.
+
+## Why the hub is the one role that can be an S3
 
 `../docs/architecture.md` §2 fixes the chip choice for `bt_bridge` and only for
-`bt_bridge`: A2DP is Bluetooth Classic, and of the ESP32 family only the
-original part has it. The hub runs no Bluetooth — that is the entire point of
-the split — so it is the one image in the project an S3 can carry.
+`bt_bridge`: A2DP is Bluetooth Classic, and of the ESP32 family only the original
+part has it. The hub runs no Bluetooth — that is the entire point of the two-chip
+split — so it is the one image in the project an S3 can carry.
 
 What §2 *also* says is that the project chose classic ESP32 everywhere anyway,
-for one part number and interchangeable spares. This directory is a departure
-from that decision, not an oversight in it.
-
-## What is actually different from `../hub`
-
-Three files, and `diff -r ../hub .` is meant to stay short enough to read.
-**Every `.c`, every `.h` and both `main/CMakeLists.txt` are byte-identical**,
-and should stay that way. What differs is configuration and prose.
-
-| File | Change |
-|---|---|
-| `CMakeLists.txt` | `project(hub_s3)` |
-| `main/Kconfig.projbuild` | pin defaults: UART RX 23 → 44, monitor 21 → 5 |
-| `sdkconfig.defaults` | target, flash size, USB console, and the whole pin map |
-
-The one *source* change the port needed went into `../hub` instead of here, so
-there is no divergence to maintain: the UART RX pin was a literal `23` in
-`sbc_in.c` and is `DANCEFLOOR_SBC_UART_RX_PIN` in both builds now, defaulting to
-23 there and 44 here. The transmit half is gone entirely — the bridge talks and
-this chip listens, so `UART_PIN_NO_CHANGE` replaces a GPIO 22 that was being
-driven as an idle-high TX line with nothing connected to it.
-
-That was not cosmetic. **GPIO 22–25 do not exist on the ESP32-S3** — its pins
-are 0–21 and 26–48 — so both hardcoded numbers were rejected by
-`uart_set_pin()`, inside an `ESP_ERROR_CHECK`, at boot rather than at compile
-time. 26–32 exist but are wired to the SPI flash and 33–37 to the octal PSRAM,
-so of the classic hub's seven pins only the marker survives the move.
+for one part number and interchangeable spares. This board is a departure from
+that decision, not an oversight in it. The satellite is still a classic ESP32.
 
 ## Pin map
 
-The board breaks out eleven GPIOs and nothing else, and the hub wants seven of
-them, so this is close to the only arrangement rather than one among many.
+The board breaks out eleven GPIOs and nothing else. Ten are spoken for.
 
-| Function | XIAO pad | GPIO | classic hub |
-|---|---|---|---|
-| UART RX ← bridge | D7 (RX) | 44 | 23 |
-| I2S BCK → DAC | D8 (SCK) | 7 | 26 |
-| I2S LRCK → DAC | D9 (MISO) | 8 | 27 |
-| I2S DATA → DAC | D10 (MOSI) | 9 | 25 |
-| WS2812 data | D0 | 1 | 18 |
-| Sync marker out | D3 | 4 | 4 |
-| Sync monitor in | D4 | 5 | 21 |
+| Function | XIAO pad | GPIO |
+|---|---|---|
+| SBC link SCK ← bridge | D7 (RX) | 44 |
+| SBC link MOSI ← bridge | D5 | 6 |
+| SBC link CS ← bridge | D4 | 5 |
+| SBC link handshake → bridge | D2 | 3 |
+| I2S BCK → DAC | D8 (SCK) | 7 |
+| I2S LRCK → DAC | D9 (MISO) | 8 |
+| I2S DATA → DAC | D10 (MOSI) | 9 |
+| WS2812 data | D0 | 1 |
+| LED sync marker | D1 | 2 |
+| Console UART TX | D6 | 43 |
 
-Free afterwards: D1, D2, D5. (D6 = GPIO 43 is the console UART TX.)
+**Free: D3 (GPIO 4) only.**
 
-The I2S trio sits on the three SPI-labelled pads so the DAC is one ribbon off
-the end of the header. The LED strip does not need those pads — the SPI backend
-reaches its pin through the GPIO matrix, which is fine at the ~2.4 MHz the
-WS2812 encoding runs at.
+The SBC link is **SPI3**. SPI2 belongs to the LED strip, which reserves a whole
+bus to drive one WS2812 pin. The S3 has no IOMUX pins for SPI3, so everything
+goes through the GPIO matrix — irrelevant at the clock this link runs at, and the
+first thing to suspect if `crc` starts moving as the clock is raised.
+
+The I2S trio sits on the three SPI-labelled pads so the DAC is one ribbon off the
+end of the header.
+
+**GPIO 22–25 do not exist on this part** — its pins are 0–21 and 26–48. 26–32 are
+wired to the SPI flash and 33–37 to the octal PSRAM. That is why none of the
+classic hub's pin numbers survived the move.
+
+**The marker/monitor instrument is finished on this board.** It needs GPIO 4 *and*
+GPIO 5, and GPIO 5 became the SBC link's CS. That was the cheapest of the four
+pads that could have gone: the instrument is off by default, needs a wire between
+two boards a deployed floor cannot have, and nothing corrects on what it
+measures. `TRACK DIVERGENCE` over WiFi still covers every satellite, not just a
+wired one.
 
 The **74AHCT125 is still required**. The S3 drives 3.3 V exactly as the classic
 ESP32 does, so nothing about the level-shifting argument in
 `../docs/architecture.md` §12 changes.
 
-**The LED sync marker is active low here**, as it now is on every unit on this
-floor: the LED goes from 3V3 through a resistor to the pin, and the pin sinks it
-to light it. `CONFIG_DANCEFLOOR_LED_MARKER_ACTIVE_LOW` carries that and defaults
-to `y`.
+**The LED sync marker is active low**, as on every unit on this floor: the LED
+goes from 3V3 through a resistor to the pin, and the pin sinks it to light it.
+`CONFIG_DANCEFLOOR_LED_MARKER_ACTIVE_LOW` carries that and defaults to `y`.
 
-This paragraph used to say the opposite — that GPIO 21's active-low onboard LED
-would read inverted "which the driver does not know", left unfixed "because a
-polarity flag in shared code wants a better reason than one board". Three boards
-rewired to VCC is that better reason, and the flag exists. What has *not* changed
-is the advice about GPIO 21 itself: it did not light when pointed at, on a Sense
-or on the Plus, and the reason was never found. Use an external LED on `D1`
-(GPIO 2), the default.
+Do not expect the onboard LED. GPIO 21 is documented as the XIAO's and did not
+light when pointed at, on a Sense or on a Plus; the reason was never found. Use
+an external LED on D1 (GPIO 2), which is the default.
 
 ## Which XIAO ESP32-S3, and why it barely matters
 
 This build ran on a **Sense** first and is on a **Plus** now. The move cost one
 line — the flash size — and not a single pin, because the plain XIAO, the Sense
 and the Plus are the same ESP32-S3R8 behind the same eleven-pad header with the
-same GPIO numbers on it. Anything in this directory that names a variant is
-describing the board on the bench, not a dependency.
+same GPIO numbers on it. Anything here that names a variant is describing the
+board on the bench, not a dependency.
 
 | | plain | Sense | Plus |
 |---|---|---|---|
@@ -101,15 +97,14 @@ describing the board on the bench, not a dependency.
 
 **The Sense's sensors were never worth anything here.** A hub analyses the
 synchronised stream and deliberately never listens to a room (§12), so the
-microphone was dead weight; the camera more so. The one thing they did cost was
-a caveat — the SD slot is reportedly wired to the same `D8`/`D9`/`D10` SPI pads
-the I2S output uses, with GPIO 21 for CS — and the Plus has no card reader, so
-that caveat is now gone rather than merely unverified.
+microphone was dead weight and the camera more so. The Plus has no card reader,
+which also retires a caveat: the Sense's SD slot is reportedly wired to the same
+D8/D9/D10 pads the I2S output uses.
 
-**What the Plus adds is not used either**, but it is worth knowing about: the
-rear pads mean a pin taken by the SBC link is no longer gone for good. The
-marker/monitor instrument lost GPIO 5 to it and could be given GPIO 38–42
-instead, by anyone willing to solder to a pad rather than a header pin.
+**What the Plus adds is not used**, but it is worth knowing: the rear pads mean a
+pin taken by the SBC link is no longer gone for good. The marker/monitor
+instrument lost GPIO 5 and could be given GPIO 38–42 instead, by anyone willing
+to solder to a pad rather than a header pin.
 
 The one piece of the board that *is* worth something on any of the three: the
 u.FL connector and external antenna, on the unit that is the SoftAP in a field.
@@ -125,9 +120,9 @@ idf.py -p /dev/ttyUSB0 -b 921600 monitor
 
 **Two ports, and they are different things.** Flashing goes over `ttyACM0`, the
 S3's own USB peripheral wired straight to the connector — there is no USB-UART
-bridge on this board. The console does not: it comes out of **UART0 TX on
-GPIO 43 (pad D6)** into a separate USB-UART adapter, whatever that enumerates as,
-at 921600 baud. Wire adapter RX ← GPIO 43, adapter GND ← board GND.
+bridge on this board. The console does not: it comes out of **UART0 TX on GPIO 43
+(pad D6)** into a separate USB-UART adapter, whatever that enumerates as, at
+921600 baud. Wire adapter RX ← GPIO 43, adapter GND ← board GND.
 
 The console was moved off USB deliberately and it is not cosmetic. This part sets
 `SOC_WIFI_PHY_NEEDS_USB_WORKAROUND`; IDF's mitigation is to power the USB PHY
@@ -135,71 +130,78 @@ down when WiFi starts, and a USB console forces `ESP_PHY_ENABLE_USB=y` to keep i
 up, which IDF's own help says lowers WiFi performance. `sdkconfig.defaults` has
 the full reasoning next to the settings.
 
-**Hold BOOT and tap RESET before every flash.** Since the USB PHY now goes down a
-few hundred ms into boot, the port vanishes once the app is running and esptool
+**Hold BOOT and tap RESET before every flash.** The USB PHY goes down a few
+hundred ms into boot, so the port vanishes once the app is running and esptool
 cannot reset the board into download mode on its own.
+
+**It must be a full `idf.py flash`, never `app-flash`.** The second-stage
+bootloader is what raises the flash to quad mode during init, so a stale one
+leaves the app in DIO. Relatedly: `idf.py flash` prints `--flash-mode dio` even
+with QIO selected. That is correct — IDF stamps the image header DIO so the ROM
+can read it. Do not "fix" it. If a board will not boot, hold BOOT and tap RESET
+for ROM download mode, set DIO back, reflash; the ROM downloader is in silicon
+and cannot be lost.
+
+## What this board is configured to use
+
+Four settings that are not IDF defaults and are each load-bearing. All are in
+`sdkconfig.defaults` with the reasoning beside them.
+
+| | value | why |
+|---|---|---|
+| CPU | **240 MHz** | with the cache below, took `analysis` 3900 → 1940 µs mean |
+| Instruction cache | **32 kB** | the S3 offers 16 or 32 and **defaults to 16** |
+| Flash | **QIO, 80 MHz** | ~40 MB/s against DIO/40's ~10; sets what every cache miss costs |
+| PSRAM | **on, `CAPS_ALLOC` only** | see `../docs/hub-audit.md` §5 |
+
+The instruction cache is the trap worth remembering on any future retarget:
+`CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB` has no counterpart on the classic ESP32,
+so retargeting could not inherit a value and silently took the default. **A
+symbol that exists only on the new target cannot be inherited from the old one,
+and no diff of the tracked files will ever show it.**
+
+Together those took `analysis` max from nearly double the 11.6 ms frame period to
+comfortably under it, and carried downstream: `render` 880 → 470 µs, `wake`
+overshoot +490 → +93 µs, `late` and `overrun` 0.
 
 ## Size, measured
 
-Both from the link maps, so these are static figures and not the runtime heap
-the `HEALTH` line reports.
+From the link map, so these are static figures and not the runtime heap the
+`HEALTH` line reports.
 
-| | classic hub | this |
-|---|---|---|
-| Free RAM at link | 104,457 B DRAM | **184,113 B DIRAM** |
-| `.bss` + `.data` | 76,279 B | 77,352 B |
-| Binary | 903,720 B | 900,977 B |
+| | |
+|---|---|
+| Free RAM at link | 184,113 B DIRAM |
+| `.bss` + `.data` | 77,352 B |
+| Binary | 900,977 B |
 
 The S3 merges IRAM and DRAM into one 341,760-byte DIRAM pool, so "free at link"
-is the honest comparison and it is **+80 kB, a 76% increase**. Static data is
-within a kilobyte of the classic build, as it should be — same code.
+is the honest figure. At ~901 kB against a 1 MB single-app partition the binary
+is 14% from the ceiling; this board has 16 MB of flash and could carry a much
+larger app partition if that ever matters.
 
-The binary is *not* smaller in any meaningful way, and at ~901 kB against a
-1 MB single-app partition it is 14% from the ceiling. That is true of the
-classic hub too (903 kB) and is not something this port introduced, but this
-board has 16 MB of flash and could carry a much larger app partition if it ever
-matters.
+**Do not read the `HEALTH` line's heap figures as internal memory.**
+`esp_get_free_heap_size()` reports the 8 MB PSRAM pool, which nothing on the
+audio path can use — every `HEALTH` line has read ~8.4 MB free while internal SRAM
+went to 1.5 kB. The `MEM:` line exists to replace it. `../docs/hub-audit.md` §5
+has the baselines to compare against.
 
-## The measurement this port exists to make
+## Still open on this board
 
-`../docs/architecture.md` §13 records that pinning lwIP to CPU0 fixed the
-pattern task — max 23226 → 5254 µs — and **failed** to improve analysis
-(17400 → 17370 µs), concluding that one is "mostly the FFT doing its own work."
-esp-dsp has an LX7 SIMD path the classic part cannot use, so that is the number
-to read first.
-
-`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` is carried over here, and it is carried
-over **without evidence**. The reasoning still holds — priority 18, core locking
-off, ~30× a satellite's send load — but the numbers behind it were taken on an
-LX6 with the generic FFT. Run it both ways before trusting it.
-
-## What this port invalidates
-
-Not bugs, but things that stop being true, and every one of them is load-bearing
-somewhere in the docs.
-
+- **`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` is carried without evidence.**
+  `../docs/architecture.md` §13 recorded pinning lwIP to CPU0 fixing the pattern
+  task (max 23226 → 5254 µs) and *failing* to improve analysis (17400 → 17370 µs),
+  concluding the latter is "mostly the FFT doing its own work". Those numbers were
+  taken on an LX6 with the generic FFT; esp-dsp has an LX7 SIMD path this part
+  uses automatically. Run it both ways before trusting it.
+- **Nothing past one satellite has been measured.** The airtime model predicts
+  ~30 with rate adaptation and A-MPDU on; nobody has put more than one on the
+  floor with this config.
 - **The satellite is no longer the control.** §13 leaves the satellite
-  deliberately unpinned as the reference the lwIP measurement is against. That
-  comparison only means something while both units are the same silicon.
-- **The 15.7 ms phase wander wart has no cause.** §16 says the hub's raw phase
-  reading swings between consecutive reads and the satellite's does not, and
-  that asymmetry is the best evidence anyone has about it. Change the chip and
-  you can no longer tell a new behaviour from the old bug.
-- **"Does the other unit have this bug too" gets harder**, which is the exact
-  question §18's third postscript says produced most of the wasted effort in the
-  drift work.
+  deliberately unpinned as the reference the lwIP measurement is against, and
+  that comparison only means something while both units are the same silicon.
+- **The 15.7 ms phase-wander wart lost its best evidence.** §16 says the hub's raw
+  phase reading swings between consecutive reads and the satellite's does not, and
+  that asymmetry was the strongest clue about it. With different silicon on each
+  side, a new behaviour can no longer be told from the old bug.
 - **A spare can no longer be promoted** to this role without a rebuild.
-
-## If this works out
-
-The endgame is not two copies of a 92 kB `streamer.c`. Once the S3 build is
-worth keeping, fold it back into `../hub` — the UART pin becomes Kconfig there
-too, and everything in this directory's `sdkconfig.defaults` becomes
-`hub/sdkconfig.defaults.esp32s3`, which ESP-IDF applies automatically on top of
-the base defaults when the target is set. That leaves one source tree and two
-configs.
-
-Until then, keep the diff to those four files. `../docs/architecture.md`'s
-postscript on the drift work is specifically about a fix landing in one unit and
-not the other; two hub source trees is the machinery for making that happen
-weekly.

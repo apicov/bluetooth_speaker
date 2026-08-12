@@ -254,31 +254,51 @@ void play_task(void *arg)
             if (rp >= 0 && samples_played >= rp) {
                 restart_pos = -1;
                 int32_t max_frames = (int32_t)stream_rate * MAX_SPLICE_MS / 1000;
-                /* Same guard as the hub: phase_err_us survives a re-anchor, so
-                 * a boundary reached before the first measurement of the new
-                 * stream would splice on a number describing the old one. */
+                /*
+                 * THE MEDIAN, not the newest reading. Was the shadow, is now the
+                 * decision; the raw value is reported beside it.
+                 *
+                 * A splice on a single reading lands wherever that reading's
+                 * noise put it, and the hub's carries ~15.7 ms of scatter. Two
+                 * units each splicing on their own noisy sample therefore land in
+                 * DIFFERENT places at the same boundary -- which is why a track
+                 * change sometimes improved cross-unit sync and sometimes made it
+                 * worse. This unit's readings are the quieter of the two, and
+                 * that does not help: the divergence is set by the noisier one.
+                 *
+                 * LANDS WITH THE HUB, NOT BEFORE IT. hub_s3/main/play.c carries
+                 * the same change in the same commit. One-sided is strictly worse
+                 * than neither side, because it guarantees the two splice by
+                 * different estimators.
+                 *
+                 * Same guard as the hub: phase_err_us survives a re-anchor, so a
+                 * boundary reached before the first measurement of the new stream
+                 * would splice on a number describing the old one. And the same
+                 * fallback: with fewer than SYNC_PHASE_MIN readings no median is
+                 * offered, so use the raw value rather than decline to splice.
+                 */
+                int32_t med_us = 0;
+                const bool have_med = phase_valid &&
+                                      sync_phase_median(&phase_hist, &med_us);
+                const int32_t splice_us = have_med ? med_us : (int32_t)phase_err_us;
+
                 int32_t adj = phase_valid
-                    ? (int32_t)((int64_t)phase_err_us * stream_rate / 1000000) : 0;
+                    ? (int32_t)((int64_t)splice_us * stream_rate / 1000000) : 0;
                 if (adj > max_frames)  adj = max_frames;
                 if (adj < -max_frames) adj = -max_frames;
                 int32_t applied = 0;      /* what the splice actually moved */
 
                 /*
-                 * SHADOW: the correction the median of the last few readings
-                 * would have asked for, clamped identically so it subtracts
-                 * meaningfully against the hub's. Reported to the hub, acted on
-                 * by nothing -- the splice above still runs on phase_err_us.
-                 * Same computation as the hub's copy, deliberately.
+                 * The RAW value is the shadow now: what this unit would have
+                 * corrected on the newest reading alone, clamped identically so
+                 * it subtracts meaningfully against the hub's. Reported, acted on
+                 * by nothing. See splice_msg_t.applied_alt_us.
                  */
-                int32_t med_us = 0;
-                if (phase_valid && sync_phase_median(&phase_hist, &med_us)) {
-                    int32_t med_adj = (int32_t)((int64_t)med_us * stream_rate / 1000000);
-                    if (med_adj > max_frames)  med_adj = max_frames;
-                    if (med_adj < -max_frames) med_adj = -max_frames;
-                    splice_report_med = (int32_t)((int64_t)med_adj * 1000000 / stream_rate);
-                } else {
-                    splice_report_med = 0;
-                }
+                int32_t raw_adj = phase_valid
+                    ? (int32_t)((int64_t)phase_err_us * stream_rate / 1000000) : 0;
+                if (raw_adj > max_frames)  raw_adj = max_frames;
+                if (raw_adj < -max_frames) raw_adj = -max_frames;
+                splice_report_alt = (int32_t)((int64_t)raw_adj * 1000000 / stream_rate);
 
                 if (adj > 0) {
                     /* Late: discard input so playback jumps forward in content.

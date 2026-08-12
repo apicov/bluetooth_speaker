@@ -14,7 +14,7 @@
 #include "sync_proto.h"
 #include "sbc_link.h"
 #include "sbc_decoder.h"
-#include "streamer.h"
+#include "streamer.h"   /* task_start() -- see the note where the task starts */
 
 /*
  * SPI3. SPI2 is the LED strip -- led_strip_wrapper.cpp asks for SPI2_HOST and
@@ -390,13 +390,13 @@ void sbc_in_start(void)
     }
     /* Checked, unlike every xTaskCreate in this tree used to be: without this
      * task the SPI link is wired, logged as listening, and silently receiving
-     * nothing. */
-    if (xTaskCreatePinnedToCore(rx_task, "sbc_in", 4096, NULL, 9, NULL, 1) != pdPASS) {
-        ESP_LOGE(TAG, "TASK \"sbc_in\" FAILED TO START -- no audio will arrive "
-                      "from the bridge. Internal heap %u free, largest block %u",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    }
+     * nothing.
+     *
+     * Through task_start() rather than its own copy of the check. That helper
+     * was static to streamer.c, so this file open-coded a near-identical message
+     * and incremented nothing -- meaning a failure HERE, the one that costs all
+     * the audio, was the one failure n_task_fail could not count. */
+    task_start(rx_task, "sbc_in", 4096, 9, 1);
     ESP_LOGI(TAG, "SBC link listening: SPI slave at %d Hz, sck %d mosi %d cs %d, "
                   "handshake out on %d", SBC_LINK_SPI_HZ, PIN_SCK, PIN_MOSI,
              PIN_CS, PIN_HS);

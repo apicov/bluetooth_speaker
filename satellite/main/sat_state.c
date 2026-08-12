@@ -41,7 +41,7 @@ volatile int32_t restart_pos = -1;  /* ring position of a track boundary */
 volatile bool phase_stepped;
 volatile int32_t splice_report_us;
 volatile int32_t splice_report_phase;
-volatile int32_t splice_report_med;
+volatile int32_t splice_report_alt;
 volatile bool    splice_report_pending;
 tsf_reading_t tsf;
 volatile uint32_t n_tsf_used;  /* anchors that used TSF */

@@ -133,14 +133,11 @@ menu "Dancefloor hub"
             only the hub can hold is exactly the arrangement ML_SOURCE_REMOTE
             exists for.
 
-    config DANCEFLOOR_AP_OPEN
-        bool "Run the SoftAP with no password (diagnostic)"
-        default n
-        help
-            Isolates the WPA2 handshake. If clients associate with this on but
-            not off, the problem is the security config; if they fail either way,
-            the AP itself is not coming up properly and the credentials are a red
-            herring. Satellites must be built to match.
+    # The SSID, the password, DANCEFLOOR_AP_OPEN and DANCEFLOOR_DISABLE_PMF live
+    # in components/dancefloor_sync/Kconfig, under "Dancefloor radio pairing".
+    # They describe one link seen from both ends and were previously declared
+    # here and in the satellite independently, with each side's help text telling
+    # the reader they had to match and nothing enforcing it.
 
     comment "Sync measurement"
 

@@ -927,7 +927,7 @@ instrument on this board — it needs GPIO 4 and GPIO 5 both.
 
 `hub/`, the classic ESP32 hub, expected the old UART on GPIO 23 and could no
 longer receive anything from the bridge. It was retired on 2026-08-12 rather
-than ported. See [`hub-s3-gap-list.md`](hub-s3-gap-list.md) §7.
+than ported.
 
 **Two status LEDs on the bridge**, both optional and neither feeding back into
 anything — GPIO 32 solid while A2DP is connected, GPIO 33 blinking while audio

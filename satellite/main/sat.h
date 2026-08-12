@@ -83,8 +83,12 @@
 
 extern const char *TAG;
 
-#define AP_SSID    "dancefloor"
-#define AP_PASS    "dancefloor"
+/* The SSID and password are the hub's, and are declared once in
+ * components/dancefloor_sync/Kconfig -- they are one link seen from both ends,
+ * and were previously a #define here and another in the hub with nothing
+ * checking they agreed. */
+#define AP_SSID    CONFIG_DANCEFLOOR_AP_SSID
+#define AP_PASS    CONFIG_DANCEFLOOR_AP_PASS
 #define MASTER_IP  "192.168.4.1"        /* esp_netif SoftAP default */
 
 #define PROBE_PERIOD_MS 250             /* see docs/clock-sync.md §3 */
@@ -286,7 +290,7 @@ extern volatile int32_t splice_report_us;
 extern volatile int32_t splice_report_phase;
 /* SHADOW: the correction the median would have produced instead. Acted on by
  * nothing here; the hub prints it beside the real one so both units' figures
- * are compared at the same boundary. See splice_msg_t.applied_med_us.
+ * are compared at the same boundary. See splice_msg_t.applied_alt_us.
  *
  * Three boundaries have been captured so far and the median agreed with the raw
  * reading at every one of them -- sat -3/-3, -1/-1, +4/+4 ms, and the hub the
@@ -295,7 +299,7 @@ extern volatile int32_t splice_report_phase;
  * decision. Three is too few to retire it on, so it stays; if it is still
  * three-for-three after a long evening, the median machinery can come out of
  * the audio path and phase_hist with it. */
-extern volatile int32_t splice_report_med;
+extern volatile int32_t splice_report_alt;
 extern volatile bool    splice_report_pending;
 
 /*

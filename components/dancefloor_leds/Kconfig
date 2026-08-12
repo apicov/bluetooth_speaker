@@ -114,8 +114,9 @@ menu "Dancefloor LEDs"
 
             With no usable onboard LED, wire one to any free pin through a
             resistor, or point this at a pin you can watch on a scope. Taken
-            here: I2S (25, 26, 27), the strip (18), the markers (4, 21), and on
-            the hub the SBC UART RX (23).
+            here: I2S (25, 26, 27), the strip (18), the markers (4, 21). The
+            hub is an S3 with its own numbering -- see its Kconfig for the four
+            SBC SPI pins.
 
             The range stops at 33 because GPIO 34-39 on the ESP32 are
             input-only and cannot drive anything. That bound is an ESP32 fact
