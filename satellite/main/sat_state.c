@@ -52,6 +52,7 @@ volatile uint32_t n_splices;  /* track-boundary corrections applied */
 volatile uint32_t n_retunes;
 volatile uint32_t n_retunes_bad;
 volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
+volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
 volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 volatile uint32_t n_gap_frames;  /* silence inserted for lost packets */
 volatile uint32_t n_gap_short;  /* gap fills the ring could not take */

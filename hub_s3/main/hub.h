@@ -16,13 +16,14 @@
  *                      _send_sbc / _send_meta / _request_restart, so it writes
  *                      s_samples_in, s_pending_pos, s_marker_sample,
  *                      s_restart_pending, s_restart_pos, the phase queue HEAD,
- *                      the s_vis_anchor pair, local_start, the slew trio and
+ *                      the s_vis_anchor pair, local_start + local_epoch, the
+ *                      slew trio and
  *                      n_restarts / n_phase_drop / n_wifi_oversize.
  *   local_play_task    writes what playback has reached: the phase queue TAIL,
  *                      s_phase_err_us, s_phase_valid, s_phase_stepped,
  *                      s_phase_hist, the s_hub_splice_* set, the refill trio,
  *                      s_marker_at, n_underruns, n_splices, n_short_*, hw_play.
- *                      It also zeroes local_start on an underrun -- see below.
+ *                      and s_playing. It no longer writes local_start.
  *   ring_monitor_task  writes the servo's own state, the retune_* set and the
  *                      windowed heap figures, and READS everything else in order
  *                      to report it. retune_dac() runs on this task.
@@ -40,15 +41,16 @@
  * microsecond clock that happens once per 71.6 minutes; for anything set to 0,
  * or crossing zero, every time.
  *
- *   local_start   THE SHARP ONE, and NOT fixed, because the honest fix is not a
- *                 lock. It has TWO writers -- streamer_send_sbc() assigns it at
- *                 a timeline start, local_play_task() zeroes it on an underrun
- *                 -- and a seqlock with two writers is silently broken. The
- *                 `== 0` park test is immune either way, since both halves of
- *                 zero are zero; the exposure is a torn NON-ZERO read producing
- *                 a wild wait instant, once, at a start. The satellite reached
- *                 the same conclusion about stream_start_local. Single
- *                 ownership is the fix when someone wants it.
+ *   local_start   FIXED, by single ownership rather than by a lock. It had TWO
+ *                 writers -- streamer_send_sbc() assigned the instant,
+ *                 local_play_task() zeroed it to park -- and a seqlock with two
+ *                 writers is silently broken, so the exposure was accepted for
+ *                 as long as that was true. The play task now parks on
+ *                 local_epoch and writes neither, leaving one writer and a
+ *                 32-bit handshake that cannot tear. See the declaration.
+ *
+ *                 The satellite's stream_start_local is the same shape and still
+ *                 has two writers; this is the worked example for fixing it.
  *
  *                 Worth knowing that this part is DUAL-CORE and "play" is pinned
  *                 to core 1 while the others float, so these tasks genuinely run
@@ -67,6 +69,7 @@
  */
 #pragma once
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -244,10 +247,54 @@
  */
 #define TIMELINE_SLEW_US 20
 
-/* Local playback ring. The master delays its own audio by LEAD_US exactly like a
- * satellite, otherwise it would play ahead of every other speaker. Must hold the
- * lead (~21 kB) with headroom; 64 kB is 371 ms at 44.1 kHz stereo. */
-#define LOCAL_RING_BYTES (64 * 1024)
+/*
+ * Throttles on the non-audio downlink lanes. Audio is the priority: a dropped
+ * audio datagram costs a gap, where a dropped frame or ML result costs only a
+ * slightly-stale LED. publish_frame and publish_ml can EACH run at the ~86 Hz
+ * analysis rate (Kconfig.projbuild), so together they add ~172 datagrams/s on
+ * top of ~50 audio and overflow the 26 static TX buffers (tx-fail ENOMEM,
+ * measured -- see the errno tally tx_fail_note() keeps).
+ *
+ * ML_PUBLISH_PERIOD_US caps the ML lane well under the analysis rate. TX_BACKOFF_US
+ * is how long BOTH non-audio lanes stay silent after ANY sendto() returns ENOMEM:
+ * the instant the pool is exhausted, non-audio yields, leaving the buffers audio
+ * was being refused for audio. fan_out() -- the audio path -- is never gated.
+ *
+ * Falsified by tx-fail on the servo line: throttling is working while that drops.
+ */
+#define ML_PUBLISH_PERIOD_US   100000   /* 10/s, down from up to 86/s */
+#define TX_BACKOFF_US           40000   /* ~2 audio packets: yield, then probe again */
+
+/*
+ * Local playback ring. The master delays its own audio by LEAD_US exactly like a
+ * satellite, otherwise it would play ahead of every other speaker.
+ *
+ * THE LEAD IS ~35 kB, not the ~21 kB this said until 2026-08-12. LEAD_US is
+ * 200 ms and 200 ms at 44.1 kHz stereo is 35,280 bytes; the old figure described
+ * a shorter lead and was never updated when it grew. It mattered, because it made
+ * this ring look far better provisioned than it was: 64 kB reads as three times
+ * the lead against 21 kB and is only 1.86x against the real one.
+ *
+ * 48 kB is 279 ms, DOWN FROM 64 kB / 371 ms, and the 16 kB it releases is spent
+ * on WiFi static TX buffers -- see ESP_WIFI_STATIC_TX_BUFFER_NUM in
+ * sdkconfig.defaults, which is the other half of this change. This ring was 48%
+ * of the internal heap and the only place a WiFi-sized block existed: internal
+ * ran 7,760 bytes free with a 3,584 largest block, so nothing could grow until
+ * something here shrank.
+ *
+ * WHY 48 AND NOT LESS. Measured occupancy over a full run was 31,744-39,424
+ * bytes (179-223 ms), so 48 kB leaves 9,728 bytes above the observed peak. The
+ * constraint is not the steady state but the FEED BURST: sbc_in reports
+ * `max gap` of 34.8-42.0 ms, so the decoder pauses and then delivers in a lump,
+ * and the ring has to swallow the lump or drop it. 9,728 bytes is 55 ms, which
+ * clears the worst gap measured (42 ms) and not by much. 44 kB would leave 26 ms
+ * and lose to a gap this unit has already produced.
+ *
+ * FALSIFIED BY fed-drop, which is why that counter exists. Non-zero here means
+ * the burst no longer fits and the ring was the wrong donor; put it back to 64 kB
+ * and take the TX buffers from somewhere else.
+ */
+#define LOCAL_RING_BYTES (48 * 1024)
 
 extern const char *TAG;
 
@@ -345,12 +392,68 @@ extern bool s_slew_told;   /* whether this episode has been announced */
 extern int64_t s_slew_since;   /* when it started, for the 5 s filter */
 
 extern volatile bool retuning;
-extern volatile int64_t local_start;   /* master-clock instant local playback begins */
+/*
+ * The instant local playback begins, and the handshake that publishes it.
+ *
+ * ONE WRITER: the timeline path, at a start. That is the fix H2 named and it is
+ * why the pair below can be read safely at all.
+ *
+ * It used to have two -- streamer_send_sbc() assigned the instant, and
+ * local_play_task() zeroed it on an underrun to make itself park. Two writers is
+ * what made a seqlock impossible, so the 64-bit tearing exposure was documented
+ * and accepted rather than fixed. The play task now parks on the EPOCH instead
+ * and writes neither, which removes the second writer and the exposure together.
+ *
+ * local_epoch is incremented AFTER local_start is written, and the play task
+ * reads it BEFORE reading local_start. A reader that sees a new epoch therefore
+ * sees the value that belongs to it: both are volatile, so the compiler may not
+ * reorder the two stores or the two loads, and this core orders stores in
+ * program order. 32-bit, so the epoch itself cannot tear -- the same rule
+ * s_marker_sample and s_samples_in are written down for.
+ *
+ * The epoch wrapping after 2^32 starts is harmless: the test is inequality
+ * against the last one seen, not ordering.
+ */
+extern volatile int64_t local_start;
+extern volatile uint32_t local_epoch;
+
+/*
+ * Whether the play task is actually playing.
+ *
+ * Written only by the play task. The servo used to ask `local_start == 0` and
+ * that stopped being the question the moment local_start gained a single owner:
+ * it now holds the last start instant for ever rather than being zeroed at an
+ * underrun, so it can no longer answer "is anything playing". This can, and it
+ * is owned by the task that knows.
+ */
+extern volatile bool s_playing;
 
 /* Bytes dropped because pcm_stream was full. Silent loss here looks exactly
  * like a starving ring, which is why it needs a counter. */
 extern volatile uint32_t s_feed_dropped;
 extern volatile uint32_t s_tx_fail;   /* sendto() rejections */
+
+/*
+ * Non-audio publish throttling, paired with ML_PUBLISH_PERIOD_US / TX_BACKOFF_US.
+ * tx_fail_note() raises s_tx_congested_until on ENOMEM; publish_frame/publish_ml
+ * skip while now < it and count the skip in n_tx_cong_skip. publish_ml additionally
+ * rate-limits to the period and counts drops in n_ml_throttled. fan_out() ignores
+ * both -- audio always sends. Racy exactly as s_tx_fail is (net.c): a torn read of
+ * the 64-bit deadline at worst sends or skips one non-audio datagram wrongly.
+ */
+extern volatile uint32_t n_ml_throttled;            /* ML sends dropped to the period */
+extern volatile uint32_t n_tx_cong_skip;            /* non-audio sends skipped under ENOMEM backoff */
+extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-audio yields until it */
+
+/*
+ * Every failed sendto() goes through this rather than incrementing s_tx_fail
+ * directly, so the reason is kept alongside the count. Call it with errno, at
+ * the failure, before anything else can overwrite it. tx_fail_summary() renders
+ * the tally for the status line and clears it. Both live in net.c, which owns
+ * the socket; the rationale for keeping the reason at all is there.
+ */
+void tx_fail_note(int err);
+void tx_fail_summary(char *buf, size_t len);
 
 /*
  * Cumulative totals for a long run, never reset -- deliberately separate from
@@ -502,7 +605,8 @@ extern volatile uint32_t n_short_frames;
 #define REFILL_FAST_US 1000     /* below this, the write did not block */
 extern bool s_refill_active;
 extern int32_t s_refill_frames;
-extern const char *s_refill_why;
+/* s_refill_why is gone with the probe's retune arm: the window only ever
+ * happens at a start now, so nothing needs to say which. */
 
 /*
  * Satellites are sent audio by UNICAST, not multicast.

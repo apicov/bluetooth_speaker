@@ -453,6 +453,56 @@ typedef struct __attribute__((packed)) {
 /* Bytes to send for a payload of `n`. */
 #define AUDIO_MSG_BYTES(n) (sizeof(audio_msg_t) - AUDIO_MAX_PAYLOAD + (n))
 
+/*
+ * Optional trailing forward-error-correction redundancy.
+ *
+ * audio_msg_t itself is UNCHANGED: when no redundancy is attached this is the
+ * same wire format every log was captured against, and an older receiver reads
+ * payload_len bytes and ignores anything after. Redundancy is appended AFTER the
+ * first payload_len bytes as one or more self-describing blocks, found by length
+ * rather than by a version byte -- so a receiver from this branch recovers from
+ * any sender that attached it, and a sender that did not is read unchanged.
+ *
+ * Each block is a packed header (red_len, red_seq_ofs) followed by red_len bytes
+ * of a previous packet's SBC. red_seq_ofs says which previous packet it recovers
+ * (1 = the packet immediately before this one). A block lives in the unused tail
+ * of payload[] on the wire; the attach path is MTU-guarded so a packet carries as
+ * many whole blocks as fit and never fragments.
+ *
+ * Decoded audio is ~1.4 Mbps in 172 packets/s; the SBC sent over the air is
+ * ~330 kbps in ~50 packets/s of ~825-byte payloads. One full redundant copy would
+ * push a packet past the 1472-byte UDP MTU, so a copy is attached only as far as
+ * it fits -- at ~825-byte payloads that is most of the previous packet, and SBC
+ * frames are independently decodable, so a partial copy still recovers the audio
+ * it contains (the satellite pads any shortfall with silence to keep the
+ * timeline length exact).
+ */
+#define AUDIO_RED_HDR_BYTES   3                     /* u16 red_len + u8 red_seq_ofs */
+#define AUDIO_RED_BYTES(r)    (AUDIO_RED_HDR_BYTES + (r))
+
+/* On-wire bytes for an audio message of n payload bytes followed by r bytes of
+ * trailing redundancy. AUDIO_MSG_BYTES(n) is the r == 0 case. */
+#define AUDIO_MSG_RED_BYTES(n, r) (AUDIO_MSG_BYTES(n) + AUDIO_RED_BYTES(r))
+
+/*
+ * Which downlink this build speaks, as a short tag for the periodic status
+ * lines. It is a compile-time choice (see DANCEFLOOR_AUDIO_MCAST), and until it
+ * appeared here the two builds were indistinguishable in any log window: the
+ * only tell was a one-time boot line that scrolls out of a capture the moment a
+ * run starts. FEC depth rides along because it is the other half of the same
+ * experiment and changes between bench phases (Phase 1 = fec 0, Phase 2 = fec 1).
+ */
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+#define AUDIO_TRANSPORT_TAG "mcast"
+#else
+#define AUDIO_TRANSPORT_TAG "unicast"
+#endif
+
+typedef struct __attribute__((packed)) {
+    uint16_t red_len;        /* bytes of red_payload that follow; 0 == none */
+    uint8_t  red_seq_ofs;    /* this recovers the packet (seq - red_seq_ofs) */
+} audio_red_hdr_t;
+
 typedef struct {
     int64_t offset[SYNC_WINDOW];
     int64_t delay[SYNC_WINDOW];   /* round-trip time, for minimum-delay selection */

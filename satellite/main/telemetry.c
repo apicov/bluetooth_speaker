@@ -105,7 +105,7 @@ void telemetry_tick(void)
     static uint32_t gaps_told, gap_frames_told, gap_short_told,
                     gap_short_frames_told, ring_full_told,
                     anchor_late_told, anchor_soon_told, gap_resyncs_told,
-                    upgrades_told;
+                    upgrades_told, fec_told;
     const uint32_t gaps_now = n_gaps, gap_frames_now = n_gap_frames,
                    gap_short_now = n_gap_short,
                    gap_short_frames_now = n_gap_short_frames,
@@ -113,14 +113,17 @@ void telemetry_tick(void)
                    anchor_late_now = n_anchor_late,
                    anchor_soon_now = n_anchor_soon,
                    gap_resyncs_now = n_gap_resyncs,
-                   upgrades_now = n_anchor_upgrades;
+                   upgrades_now = n_anchor_upgrades,
+                   fec_now = n_fec_recovered;
     if (gaps_now != gaps_told || ring_full_now != ring_full_told ||
         anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told ||
-        gap_resyncs_now != gap_resyncs_told || upgrades_now != upgrades_told) {
+        gap_resyncs_now != gap_resyncs_told || upgrades_now != upgrades_told ||
+        fec_now != fec_told) {
         ESP_LOGW(TAG, "RX 5s: gaps %" PRIu32 " (%" PRIu32 " ms silence, %"
                       PRIu32 " short by %" PRIu32 " ms) | ring-full %" PRIu32
                       " | too big to fill %" PRIu32 " | upgrades %" PRIu32
-                      " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon",
+                      " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon"
+                      " | fec %" PRIu32,
                  gaps_now - gaps_told,
                  (gap_frames_now - gap_frames_told) * 1000 / stream_rate,
                  gap_short_now - gap_short_told,
@@ -129,7 +132,8 @@ void telemetry_tick(void)
                  gap_resyncs_now - gap_resyncs_told,
                  upgrades_now - upgrades_told,
                  anchor_late_now - anchor_late_told,
-                 anchor_soon_now - anchor_soon_told);
+                 anchor_soon_now - anchor_soon_told,
+                 fec_now - fec_told);
     }
     gaps_told = gaps_now;
     gap_frames_told = gap_frames_now;
@@ -140,6 +144,7 @@ void telemetry_tick(void)
     anchor_soon_told = anchor_soon_now;
     gap_resyncs_told = gap_resyncs_now;
     upgrades_told = upgrades_now;
+    fec_told = fec_now;
 
     /* Soak line, every 60 s, ahead of the streaming check below: if audio
      * has stopped, that is when the heap and the counters matter most.

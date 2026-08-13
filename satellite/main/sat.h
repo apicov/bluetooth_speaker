@@ -410,6 +410,7 @@ extern volatile uint32_t n_splices;  /* track-boundary corrections applied */
 extern volatile uint32_t n_retunes;
 extern volatile uint32_t n_retunes_bad;
 extern volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
+extern volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
 extern volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 /*
  * The receive path's own instruments, counted here rather than logged there.

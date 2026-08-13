@@ -152,6 +152,26 @@ void socket_start(void)
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
     assert(bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0);
-    /* No multicast group to join: audio arrives by unicast, and the time probes
-     * this unit already sends are what register it with the hub. */
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+    /*
+     * Audio arrives by multicast, so join the group. The socket is already bound
+     * to INADDR_ANY:SYNC_PORT, which is what a membership needs, and the one
+     * recvfrom/type-demux in rx_task handles group and unicast packets alike --
+     * the time probes this unit still sends are what register it with the hub,
+     * and they arrive on the same socket as unicast. IGMP is on by default in
+     * the IDF v6 lwip port, so this needs no Kconfig.
+     */
+    struct ip_mreq mreq;
+    inet_pton(AF_INET, CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP, &mreq.imr_multiaddr);
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        ESP_LOGW(TAG, "could not join audio multicast group %s",
+                 CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP);
+    } else {
+        ESP_LOGI(TAG, "joined audio multicast group %s",
+                 CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP);
+    }
+#else
+    /* Audio arrives by unicast; the time probes this unit sends register it. */
+#endif
 }
