@@ -635,3 +635,97 @@ and the spans are now an order of magnitude past the threshold rather than
 twice it. Worth understanding before TSF is filtered on span — and worth noting
 that the reported figure is a running maximum cleared per log line, so these are
 individual samples, not a drift in the typical case, which stays at 73–99 µs.
+
+---
+
+## 8. The receive path, 2026-08-13
+
+The hub-side story is in `hub-audit.md` §13 and is most of what changed; this is
+what it meant here. The short version: **the gaps were the hub discarding its own
+audio**, not the air, and once that stopped the satellite went from 0.17 gaps/s
+to zero over a 125 s run.
+
+### 8.1 A gap fill that did not fit slid the timeline permanently
+
+The note in `absorb_sequence_gap()` said what happens and did not act on it:
+*"those frames were owed to the timeline and are not in it, so playback runs that
+much early until the servo walks it back."* The servo cannot walk it back. It
+trims ±100 Hz, 2.27 ms/s, against a shortfall that arrives hundreds of ms at a
+time.
+
+Measured when a hub transmit burst cost 37 audio packets in one window:
+
+```
+gaps 18 (658 ms silence) | ring-full 15
+gaps 13 (920 ms silence, 3 short by 229 ms) | ring-full 63
+buffer 409 ms | phase +250217 us          <- held for over two minutes
+```
+
+658 ms of silence written into a 464 ms ring in a few hundred ms of wall time,
+because a gap is filled the moment the packet *after* it arrives rather than at
+the rate audio plays. The ring jammed, 229 ms went uncounted, and the unit sat a
+quarter of a second behind the floor hunting with ±97 Hz retunes until
+`no anchorable packet for 5005 ms` rescued it.
+
+A fill that does not fit is now treated as a gap too big to fill, which is the
+same fault by another route and already had the right answer: reset and
+re-anchor. A few hundred ms of silence once, rather than minutes out of sync.
+Counted as `short-resync`, separately from `too big to fill`, because one says
+the air was bad and the other says the ring could not absorb a burst.
+
+### 8.2 The FEC path was resetting the shared decoder
+
+`fill_recovered_then_silence()` called `sbc_decoder_init()` whenever a redundant
+copy failed to decode — and since the hub's MTU guard truncates every copy
+mid-frame, that was essentially every recovery. The decoder is one global context
+shared with the live stream, and what `init()` discards is the synthesis
+filterbank history, so each recovery also put a transient into the frames after
+it. Two artefacts from one cause, and the second looked like a decoder problem.
+A failed copy says nothing about the live stream, which resets on its own errors,
+so this path now counts (`n_fec_decode_err`) and leaves the state alone.
+
+### 8.3 Concealment
+
+A lost packet was filled with digital zero, so the output stepped from whatever
+it was playing to zero and back ~20 ms later. Those two discontinuities are a
+click each and are most of what a dropout is heard as; the missing music, on its
+own, is far less objectionable. The fill now starts from the last audio that
+really played and fades it out over ~2.9 ms, and the audio that resumes is faded
+back in.
+
+Nothing is invented — past the fade it is still silence and a long gap still
+sounds like one. The **length** is untouched, which is the property that matters:
+every concealed frame is still counted into `samples_in` exactly as the silence
+was, so this cannot slide the stream, and it composes with whatever loss recovery
+comes later.
+
+### 8.4 New counters, and one that was lying
+
+`n_fec_short_frames` and `n_fec_truncated` are the two ends of the same fact: a
+redundant copy is truncated to ~¾ whenever FEC is on, so a "recovered" packet
+still carried ~6 ms of silence while the log read `gaps 1 (20 ms silence) | fec 1`
+and left the reader to assume they cancelled. They did not. Both read 0 today
+only because the depth defaults to 0.
+
+`n_seq_dropped`, `n_decode_err` and `n_recv_err` cover three faults that were a
+bare `return false`, a `break` and a `continue`. The last also **spun**: a
+persistent `recvfrom` error does not block, so it became an uncounted, unbounded
+loop at priority 7 that would starve the receive path it was failing to serve.
+
+`dma-starve` counts the I2S driver's own `on_send_q_ovf` — the moment a starved
+channel begins emitting `auto_clear` silence, which was previously invisible
+below the 500 ms underrun timeout. It is gated on the play task actually feeding:
+counting every overflow made it read ~20000 on a healthy unit, because the
+channel is enabled from boot and every descriptor completion overflows while
+nothing writes. That reads 0 now.
+
+### 8.5 Still open
+
+- **`wide-span` is still climbing and still unexplained.** Sixth run. `span max`
+  reaches 300–400 µs against a `TSF_SPAN_MAX_US` of 100, while the typical case
+  stays at 70–100 µs. Nothing acts on it; enforcing it is still not free.
+- **No S3 satellite has ever been run on a bench.**
+- Both units are now `ML_SOURCE_REMOTE`, so **nothing in the tree compiles the
+  analyser lane**. The intent is to run it on a satellite later;
+  `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` and a full build of
+  that branch are what keep it from rotting until then.

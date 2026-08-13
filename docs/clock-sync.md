@@ -448,10 +448,26 @@ The cause is still not found.
 Two consequences worth knowing:
 
 - The servo used to act on that raw number directly, so it was substantially
-  triggering on measurement noise. Both units now servo on a 4-sample EMA (§8),
-  which cut the hub's retunes about fourfold and changed the cross-unit figure
-  not at all — the excursions between splices are the same either way, so they
-  are not a servo-input artefact.
+  triggering on measurement noise. Both units then servoed on a 4-sample EMA
+  (§8), which cut the hub's retunes about fourfold and changed the cross-unit
+  figure not at all — the excursions between splices are the same either way, so
+  they are not a servo-input artefact.
+
+  **The hub now feeds that EMA a median rather than the raw reading.** The EMA
+  was the right filter on the wrong input: it averages across servo ticks 5 s
+  apart, so rejecting scatter that lives inside 180 ms costs it tens of seconds
+  of memory, and an average only mixes an outlier in where a median discards it.
+  The play task publishes the median of the same nine packet-cadence readings the
+  splice has used since it stopped splicing on one sample, and the servo's EMA
+  runs on that. The deadband was deliberately **not** widened — that would have
+  been the obvious way to cut retunes and the wrong one, since two units at
+  opposite edges of a wider band are that much further apart.
+
+  Honest reading of the result: on the runs since, `phase` and `median` track
+  each other to within a few µs (`phase -1443 us (median -1439, smoothed ...)`),
+  so the 15.7 ms scatter is not present in them and the filter is not currently
+  earning its place. It is cheap, it cannot hurt, and the status line prints raw,
+  median and average together precisely so this stays checkable.
 - Any single-sample figure derived from the hub's phase is untrustworthy,
   including the per-retune costs it prints. The satellite's are usable; the
   hub's are only meaningful averaged over many.
@@ -672,13 +688,25 @@ where every suite sits next to the code it exercises.
 The estimator is deliberately free of platform dependencies. It is the part most
 likely to be subtly wrong, and hardware bring-up is a bad place to discover that.
 
-Everything on this socket is **unicast**, probes included. That was not the
-original plan — the M4 harness announced over multicast on the reasoning that one
-transmission feeding every satellite keeps airtime independent of unit count —
-and the measurement went the other way: group-addressed frames are never
-acknowledged and so never retried, which put a ~20% loss floor under the audio at
-every PHY rate tried. Multicast is gone from the whole system, and
+**Everything the clock itself uses is unicast** — probes, time responses and the
+TSF message all go to the station that asked. That is the right shape for them
+whatever else the socket carries: a probe is a question from one unit, its
+answer belongs to that unit, and there are only 4 a second of each per satellite.
+
+The socket is shared with traffic that is *not* unicast any more, and the history
+is worth keeping straight because it reversed. The M4 harness announced over
+multicast on the reasoning that one transmission feeding every satellite keeps
+airtime independent of unit count; the measurement went the other way, since
+group-addressed frames are never acknowledged and so never retried, which put a
+~20% loss floor under the audio. Multicast was removed from the whole system and
 `SYNC_MCAST_ADDR` went with the harness.
+
+**Audio and analysis frames are group-addressed again**, to `239.0.0.1`. The 20%
+was measured at the 1 Mbps basic rate that 802.11b forces; with 11b dropped the
+group goes at 6 Mbps OFDM and loss is 0.2–0.3%. See `architecture.md` §4 for what
+else had to be true first. Nothing about the clock changed — the estimator still
+sees only unicast round trips, and the reason a satellite must keep probing is
+still that probing is what puts it on the metadata list.
 
 ---
 

@@ -16,11 +16,19 @@ agreement rather than a replacement; see [`docs/architecture.md`](docs/architect
 
 ```
 phone --A2DP/SBC--> bt_bridge --SBC over SPI--> hub_s3 --SBC over WiFi--> satellites
-                    (chip A)     5 MHz, 4 wires   (chip B)   unicast      (any number)
+                    (chip A)     5 MHz, 4 wires   (chip B)  multicast     (any number)
                                                     |                        |
                                                  speaker                  speaker
                                                  + strip                  + strip
 ```
+
+Audio and analysis frames go to one multicast group, so the hub's transmit rate
+does not grow with speaker count — ~136 packets/s however many are listening,
+plus ~8/s per satellite of clock-sync traffic, which stays unicast because a
+probe's answer belongs to the unit that asked. Multicast was tried, removed for
+a 20% loss floor, and brought back once that floor turned out to be an artefact
+of the 1 Mbps basic rate 802.11b forces; see
+[`docs/architecture.md`](docs/architecture.md) §4.
 
 | Directory | What it is |
 |---|---|
