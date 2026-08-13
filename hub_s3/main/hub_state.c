@@ -24,6 +24,8 @@ volatile uint32_t s_phase_head, s_phase_tail;
 volatile int32_t s_phase_err_us;
 volatile bool s_phase_valid;
 sync_phase_hist_t s_phase_hist;
+volatile int32_t s_phase_med_us;
+volatile bool s_phase_med_valid;
 volatile bool s_phase_stepped;
 volatile bool s_restart_pending;
 uint8_t s_jump_arm;

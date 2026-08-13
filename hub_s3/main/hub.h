@@ -347,6 +347,22 @@ extern volatile bool s_phase_valid;
  * needs its own filter and cannot borrow the servo's.
  */
 extern sync_phase_hist_t s_phase_hist;
+/*
+ * The median of that history, published for the servo.
+ *
+ * The servo runs on ring_monitor_task and s_phase_hist is play-task-only, so
+ * the servo cannot take the median itself -- and taking one across its own 5 s
+ * samples would filter at the wrong cadence, adding tens of seconds of lag to
+ * reject scatter that lives inside 180 ms. The play task already has the
+ * history at packet cadence, so it publishes the answer instead.
+ *
+ * Cleared, not just stale, when the history is reset: a median that survived a
+ * splice would describe the phase the splice just removed. Valid stays false
+ * until SYNC_PHASE_MIN readings have arrived, which is what the servo's fallback
+ * to the raw reading is for.
+ */
+extern volatile int32_t s_phase_med_us;
+extern volatile bool s_phase_med_valid;
 /* Set when a splice steps the phase, so the shadow average in ring_monitor_task
  * forgets a history that describes the situation before it -- the satellite has
  * done this since "Forget the phase average after a splice". */
