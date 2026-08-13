@@ -74,7 +74,10 @@ void wifi_start_ap(void)
     strcpy((char *)wc.ap.ssid, AP_SSID);
     strcpy((char *)wc.ap.password, AP_PASS);
     wc.ap.ssid_len = strlen(AP_SSID);
-    wc.ap.max_connection = 8;
+    /* One of the three limits that have to agree; see MAX_CLIENTS, which is the
+     * same number and carries the reasoning. The driver's own ceiling is
+     * ESP_WIFI_MAX_CONN_NUM. */
+    wc.ap.max_connection = MAX_CLIENTS;
     wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
     wc.ap.channel = CONFIG_DANCEFLOOR_WIFI_CHANNEL;
     wc.ap.dtim_period = 1;

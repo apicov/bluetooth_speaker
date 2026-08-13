@@ -680,3 +680,16 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
 # relays every satellite's logs to the collector, so this is the one unit that
 # must have it on for centralised capture to work.
 CONFIG_DANCEFLOOR_WIFI_LOGS=y
+
+# How many DHCP leases the SoftAP can hand out. IDF's default is 8, which was
+# invisible while MAX_CLIENTS was also 8: it agreed by coincidence rather than
+# by construction, and nothing named it.
+#
+# It is the THIRD of three limits that decide how many satellites a floor can
+# hold, and the only one whose failure is quiet. The other two -- MAX_CLIENTS
+# and wifi_config.ap.max_connection -- refuse a satellite at association, which
+# it notices and reports. Running out of leases lets it associate and then gives
+# it no address, so the hub sees a station that joined and never probed, and
+# n_sta_nolease is the only tell. Kept at MAX_CLIENTS so the three move
+# together.
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=15

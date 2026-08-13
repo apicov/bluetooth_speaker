@@ -609,20 +609,32 @@ extern int32_t s_refill_frames;
  * happens at a start now, so nothing needs to say which. */
 
 /*
- * Satellites are sent audio by UNICAST, not multicast.
+ * How many satellites this hub will carry.
  *
- * Group-addressed frames are never acknowledged and never retried, so any
- * corrupted frame is simply lost. Measured 20% loss across three different PHY
- * rates -- the rate was never the problem, the absence of retries was. Unicast
- * gets link-layer ACK and retransmission, which is what makes 802.11 reliable.
+ * 15 is the ceiling the radio imposes, not a guess: ESP_WIFI_MAX_CONN_NUM in
+ * esp_wifi_ap_get_sta_list.h. Three separate limits have to agree or the count
+ * is whichever is smallest -- this one, wifi_config.ap.max_connection in
+ * wifi_start_ap(), and CONFIG_LWIP_DHCPS_MAX_STATION_NUM, which decides how many
+ * leases the DHCP server has to give out. A satellite refused by the third
+ * associates and then has no address, which reports as a unit that joined and
+ * never probed rather than as a floor that is full.
  *
- * The cost is that airtime scales with speaker count. At ~42 kB/s of SBC that is
- * affordable for a handful of units; it would not have been for 179 kB/s of PCM.
+ * Was 8, from when audio and analysis frames were both unicast and airtime
+ * scaled with speaker count -- 50 + ~96xN packets a second, which 8 already
+ * strained. Both are group-addressed now, so the hub's transmit rate is ~146
+ * packets a second flat and what scales with N is only the probe traffic: 4
+ * probes a second per satellite, replied to individually, which at 15 is ~180
+ * small packets a second. That is the arithmetic that makes 15 affordable; see
+ * the airtime table in the audit.
+ *
+ * MEASURED AT TWO. Nothing past one satellite had been run when this was 8, and
+ * nothing past two has been run now. The number says what the design intends to
+ * carry, not what has been demonstrated.
  *
  * Registration is implicit: satellites already send time probes every 250 ms, so
  * anything that has probed recently is listening.
  */
-#define MAX_CLIENTS 8
+#define MAX_CLIENTS 15
 
 /*
  * How long a satellite that has stopped probing stays on the send list.
