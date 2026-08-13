@@ -742,19 +742,19 @@ extern volatile uint32_t n_sta_timeout;
 extern uint32_t n_wifi_oversize;
 
 /*
- * Redundant copies the MTU forced short, which should never happen.
+ * Redundant copies the MTU forced short.
  *
- * streamer_send_sbc() is fed spans capped at AUDIO_TX_PAYLOAD_MAX precisely so
- * every copy fits whole, and a short copy is the bug this branch was written to
- * remove -- it is what made a "recovered" packet still carry ~6 ms of silence.
- * One case can still reach it legitimately: a SINGLE SBC frame larger than the
- * cap cannot be split, so sbc_in.c sends it alone and the copy truncates as it
- * used to. At depth 1 that needs a frame over 721 bytes, which bitpool 250
- * joint-stereo (~508 B) does not reach; at depth 2 the cap is 480 and it does.
+ * Zero while DANCEFLOOR_AUDIO_FEC_DEPTH is 0, which is the default and why this
+ * is quiet today. With redundancy on it counts almost every packet, and that is
+ * the honest reading rather than a fault: an ~825-byte payload leaves ~618 bytes
+ * for a copy, so ~1/4 of each one is missing and the satellite pads it with
+ * silence -- about 6 ms per "recovered" packet. The satellite's
+ * n_fec_short_frames is the same fact seen from the receiving end.
  *
- * So this is not dead: it is the counter that tells a depth-2 experiment that
- * its cap is under the source's frame size, which otherwise presents as
- * unexplained residual silence on every satellite at once.
+ * A cap that made copies fit whole was tried and reverted; see
+ * DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help. So this counter is what any future
+ * attempt at redundancy has to drive to zero, and what says immediately whether
+ * a given payload size and depth actually fit each other.
  */
 extern uint32_t n_fec_truncated;
 

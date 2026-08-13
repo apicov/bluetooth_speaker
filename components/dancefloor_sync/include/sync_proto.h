@@ -471,20 +471,16 @@ typedef struct __attribute__((packed)) {
  *
  * Decoded audio is ~1.4 Mbps in 172 packets/s; the SBC sent over the air is
  * ~330 kbps in ~50 packets/s of ~825-byte payloads. A copy is attached only as
- * far as the MTU allows, and the SENDER IS RESPONSIBLE for not offering a
- * payload too large to copy whole -- see AUDIO_TX_PAYLOAD_MAX.
+ * far as the MTU allows, so at those payload sizes it is TRUNCATED to about
+ * three quarters and the satellite pads the rest with silence -- roughly 6 ms
+ * per "recovered" packet, which the log still reports as a clean recovery.
  *
- * IT DID NOT USED TO BE. The attach path clamped with min(prev_len, room) and
- * called the short copy good enough, on the reasoning that SBC frames are
- * independently decodable so a partial copy still recovers the audio it
- * contains. That reasoning is sound and the conclusion was still wrong, because
- * nothing sized the payload against the MTU: at ~825-byte payloads a copy came
- * to ~618 bytes, three quarters, and the satellite padded the rest with silence
- * to keep the timeline exact. So every "recovered" packet still had ~6 ms of
- * silence in its tail, and the log reported it as a clean recovery --
- * `gaps 1 (20 ms silence) | fec 1`. Measured at one such event every ~2.7 s per
- * satellite (logs-20260813-142339), which is the ticking this was supposed to
- * remove. Redundancy that only mostly arrives is not redundancy.
+ * That is why the depth defaults to 0. A whole copy needs 2 x 825 + 29 bytes
+ * against a 1472-byte MTU and cannot fit, and making it fit by shrinking the
+ * payload doubles the packet rate, which this hub cannot afford. The full
+ * measurement is in DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help; it is kept there
+ * rather than here because it is a decision about a setting, not about the wire
+ * format, and the wire format is what this header is for.
  */
 #define AUDIO_RED_HDR_BYTES   3                     /* u16 red_len + u8 red_seq_ofs */
 #define AUDIO_RED_BYTES(r)    (AUDIO_RED_HDR_BYTES + (r))
@@ -501,71 +497,24 @@ typedef struct __attribute__((packed)) {
 #define AUDIO_UDP_MTU 1472
 
 /*
- * The depth as a plain integer, so this header still compiles on a host.
+ * The largest payload a sender may put in one datagram: header plus payload
+ * against the MTU, 1446 bytes.
  *
- * The test in test/ builds it with gcc and no sdkconfig.h. `#if CONFIG_x` is
- * fine undefined -- the preprocessor reads it as 0 -- but the arithmetic below
- * expands into real code, where an undeclared identifier is an error rather than
- * a zero. Depth 0 is the honest host default: it is the no-redundancy case, and
- * it makes AUDIO_TX_PAYLOAD_MAX degrade to "the whole MTU", which is exactly the
- * behaviour a build with no FEC should have.
+ * At the ~825-byte payloads a phone produces it never binds, so the packet rate
+ * is unchanged from every log ever captured. It exists for the case that always
+ * could have fragmented and never had a guard: a 1500-byte A2DP payload becoming
+ * a 1526-byte datagram, since the only ceiling checked was AUDIO_MAX_PAYLOAD at
+ * 2048. The FEC attach path clamps its own copies to whatever is left, so it
+ * cannot push a packet over on its own.
+ *
+ * A cap that DID bind -- one sized so a whole redundant copy fits beside the
+ * payload -- was tried and reverted: it splits every packet in two, and the
+ * doubled packet rate both exhausts the transmit buffers and doubles the
+ * timeline slew, which is per packet. See DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig
+ * help for the measurement. Anything that reintroduces such a cap has to make
+ * TIMELINE_SLEW_US per unit of audio first.
  */
-#ifdef CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH
-#define AUDIO_FEC_DEPTH CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH
-#else
-#define AUDIO_FEC_DEPTH 0
-#endif
-
-/*
- * The largest payload for which DEPTH whole copies would still fit one datagram.
- *
- *   depth 0 -> 1446 B      depth 1 -> 721 B      depth 2 -> 480 B
- *
- * NOT APPLIED, AND THE REASON IS THE POINT. Capping the payload at 721 is what
- * whole-copy redundancy at depth 1 would require, and it was tried: a phone
- * sends ~825-byte payloads, so the cap binds on EVERY one, and every payload
- * becomes two datagrams instead of one. That doubles the audio packet rate,
- * 50/s to ~100/s, and the hub has 26 static TX buffers in ~6.7 kB of free
- * internal SRAM. Measured consequence, 2026-08-13: `tx-fail 370 (312 audio)` in
- * a 20 s window -- about 15% of the hub's own audio discarded before it reached
- * the air, where the baseline was 92 failures in 365 s.
- *
- * It broke synchronisation too, by a second route nobody would have predicted
- * from the packet size alone. TIMELINE_SLEW_US is 20 us PER PACKET, sized
- * against ~50 packets/s to give 1 ms/s inside the servo's 2.27 ms/s ceiling.
- * Doubling the packet rate doubled the slew to ~2 ms/s, which is the ceiling,
- * and the satellites could no longer follow: phase ran to +271 ms, anchors were
- * refused 40 at a time, and the units re-anchored every few seconds.
- *
- * So this stays as arithmetic, not as policy. Whole-copy FEC needs
- * 2 x 825 + 29 = 1679 bytes against a 1472-byte MTU -- it CANNOT fit, at any
- * bitpool a phone is likely to negotiate -- so it requires smaller packets,
- * which require more packets, which require transmit capacity this hub does not
- * have. Fix the capacity first (ESP_WIFI_CACHE_TX_BUFFER_NUM, and internal SRAM
- * for more static buffers); then this constant becomes usable, and anything
- * that starts applying it must also make TIMELINE_SLEW_US per-unit-of-audio
- * rather than per-packet.
- *
- * Parameterised by depth so the host test can check every row without three
- * builds, and kept compiled so the relationship cannot rot while it waits.
- */
-#define AUDIO_TX_PAYLOAD_MAX_AT(depth)                                        \
-    ((AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0) - (depth) * AUDIO_RED_HDR_BYTES)     \
-     / ((depth) + 1))
-#define AUDIO_TX_PAYLOAD_MAX AUDIO_TX_PAYLOAD_MAX_AT(AUDIO_FEC_DEPTH)
-
-/*
- * What IS applied: the cap that stops a datagram exceeding the MTU at all.
- *
- * This is AUDIO_TX_PAYLOAD_MAX_AT(0) -- header plus payload, no redundancy --
- * and at ~825-byte payloads it never binds, so the packet rate is unchanged from
- * every log ever captured. It exists for the case that always could have
- * fragmented and never had a guard: a 1500-byte A2DP payload becoming a
- * 1526-byte datagram, since the only ceiling checked was AUDIO_MAX_PAYLOAD at
- * 2048. The FEC attach path clamps its own copies to what is left, so it cannot
- * push a packet over on its own.
- */
-#define AUDIO_TX_PAYLOAD_MTU_MAX AUDIO_TX_PAYLOAD_MAX_AT(0)
+#define AUDIO_TX_PAYLOAD_MTU_MAX (AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0))
 
 /*
  * Which downlink this build speaks, as a short tag for the periodic status

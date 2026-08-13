@@ -297,10 +297,9 @@ static bool upgrade_provisional_anchor(const audio_msg_t *msg, int64_t offset)
  * silence, so the fill is length-exact. red == NULL means no redundancy covered
  * this packet, so the whole fill is silence -- the behaviour this path always had.
  *
- * Any shortfall is counted in n_fec_short_frames rather than quietly padded.
- * With the hub capping spans at AUDIO_TX_PAYLOAD_MAX a copy arrives whole and
- * the shortfall is zero; it was ~1/4 of every recovery before that cap existed,
- * and nothing said so.
+ * Any shortfall is counted in n_fec_short_frames rather than quietly padded. It
+ * is ~1/4 of every recovery whenever redundancy is on -- a copy of an ~825-byte
+ * payload does not fit beside it -- and nothing used to say so.
  */
 static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
                                             uint32_t want_frames)

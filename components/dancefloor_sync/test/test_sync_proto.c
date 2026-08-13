@@ -342,53 +342,6 @@ int main(void)
               AUDIO_MAX_PAYLOAD >= SBC_LINK_MAX_PAYLOAD, d);
     }
 
-    /*
-     * The transmit cap must leave room for DEPTH WHOLE redundant copies inside
-     * one datagram, at every depth the Kconfig offers.
-     *
-     * This is the arithmetic the audible bug was in. The attach path clamped a
-     * copy to whatever space was left and called it done, so at an ~825-byte
-     * payload it carried three quarters and the satellite silenced the rest --
-     * about 6 ms per recovered packet, reported by the log as a clean recovery.
-     * Nothing checked that a payload and its copies fit; the MTU was a literal
-     * in one .c file and the payload size was whatever the phone happened to
-     * send.
-     *
-     * Checked as a property rather than against three copied numbers: for each
-     * depth, a full-size payload plus that many full-size copies plus their
-     * headers must fit AUDIO_UDP_MTU. Depth 0 is included because it is the case
-     * with no redundancy at all, where the cap still has to stop a large A2DP
-     * payload becoming a fragmented datagram.
-     */
-    for (int depth = 0; depth <= 4; depth++) {
-        const size_t cap = AUDIO_TX_PAYLOAD_MAX_AT(depth);
-        const size_t on_wire = AUDIO_MSG_BYTES(cap)
-                             + (size_t)depth * AUDIO_RED_BYTES(cap);
-        char d[96];
-        snprintf(d, sizeof d, "depth=%d cap=%zu wire=%zu mtu=%d",
-                 depth, cap, on_wire, AUDIO_UDP_MTU);
-        check("a capped payload and its whole copies fit the MTU",
-              on_wire <= AUDIO_UDP_MTU, d);
-
-        /* And the cap is not needlessly small -- one more byte must not fit,
-         * or the split is costing packets it did not have to. */
-        const size_t one_more = AUDIO_MSG_BYTES(cap + 1)
-                              + (size_t)depth * AUDIO_RED_BYTES(cap + 1);
-        check("the cap is the largest payload that fits",
-              one_more > AUDIO_UDP_MTU, d);
-    }
-
-    /*
-     * The depth-1 cap is the one the shipped default runs at, so it is pinned to
-     * a number rather than only to a property: a change here moves the packet
-     * rate every airtime figure in the docs was computed from.
-     */
-    {
-        char d[64];
-        snprintf(d, sizeof d, "cap=%zu", (size_t)AUDIO_TX_PAYLOAD_MAX_AT(1));
-        check("depth 1 caps the payload at 721 bytes",
-              AUDIO_TX_PAYLOAD_MAX_AT(1) == 721, d);
-    }
 
     /*
      * THE APPLIED THRESHOLD MUST NOT BIND AT REAL PAYLOAD SIZES.

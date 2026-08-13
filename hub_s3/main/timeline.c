@@ -593,12 +593,12 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
      * msg.payload[], which is AUDIO_MAX_PAYLOAD bytes and so always holds a
      * packet that itself fits the MTU.
      *
-     * COPIES ARE WHOLE. sbc_in.c caps every span it offers at
-     * AUDIO_TX_PAYLOAD_MAX, which is derived from this depth for exactly this
-     * reason, so `room` covers `len` and the clamp below does not bind. It is
-     * kept, and now counted, because one span can still arrive over the cap: a
-     * single SBC frame larger than it, which cannot be split. See
-     * n_fec_truncated -- a partial copy is a fault to be seen, not the design.
+     * COPIES ARE TRUNCATED, and n_fec_truncated counts it. An ~825-byte payload
+     * leaves ~618 bytes of room, so about a quarter of each copy is missing and
+     * the satellite pads that much silence -- which is why the depth defaults to
+     * 0 and this loop does not run. Sizing the payload so a copy fits whole was
+     * tried and reverted; DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help has the
+     * measurement.
      */
     {
         size_t off = AUDIO_MSG_BYTES(len);          /* where the next block goes */

@@ -253,14 +253,14 @@ static void rx_task(void *arg)
              * at 1446 bytes and which a phone sending ~825 does not reach. It
              * does not bind, so the packet rate is what every captured log shows.
              *
-             * IT WAS AUDIO_TX_PAYLOAD_MAX -- 721 at depth 1, the cap whole-copy
-             * redundancy needs -- and that binds on every payload, so every one
-             * became two datagrams and the audio packet rate doubled. See that
-             * macro for what the hub did under it; the short version is 15% of
-             * its own audio discarded at the socket, and a timeline slewing at
-             * twice the rate the satellites could follow. The threshold is the
-             * whole difference between the two behaviours, which is why it is
-             * named for what it protects rather than for a number.
+             * IT WAS 721 -- the cap a whole redundant copy needs at depth 1 --
+             * and that binds on every payload, so every one became two datagrams
+             * and the audio packet rate doubled: 15% of the hub's own audio
+             * discarded at the socket, and a timeline slewing at twice the rate
+             * the satellites could follow. DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig
+             * help has the run. The threshold is the whole difference between
+             * the two behaviours, which is why it is named for what it protects
+             * rather than for a number.
              *
              * The split is free where it is. This loop already walks SBC frames
              * and knows each one's length, so nothing parses SBC twice to find a

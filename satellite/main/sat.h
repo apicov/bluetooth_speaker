@@ -415,18 +415,19 @@ extern volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redu
  * Frames a recovery was SHORT by, padded with silence -- the honest half of
  * n_fec_recovered.
  *
- * These two together are the instrument that was missing while the bug was
- * live. n_fec_recovered counts packets a redundant copy covered; it said
- * nothing about how MUCH of each one the copy actually carried, and the copy
- * was truncated to ~3/4 by the hub's MTU guard. So the log read
- * `gaps 1 (20 ms silence) | fec 1` -- a gap, and a recovery, and the reader is
- * left to assume they cancel. They did not: ~6 ms of that 20 was still silence,
- * every time, once every ~2.7 s.
+ * These two together are the instrument that was missing. n_fec_recovered
+ * counts packets a redundant copy covered; it said nothing about how MUCH of
+ * each one the copy actually carried, and the copy is truncated to ~3/4 by the
+ * hub's MTU guard. So the log read `gaps 1 (20 ms silence) | fec 1` -- a gap,
+ * and a recovery, and the reader is left to assume they cancel. They did not:
+ * ~6 ms of that 20 was still silence, every time, once every ~2.7 s.
  *
- * Now the shortfall is its own number. Expect it at 0: the hub caps every span
- * at AUDIO_TX_PAYLOAD_MAX so a copy fits whole. Anything else means the cap and
- * the source's frame size have come apart -- see n_fec_truncated at the hub end,
- * which is the same fault seen from the sender.
+ * Now the shortfall is its own number, and it reads 0 only because redundancy
+ * is off by default. Turn DANCEFLOOR_AUDIO_FEC_DEPTH up and it will be roughly a
+ * quarter of every recovery; n_fec_truncated at the hub end is the same fact
+ * seen from the sender. Between them they are what any future attempt at
+ * redundancy has to drive to zero before it can claim to have recovered
+ * anything.
  */
 extern volatile uint32_t n_fec_short_frames;
 /*

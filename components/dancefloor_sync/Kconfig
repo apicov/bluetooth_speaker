@@ -242,8 +242,13 @@ menu "Dancefloor audio transport (multicast + FEC)"
 
           What would work needs the packets to get smaller, which needs the
           packet rate to rise, which needs transmit capacity this hub does not
-          have -- see AUDIO_TX_PAYLOAD_MAX in sync_proto.h, which carries the
-          arithmetic and the run where applying it took the floor down. XOR
+          have. Capping the payload so a copy fits was tried on 2026-08-13 and
+          took the floor down: it binds on every packet, so each payload becomes
+          two datagrams, and the doubled rate both exhausts the transmit buffers
+          (`tx-fail 370 (312 audio)` in one 20 s window) and doubles the timeline
+          slew, which is 20 us PER PACKET -- phase ran to +271 ms and the
+          satellites re-anchored every few seconds. Anything that reintroduces
+          such a cap must make TIMELINE_SLEW_US per unit of audio first. XOR
           parity across a group of packets is the design that fits: one parity
           packet per K recovers any single loss for 1/K overhead instead of 1x,
           and leaves packets at ~851 B.
