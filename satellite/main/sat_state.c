@@ -98,3 +98,4 @@ volatile int64_t retune_outage_us;
 volatile int64_t retune_done_at;
 volatile uint8_t retune_tail_left;
 volatile bool retuning;
+volatile bool playing;  /* the play task is feeding the DAC; read from the ISR */

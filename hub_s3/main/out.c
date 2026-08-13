@@ -77,13 +77,28 @@ void streamer_set_sample_rate(uint32_t hz)
  * play at 8 on the same core, decoding, feeding two stream buffers and calling
  * sendto in one block. If that block ever exceeds the 34.8 ms the DMA holds,
  * this is the counter that says so.
+ *
+ * ONLY COUNTED WHILE SOMETHING IS SUPPOSED TO BE FEEDING IT. Counting every
+ * overflow made this read ~20000 on a healthy hub: the channel is enabled from
+ * boot, so before the bridge delivers a first packet -- and through every
+ * underrun park -- nothing writes, every descriptor completion overflows, and it
+ * accrues at ~172/s for as long as that lasts. The total then said nothing about
+ * playback and looked like a catastrophe; it was frozen across consecutive
+ * HEALTH lines, which is what gave it away.
+ *
+ * s_playing is the play task's own flag, already used by the servo for the same
+ * question, and `retuning` covers the re-enable after a clock change where the
+ * descriptors are empty by construction -- that cost is reported as
+ * `channel down` and does not belong here twice.
  */
 static volatile uint32_t s_dma_starve;
 
 static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, void *ctx)
 {
     (void)h; (void)e; (void)ctx;
-    s_dma_starve++;
+    if (s_playing && !retuning) {
+        s_dma_starve++;
+    }
     return false;
 }
 

@@ -758,6 +758,20 @@ extern volatile uint8_t retune_tail_left;
  * for it since.
  */
 extern volatile bool retuning;
+/*
+ * True while the play task is inside its write loop, i.e. while something is
+ * supposed to be feeding the DAC.
+ *
+ * Read from the I2S ISR, which is the only reason it exists: a starved channel
+ * is a fault only if a writer was meant to be keeping up with it. Set by the
+ * play task on either side of that loop and by nothing else, so it needs no
+ * lock -- a torn read is not possible on a bool and the worst a stale one costs
+ * is one counted or uncounted starve at a park boundary.
+ *
+ * The hub's s_playing is the same flag for the same reason; it predates this and
+ * the servo already used it.
+ */
+extern volatile bool playing;
 
 
 /* ------------------------------------------------------------- module entry */

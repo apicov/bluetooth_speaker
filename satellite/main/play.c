@@ -104,6 +104,10 @@ void play_task(void *arg)
          * the phase loop. Seeded so the first pass has a sane value. */
         int64_t wrote_at = esp_timer_get_time();
 
+        /* Something is now meant to be keeping the DAC fed, which is the only
+         * condition under which a starved channel is a fault. See `playing`. */
+        playing = true;
+
         while (1) {
             if (retuning) {
                 /* Do not pull from the ring while the channel is down -- the
@@ -393,5 +397,9 @@ void play_task(void *arg)
              * reading from. */
             wrote_at = esp_timer_get_time();
         }
+        /* The inner loop only ends by parking -- underrun, resync, or a changed
+         * timeline -- and from here until it starts again nothing is feeding the
+         * DAC, so its running dry is expected rather than a fault. */
+        playing = false;
     }
 }

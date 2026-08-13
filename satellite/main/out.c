@@ -61,16 +61,30 @@
  * is three instructions, and an ISR that never has to be masked is cheaper than
  * one that does.
  *
- * A retune contributes to this legitimately: the channel is disabled and
- * re-enabled with empty descriptors, so the first traversal after one starves
- * by construction. n_retunes is printed beside it for exactly that subtraction.
+ * ONLY COUNTED WHILE SOMETHING IS SUPPOSED TO BE FEEDING IT, which is the whole
+ * difference between a number worth reading and one that is not. Counting every
+ * overflow made this read ~20000 on a healthy unit: the channel is enabled from
+ * boot, so before a stream anchors -- and through every underrun park and
+ * re-anchor -- nothing writes, every descriptor completion overflows, and it
+ * accrues at ~172/s for as long as that lasts. The total then said nothing about
+ * playback and looked like a catastrophe. It was also frozen across consecutive
+ * HEALTH lines, which is what gave it away.
+ *
+ * `playing` is false whenever the play task is parked, and `retuning` covers the
+ * re-enable after a clock change, where the descriptors are empty by
+ * construction and the first traversal would starve however well-behaved the
+ * writer is -- that cost is already reported as `channel down`. What is left is
+ * the case that matters: the DAC ran dry while a writer was meant to be keeping
+ * up with it, which on this unit means the receive path did not deliver.
  */
 static volatile uint32_t s_dma_starve;
 
 static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, void *ctx)
 {
     (void)h; (void)e; (void)ctx;
-    s_dma_starve++;
+    if (playing && !retuning) {
+        s_dma_starve++;
+    }
     return false;          /* nothing woken, so no yield */
 }
 
