@@ -154,19 +154,109 @@ menu "Dancefloor audio transport (multicast + FEC)"
           the default IP_MULTICAST_TTL of 1 is correct and no routing is involved.
           Both ends must match.
 
+    config DANCEFLOOR_MCAST_FRAMES
+        bool "Send LED analysis frames to the group too"
+        default n
+        depends on DANCEFLOOR_AUDIO_MCAST
+        help
+          WORKS, BUT ONLY WITH ENOUGH TRANSMIT BUFFERS -- which is why the
+          default is still n, since the default buffer count cannot carry it.
+          The measurements, in the order they were taken:
+
+            frames unicast, 26 buffers   tx-fail 0        sat gaps 0.17/s
+            frames MCAST,   26 buffers   tx-fail 14-27    sat gaps 1.1/s
+            frames MCAST,   32 buffers   tx-fail 0        sat gaps 0 in 125 s
+
+          The first attempt was argued on airtime -- 96xN unicast sends becoming
+          ~96 -- and that arithmetic is right and was the wrong question. What
+          decides it is the BURST. A SoftAP buffers group-addressed frames and
+          releases them after each DTIM beacon, while unicast goes out
+          immediately with rate adaptation; at dtim_period 1 on a 100 ms beacon
+          that is one burst per 100 ms. Audio alone is ~5 frames a burst, and
+          86 analysis frames a second makes it ~15, each holding a static TX
+          buffer until its window opens. 26 could not hold that. 32 can, and 32
+          only became affordable when the hub stopped running the ML lane and
+          got ~25 kB of internal SRAM back.
+
+          So this needs ESP_WIFI_STATIC_TX_BUFFER_NUM at 32 or more, and the
+          hub's sdkconfig.defaults sets both together for that reason. Turning
+          this on without the buffers reproduces the middle row.
+
+          What it buys is the only thing that makes the hub's transmit rate FLAT
+          in speaker count: 50 + 96xN packets/s becomes ~146 whatever N is. At
+          fifteen satellites that is ~316/s against ~1490/s, and the analysis
+          frames stop scaling entirely -- only the probe traffic still does.
+
+
+          An analysis frame is byte-identical for every satellite -- the whole
+          point of computing it in one place is that no algorithm has to be proved
+          deterministic across units -- and it was still sent once per satellite.
+          At ~86 frames a second that made the hub's transmit rate 50 + ~96xN
+          packets, so the analysis traffic passed the audio at two satellites and
+          buried it at ten. This makes it ~96, flat, and it is what lets a floor
+          scale past the handful the bench has run.
+
+          THE OBJECTION IN THE CODE WAS REAL AND IS NOW OBSOLETE. publish_frame()
+          carried "group-addressed frames are never acknowledged, measured at ~20%
+          loss here, and a fifth of the frames missing is a visibly broken strip".
+          That measurement was taken at the 1 Mbps 11b basic rate, which is also
+          what made audio multicast fail the first time. wifi_start_ap() drops 11b
+          now, the group rate is the 6 Mbps OFDM basic rate, and measured group
+          loss is 0.2-0.3%. One frame in ~400 is not a visibly broken strip.
+
+          Separate from DANCEFLOOR_AUDIO_MCAST, which it depends on for the
+          group membership, because the two have different loss tolerances: a lost
+          audio packet is a hole in the sound and a lost frame is one dropped
+          video frame on a strip redrawn 86 times a second. Turning this off
+          returns the strips to ACKed unicast without giving up the audio
+          transport, which is the experiment worth being able to run separately.
+
+          No satellite change: a satellite already joins the group for audio and
+          already receives MSG_FRAME on that socket.
+
     config DANCEFLOOR_AUDIO_FEC_DEPTH
         int "Piggyback redundancy depth (previous packets carried)"
-        default 1
+        default 0
         range 0 4
         help
           How many previous audio payloads each packet piggybacks as trailing
           redundancy, so a lost datagram is decoded from the next one instead of
-          becoming a silence gap. 0 disables it (measures the raw loss floor).
-          1 recovers an isolated loss; 2 recovers a two-packet burst. Bandwidth
-          scales (1+depth)x the audio -- at the ~340 kbps SBC stream that is
-          11%/17%/23% of a 6 Mbps channel for depth 1/2/3, so airtime is not the
-          limit; the UDP MTU is, and the attach path is MTU-guarded (a packet
-          carries as much redundancy as fits, never fragments).
+          becoming a silence gap.
+
+          DEFAULT 0, AND THAT IS A MEASURED RESULT, NOT CAUTION. Depth 1 was the
+          default for one afternoon and cost more audio than it saved:
+
+            mcast fec 0 (13:02, 13:30)   hub tx-fail 0
+            mcast fec 1 (14:23)          hub tx-fail 92 / 365 s
+            mcast fec 1 (17:52)          hub tx-fail 10-58 AUDIO per 20 s
+
+          The mechanism is airtime, not the MTU. A depth-1 packet is pinned at
+          the full 1472-byte MTU instead of ~851 B -- 73% more airtime for audio,
+          at the fixed 6 Mbps group rate with no aggregation -- and the hub's
+          26 static TX buffers cannot absorb it. That is 4-6% of the audio
+          discarded at the socket, against an on-air loss of 0.2-0.3% that the
+          redundancy exists to repair. It also cannot repair it fully: a whole
+          copy of an ~825-byte payload does not fit beside it, so what arrives is
+          ~75% and the satellite pads the rest, logged as
+          `fec 5 (29 ms short, 5 err)` -- about 5.8 ms of silence per recovery
+          and a decode error on every one.
+
+          So depth 1 spent ~5% of the stream to recover ~70% of 0.3%. Turning it
+          off is not giving up on loss recovery; it is declining to pay for a
+          version of it that costs more than the loss.
+
+          What would work needs the packets to get smaller, which needs the
+          packet rate to rise, which needs transmit capacity this hub does not
+          have. Capping the payload so a copy fits was tried on 2026-08-13 and
+          took the floor down: it binds on every packet, so each payload becomes
+          two datagrams, and the doubled rate both exhausts the transmit buffers
+          (`tx-fail 370 (312 audio)` in one 20 s window) and doubles the timeline
+          slew, which is 20 us PER PACKET -- phase ran to +271 ms and the
+          satellites re-anchored every few seconds. Anything that reintroduces
+          such a cap must make TIMELINE_SLEW_US per unit of audio first. XOR
+          parity across a group of packets is the design that fits: one parity
+          packet per K recovers any single loss for 1/K overhead instead of 1x,
+          and leaves packets at ~851 B.
 
           Independent of DANCEFLOOR_AUDIO_MCAST: a receiver parses trailing
           redundancy by length, so it recovers from any sender that attached it,

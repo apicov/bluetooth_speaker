@@ -347,6 +347,22 @@ extern volatile bool s_phase_valid;
  * needs its own filter and cannot borrow the servo's.
  */
 extern sync_phase_hist_t s_phase_hist;
+/*
+ * The median of that history, published for the servo.
+ *
+ * The servo runs on ring_monitor_task and s_phase_hist is play-task-only, so
+ * the servo cannot take the median itself -- and taking one across its own 5 s
+ * samples would filter at the wrong cadence, adding tens of seconds of lag to
+ * reject scatter that lives inside 180 ms. The play task already has the
+ * history at packet cadence, so it publishes the answer instead.
+ *
+ * Cleared, not just stale, when the history is reset: a median that survived a
+ * splice would describe the phase the splice just removed. Valid stays false
+ * until SYNC_PHASE_MIN readings have arrived, which is what the servo's fallback
+ * to the raw reading is for.
+ */
+extern volatile int32_t s_phase_med_us;
+extern volatile bool s_phase_med_valid;
 /* Set when a splice steps the phase, so the shadow average in ring_monitor_task
  * forgets a history that describes the situation before it -- the satellite has
  * done this since "Forget the phase average after a splice". */
@@ -432,6 +448,26 @@ extern volatile bool s_playing;
  * like a starving ring, which is why it needs a counter. */
 extern volatile uint32_t s_feed_dropped;
 extern volatile uint32_t s_tx_fail;   /* sendto() rejections */
+/*
+ * Audio datagrams handed to fan_out() this window, printed as a rate.
+ *
+ * The packet RATE is a load-bearing number that nothing reported. Two constants
+ * are sized against it -- TIMELINE_SLEW_US is per packet and assumes ~50/s, and
+ * the TX buffer pool is consumed per packet -- so a change to packetisation
+ * moves the timeline slew and the transmit pressure together, silently. A commit
+ * that doubled it got through review, a build and two test suites, and was only
+ * caught by a floor that stopped working. `pkts/s` on the status line is what
+ * would have caught it in the first log window.
+ *
+ * Note this is NOT sbc_in's `pkts`, which counts SPI frames from the bridge:
+ * that stayed at ~250 per window throughout, because the fault was downstream of
+ * it. The two numbers were equal until packetisation stopped being one-to-one,
+ * which is exactly when it mattered that they are different questions.
+ */
+extern volatile uint32_t s_audio_pkts;
+/* ... and the subset of them that were AUDIO, which is the only subset that is
+ * audible. See tx_fail_note_audio(). */
+extern volatile uint32_t s_tx_fail_audio;
 
 /*
  * Non-audio publish throttling, paired with ML_PUBLISH_PERIOD_US / TX_BACKOFF_US.
@@ -453,7 +489,11 @@ extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-a
  * the socket; the rationale for keeping the reason at all is there.
  */
 void tx_fail_note(int err);
+/* The audio downlink's own entry point, which also counts s_tx_fail_audio. */
+void tx_fail_note_audio(int err);
 void tx_fail_summary(char *buf, size_t len);
+/* Both units count the DMA running dry; see on_tx_starved() in out.c. */
+uint32_t dma_starve_count(void);
 
 /*
  * Cumulative totals for a long run, never reset -- deliberately separate from
@@ -609,20 +649,32 @@ extern int32_t s_refill_frames;
  * happens at a start now, so nothing needs to say which. */
 
 /*
- * Satellites are sent audio by UNICAST, not multicast.
+ * How many satellites this hub will carry.
  *
- * Group-addressed frames are never acknowledged and never retried, so any
- * corrupted frame is simply lost. Measured 20% loss across three different PHY
- * rates -- the rate was never the problem, the absence of retries was. Unicast
- * gets link-layer ACK and retransmission, which is what makes 802.11 reliable.
+ * 15 is the ceiling the radio imposes, not a guess: ESP_WIFI_MAX_CONN_NUM in
+ * esp_wifi_ap_get_sta_list.h. Three separate limits have to agree or the count
+ * is whichever is smallest -- this one, wifi_config.ap.max_connection in
+ * wifi_start_ap(), and CONFIG_LWIP_DHCPS_MAX_STATION_NUM, which decides how many
+ * leases the DHCP server has to give out. A satellite refused by the third
+ * associates and then has no address, which reports as a unit that joined and
+ * never probed rather than as a floor that is full.
  *
- * The cost is that airtime scales with speaker count. At ~42 kB/s of SBC that is
- * affordable for a handful of units; it would not have been for 179 kB/s of PCM.
+ * Was 8, from when audio and analysis frames were both unicast and airtime
+ * scaled with speaker count -- 50 + ~96xN packets a second, which 8 already
+ * strained. Both are group-addressed now, so the hub's transmit rate is ~146
+ * packets a second flat and what scales with N is only the probe traffic: 4
+ * probes a second per satellite, replied to individually, which at 15 is ~180
+ * small packets a second. That is the arithmetic that makes 15 affordable; see
+ * the airtime table in the audit.
+ *
+ * MEASURED AT TWO. Nothing past one satellite had been run when this was 8, and
+ * nothing past two has been run now. The number says what the design intends to
+ * carry, not what has been demonstrated.
  *
  * Registration is implicit: satellites already send time probes every 250 ms, so
  * anything that has probed recently is listening.
  */
-#define MAX_CLIENTS 8
+#define MAX_CLIENTS 15
 
 /*
  * How long a satellite that has stopped probing stays on the send list.
@@ -688,6 +740,23 @@ extern volatile uint32_t n_sta_timeout;
  * AUDIO_MAX_PAYLOAD tracks SBC_LINK_MAX_PAYLOAD; counted, not silent, because a
  * ceiling drift here would otherwise read as satellite-side gaps. */
 extern uint32_t n_wifi_oversize;
+
+/*
+ * Redundant copies the MTU forced short.
+ *
+ * Zero while DANCEFLOOR_AUDIO_FEC_DEPTH is 0, which is the default and why this
+ * is quiet today. With redundancy on it counts almost every packet, and that is
+ * the honest reading rather than a fault: an ~825-byte payload leaves ~618 bytes
+ * for a copy, so ~1/4 of each one is missing and the satellite pads it with
+ * silence -- about 6 ms per "recovered" packet. The satellite's
+ * n_fec_short_frames is the same fact seen from the receiving end.
+ *
+ * A cap that made copies fit whole was tried and reverted; see
+ * DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help. So this counter is what any future
+ * attempt at redundancy has to drive to zero, and what says immediately whether
+ * a given payload size and depth actually fit each other.
+ */
+extern uint32_t n_fec_truncated;
 
 /* Ring position and scheduled instant of the last packet sent, so the analysis
  * -- fed on arrival, before this packet's stamp exists -- can date what it is
@@ -792,6 +861,11 @@ void retune_dac(uint32_t hz);
 /* net.c -- SoftAP and the sync socket. */
 void wifi_start_ap(void);
 void socket_start(void);
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+/* The group address, resolved once and owned by net.c. Both the audio path and
+ * the analysis frames send to it; see the note beside the definition. */
+const struct sockaddr_in *mcast_addr(void);
+#endif
 
 /* clients.c -- the send list, and every fan-out over it.
  *

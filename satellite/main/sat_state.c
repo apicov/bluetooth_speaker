@@ -53,6 +53,12 @@ volatile uint32_t n_retunes;
 volatile uint32_t n_retunes_bad;
 volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
 volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
+volatile uint32_t n_fec_short_frames;  /* frames a recovery was short by, silenced */
+volatile uint32_t n_fec_decode_err;  /* a redundant copy failed to decode part-way */
+volatile uint32_t n_gap_short_resyncs;  /* re-anchors forced by a fill that did not fit */
+volatile uint32_t n_seq_dropped;  /* packets older than expected, dropped */
+volatile uint32_t n_decode_err;  /* live-stream SBC frames that would not decode */
+volatile uint32_t n_recv_err;  /* recvfrom() errors */
 volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 volatile uint32_t n_gap_frames;  /* silence inserted for lost packets */
 volatile uint32_t n_gap_short;  /* gap fills the ring could not take */
@@ -92,3 +98,4 @@ volatile int64_t retune_outage_us;
 volatile int64_t retune_done_at;
 volatile uint8_t retune_tail_left;
 volatile bool retuning;
+volatile bool playing;  /* the play task is feeding the DAC; read from the ISR */

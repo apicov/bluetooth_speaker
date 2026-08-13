@@ -307,15 +307,28 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 # and 16 static buffers does not absorb the bursts at 222/s. The pre-fix logs
 # reading tx-fail 0 were measuring a hub with its analysis lane dead.
 #
-# 26, NOT 32. Each static buffer is ~1.6 kB of INTERNAL memory -- the pool that
-# had 7,760 bytes free -- so 32 would need 25.6 kB and only 16 kB was freed by
-# taking the ring from 64 kB to 48 kB. 26 is what that buys: +62% on the pool
-# that is actually refusing work. Going further means shrinking the ring past the
-# feed burst it has to absorb, and hub.h says why that is where the line is.
+# WAS 26, NOW 32, and the reason 26 was the ceiling has gone away. Each static
+# buffer is ~1.6 kB of INTERNAL memory; the pool had 7,760 bytes free, so 32
+# would have needed 25.6 kB against the 16 kB freed by taking the ring from
+# 64 kB to 48 kB. 26 was what that bought.
+#
+# The hub then stopped running its ML lane (DANCEFLOOR_ML_SOURCE_REMOTE below)
+# and got ~24.9 kB of internal SRAM back -- measured, `MEM: internal` min going
+# 6740 -> 22012 with the 26 -> 32 step already paid for out of it. That is what
+# 32 is spent from, not the ring, which stays at 48 kB and keeps the feed-burst
+# margin hub.h argues for.
+#
+# 32 IS WHAT WAS MEASURED, and it is enough for the DTIM burst that
+# DANCEFLOOR_MCAST_FRAMES creates: with analysis frames on the group the hub
+# reads `tx-fail 0 (0 audio)` and the satellite `gaps 0` over 125 s, where 26
+# gave `tx-fail 14-27 audio` per 20 s window. 40 was written here briefly and
+# never reached a board -- an existing sdkconfig kept 32 and the run that passed
+# was at 32. Do not raise it on the strength of that; there is headroom
+# (`min 28948` free with the log shipper off) but no measurement above 32.
 #
 # Falsified by tx-fail itself, which is the counter CACHE_TX_BUFFER_NUM is pinned
 # to 0 further down to keep honest.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=26
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
 
 # The socket's receive queue, in datagrams. IDF defaults to 6 and the boot
 # banner prints it as `udp mbox: 6`.
@@ -661,22 +674,134 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_RX_BA_WIN=6
 
 # CACHE_TX_BUFFER_NUM only exists when the symbol above is set, and defaults to
-# 32. Pinned to 0 DELIBERATELY, and not as conservatism.
+# 32. It queues upper-layer packets in PSRAM when no static TX buffer is free,
+# instead of rejecting them.
 #
-# It queues upper-layer packets the driver could not buffer instead of rejecting
-# them, which is the wrong trade twice over here. A late audio packet is refused
-# at anchor time anyway (ANCHOR_MIN_LEAD_US) -- so the queue buys nothing but
-# latency for the thing it delays. And it converts tx-fail, the visible counter
-# the whole tuning log at the top of this file is written around, into silence:
-# the storm that measured 1016 rejections in 20 s would have shown up as a
-# healthy zero with a 32-deep cache in front of it.
+# WAS 0 DELIBERATELY, on two objections. "Worth trying on its own once the
+# fan-out work needs it" is what the note said, and the fan-out work needs it.
 #
-# Worth trying on its own once the fan-out work needs it. Not smuggled in here.
+# The first objection does not survive being checked. "A late audio packet is
+# refused at anchor time anyway (ANCHOR_MIN_LEAD_US)" -- but that gate applies
+# at STREAM START, not to packets inside a running stream, and the hub stamps
+# play_at 200 ms ahead. A packet held a few ms in this queue still arrives with
+# ~195 ms of lead and plays normally. The alternative is not a late packet, it
+# is no packet: a hole in the sound on every satellite at once, recoverable from
+# the FEC only if the NEXT packet gets through, which under a burst of ENOMEM is
+# exactly what does not happen.
+#
+# The second objection stands, and is why this is BACK AT 0 after one run with
+# it on: it converts tx-fail into silence, and tx-fail is the counter this whole
+# file is written around.
+#
+# The run with it on (17:52) is the useful negative result. tx-fail did NOT go
+# away -- 10 to 58 audio rejections per 20 s window with 32 cache buffers in
+# front of them -- which says the constraint is AIRTIME, not buffer count. A
+# queue cannot make a stream fit that does not fit; it only delays the moment it
+# does not. So the queue was never going to be the fix, and leaving it on now
+# would confound the thing that might be: with FEC at 0 an audio packet drops
+# from the 1472-byte MTU back to ~851 B, and the question is whether tx-fail
+# goes to zero because of that. It cannot be answered through a queue that
+# absorbs the evidence either way.
+#
+# Turn it back on once tx-fail is genuinely 0 and the reason is understood. It
+# is free in the pool that matters -- these live in PSRAM, of which the hub has
+# 8 MB, while the static buffers are internal SRAM with ~6.7 kB free and a
+# largest block of 3584, room for two more of those at most -- so it is worth
+# having as burst insurance. It is not worth having as a blindfold.
 CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
-# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
-# production flash, where the shipper compiles out entirely. The hub also
-# relays every satellite's logs to the collector, so this is the one unit that
-# must have it on for centralised capture to work.
-CONFIG_DANCEFLOOR_WIFI_LOGS=y
+# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only, and now OFF by
+# default -- which is what the line above always said and what this setting
+# contradicted. The Kconfig default is n; these two files were the only thing
+# turning it on.
+#
+# Off because it is not free on the resource this hub is short of. Every
+# ESP_LOG line becomes a datagram, and the hub relays every satellite's as well,
+# so it is bursty unicast traffic drawn from the same static TX buffer pool that
+# the audio and the analysis frames are competing for -- and a burst of log
+# lines is exactly what a fault produces, so the instrument gets loudest at the
+# moment it can least afford to. The satellite's own Kconfig help records the
+# sharper version of this: a blocking log write in the receive path "starves the
+# UDP mailbox and causes the very loss it was logging".
+#
+# WHAT TURNING IT OFF COSTS: tools/log_collector/collect.py stops working, and a
+# satellite's log is then only readable on that satellite's own serial port.
+# Turn it back on -- here and on every satellite, they must agree -- for any run
+# where centralised capture is worth the airtime. It compiles out entirely when
+# unset: no shipper task, no queue, no wifi_log symbols.
+CONFIG_DANCEFLOOR_WIFI_LOGS=n
+
+# How many DHCP leases the SoftAP can hand out. IDF's default is 8, which was
+# invisible while MAX_CLIENTS was also 8: it agreed by coincidence rather than
+# by construction, and nothing named it.
+#
+# It is the THIRD of three limits that decide how many satellites a floor can
+# hold, and the only one whose failure is quiet. The other two -- MAX_CLIENTS
+# and wifi_config.ap.max_connection -- refuse a satellite at association, which
+# it notices and reports. Running out of leases lets it associate and then gives
+# it no address, so the hub sees a station that joined and never probed, and
+# n_sta_nolease is the only tell. Kept at MAX_CLIENTS so the three move
+# together.
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=15
+
+# The hub runs NO pluggable analysers, and gives up its own to buy transmit
+# capacity. Pinned here because it was not pinned anywhere: the Kconfig default
+# is DANCEFLOOR_ML_SOURCE_LOCAL, sdkconfig is gitignored, and so a clone of this
+# repo built a hub that started the slow lane while every measurement written
+# above was taken on one that did not.
+#
+# What it costs the hub: nothing it was using. The lane's two analysers are
+# ZcrRms and Mood; the periodic log read `slow 0/0 us` and `results N+0` for the
+# whole of every run captured -- the slow lane produced nothing at all -- and
+# `ml-throt` showed ~77 of the fast one's results a second being computed and
+# thrown away against a 100 ms publish period.
+#
+# What it buys: ~25 kB of INTERNAL SRAM, which is the pool the WiFi static TX
+# buffers come from and the binding constraint on this board. The lane's stream
+# buffer alone is 12.8 kB (16 kHz x 400 ms x 2 B), plus a 4 kB mlan stack and
+# its TCB, plus ~6.3 kB of resampler table and decimation buffer that
+# DF_RUNS_ANALYSERS drops with it. None of it can live in PSRAM:
+# SPIRAM_USE_CAPS_ALLOC means plain malloc and every task stack are internal.
+#
+# The analysers stay in the shared component and stay buildable -- the intent is
+# to run them on a SATELLITE, which has the audio and none of this hub's
+# transmit load. Nothing in the tree compiles that path now, so
+# `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` is what keeps it
+# from rotting.
+CONFIG_DANCEFLOOR_ML_SOURCE_LOCAL=n
+CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
+
+# Nothing to publish once no analyser runs here, so this would send an empty
+# result stream to every satellite. ~10 datagrams/s per satellite, unicast.
+CONFIG_DANCEFLOOR_PUBLISH_ML=n
+
+# MEASURED, AND IT WORKS AT 32 BUFFERS. Overrides the Kconfig default of n,
+# which stays n because it is the right answer for a hub with the 26 static TX
+# buffers that default implies. This one has 32, which is the whole point of the
+# two settings above -- they belong together and neither is safe alone.
+#
+# The question was narrow: does a 32-buffer pool absorb a DTIM burst of ~15
+# group frames, where 26 could not? It does. The run:
+#
+#   hub  tx-fail 0 (0 audio) | cong-skip 0 | 50 pkts/s | frames mcast
+#   sat  gaps 0 (0 short, 0 too big) ring-full 0        -- at 65 s AND 125 s
+#   sat  leds remote hop 512 (rx 5012 -> 10181, bad 0)  -- 86.1 frames/s, none bad
+#
+# Zero audio gaps across the whole run, against 8 in 545 s on the unicast-frames
+# build and 0.17/s when this branch started. The strips get every frame.
+#
+# What it buys is the only thing that makes the hub's transmit rate FLAT in
+# speaker count: 50 + 96xN packets/s becomes ~146, whatever N is. At fifteen
+# satellites that is ~316/s against ~1490/s, and only the probe traffic still
+# scales.
+#
+# If this is ever turned on WITHOUT the 32 buffers it reproduces the failure it
+# came from -- `tx-fail 14-27 audio` per 20 s and the satellite's gap rate
+# tracking it one for one at 1.1/s. The burst, not the average, is what empties
+# the pool, so the two settings move together or not at all.
+#
+# STILL ONLY MEASURED AT TWO SATELLITES. The arithmetic says the frames stop
+# scaling; nothing has put more than two on the floor to check it, and the
+# probe traffic that does still scale has never been measured past two either.
+CONFIG_DANCEFLOOR_MCAST_FRAMES=y

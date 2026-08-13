@@ -44,6 +44,44 @@ static uint32_t expect_seq;
 static bool have_seq;
 
 /*
+ * The tail of the last audio actually queued, kept so a gap can be concealed
+ * with something other than digital zero.
+ *
+ * A lost packet is ~20 ms. Filling it with zeros is correct for the TIMELINE --
+ * the length has to be exact or every later sample plays early -- and wrong for
+ * the EAR: the output jumps from whatever it was playing to zero and back, and
+ * those two discontinuities are a click at each end. The click is most of what
+ * a dropout sounds like. The missing 20 ms of music, on its own, is much less
+ * objectionable than the edges around it.
+ *
+ * So the fill starts from the last samples that really played and fades them to
+ * silence, and the audio that resumes afterwards is faded in. Nothing here
+ * invents music: past the fade it is still silence, and a long gap still sounds
+ * like a gap. What it removes is the two transients, which cost nothing to
+ * remove and are the part that carries.
+ *
+ * PLC_TAIL_FRAMES is one SBC frame's worth at the usual settings, which is the
+ * most the concealer ever repeats before it has faded out entirely.
+ */
+#define PLC_TAIL_FRAMES 128
+#define PLC_FADE_FRAMES 128          /* ~2.9 ms at 44.1 kHz, both directions */
+static int16_t s_plc_tail[PLC_TAIL_FRAMES * AUDIO_CHANNELS];
+static uint32_t s_plc_have;          /* frames held, 0 until the first decode */
+static uint32_t s_plc_fade_in;       /* frames of fade-in still owed after a gap */
+
+/* Remember the tail of what was just queued. Called with whole frames only. */
+static void plc_note(const int16_t *pcm, uint32_t frames)
+{
+    if (frames == 0) {
+        return;
+    }
+    const uint32_t take = frames > PLC_TAIL_FRAMES ? PLC_TAIL_FRAMES : frames;
+    memcpy(s_plc_tail, pcm + (frames - take) * AUDIO_CHANNELS,
+           (size_t)take * AUDIO_CHANNELS * sizeof(int16_t));
+    s_plc_have = take;
+}
+
+/*
  * Decide whether this packet can start a stream, and start it if so.
  *
  * Returns false when the packet is refused and there is nothing more to do with
@@ -167,6 +205,12 @@ static bool anchor_stream(const audio_msg_t *msg, int64_t offset, bool by_tsf)
     visualiser_flush();
 #endif
     sbc_decoder_init();
+    /* The concealer's tail belongs to the stream that just ended, and the ring
+     * is about to be reset -- fading the new stream's first samples up from
+     * whatever the old one was playing would be a discontinuity invented where
+     * there is none. Playback restarts from a clean buffer either way. */
+    s_plc_have = 0;
+    s_plc_fade_in = 0;
     stream_start_local = start_local;
     stream_offset = offset;
     offset_slew_last = 0;                /* re-seed the slew for this stream */
@@ -250,9 +294,12 @@ static bool upgrade_provisional_anchor(const audio_msg_t *msg, int64_t offset)
  * slide the whole stream.
  *
  * Whole SBC frames are decoded until want_frames would be overshot; the rest is
- * silence, so the fill is length-exact even when the recovered payload was
- * truncated by the hub's MTU guard. red == NULL means no redundancy covered this
- * packet, so the whole fill is silence -- the behaviour this path always had.
+ * silence, so the fill is length-exact. red == NULL means no redundancy covered
+ * this packet, so the whole fill is silence -- the behaviour this path always had.
+ *
+ * Any shortfall is counted in n_fec_short_frames rather than quietly padded. It
+ * is ~1/4 of every recovery whenever redundancy is on -- a copy of an ~825-byte
+ * payload does not fit beside it -- and nothing used to say so.
  */
 static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
                                             uint32_t want_frames)
@@ -267,7 +314,25 @@ static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
             size_t consumed = 0, samples = 0;
             if (!sbc_decode_frame(red + off, red_len - off, &consumed, pcm, &samples)
                 || consumed == 0) {
-                sbc_decoder_init();          /* resync rather than wedge */
+                /*
+                 * Stop, but DO NOT reinitialise the decoder.
+                 *
+                 * This used to call sbc_decoder_init() here, and because the
+                 * copy was cut mid-frame by the hub's MTU guard it fired on
+                 * essentially every recovery. The decoder is one global context
+                 * shared with the live stream, and what init() throws away is
+                 * the synthesis filterbank history -- so each recovery also put
+                 * a transient into the frames that followed it, on top of the
+                 * silence the truncation had already caused. Two artefacts from
+                 * one cause, and the second one looked like a decoder problem.
+                 *
+                 * A failure here says the COPY is short or corrupt. It says
+                 * nothing about the live stream, whose own decode path resets on
+                 * its own errors (decode_into_ring). SBC frames are
+                 * independently decodable, so leaving the state alone costs
+                 * nothing and keeps the history the next real frame needs.
+                 */
+                n_fec_decode_err++;
                 break;
             }
             off += consumed;
@@ -286,18 +351,62 @@ static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
         }
     }
 
+    /* Whatever the copy did not supply. Counted before the loop so a ring that
+     * fills mid-pad does not hide the shortfall behind a second cause -- these
+     * frames were owed by the recovery either way. */
+    if (red && filled < want_frames) {
+        n_fec_short_frames += want_frames - filled;
+    }
+
+    /*
+     * The rest is concealed rather than silenced: the last audio that really
+     * played, faded to zero over PLC_FADE_FRAMES, then zeros for however much
+     * gap is left. Same LENGTH as the silence it replaces -- every frame is
+     * still counted into samples_in below, so the timeline is untouched and this
+     * cannot slide the stream. Only the content differs.
+     *
+     * Before the first decode there is nothing to fade from, so it degrades to
+     * exactly the old behaviour.
+     */
+    static int16_t conceal[128 * AUDIO_CHANNELS];
+    uint32_t faded = 0;                  /* frames of fade emitted so far */
+
     while (filled < want_frames) {
         uint32_t left = want_frames - filled;
         uint32_t n = left > 128 ? 128 : left;
+        const int16_t *src = silence;
+
+        if (s_plc_have && faded < PLC_FADE_FRAMES) {
+            for (uint32_t i = 0; i < n; i++) {
+                const uint32_t pos = faded + i;
+                /* Linear ramp to zero; past the ramp the rest of this block is
+                 * zero too, which is what the multiply gives without a branch. */
+                const int32_t gain = pos < PLC_FADE_FRAMES
+                                   ? (int32_t)(PLC_FADE_FRAMES - pos) : 0;
+                const int16_t *s = &s_plc_tail[(pos % s_plc_have) * AUDIO_CHANNELS];
+                for (int c = 0; c < AUDIO_CHANNELS; c++) {
+                    conceal[i * AUDIO_CHANNELS + c] =
+                        (int16_t)((int32_t)s[c] * gain / (int32_t)PLC_FADE_FRAMES);
+                }
+            }
+            src = conceal;
+        }
+
         size_t want = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
-        size_t sent = xStreamBufferSend(ring, silence, want, 0);
+        size_t sent = xStreamBufferSend(ring, src, want, 0);
         uint32_t got = (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
         filled += got;
+        faded += got;
         samples_in += (int32_t)got;
         if (sent < want) {
             break;                           /* raced the playback task; counted above */
         }
     }
+
+    /* Whatever resumes after this gap is ramped back up, so the far edge is not
+     * a step either. Armed even when nothing was concealed: the discontinuity
+     * into real audio exists whether the gap was faded or silent. */
+    s_plc_fade_in = PLC_FADE_FRAMES;
     return filled;
 }
 
@@ -404,17 +513,45 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
          * failing sends, and the shortfall came out as a number nobody could
          * check against the ring's actual free space at the time.
          *
-         * What the shortfall MEANS is unchanged and is not fixed here: those
-         * frames were owed to the timeline and are not in it, so playback runs
-         * that much early until the servo walks it back. Capping only makes the
-         * amount honest and the attempt cheap.
+         * WHAT THE SHORTFALL MEANS IS NOW ACTED ON, which it was not. The note
+         * that used to end here said the owed frames "are not in it, so playback
+         * runs that much early until the servo walks it back", and the servo
+         * cannot walk it back: it trims +-100 Hz, 2.27 ms/s, against a shortfall
+         * that arrives hundreds of milliseconds at a time.
+         *
+         * Measured 2026-08-13 17:53. A hub transmit burst cost 37 audio packets
+         * in one window; the satellite met them with
+         *
+         *   gaps 18 (658 ms silence) | ring-full 15
+         *   gaps 13 (920 ms silence, 3 short by 229 ms) | ring-full 63
+         *
+         * -- 658 ms of silence written into a 464 ms ring in a few hundred ms of
+         * wall time, because a gap is filled the moment the packet AFTER it
+         * arrives rather than at the rate audio plays. The ring jammed, 229 ms
+         * went uncounted, and the timeline slid by exactly that. The unit then
+         * sat at `phase +250217 us` with `buffer 409 ms` for over two minutes,
+         * hunting with +-97 Hz retunes it had no chance of closing, and only
+         * escaped via "no anchorable packet for 5005 ms".
+         *
+         * So a fill that does not fit is treated as a gap too big to fill, which
+         * is the same fault by a different route and already has the right
+         * answer: reset and re-anchor. That costs a few hundred ms of silence
+         * once. The slide costs minutes, and takes the unit out of sync with
+         * every other speaker on the floor while it lasts.
+         *
+         * Counted separately from n_gap_resyncs so the two causes stay
+         * distinguishable -- a gap longer than GAP_RESYNC_MS says the air was
+         * bad, this says the ring could not absorb the burst.
          */
         size_t room = xStreamBufferSpacesAvailable(ring);
         uint32_t can_take = (uint32_t)(room / (AUDIO_CHANNELS * sizeof(int16_t)));
         if (can_take < frames_missing) {
             n_gap_short++;
             n_gap_short_frames += frames_missing - can_take;
-            frames_missing = can_take;
+            n_gap_short_resyncs++;
+            resync_request = true;
+            have_seq = false;
+            return false;
         }
         /*
          * Fill in sequence order. For each missing packet, decode the recovered
@@ -445,11 +582,40 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
             uint32_t got = fill_recovered_then_silence(red, rlen, per);
             filled += got;
             if (got < per) {
-                break;                       /* ring filled mid-packet; counted above */
+                /*
+                 * The ring jammed mid-fill despite having had room a moment ago
+                 * -- the space check above is a snapshot and this task is not
+                 * the only one touching the buffer. Same consequence as the
+                 * check failing outright, so the same answer: the frames owed
+                 * to the timeline are not in it, and re-anchoring is the only
+                 * way back that does not leave the unit permanently early.
+                 */
+                n_gap_short++;
+                n_gap_short_frames += per - got;
+                n_gap_short_resyncs++;
+                resync_request = true;
+                have_seq = false;
+                return false;
             }
         }
     } else if (have_seq && msg->seq < expect_seq) {
-        return false;                              /* duplicate or reorder, drop */
+        /*
+         * A duplicate or a reorder, dropped -- its audio slot has already been
+         * filled with silence or a recovered copy, so there is nowhere to put
+         * it. Counted now because the two possible causes want opposite
+         * responses and nothing could tell them apart.
+         *
+         * Duplicates should be impossible: the hub sends each packet once, and
+         * a group frame is not retried. If this moves under multicast it means
+         * something is duplicating on the air or in lwIP. Reordering should be
+         * near-impossible too on a single-hop link with one traffic class -- and
+         * if it is happening, the gap that preceded it was not a loss at all,
+         * so the silence filled for it was inserted against a packet that did
+         * arrive, just late. That is a fill this unit should stop doing, and
+         * this is the number that would justify the work.
+         */
+        n_seq_dropped++;
+        return false;
     }
     return true;
 }
@@ -499,6 +665,21 @@ static void decode_into_ring(const audio_msg_t *msg)
         size_t consumed = 0, samples = 0;
         if (!sbc_decode_frame(msg->payload + off, msg->payload_len - off,
                               &consumed, pcm, &samples)) {
+            /*
+             * The rest of this packet is dropped and the decoder is reset. This
+             * one DOES reset -- unlike the FEC path, which must not -- because
+             * a failure on the live stream means the decoder's own state is
+             * suspect, and that is what a resync is for.
+             *
+             * Counted because it is a hole in the audio that no other counter
+             * sees: the frames are simply never queued, so samples_in does not
+             * advance for them and the timeline shortens by however much the
+             * packet had left. The hub distinguishes a CRC failure from any
+             * other (dec vs dcrc on its sbc_in line); this end is one number,
+             * because on this side the interesting question is only whether it
+             * is happening at all.
+             */
+            n_decode_err++;
             sbc_decoder_init();              /* resync rather than wedge */
             break;
         }
@@ -507,6 +688,32 @@ static void decode_into_ring(const audio_msg_t *msg)
         }
         off += consumed;
         size_t want = samples * sizeof(int16_t);
+
+        /*
+         * Ramp back up if a gap just ended. The concealer faded the near edge
+         * down; this is the far edge, and without it the step from silence into
+         * full-level audio is the second of the two clicks a dropout makes.
+         *
+         * In place in pcm[], before the ring sees it and before the visualiser
+         * is fed, so both get the samples that will actually be heard.
+         */
+        if (s_plc_fade_in) {
+            const uint32_t frames = (uint32_t)(samples / AUDIO_CHANNELS);
+            for (uint32_t i = 0; i < frames && s_plc_fade_in; i++) {
+                const int32_t gain =
+                    (int32_t)(PLC_FADE_FRAMES - s_plc_fade_in) + 1;
+                for (int c = 0; c < AUDIO_CHANNELS; c++) {
+                    int16_t *v = &pcm[i * AUDIO_CHANNELS + c];
+                    *v = (int16_t)((int32_t)*v * gain / (int32_t)PLC_FADE_FRAMES);
+                }
+                s_plc_fade_in--;
+            }
+        }
+
+        /* Keep the tail for the next gap, taken from the audio as it will be
+         * heard -- after any fade-in above, not before. */
+        plc_note(pcm, (uint32_t)(samples / AUDIO_CHANNELS));
+
         /* Count what the ring actually took, not what we offered: the same
          * accounting the gap filler above depends on, and a short send here
          * would otherwise bias every later position the other way. */
@@ -586,6 +793,25 @@ void rx_task(void *arg)
         int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
         int64_t t4 = esp_timer_get_time();
         if (n < 1) {
+            /*
+             * A zero-length datagram is nothing to do; an error is not.
+             *
+             * This used to `continue` on both, silently. recvfrom() blocks, so
+             * in the normal case the loop is idle -- but an error does NOT
+             * block, and a persistent one (the socket going down under a WiFi
+             * drop, most plausibly) turns this into a spin at priority 7 that
+             * nothing counts and nothing bounds. It would starve the very
+             * receive path it is failing to serve, and present as loss on the
+             * air.
+             *
+             * Counted, and yielded on. One tick is nothing against a real
+             * datagram rate of ~136 a second, and it is the difference between
+             * a spin and a poll.
+             */
+            if (n < 0) {
+                n_recv_err++;
+                vTaskDelay(1);
+            }
             continue;
         }
 

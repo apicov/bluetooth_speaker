@@ -165,7 +165,8 @@ void telemetry_tick(void)
                       " | alloc-fail %" PRIu32
                       " | refill-withheld %" PRIu32
                       " | phase-drop %" PRIu32 " short-reads %" PRIu32
-                      " (%" PRIu32 " frames) | wifi-over %" PRIu32,
+                      " (%" PRIu32 " frames) | wifi-over %" PRIu32
+                      " | dma-starve %" PRIu32 " fec-trunc %" PRIu32,
                  (unsigned long long)(esp_timer_get_time() / 1000000),
                  esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                  heap_win == UINT32_MAX ? 0 : heap_win,
@@ -174,7 +175,8 @@ void telemetry_tick(void)
                  n_retunes, n_retunes_bad, n_sta_left, n_sta_dropped,
                  n_sta_nolease, n_sta_timeout, n_alloc_fail,
                  n_refill_withheld,
-                 n_phase_drop, n_short_reads, n_short_frames, n_wifi_oversize);
+                 n_phase_drop, n_short_reads, n_short_frames, n_wifi_oversize,
+                 dma_starve_count(), n_fec_truncated);
 
         /*
          * Its own line, not four more fields above. The HEALTH line already

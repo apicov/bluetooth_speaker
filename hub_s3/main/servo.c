@@ -74,6 +74,24 @@ void servo_tick(void)
      * is expected to reduce pointless retunes rather than to move that
      * number. If it moves it the wrong way, revert this commit -- the raw
      * value is still computed below and still logged.
+     *
+     * THE EMA WAS THE RIGHT FILTER ON THE WRONG INPUT. It averages across
+     * servo ticks, 5 s apart, so rejecting scatter that lives inside 180 ms
+     * costs it tens of seconds of memory -- and it still only averages the
+     * outliers in rather than discarding them, which is what let 10 retunes
+     * happen in 365 s against a real drift of ~14 ppm. Its input is now the
+     * median the play task publishes, taken over the same nine packet-cadence
+     * readings the splice has used since it stopped splicing on one sample.
+     * One outlier in nine cannot move a median at all; it moves a 4-sample
+     * EMA by a quarter of itself.
+     *
+     * The EMA is kept on top rather than replaced. It is what carries state
+     * across the deadband and cooldown, and the two filters answer different
+     * questions: the median says where this unit is now, the average says
+     * whether it has been there long enough to act on. Falling back to the raw
+     * reading while the median is invalid keeps the servo working through the
+     * first ~100 ms after a splice or a start, which is exactly when it must
+     * not be idle.
      */
     static int32_t s_err_ema;
     static bool    s_err_ema_valid;
@@ -81,8 +99,8 @@ void servo_tick(void)
         s_phase_stepped = false;
         s_err_ema_valid = false;   /* history describes a different world */
     }
-    s_err_ema = s_err_ema_valid ? (s_err_ema * 3 + s_phase_err_us) / 4
-                                : s_phase_err_us;
+    const int32_t err_in = s_phase_med_valid ? s_phase_med_us : s_phase_err_us;
+    s_err_ema = s_err_ema_valid ? (s_err_ema * 3 + err_in) / 4 : err_in;
     s_err_ema_valid = true;
 
     size_t filled = LOCAL_RING_BYTES - xStreamBufferSpacesAvailable(local_ring);
@@ -95,15 +113,30 @@ void servo_tick(void)
          * every log captured before this instrument existed. */
         char why[128];
         tx_fail_summary(why, sizeof(why));
-        ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
-                      "tx-fail %" PRIu32 "%s | ml-throt %" PRIu32 " | cong-skip %" PRIu32
-                      " | xport %s fec %d",
+        /* Raw, median and average side by side, because the change from feeding
+         * the servo the raw reading to feeding it the median is only
+         * falsifiable if a log shows both. Raw minus median IS the scatter this
+         * was written to reject: if they track each other, the 15.7 ms wart has
+         * gone somewhere else and this filter is not earning its place. */
+        ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us "
+                      "(median %+ld%s, smoothed %+ld us) | "
+                      "tx-fail %" PRIu32 " (%" PRIu32 " audio)%s | ml-throt %" PRIu32
+                      " | cong-skip %" PRIu32
+                      " | %lu pkts/s"
+                      " | xport %s fec %d frames %s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
-                 (long)s_phase_err_us, (long)s_err_ema, s_tx_fail, why,
+                 (long)s_phase_err_us,
+                 (long)(s_phase_med_valid ? s_phase_med_us : 0),
+                 s_phase_med_valid ? "" : " n/a",
+                 (long)s_err_ema, s_tx_fail, s_tx_fail_audio, why,
                  n_ml_throttled, n_tx_cong_skip,
-                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH);
+                 (unsigned long)(s_audio_pkts / (uint32_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S),
+                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
+                 FRAMES_TRANSPORT_TAG);
         s_tx_fail = 0;
+        s_tx_fail_audio = 0;   /* same window as the total it is a subset of */
+        s_audio_pkts = 0;
         n_ml_throttled = 0;
         n_tx_cong_skip = 0;
     }

@@ -470,12 +470,17 @@ typedef struct __attribute__((packed)) {
  * many whole blocks as fit and never fragments.
  *
  * Decoded audio is ~1.4 Mbps in 172 packets/s; the SBC sent over the air is
- * ~330 kbps in ~50 packets/s of ~825-byte payloads. One full redundant copy would
- * push a packet past the 1472-byte UDP MTU, so a copy is attached only as far as
- * it fits -- at ~825-byte payloads that is most of the previous packet, and SBC
- * frames are independently decodable, so a partial copy still recovers the audio
- * it contains (the satellite pads any shortfall with silence to keep the
- * timeline length exact).
+ * ~330 kbps in ~50 packets/s of ~825-byte payloads. A copy is attached only as
+ * far as the MTU allows, so at those payload sizes it is TRUNCATED to about
+ * three quarters and the satellite pads the rest with silence -- roughly 6 ms
+ * per "recovered" packet, which the log still reports as a clean recovery.
+ *
+ * That is why the depth defaults to 0. A whole copy needs 2 x 825 + 29 bytes
+ * against a 1472-byte MTU and cannot fit, and making it fit by shrinking the
+ * payload doubles the packet rate, which this hub cannot afford. The full
+ * measurement is in DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help; it is kept there
+ * rather than here because it is a decision about a setting, not about the wire
+ * format, and the wire format is what this header is for.
  */
 #define AUDIO_RED_HDR_BYTES   3                     /* u16 red_len + u8 red_seq_ofs */
 #define AUDIO_RED_BYTES(r)    (AUDIO_RED_HDR_BYTES + (r))
@@ -483,6 +488,33 @@ typedef struct __attribute__((packed)) {
 /* On-wire bytes for an audio message of n payload bytes followed by r bytes of
  * trailing redundancy. AUDIO_MSG_BYTES(n) is the r == 0 case. */
 #define AUDIO_MSG_RED_BYTES(n, r) (AUDIO_MSG_BYTES(n) + AUDIO_RED_BYTES(r))
+
+/*
+ * What one UDP datagram may carry: 1500-byte Ethernet-equivalent MTU less 20
+ * bytes of IP and 8 of UDP. On-link under the SoftAP, so nothing fragments this
+ * further and nothing routes it.
+ */
+#define AUDIO_UDP_MTU 1472
+
+/*
+ * The largest payload a sender may put in one datagram: header plus payload
+ * against the MTU, 1446 bytes.
+ *
+ * At the ~825-byte payloads a phone produces it never binds, so the packet rate
+ * is unchanged from every log ever captured. It exists for the case that always
+ * could have fragmented and never had a guard: a 1500-byte A2DP payload becoming
+ * a 1526-byte datagram, since the only ceiling checked was AUDIO_MAX_PAYLOAD at
+ * 2048. The FEC attach path clamps its own copies to whatever is left, so it
+ * cannot push a packet over on its own.
+ *
+ * A cap that DID bind -- one sized so a whole redundant copy fits beside the
+ * payload -- was tried and reverted: it splits every packet in two, and the
+ * doubled packet rate both exhausts the transmit buffers and doubles the
+ * timeline slew, which is per packet. See DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig
+ * help for the measurement. Anything that reintroduces such a cap has to make
+ * TIMELINE_SLEW_US per unit of audio first.
+ */
+#define AUDIO_TX_PAYLOAD_MTU_MAX (AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0))
 
 /*
  * Which downlink this build speaks, as a short tag for the periodic status
@@ -496,6 +528,21 @@ typedef struct __attribute__((packed)) {
 #define AUDIO_TRANSPORT_TAG "mcast"
 #else
 #define AUDIO_TRANSPORT_TAG "unicast"
+#endif
+
+/*
+ * The same for the analysis frames, which are a separate switch
+ * (DANCEFLOOR_MCAST_FRAMES) because they are a separate loss budget. Printed by
+ * the hub only -- a satellite receives frames and has no transport to report --
+ * and printed for the same reason as the audio tag: at 86 frames a second per
+ * satellite this is the difference between a hub that transmits ~146 packets a
+ * second and one that transmits over a thousand, which is far too large a
+ * difference to have to infer from a boot line that has scrolled away.
+ */
+#if CONFIG_DANCEFLOOR_MCAST_FRAMES
+#define FRAMES_TRANSPORT_TAG "mcast"
+#else
+#define FRAMES_TRANSPORT_TAG "unicast"
 #endif
 
 typedef struct __attribute__((packed)) {

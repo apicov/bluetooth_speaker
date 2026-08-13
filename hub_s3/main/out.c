@@ -60,6 +60,53 @@ void streamer_set_sample_rate(uint32_t hz)
 
 /* I2S_NUM_1 by history: port 0 used to be the slave receiver from the bridge.
  * That link is SPI now, but there is no reason to move this. */
+/*
+ * The moment silence starts, counted. Both units carry this; see the satellite's
+ * copy for the full reasoning.
+ *
+ * In short: auto_clear makes a starved channel emit zeroes rather than repeat
+ * itself, which made every stall shorter than the underrun timeout invisible --
+ * no counter, no log, and samples_played not advancing, so the only trace was a
+ * phase error the servo then chased with a retune. The driver raises
+ * on_send_q_ovf when the DMA has been all the way round its descriptor ring
+ * without the writer taking a buffer back, which with auto_clear on is exactly
+ * when the output goes quiet.
+ *
+ * This end is where it matters most for diagnosis: the hub loses no packets, so
+ * anything it silences it did to itself -- and sbc_in at priority 9 sits above
+ * play at 8 on the same core, decoding, feeding two stream buffers and calling
+ * sendto in one block. If that block ever exceeds the 34.8 ms the DMA holds,
+ * this is the counter that says so.
+ *
+ * ONLY COUNTED WHILE SOMETHING IS SUPPOSED TO BE FEEDING IT. Counting every
+ * overflow made this read ~20000 on a healthy hub: the channel is enabled from
+ * boot, so before the bridge delivers a first packet -- and through every
+ * underrun park -- nothing writes, every descriptor completion overflows, and it
+ * accrues at ~172/s for as long as that lasts. The total then said nothing about
+ * playback and looked like a catastrophe; it was frozen across consecutive
+ * HEALTH lines, which is what gave it away.
+ *
+ * s_playing is the play task's own flag, already used by the servo for the same
+ * question, and `retuning` covers the re-enable after a clock change where the
+ * descriptors are empty by construction -- that cost is reported as
+ * `channel down` and does not belong here twice.
+ */
+static volatile uint32_t s_dma_starve;
+
+static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, void *ctx)
+{
+    (void)h; (void)e; (void)ctx;
+    if (s_playing && !retuning) {
+        s_dma_starve++;
+    }
+    return false;
+}
+
+uint32_t dma_starve_count(void)
+{
+    return s_dma_starve;
+}
+
 void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
@@ -99,6 +146,9 @@ void i2s_start(uint32_t rate)
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
+    /* Registered before enable, so the first traversal is covered. */
+    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = on_tx_starved };
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(i2s_tx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
     tx_rate = rate;
     /* Compare this against the satellite's line. The sync marker fires when a

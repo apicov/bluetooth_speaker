@@ -293,6 +293,23 @@ static void absorb_phase_crossings(void)
                 s_phase_err_us = err;
                 s_phase_valid = true;
                 sync_phase_push(&s_phase_hist, err);
+                /*
+                 * Publish the median for the servo, which runs on another task
+                 * and cannot read s_phase_hist -- that history is play-task-only
+                 * and is reset under this task's feet at every splice.
+                 *
+                 * The splice has filtered its input this way since it stopped
+                 * splicing on one raw reading; the servo had not, and it is the
+                 * same 15.7 ms of scatter feeding both. Computed here rather
+                 * than in the servo because it needs the packet-cadence history:
+                 * nine readings span ~180 ms, so this removes the scatter
+                 * without adding lag the servo would have to wait out.
+                 */
+                int32_t med;
+                if (sync_phase_median(&s_phase_hist, &med)) {
+                    s_phase_med_us = med;
+                    s_phase_med_valid = true;
+                }
             }
         }
         s_phase_tail = (s_phase_tail + 1) % PHASE_Q_LEN;
@@ -409,6 +426,7 @@ static void apply_track_boundary(void)
             /* And so is the splice's own history, for the same reason:
              * every reading in it was taken before this unit moved. */
             sync_phase_reset(&s_phase_hist);
+            s_phase_med_valid = false;   /* it summarised the phase just removed */
         }
 
         /*
@@ -529,6 +547,7 @@ s_samples_played = 0;
 /* Every reading in it was measured against the timeline this start
  * replaces, so none of them describes where this unit now is. */
 sync_phase_reset(&s_phase_hist);
+s_phase_med_valid = false;
 /* The channel drained while this task was parked, so it is empty here
  * for the same reason it is empty after a disable. See s_refill_active. */
 s_refill_active = true;

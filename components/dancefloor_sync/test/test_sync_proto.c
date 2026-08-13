@@ -342,6 +342,42 @@ int main(void)
               AUDIO_MAX_PAYLOAD >= SBC_LINK_MAX_PAYLOAD, d);
     }
 
+
+    /*
+     * THE APPLIED THRESHOLD MUST NOT BIND AT REAL PAYLOAD SIZES.
+     *
+     * This is the test that was missing. Everything above checks the FEC
+     * arithmetic and all of it passed while the hub was splitting every payload
+     * in two, doubling the audio packet rate, discarding 15% of its own audio at
+     * the socket and slewing the timeline at twice the rate the satellites could
+     * follow. Not one assertion here noticed, because none of them asked the
+     * question that mattered: how many datagrams does one A2DP payload become?
+     *
+     * A phone at bitpool 53, 44.1 kHz joint stereo sends ~119-byte SBC frames,
+     * ~7 to a payload, ~825 bytes -- and up to 1024 has been seen. If the
+     * threshold sbc_in.c cuts on is below that, the rate doubles and both
+     * TIMELINE_SLEW_US and the TX buffer pool are silently resized with it.
+     */
+    {
+        char d[96];
+        snprintf(d, sizeof d, "mtu-cap=%zu", (size_t)AUDIO_TX_PAYLOAD_MTU_MAX);
+        check("the applied cap is header-plus-payload against the MTU",
+              AUDIO_TX_PAYLOAD_MTU_MAX == 1446 &&
+              AUDIO_MSG_BYTES(AUDIO_TX_PAYLOAD_MTU_MAX) == AUDIO_UDP_MTU, d);
+
+        /* One datagram per payload at every size this source produces. */
+        static const size_t seen[] = { 512, 700, 825, 1024, 1200, 1446 };
+        bool one_each = true;
+        for (size_t i = 0; i < sizeof seen / sizeof seen[0]; i++) {
+            if (seen[i] > AUDIO_TX_PAYLOAD_MTU_MAX) {
+                one_each = false;
+            }
+        }
+        snprintf(d, sizeof d, "up to %zu B stays one datagram",
+                 (size_t)AUDIO_TX_PAYLOAD_MTU_MAX);
+        check("a real A2DP payload is not split", one_each, d);
+    }
+
     /*
      * 18. The CRC is CRC-16/CCITT-FALSE, checked against an independent
      *     implementation rather than against a number this file copied from

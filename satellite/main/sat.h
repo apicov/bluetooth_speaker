@@ -411,6 +411,62 @@ extern volatile uint32_t n_retunes;
 extern volatile uint32_t n_retunes_bad;
 extern volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
 extern volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
+/*
+ * Frames a recovery was SHORT by, padded with silence -- the honest half of
+ * n_fec_recovered.
+ *
+ * These two together are the instrument that was missing. n_fec_recovered
+ * counts packets a redundant copy covered; it said nothing about how MUCH of
+ * each one the copy actually carried, and the copy is truncated to ~3/4 by the
+ * hub's MTU guard. So the log read `gaps 1 (20 ms silence) | fec 1` -- a gap,
+ * and a recovery, and the reader is left to assume they cancel. They did not:
+ * ~6 ms of that 20 was still silence, every time, once every ~2.7 s.
+ *
+ * Now the shortfall is its own number, and it reads 0 only because redundancy
+ * is off by default. Turn DANCEFLOOR_AUDIO_FEC_DEPTH up and it will be roughly a
+ * quarter of every recovery; n_fec_truncated at the hub end is the same fact
+ * seen from the sender. Between them they are what any future attempt at
+ * redundancy has to drive to zero before it can claim to have recovered
+ * anything.
+ */
+extern volatile uint32_t n_fec_short_frames;
+/*
+ * Decodes of a redundant copy that failed part-way.
+ *
+ * Distinct from a live-stream decode error because the response differs: this
+ * path deliberately does NOT reinitialise the decoder. See the note in
+ * fill_recovered_then_silence().
+ */
+extern volatile uint32_t n_fec_decode_err;
+/*
+ * Three faults that used to happen silently. Each was a `continue`, a `break` or
+ * a bare `return false` with nothing recorded, so a run in which any of them
+ * fired looked exactly like a clean one.
+ *
+ * n_seq_dropped -- a packet older than expected. Should be 0: the hub sends
+ *   each once and a group frame is not retried. Non-zero means either something
+ *   is duplicating, or packets are arriving out of order -- and a reorder means
+ *   the "gap" before it was never a loss, so the silence filled for it was
+ *   inserted against a packet that did arrive.
+ * n_decode_err -- a live-stream SBC frame that would not decode. The rest of
+ *   that packet is dropped, so the timeline is short by whatever it held, and
+ *   no other counter sees it.
+ * n_recv_err -- recvfrom() returning an error rather than a datagram. The old
+ *   code spun on this at priority 7 without counting it.
+ */
+/*
+ * Re-anchors forced because a gap fill did not fit the ring.
+ *
+ * Distinct from n_gap_resyncs, which is a gap longer than GAP_RESYNC_MS: that
+ * one says the air was bad, this one says the ring could not absorb a burst
+ * arriving faster than it plays. Both end in a reset and a re-anchor, and
+ * telling them apart is what says whether to spend the next effort on loss or
+ * on buffering.
+ */
+extern volatile uint32_t n_gap_short_resyncs;
+extern volatile uint32_t n_seq_dropped;
+extern volatile uint32_t n_decode_err;
+extern volatile uint32_t n_recv_err;
 extern volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 /*
  * The receive path's own instruments, counted here rather than logged there.
@@ -702,6 +758,20 @@ extern volatile uint8_t retune_tail_left;
  * for it since.
  */
 extern volatile bool retuning;
+/*
+ * True while the play task is inside its write loop, i.e. while something is
+ * supposed to be feeding the DAC.
+ *
+ * Read from the I2S ISR, which is the only reason it exists: a starved channel
+ * is a fault only if a writer was meant to be keeping up with it. Set by the
+ * play task on either side of that loop and by nothing else, so it needs no
+ * lock -- a torn read is not possible on a bool and the worst a stale one costs
+ * is one counted or uncounted starve at a park boundary.
+ *
+ * The hub's s_playing is the same flag for the same reason; it predates this and
+ * the servo already used it.
+ */
+extern volatile bool playing;
 
 
 /* ------------------------------------------------------------- module entry */
@@ -716,6 +786,9 @@ void socket_start(void);
 
 /* out.c -- the I2S channel, the write path, and retuning its clock */
 void i2s_start(uint32_t rate);
+/* How many times the DMA has run out of audio to send -- see on_tx_starved().
+ * A running total, not a rate; a retune contributes by construction. */
+uint32_t dma_starve_count(void);
 void write_audio(const uint8_t *pcm, size_t bytes);
 void retune_output(uint32_t hz);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER

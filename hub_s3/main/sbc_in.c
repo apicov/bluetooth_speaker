@@ -246,8 +246,30 @@ static void rx_task(void *arg)
              * is why this buffer is not re-armed until the loop below is done
              * with it, and why there are two of them. */
             static int16_t pcm[SBC_MAX_PCM_SAMPLES];
-            uint32_t frames_here = 0;
+            /*
+             * Normally one packet per A2DP payload, exactly as before. The span
+             * machinery exists for the one case that could never have worked: a
+             * payload too large for one datagram, which is AUDIO_TX_PAYLOAD_MTU_MAX
+             * at 1446 bytes and which a phone sending ~825 does not reach. It
+             * does not bind, so the packet rate is what every captured log shows.
+             *
+             * IT WAS 721 -- the cap a whole redundant copy needs at depth 1 --
+             * and that binds on every payload, so every one became two datagrams
+             * and the audio packet rate doubled: 15% of the hub's own audio
+             * discarded at the socket, and a timeline slewing at twice the rate
+             * the satellites could follow. DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig
+             * help has the run. The threshold is the whole difference between
+             * the two behaviours, which is why it is named for what it protects
+             * rather than for a number.
+             *
+             * The split is free where it is. This loop already walks SBC frames
+             * and knows each one's length, so nothing parses SBC twice to find a
+             * boundary it is safe to cut on.
+             */
             size_t off = 0;
+            size_t span_off = 0;        /* first byte not yet sent */
+            uint32_t span_frames = 0;   /* PCM frames in [span_off, off) */
+            bool first_span = true;     /* only the first carries the marker */
             while (off < hdr.len) {
                 size_t consumed = 0, samples = 0;
                 if (!sbc_decode_frame(payload + off, hdr.len - off, &consumed, pcm, &samples)) {
@@ -266,9 +288,32 @@ static void rx_task(void *arg)
                 if (consumed == 0) {
                     break;
                 }
+
+                /*
+                 * Flush before taking this frame if it would push the span past
+                 * the cap. Never flushes an empty span: a single SBC frame
+                 * larger than the cap cannot be cut, so it goes on its own and
+                 * the attach path truncates its copy and counts n_fec_truncated.
+                 *
+                 * streamer_begin_packet() again for the new span -- it snapshots
+                 * the ring position this packet's audio starts at, which is the
+                 * servo's input, and a span that inherited the previous span's
+                 * position would be dated to audio already fed.
+                 */
+                if (span_frames > 0 &&
+                    (off - span_off) + consumed > AUDIO_TX_PAYLOAD_MTU_MAX) {
+                    streamer_send_sbc(payload + span_off,
+                                      (uint16_t)(off - span_off),
+                                      span_frames, first_span && tagged);
+                    first_span = false;
+                    span_off = off;
+                    span_frames = 0;
+                    streamer_begin_packet();
+                }
+
                 off += consumed;
                 s_pcm_samples += samples;
-                frames_here += samples / AUDIO_CHANNELS;
+                span_frames += samples / AUDIO_CHANNELS;
 
                 const uint8_t *bytes = (const uint8_t *)pcm;
                 size_t nbytes = samples * sizeof(int16_t);
@@ -279,8 +324,20 @@ static void rx_task(void *arg)
                 streamer_feed(bytes, nbytes);
             }
 
-            /* Satellites get the SBC itself, not what we decoded from it. */
-            streamer_send_sbc(payload, hdr.len, frames_here, tagged);
+            /*
+             * Satellites get the SBC itself, not what we decoded from it.
+             *
+             * Whatever is left, which includes the case where a decode error
+             * broke the loop early. Sending only the span that decoded cleanly
+             * is a correction in its own right: this used to send the whole
+             * payload with a frame count covering only the good prefix, so a
+             * satellite decoded more audio than the packet claimed to carry and
+             * every gap length computed from msg->frames after it was wrong.
+             */
+            if (span_frames > 0) {
+                streamer_send_sbc(payload + span_off, (uint16_t)(off - span_off),
+                                  span_frames, first_span && tagged);
+            }
 
 rearm:
             ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_LINK_HOST, done, portMAX_DELAY));

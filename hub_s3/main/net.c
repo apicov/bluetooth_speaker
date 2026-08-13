@@ -74,7 +74,10 @@ void wifi_start_ap(void)
     strcpy((char *)wc.ap.ssid, AP_SSID);
     strcpy((char *)wc.ap.password, AP_PASS);
     wc.ap.ssid_len = strlen(AP_SSID);
-    wc.ap.max_connection = 8;
+    /* One of the three limits that have to agree; see MAX_CLIENTS, which is the
+     * same number and carries the reasoning. The driver's own ceiling is
+     * ESP_WIFI_MAX_CONN_NUM. */
+    wc.ap.max_connection = MAX_CLIENTS;
     wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
     wc.ap.channel = CONFIG_DANCEFLOOR_WIFI_CHANNEL;
     wc.ap.dtim_period = 1;
@@ -274,6 +277,28 @@ static struct {
 } s_tx_err[TX_ERR_SLOTS];
 static uint32_t s_tx_err_other;   /* more distinct codes than slots */
 
+/*
+ * The same, for the audio downlink specifically.
+ *
+ * tx-fail was one number shared by audio, analysis frames, ML results, metadata
+ * and the log shipper, so `tx-fail 92` could not say how many satellite gaps
+ * this hub had caused itself -- and that is the only part of it that is
+ * audible. A refused frame costs one repaint; a refused audio packet is a hole
+ * in the sound on every satellite at once, and under FEC it is recoverable only
+ * if the NEXT packet gets through, which under a burst of ENOMEM is exactly
+ * what does not happen.
+ *
+ * A separate entry point rather than a flag on the existing one: the two audio
+ * send paths are the only callers, they are three lines apart in timeline.c, and
+ * a parameter would have to be passed correctly by six call sites that mostly
+ * do not care.
+ */
+void tx_fail_note_audio(int err)
+{
+    s_tx_fail_audio++;
+    tx_fail_note(err);
+}
+
 void tx_fail_note(int err)
 {
     s_tx_fail++;
@@ -342,3 +367,34 @@ void socket_start(void)
     };
     assert(bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0);
 }
+
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+/*
+ * The group every satellite is listening to, resolved once.
+ *
+ * Lives here, beside the socket it is sent on, because it now has two senders:
+ * the audio path in timeline.c and the analysis frames in clients.c. It began as
+ * a static in timeline.c when audio was the only thing addressed to the group,
+ * and a second copy in clients.c would be two parses of one Kconfig string that
+ * nothing checks agree -- the same shape of fault as the SSID that used to be
+ * #defined once per firmware.
+ *
+ * Built lazily rather than in socket_start() so it stays independent of start
+ * order; inet_pton on a compile-time constant is not worth guarding beyond the
+ * once-only flag.
+ */
+static struct sockaddr_in s_mcast_addr;
+static bool s_mcast_addr_ready;
+
+const struct sockaddr_in *mcast_addr(void)
+{
+    if (!s_mcast_addr_ready) {
+        s_mcast_addr.sin_family = AF_INET;
+        s_mcast_addr.sin_port = htons(SYNC_PORT);
+        inet_pton(AF_INET, CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP,
+                  &s_mcast_addr.sin_addr);
+        s_mcast_addr_ready = true;
+    }
+    return &s_mcast_addr;
+}
+#endif

@@ -1053,3 +1053,103 @@ record.
   appearing once per timeline start and not repeating (the epoch handshake), and
   the servo continuing to hold off while parked (`s_playing`).
 - The satellite's `stream_start_local` (12.2).
+
+---
+
+## 13. The transmit path, 2026-08-13
+
+A session that began as "audible gaps on satellites and on the hub" and ended
+somewhere else entirely. Recorded in the order the evidence arrived, because two
+of the three changes made first were wrong and the reasons are the useful part.
+
+### 13.1 What the gaps actually were
+
+Not the radio. **The hub was discarding its own audio at the socket.** `tx-fail`
+had a per-errno tally already and every one was `ENOMEM`; what it lacked was a
+way to say how many of them were *audio*, which is the only kind the room hears.
+`s_tx_fail_audio` and a `pkts/s` figure were added for that, and with them the
+satellite's gap rate tracks the hub's audio rejections almost one for one.
+
+The measurements, all at two satellites, `fec 0` unless stated:
+
+| configuration | hub tx-fail (audio / 20 s) | satellite gaps |
+|---|---|---|
+| frames unicast, 26 buffers | 0 | 0.17/s |
+| frames unicast, 26 buffers, **FEC 1** | 10–58 | ~0.8/s |
+| frames **mcast**, 26 buffers | 14–27 | 1.1/s |
+| frames **mcast**, 32 buffers, ML lane off | **0** | **0 in 125 s** |
+
+### 13.2 Two changes that made it worse, and why
+
+**Sizing the audio payload so a whole FEC copy fits.** A depth-1 copy needs
+`2 × 825 + 29` bytes against a 1472-byte MTU and cannot fit; capping the payload
+to make it fit binds on *every* packet a phone sends, so each became two
+datagrams. The audio packet rate went 50 → ~100/s, which exhausted the 26 static
+TX buffers — `tx-fail 370 (312 audio)` in one window, ~15% of the hub's audio
+gone before it reached the air — and, by a second route nobody predicted from the
+packet size, doubled the timeline slew, because `TIMELINE_SLEW_US` is 20 µs **per
+packet** and was sized against ~50/s to stay inside the servo's 2.27 ms/s
+ceiling. Satellites could not follow: `phase +271874 us`, `anchors refused 40
+late`, re-anchoring every few seconds. `hub.h` had predicted exactly this
+("anything near that leaves the units unable to keep up and puts the error
+back") and it was not read.
+
+**Moving the analysis frames to multicast at 26 buffers.** Argued on airtime —
+`96×N` unicast sends becoming ~96 — which is correct arithmetic and the wrong
+question. What decides it is the **DTIM burst**: a SoftAP holds group-addressed
+frames and releases them after each beacon, while unicast leaves immediately with
+rate adaptation. At `dtim_period 1` on a 100 ms beacon, audio alone is ~5 frames
+a burst and 86 analysis frames a second makes it ~15, each holding a buffer until
+its window opens. The pool empties on the burst, not the average.
+
+Both were bundled into one flash with three other changes, which is why
+attribution took four more flash cycles. **One variable per run**; the
+`pkts/s` counter that would have caught the first fault in a single log window
+was added *after* it.
+
+### 13.3 What worked
+
+- **FEC off.** Depth 1 spent ~5% of the stream to recover ~70% of a 0.3% loss,
+  and could not recover it whole at any payload size a phone produces.
+- **Concealment instead of silence.** A lost packet now fades out from the last
+  audio that played and the resuming audio fades in. The missing ~20 ms cannot be
+  invented; the two discontinuities around it — which are most of what a dropout
+  *sounds* like — are gone for nothing.
+- **The ML lane off the hub** (`DANCEFLOOR_ML_SOURCE_REMOTE`), which returned
+  ~24.9 kB of internal SRAM: `MEM: internal` min 6740 → 22012. The Kconfig's
+  "about 25 kB" was exact. Nothing was lost — the slow lane had logged
+  `slow 0/0 us` and `results N+0` in every run ever captured, producing nothing,
+  while `ml-throt ~1450` per window says ~77 of the fast one's results a second
+  were computed and thrown away.
+- **32 TX buffers**, which that SRAM bought, and which absorbs the burst 26 could
+  not.
+- **The log shipper off.** Bursty unicast from the same pool, burstiest exactly
+  when something is wrong.
+
+### 13.4 Counters added
+
+`s_tx_fail_audio`, `s_audio_pkts` (as `pkts/s`), `n_fec_truncated`,
+`n_fec_short_frames`, `n_fec_decode_err`, `n_gap_short_resyncs`, `n_seq_dropped`,
+`n_decode_err`, `n_recv_err`, and a DMA-starvation counter on both units from the
+I2S driver's own `on_send_q_ovf`.
+
+Two of them corrected faults nobody could see. A gap fill that did not fit the
+ring used to under-count `samples_in` and slide the timeline permanently — the
+note in `absorb_sequence_gap()` said so and nothing acted on it; measured at
+`phase +250217 us` held for over two minutes. It now forces a re-anchor. And the
+FEC path called `sbc_decoder_init()` on a copy the MTU had truncated, which is
+essentially every recovery, resetting the *shared* decoder's synthesis history
+and putting a transient into the live stream on top of the silence.
+
+### 13.5 What is left
+
+- **Nothing past two satellites has ever been run.** The analysis frames provably
+  stop scaling; the ~8/s per satellite of clock traffic that still does has never
+  been measured at scale. This is the one claim resting on arithmetic alone.
+- `TIMELINE_SLEW_US` is still **per packet**. It is correct at the current rate
+  and is a trap for anything that changes packetisation again.
+- The tracked-versus-flashed trap bit twice in one session: the hub's ML source
+  was never in `sdkconfig.defaults`, so a clone built a hub that *ran* the lane,
+  and a buffer count was later raised in the defaults without reaching a board.
+  The check that catches it is cheap — delete `sdkconfig`, rebuild, read the
+  generated header — and is worth running whenever a default changes.
