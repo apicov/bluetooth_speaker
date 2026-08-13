@@ -246,8 +246,26 @@ static void rx_task(void *arg)
              * is why this buffer is not re-armed until the loop below is done
              * with it, and why there are two of them. */
             static int16_t pcm[SBC_MAX_PCM_SAMPLES];
-            uint32_t frames_here = 0;
+            /*
+             * Sent in spans of at most AUDIO_TX_PAYLOAD_MAX, cut on SBC frame
+             * boundaries, rather than one packet per A2DP payload.
+             *
+             * The cap is what lets the FEC attach a WHOLE copy of a previous
+             * payload inside the MTU. At ~825-byte payloads there was room for
+             * only ~618 bytes of copy, so every "recovered" packet still ended
+             * in silence; capping at 721 costs ~8 more packets a second and
+             * removes it. It also stops the no-FEC path fragmenting: a 1500-byte
+             * A2DP payload used to become a 1526-byte datagram, over the MTU,
+             * because the only ceiling checked was AUDIO_MAX_PAYLOAD at 2048.
+             *
+             * The split is free here. This loop already walks SBC frames and
+             * already knows each one's byte length, so nothing has to parse SBC
+             * a second time to find a boundary it is safe to cut on.
+             */
             size_t off = 0;
+            size_t span_off = 0;        /* first byte not yet sent */
+            uint32_t span_frames = 0;   /* PCM frames in [span_off, off) */
+            bool first_span = true;     /* only the first carries the marker */
             while (off < hdr.len) {
                 size_t consumed = 0, samples = 0;
                 if (!sbc_decode_frame(payload + off, hdr.len - off, &consumed, pcm, &samples)) {
@@ -266,9 +284,32 @@ static void rx_task(void *arg)
                 if (consumed == 0) {
                     break;
                 }
+
+                /*
+                 * Flush before taking this frame if it would push the span past
+                 * the cap. Never flushes an empty span: a single SBC frame
+                 * larger than the cap cannot be cut, so it goes on its own and
+                 * the attach path truncates its copy and counts n_fec_truncated.
+                 *
+                 * streamer_begin_packet() again for the new span -- it snapshots
+                 * the ring position this packet's audio starts at, which is the
+                 * servo's input, and a span that inherited the previous span's
+                 * position would be dated to audio already fed.
+                 */
+                if (span_frames > 0 &&
+                    (off - span_off) + consumed > AUDIO_TX_PAYLOAD_MAX) {
+                    streamer_send_sbc(payload + span_off,
+                                      (uint16_t)(off - span_off),
+                                      span_frames, first_span && tagged);
+                    first_span = false;
+                    span_off = off;
+                    span_frames = 0;
+                    streamer_begin_packet();
+                }
+
                 off += consumed;
                 s_pcm_samples += samples;
-                frames_here += samples / AUDIO_CHANNELS;
+                span_frames += samples / AUDIO_CHANNELS;
 
                 const uint8_t *bytes = (const uint8_t *)pcm;
                 size_t nbytes = samples * sizeof(int16_t);
@@ -279,8 +320,20 @@ static void rx_task(void *arg)
                 streamer_feed(bytes, nbytes);
             }
 
-            /* Satellites get the SBC itself, not what we decoded from it. */
-            streamer_send_sbc(payload, hdr.len, frames_here, tagged);
+            /*
+             * Satellites get the SBC itself, not what we decoded from it.
+             *
+             * Whatever is left, which includes the case where a decode error
+             * broke the loop early. Sending only the span that decoded cleanly
+             * is a correction in its own right: this used to send the whole
+             * payload with a frame count covering only the good prefix, so a
+             * satellite decoded more audio than the packet claimed to carry and
+             * every gap length computed from msg->frames after it was wrong.
+             */
+            if (span_frames > 0) {
+                streamer_send_sbc(payload + span_off, (uint16_t)(off - span_off),
+                                  span_frames, first_span && tagged);
+            }
 
 rearm:
             ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_LINK_HOST, done, portMAX_DELAY));

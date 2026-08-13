@@ -689,6 +689,23 @@ extern volatile uint32_t n_sta_timeout;
  * ceiling drift here would otherwise read as satellite-side gaps. */
 extern uint32_t n_wifi_oversize;
 
+/*
+ * Redundant copies the MTU forced short, which should never happen.
+ *
+ * streamer_send_sbc() is fed spans capped at AUDIO_TX_PAYLOAD_MAX precisely so
+ * every copy fits whole, and a short copy is the bug this branch was written to
+ * remove -- it is what made a "recovered" packet still carry ~6 ms of silence.
+ * One case can still reach it legitimately: a SINGLE SBC frame larger than the
+ * cap cannot be split, so sbc_in.c sends it alone and the copy truncates as it
+ * used to. At depth 1 that needs a frame over 721 bytes, which bitpool 250
+ * joint-stereo (~508 B) does not reach; at depth 2 the cap is 480 and it does.
+ *
+ * So this is not dead: it is the counter that tells a depth-2 experiment that
+ * its cap is under the source's frame size, which otherwise presents as
+ * unexplained residual silence on every satellite at once.
+ */
+extern uint32_t n_fec_truncated;
+
 /* Ring position and scheduled instant of the last packet sent, so the analysis
  * -- fed on arrival, before this packet's stamp exists -- can date what it is
  * given. See where they are set. */

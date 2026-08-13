@@ -69,6 +69,7 @@ volatile uint32_t n_sta_dropped;
 volatile uint32_t n_sta_nolease;
 volatile uint32_t n_sta_timeout;
 uint32_t n_wifi_oversize;
+uint32_t n_fec_truncated;
 volatile int32_t s_vis_anchor_pos;
 volatile int64_t s_vis_anchor_due;
 int32_t s_pending_pos;

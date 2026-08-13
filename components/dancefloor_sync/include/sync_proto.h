@@ -470,12 +470,21 @@ typedef struct __attribute__((packed)) {
  * many whole blocks as fit and never fragments.
  *
  * Decoded audio is ~1.4 Mbps in 172 packets/s; the SBC sent over the air is
- * ~330 kbps in ~50 packets/s of ~825-byte payloads. One full redundant copy would
- * push a packet past the 1472-byte UDP MTU, so a copy is attached only as far as
- * it fits -- at ~825-byte payloads that is most of the previous packet, and SBC
- * frames are independently decodable, so a partial copy still recovers the audio
- * it contains (the satellite pads any shortfall with silence to keep the
- * timeline length exact).
+ * ~330 kbps in ~50 packets/s of ~825-byte payloads. A copy is attached only as
+ * far as the MTU allows, and the SENDER IS RESPONSIBLE for not offering a
+ * payload too large to copy whole -- see AUDIO_TX_PAYLOAD_MAX.
+ *
+ * IT DID NOT USED TO BE. The attach path clamped with min(prev_len, room) and
+ * called the short copy good enough, on the reasoning that SBC frames are
+ * independently decodable so a partial copy still recovers the audio it
+ * contains. That reasoning is sound and the conclusion was still wrong, because
+ * nothing sized the payload against the MTU: at ~825-byte payloads a copy came
+ * to ~618 bytes, three quarters, and the satellite padded the rest with silence
+ * to keep the timeline exact. So every "recovered" packet still had ~6 ms of
+ * silence in its tail, and the log reported it as a clean recovery --
+ * `gaps 1 (20 ms silence) | fec 1`. Measured at one such event every ~2.7 s per
+ * satellite (logs-20260813-142339), which is the ticking this was supposed to
+ * remove. Redundancy that only mostly arrives is not redundancy.
  */
 #define AUDIO_RED_HDR_BYTES   3                     /* u16 red_len + u8 red_seq_ofs */
 #define AUDIO_RED_BYTES(r)    (AUDIO_RED_HDR_BYTES + (r))
@@ -483,6 +492,56 @@ typedef struct __attribute__((packed)) {
 /* On-wire bytes for an audio message of n payload bytes followed by r bytes of
  * trailing redundancy. AUDIO_MSG_BYTES(n) is the r == 0 case. */
 #define AUDIO_MSG_RED_BYTES(n, r) (AUDIO_MSG_BYTES(n) + AUDIO_RED_BYTES(r))
+
+/*
+ * What one UDP datagram may carry: 1500-byte Ethernet-equivalent MTU less 20
+ * bytes of IP and 8 of UDP. On-link under the SoftAP, so nothing fragments this
+ * further and nothing routes it.
+ */
+#define AUDIO_UDP_MTU 1472
+
+/*
+ * The depth as a plain integer, so this header still compiles on a host.
+ *
+ * The test in test/ builds it with gcc and no sdkconfig.h. `#if CONFIG_x` is
+ * fine undefined -- the preprocessor reads it as 0 -- but the arithmetic below
+ * expands into real code, where an undeclared identifier is an error rather than
+ * a zero. Depth 0 is the honest host default: it is the no-redundancy case, and
+ * it makes AUDIO_TX_PAYLOAD_MAX degrade to "the whole MTU", which is exactly the
+ * behaviour a build with no FEC should have.
+ */
+#ifdef CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH
+#define AUDIO_FEC_DEPTH CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH
+#else
+#define AUDIO_FEC_DEPTH 0
+#endif
+
+/*
+ * The largest payload a sender may put in one packet, so that DEPTH whole
+ * copies of previous payloads still fit beside it.
+ *
+ * This is what makes the depth knob mean something. DANCEFLOOR_AUDIO_FEC_DEPTH
+ * offers 0-4 and, before this existed, delivered 0-or-1: one truncated copy
+ * already filled the MTU, so depths 2-4 attached nothing and the Kconfig range
+ * was decoration. Deriving the payload cap FROM the depth inverts that -- ask
+ * for depth 2 and packets get smaller until two whole copies fit.
+ *
+ *   depth 0 -> 1446 B   (no redundancy; the cap is the MTU and never binds)
+ *   depth 1 ->  721 B   (~58 packets/s, ~85 kB/s on the wire)
+ *   depth 2 ->  480 B   (~100 packets/s, and twice the TX-buffer pressure)
+ *
+ * The cap is on the payload a sender OFFERS, not on what a receiver accepts: a
+ * receiver still reads payload_len and trailing blocks by length, so it reads an
+ * uncapped sender unchanged. AUDIO_MAX_PAYLOAD stays at 2048 for that reason --
+ * it is the buffer ceiling, this is the packetisation policy.
+ *
+ * Parameterised by depth as well as fixed, so the host test can check all three
+ * rows above without three builds.
+ */
+#define AUDIO_TX_PAYLOAD_MAX_AT(depth)                                        \
+    ((AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0) - (depth) * AUDIO_RED_HDR_BYTES)     \
+     / ((depth) + 1))
+#define AUDIO_TX_PAYLOAD_MAX AUDIO_TX_PAYLOAD_MAX_AT(AUDIO_FEC_DEPTH)
 
 /*
  * Which downlink this build speaks, as a short tag for the periodic status

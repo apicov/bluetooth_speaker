@@ -411,6 +411,32 @@ extern volatile uint32_t n_retunes;
 extern volatile uint32_t n_retunes_bad;
 extern volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
 extern volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
+/*
+ * Frames a recovery was SHORT by, padded with silence -- the honest half of
+ * n_fec_recovered.
+ *
+ * These two together are the instrument that was missing while the bug was
+ * live. n_fec_recovered counts packets a redundant copy covered; it said
+ * nothing about how MUCH of each one the copy actually carried, and the copy
+ * was truncated to ~3/4 by the hub's MTU guard. So the log read
+ * `gaps 1 (20 ms silence) | fec 1` -- a gap, and a recovery, and the reader is
+ * left to assume they cancel. They did not: ~6 ms of that 20 was still silence,
+ * every time, once every ~2.7 s.
+ *
+ * Now the shortfall is its own number. Expect it at 0: the hub caps every span
+ * at AUDIO_TX_PAYLOAD_MAX so a copy fits whole. Anything else means the cap and
+ * the source's frame size have come apart -- see n_fec_truncated at the hub end,
+ * which is the same fault seen from the sender.
+ */
+extern volatile uint32_t n_fec_short_frames;
+/*
+ * Decodes of a redundant copy that failed part-way.
+ *
+ * Distinct from a live-stream decode error because the response differs: this
+ * path deliberately does NOT reinitialise the decoder. See the note in
+ * fill_recovered_then_silence().
+ */
+extern volatile uint32_t n_fec_decode_err;
 extern volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 /*
  * The receive path's own instruments, counted here rather than logged there.

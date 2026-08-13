@@ -250,9 +250,13 @@ static bool upgrade_provisional_anchor(const audio_msg_t *msg, int64_t offset)
  * slide the whole stream.
  *
  * Whole SBC frames are decoded until want_frames would be overshot; the rest is
- * silence, so the fill is length-exact even when the recovered payload was
- * truncated by the hub's MTU guard. red == NULL means no redundancy covered this
- * packet, so the whole fill is silence -- the behaviour this path always had.
+ * silence, so the fill is length-exact. red == NULL means no redundancy covered
+ * this packet, so the whole fill is silence -- the behaviour this path always had.
+ *
+ * Any shortfall is counted in n_fec_short_frames rather than quietly padded.
+ * With the hub capping spans at AUDIO_TX_PAYLOAD_MAX a copy arrives whole and
+ * the shortfall is zero; it was ~1/4 of every recovery before that cap existed,
+ * and nothing said so.
  */
 static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
                                             uint32_t want_frames)
@@ -267,7 +271,25 @@ static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
             size_t consumed = 0, samples = 0;
             if (!sbc_decode_frame(red + off, red_len - off, &consumed, pcm, &samples)
                 || consumed == 0) {
-                sbc_decoder_init();          /* resync rather than wedge */
+                /*
+                 * Stop, but DO NOT reinitialise the decoder.
+                 *
+                 * This used to call sbc_decoder_init() here, and because the
+                 * copy was cut mid-frame by the hub's MTU guard it fired on
+                 * essentially every recovery. The decoder is one global context
+                 * shared with the live stream, and what init() throws away is
+                 * the synthesis filterbank history -- so each recovery also put
+                 * a transient into the frames that followed it, on top of the
+                 * silence the truncation had already caused. Two artefacts from
+                 * one cause, and the second one looked like a decoder problem.
+                 *
+                 * A failure here says the COPY is short or corrupt. It says
+                 * nothing about the live stream, whose own decode path resets on
+                 * its own errors (decode_into_ring). SBC frames are
+                 * independently decodable, so leaving the state alone costs
+                 * nothing and keeps the history the next real frame needs.
+                 */
+                n_fec_decode_err++;
                 break;
             }
             off += consumed;
@@ -284,6 +306,13 @@ static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
                 return filled;               /* ring filled mid-packet */
             }
         }
+    }
+
+    /* Whatever the copy did not supply. Counted before the loop so a ring that
+     * fills mid-pad does not hide the shortfall behind a second cause -- these
+     * frames were owed by the recovery either way. */
+    if (red && filled < want_frames) {
+        n_fec_short_frames += want_frames - filled;
     }
 
     while (filled < want_frames) {

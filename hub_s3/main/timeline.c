@@ -604,12 +604,16 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
      * return above left a hole in seq), the deeper slots no longer describe a
      * run and are left off. The blocks are written into the unused tail of
      * msg.payload[], which is AUDIO_MAX_PAYLOAD bytes and so always holds a
-     * packet that itself fits the MTU. Take is capped to what fits, so a copy is
-     * partial rather than fragmented -- the satellite decodes what arrived and
-     * pads the rest with silence.
+     * packet that itself fits the MTU.
+     *
+     * COPIES ARE WHOLE. sbc_in.c caps every span it offers at
+     * AUDIO_TX_PAYLOAD_MAX, which is derived from this depth for exactly this
+     * reason, so `room` covers `len` and the clamp below does not bind. It is
+     * kept, and now counted, because one span can still arrive over the cap: a
+     * single SBC frame larger than it, which cannot be split. See
+     * n_fec_truncated -- a partial copy is a fault to be seen, not the design.
      */
     {
-        const size_t mtu = 1472;
         size_t off = AUDIO_MSG_BYTES(len);          /* where the next block goes */
         for (int d = 0; d < CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH; d++) {
             if (!fec_prev[d].valid) {
@@ -618,11 +622,15 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
             if (fec_prev[d].seq + (uint32_t)(d + 1) != msg.seq) {
                 break;                              /* chain broken by a skip */
             }
-            if (off + AUDIO_RED_HDR_BYTES > mtu) {
+            if (off + AUDIO_RED_HDR_BYTES > AUDIO_UDP_MTU) {
                 break;
             }
-            size_t room = mtu - off - AUDIO_RED_HDR_BYTES;
-            uint16_t take = fec_prev[d].len < room ? fec_prev[d].len : (uint16_t)room;
+            size_t room = AUDIO_UDP_MTU - off - AUDIO_RED_HDR_BYTES;
+            uint16_t take = fec_prev[d].len;
+            if (take > room) {
+                take = (uint16_t)room;
+                n_fec_truncated++;
+            }
             audio_red_hdr_t rh = { .red_len = take, .red_seq_ofs = (uint8_t)(d + 1) };
             uint8_t *dst = (uint8_t *)&msg + off;
             memcpy(dst, &rh, AUDIO_RED_HDR_BYTES);
