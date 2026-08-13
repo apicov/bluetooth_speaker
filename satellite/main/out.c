@@ -37,6 +37,48 @@
 
 /* -------------------------------------------------------------------- i2s */
 
+/*
+ * The moment silence starts, counted.
+ *
+ * auto_clear below makes a starved channel emit digital zero instead of
+ * repeating itself, which is right, and which made every stall shorter than the
+ * 500 ms underrun timeout completely invisible: the DAC went quiet, nothing
+ * incremented, nothing logged, and samples_played did not advance -- so the
+ * only trace was a phase error the servo then chased with a retune that cost
+ * another few ms of silence. A gap nobody could see, causing corrections nobody
+ * could explain.
+ *
+ * The driver already knows. It keeps a queue of played descriptors for the
+ * writer to refill, and raises this when that queue is full at the instant
+ * another descriptor finishes -- meaning the DMA has been all the way round its
+ * ring without the writer taking a single buffer back. With auto_clear on, that
+ * is exactly when the output becomes zeroes. No polling, no proxy, no guess at
+ * a threshold.
+ *
+ * ISR context: increment and return, nothing woken, so no yield. IRAM_ATTR is
+ * not required -- CONFIG_I2S_ISR_IRAM_SAFE is unset, so the driver masks the
+ * interrupt across flash writes and a callback in flash would be safe -- but it
+ * is three instructions, and an ISR that never has to be masked is cheaper than
+ * one that does.
+ *
+ * A retune contributes to this legitimately: the channel is disabled and
+ * re-enabled with empty descriptors, so the first traversal after one starves
+ * by construction. n_retunes is printed beside it for exactly that subtraction.
+ */
+static volatile uint32_t s_dma_starve;
+
+static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, void *ctx)
+{
+    (void)h; (void)e; (void)ctx;
+    s_dma_starve++;
+    return false;          /* nothing woken, so no yield */
+}
+
+uint32_t dma_starve_count(void)
+{
+    return s_dma_starve;
+}
+
 void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -81,6 +123,10 @@ void i2s_start(uint32_t rate)
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
+    /* Registered before enable: the callback must be in place for the first
+     * traversal, which is the one a cold start is most likely to starve. */
+    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = on_tx_starved };
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(i2s_tx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
     ESP_LOGW(TAG, "OUTPUT: I2S external DAC, buffer %d x %d frames = %d ms, "
                   "channels=%s, silence on starve",

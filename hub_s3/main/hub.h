@@ -448,6 +448,9 @@ extern volatile bool s_playing;
  * like a starving ring, which is why it needs a counter. */
 extern volatile uint32_t s_feed_dropped;
 extern volatile uint32_t s_tx_fail;   /* sendto() rejections */
+/* ... and the subset of them that were AUDIO, which is the only subset that is
+ * audible. See tx_fail_note_audio(). */
+extern volatile uint32_t s_tx_fail_audio;
 
 /*
  * Non-audio publish throttling, paired with ML_PUBLISH_PERIOD_US / TX_BACKOFF_US.
@@ -469,7 +472,11 @@ extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-a
  * the socket; the rationale for keeping the reason at all is there.
  */
 void tx_fail_note(int err);
+/* The audio downlink's own entry point, which also counts s_tx_fail_audio. */
+void tx_fail_note_audio(int err);
 void tx_fail_summary(char *buf, size_t len);
+/* Both units count the DMA running dry; see on_tx_starved() in out.c. */
+uint32_t dma_starve_count(void);
 
 /*
  * Cumulative totals for a long run, never reset -- deliberately separate from

@@ -277,6 +277,28 @@ static struct {
 } s_tx_err[TX_ERR_SLOTS];
 static uint32_t s_tx_err_other;   /* more distinct codes than slots */
 
+/*
+ * The same, for the audio downlink specifically.
+ *
+ * tx-fail was one number shared by audio, analysis frames, ML results, metadata
+ * and the log shipper, so `tx-fail 92` could not say how many satellite gaps
+ * this hub had caused itself -- and that is the only part of it that is
+ * audible. A refused frame costs one repaint; a refused audio packet is a hole
+ * in the sound on every satellite at once, and under FEC it is recoverable only
+ * if the NEXT packet gets through, which under a burst of ENOMEM is exactly
+ * what does not happen.
+ *
+ * A separate entry point rather than a flag on the existing one: the two audio
+ * send paths are the only callers, they are three lines apart in timeline.c, and
+ * a parameter would have to be passed correctly by six call sites that mostly
+ * do not care.
+ */
+void tx_fail_note_audio(int err)
+{
+    s_tx_fail_audio++;
+    tx_fail_note(err);
+}
+
 void tx_fail_note(int err)
 {
     s_tx_fail++;

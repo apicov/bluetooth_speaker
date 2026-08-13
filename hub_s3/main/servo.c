@@ -120,18 +120,20 @@ void servo_tick(void)
          * gone somewhere else and this filter is not earning its place. */
         ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us "
                       "(median %+ld%s, smoothed %+ld us) | "
-                      "tx-fail %" PRIu32 "%s | ml-throt %" PRIu32 " | cong-skip %" PRIu32
+                      "tx-fail %" PRIu32 " (%" PRIu32 " audio)%s | ml-throt %" PRIu32
+                      " | cong-skip %" PRIu32
                       " | xport %s fec %d frames %s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
                  (long)s_phase_err_us,
                  (long)(s_phase_med_valid ? s_phase_med_us : 0),
                  s_phase_med_valid ? "" : " n/a",
-                 (long)s_err_ema, s_tx_fail, why,
+                 (long)s_err_ema, s_tx_fail, s_tx_fail_audio, why,
                  n_ml_throttled, n_tx_cong_skip,
                  AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
                  FRAMES_TRANSPORT_TAG);
         s_tx_fail = 0;
+        s_tx_fail_audio = 0;   /* same window as the total it is a subset of */
         n_ml_throttled = 0;
         n_tx_cong_skip = 0;
     }

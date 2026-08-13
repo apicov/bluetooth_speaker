@@ -179,6 +179,9 @@ void telemetry_tick(void)
                       ", wide-span %" PRIu32 ")"
                       " | phase-drop %" PRIu32 " short-reads %" PRIu32
                       " (%" PRIu32 " frames)"
+                      " | dma-starve %" PRIu32
+                      " | seq-drop %" PRIu32 " decode-err %" PRIu32
+                      " recv-err %" PRIu32
                  " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")"
                       " | ml %s (rx %" PRIu32 ", bad %" PRIu32 ")",
                  (unsigned long long)(esp_timer_get_time() / 1000000),
@@ -192,6 +195,7 @@ void telemetry_tick(void)
                  tsf_fresh(esp_timer_get_time(), NULL) ? "TSF" : "probe",
                  n_tsf_used, n_tsf_fallback, n_tsf_wide,
                  n_phase_drop, n_short_reads, n_short_frames,
+                 dma_starve_count(), n_seq_dropped, n_decode_err, n_recv_err,
                  visualiser_source_name(), visualiser_hop(),
                  n_frames_rx, n_frames_bad,
                  visualiser_ml_source_name(), n_ml_rx, n_ml_bad);

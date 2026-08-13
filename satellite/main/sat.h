@@ -437,6 +437,25 @@ extern volatile uint32_t n_fec_short_frames;
  * fill_recovered_then_silence().
  */
 extern volatile uint32_t n_fec_decode_err;
+/*
+ * Three faults that used to happen silently. Each was a `continue`, a `break` or
+ * a bare `return false` with nothing recorded, so a run in which any of them
+ * fired looked exactly like a clean one.
+ *
+ * n_seq_dropped -- a packet older than expected. Should be 0: the hub sends
+ *   each once and a group frame is not retried. Non-zero means either something
+ *   is duplicating, or packets are arriving out of order -- and a reorder means
+ *   the "gap" before it was never a loss, so the silence filled for it was
+ *   inserted against a packet that did arrive.
+ * n_decode_err -- a live-stream SBC frame that would not decode. The rest of
+ *   that packet is dropped, so the timeline is short by whatever it held, and
+ *   no other counter sees it.
+ * n_recv_err -- recvfrom() returning an error rather than a datagram. The old
+ *   code spun on this at priority 7 without counting it.
+ */
+extern volatile uint32_t n_seq_dropped;
+extern volatile uint32_t n_decode_err;
+extern volatile uint32_t n_recv_err;
 extern volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 /*
  * The receive path's own instruments, counted here rather than logged there.
@@ -742,6 +761,9 @@ void socket_start(void);
 
 /* out.c -- the I2S channel, the write path, and retuning its clock */
 void i2s_start(uint32_t rate);
+/* How many times the DMA has run out of audio to send -- see on_tx_starved().
+ * A running total, not a rate; a retune contributes by construction. */
+uint32_t dma_starve_count(void);
 void write_audio(const uint8_t *pcm, size_t bytes);
 void retune_output(uint32_t hz);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER

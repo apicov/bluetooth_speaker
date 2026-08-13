@@ -478,7 +478,23 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
             }
         }
     } else if (have_seq && msg->seq < expect_seq) {
-        return false;                              /* duplicate or reorder, drop */
+        /*
+         * A duplicate or a reorder, dropped -- its audio slot has already been
+         * filled with silence or a recovered copy, so there is nowhere to put
+         * it. Counted now because the two possible causes want opposite
+         * responses and nothing could tell them apart.
+         *
+         * Duplicates should be impossible: the hub sends each packet once, and
+         * a group frame is not retried. If this moves under multicast it means
+         * something is duplicating on the air or in lwIP. Reordering should be
+         * near-impossible too on a single-hop link with one traffic class -- and
+         * if it is happening, the gap that preceded it was not a loss at all,
+         * so the silence filled for it was inserted against a packet that did
+         * arrive, just late. That is a fill this unit should stop doing, and
+         * this is the number that would justify the work.
+         */
+        n_seq_dropped++;
+        return false;
     }
     return true;
 }
@@ -528,6 +544,21 @@ static void decode_into_ring(const audio_msg_t *msg)
         size_t consumed = 0, samples = 0;
         if (!sbc_decode_frame(msg->payload + off, msg->payload_len - off,
                               &consumed, pcm, &samples)) {
+            /*
+             * The rest of this packet is dropped and the decoder is reset. This
+             * one DOES reset -- unlike the FEC path, which must not -- because
+             * a failure on the live stream means the decoder's own state is
+             * suspect, and that is what a resync is for.
+             *
+             * Counted because it is a hole in the audio that no other counter
+             * sees: the frames are simply never queued, so samples_in does not
+             * advance for them and the timeline shortens by however much the
+             * packet had left. The hub distinguishes a CRC failure from any
+             * other (dec vs dcrc on its sbc_in line); this end is one number,
+             * because on this side the interesting question is only whether it
+             * is happening at all.
+             */
+            n_decode_err++;
             sbc_decoder_init();              /* resync rather than wedge */
             break;
         }
@@ -615,6 +646,25 @@ void rx_task(void *arg)
         int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
         int64_t t4 = esp_timer_get_time();
         if (n < 1) {
+            /*
+             * A zero-length datagram is nothing to do; an error is not.
+             *
+             * This used to `continue` on both, silently. recvfrom() blocks, so
+             * in the normal case the loop is idle -- but an error does NOT
+             * block, and a persistent one (the socket going down under a WiFi
+             * drop, most plausibly) turns this into a spin at priority 7 that
+             * nothing counts and nothing bounds. It would starve the very
+             * receive path it is failing to serve, and present as loss on the
+             * air.
+             *
+             * Counted, and yielded on. One tick is nothing against a real
+             * datagram rate of ~136 a second, and it is the difference between
+             * a spin and a poll.
+             */
+            if (n < 0) {
+                n_recv_err++;
+                vTaskDelay(1);
+            }
             continue;
         }
 
