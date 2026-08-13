@@ -275,7 +275,47 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 # 1016; if 32 buffers with a 32 kB cache measures near zero, the cache was the
 # cause and the buffer count never was. If the storm comes back, the cache is
 # not the answer and 64 should return.
+#
+# INERT SINCE SPIRAM_TRY_ALLOCATE_WIFI_LWIP WENT ON, and kept only as the record
+# of what this unit was tuned to. esp_wifi/Kconfig makes the DYNAMIC option
+# `depends on !(SPIRAM_TRY_ALLOCATE_WIFI_LWIP && !SPIRAM_IGNORE_NOTFOUND)`, so
+# enabling PSRAM for WiFi did not merely change where TX buffers come from -- it
+# removed the dynamic choice entirely and dropped the build to STATIC, whose
+# count is a different symbol with a default of 16. The line below reads as 32
+# buffers and delivered 16.
+#
+# That is the confound the block at SPIRAM_TRY_ALLOCATE_WIFI_LWIP pinned three
+# other symbols to avoid. It could not pin this one, because the dependency
+# removes the option rather than changing its default -- so the PSRAM experiment
+# silently also halved TX capacity, and the "BUFFER COUNT problem" fixed above
+# came back with it.
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+
+# The count that is actually in force, and the other half of the LOCAL_RING_BYTES
+# change in main/hub.h.
+#
+# THE FAULT, 2026-08-12: tx-fail returned at 1-148 per 20 s window, ~1% of
+# datagrams, and every one of them was ENOMEM -- measured, not inferred, by the
+# errno tally tx_fail_note() now keeps. No EHOSTUNREACH at all, which is what
+# rules out the ARP path client_joined() exists to protect and leaves buffer
+# exhaustion as the whole of it.
+#
+# WHY NOW. It was hiding behind a bug. A refactor had local_play_task reading the
+# ring 4 bytes at a time (sizeof on a pointer parameter), which starved the
+# visualiser, which meant publish_frame() and publish_ml() sent NOTHING. Fixing
+# the audio restored ~172 datagrams/s of publish traffic on top of ~50 of audio,
+# and 16 static buffers does not absorb the bursts at 222/s. The pre-fix logs
+# reading tx-fail 0 were measuring a hub with its analysis lane dead.
+#
+# 26, NOT 32. Each static buffer is ~1.6 kB of INTERNAL memory -- the pool that
+# had 7,760 bytes free -- so 32 would need 25.6 kB and only 16 kB was freed by
+# taking the ring from 64 kB to 48 kB. 26 is what that buys: +62% on the pool
+# that is actually refusing work. Going further means shrinking the ring past the
+# feed burst it has to absorb, and hub.h says why that is where the line is.
+#
+# Falsified by tx-fail itself, which is the counter CACHE_TX_BUFFER_NUM is pinned
+# to 0 further down to keep honest.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=26
 
 # The socket's receive queue, in datagrams. IDF defaults to 6 and the boot
 # banner prints it as `udp mbox: 6`.

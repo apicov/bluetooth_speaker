@@ -105,9 +105,10 @@ void servo_tick(void)
     static int status_left;
     if (--status_left <= 0) {
         status_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
-        ESP_LOGI(TAG, "buffer %lu ms | phase %+ld us (smoothed %+ld us)",
+        ESP_LOGI(TAG, "buffer %lu ms | phase %+ld us (smoothed %+ld us) | xport %s fec %d",
                  (unsigned long)(filled * 1000 / (stream_rate * AUDIO_CHANNELS * 2)),
-                 (long)ph, (long)err_ema);
+                 (long)ph, (long)err_ema,
+                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH);
     }
 
     /*

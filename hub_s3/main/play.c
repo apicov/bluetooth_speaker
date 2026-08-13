@@ -31,6 +31,18 @@
  */
 static int32_t s_samples_played;   /* position in the ring stream */
 static int64_t s_wrote_at;         /* when the DAC last accepted a chunk */
+/*
+ * The chunk in flight, at FILE SCOPE and deliberately not a parameter.
+ *
+ * Both bodies below ask it `sizeof(chunk)`, and that has to keep meaning
+ * AUDIO_CHUNK_BYTES. Passed as `uint8_t *` it silently means 4 -- the pointer --
+ * so the ring was read 4 bytes at a time and the DAC written 4 bytes at a time,
+ * one frame per pass instead of 256. The bodies still read exactly as they did
+ * inside the loop; only their meaning had changed, which is the one thing the
+ * split promised not to do. Array-to-pointer decay is invisible at the call and
+ * the compiler does not warn, so the fix is to leave nothing to decay.
+ */
+static uint8_t chunk[AUDIO_CHUNK_BYTES];
 /* The timeline generation this task last started on. Compared against
  * local_epoch to decide whether a new origin has been published. */
 static uint32_t s_play_epoch;
@@ -79,7 +91,7 @@ static bool park_for_retune(void)
 
 
 /* Pull one chunk out of the ring, or report that it ran dry. */
-static chunk_result_t read_chunk(uint8_t *chunk, uint32_t *got_frames)
+static chunk_result_t read_chunk(uint32_t *got_frames)
 {
     hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
     size_t got = xStreamBufferReceive(local_ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
@@ -469,7 +481,7 @@ static void pulse_marker(void)
  * The write is the only DAC-paced event in the whole loop, which is why the
  * instant after it is what every phase reading is dated from.
  */
-static void write_chunk(uint8_t *chunk)
+static void write_chunk(void)
 {
     /* Last thing before the DMA buffer, and deliberately after every
      * count above: it rewrites slots within frames that already exist,
@@ -533,7 +545,6 @@ s_wrote_at = esp_timer_get_time();
 void local_play_task(void *arg)
 {
     (void)arg;
-    static uint8_t chunk[AUDIO_CHUNK_BYTES];
 
     while (1) {
         /*
@@ -573,7 +584,7 @@ void local_play_task(void *arg)
             if (park_for_retune()) {
                 continue;
             }
-            if (read_chunk(chunk, &got_frames) == CHUNK_UNDERRUN) {
+            if (read_chunk(&got_frames) == CHUNK_UNDERRUN) {
                 break;
             }
             absorb_phase_crossings();
@@ -583,7 +594,7 @@ void local_play_task(void *arg)
              * the short-read note above. Equal to AUDIO_FRAMES in every pass that
              * did not come up short. */
             s_samples_played += (int32_t)got_frames;
-            write_chunk(chunk);
+            write_chunk();
         }
         /* The inner loop only ends on an underrun, and the servo should stop
          * treating this unit as playing the moment it does. */

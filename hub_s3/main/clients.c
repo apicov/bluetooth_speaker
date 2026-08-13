@@ -273,6 +273,13 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
  */
 void publish_frame(const vis_frame_t *f)
 {
+    /* Yield the instant the TX pool is exhausted: see TX_BACKOFF_US. fan_out() --
+     * the audio path -- is never gated, so this is what keeps a frame burst off the
+     * buffers audio is being refused. */
+    if (esp_timer_get_time() < s_tx_congested_until) {
+        n_tx_cong_skip++;
+        return;
+    }
     if (sizeof(*f) > FRAME_PAYLOAD_MAX) {
         return;                              /* refuse rather than truncate */
     }
@@ -289,7 +296,7 @@ void publish_frame(const vis_frame_t *f)
         }
         if (sendto(sock, &msg, bytes, 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
-            s_tx_fail++;
+            tx_fail_note(errno);
         }
     }
 }
@@ -312,6 +319,21 @@ void publish_frame(const vis_frame_t *f)
 #if CONFIG_DANCEFLOOR_PUBLISH_ML
 void publish_ml(const ml_result_t *r)
 {
+    const int64_t now = esp_timer_get_time();
+    /* Yield the instant the TX pool is exhausted: see TX_BACKOFF_US. */
+    if (now < s_tx_congested_until) {
+        n_tx_cong_skip++;
+        return;
+    }
+    /* Capped well under the analysis rate -- see ML_PUBLISH_PERIOD_US. The comment
+     * above this function named this rate limit as the first thing the lane would
+     * grow; this is it. A stale result costs a satellite one old reading, not a gap. */
+    static int64_t last_us = 0;
+    if (now - last_us < ML_PUBLISH_PERIOD_US) {
+        n_ml_throttled++;
+        return;
+    }
+    last_us = now;
     if (sizeof(*r) > ML_PAYLOAD_MAX) {
         return;                              /* refuse rather than truncate */
     }
@@ -328,7 +350,7 @@ void publish_ml(const ml_result_t *r)
         }
         if (sendto(sock, &msg, bytes, 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
-            s_tx_fail++;
+            tx_fail_note(errno);
         }
     }
 }

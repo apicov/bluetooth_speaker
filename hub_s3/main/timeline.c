@@ -44,6 +44,21 @@ static int64_t s_last_pkt_us;
 static int64_t s_steady_since;
 static int64_t s_wait_since;
 
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
+/*
+ * The last FEC_DEPTH payloads, kept so each outgoing packet can piggyback them
+ * as trailing redundancy for the satellite to recover a loss from. [0] is the
+ * packet immediately before this one, [1] the one before that. Single-writer
+ * like everything else in this file: sbc_in's rx_task is the only caller.
+ */
+static struct {
+    uint8_t  payload[AUDIO_MAX_PAYLOAD];
+    uint16_t len;
+    uint32_t seq;
+    bool     valid;
+} fec_prev[CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH];
+#endif
+
 uint32_t streamer_take_dropped(void)
 {
     uint32_t d = s_feed_dropped;
@@ -413,18 +428,62 @@ s_vis_anchor_due = next_play_at;
 
 
 /*
- * Unicast to every registered listener.
+ * The audio downlink. One destination under multicast, one sendto per satellite
+ * under unicast -- and that is the WHOLE difference between the two. Everything
+ * else about a packet (its format, the FEC redundancy attached in
+ * streamer_send_sbc(), the socket it leaves on, the satellite's receive path)
+ * is shared, so the two transports are just two send targets. Each lives in its
+ * own function below so a reviewer reads one mode at a time; fan_out() is the
+ * switch between them.
  */
-static void fan_out(size_t bytes, int64_t now)
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+/*
+ * The group address audio goes to under multicast. Built once, lazily, on the
+ * first send -- send_audio_to_group() is the only sender. One sendto to this
+ * instead of one per satellite is the whole point of the mode: airtime stops
+ * scaling with speaker count.
+ */
+static struct sockaddr_in s_mcast_addr;
+static bool s_mcast_addr_ready;
+static void ensure_mcast_addr(void)
 {
-/* Age the list before snapshotting it, so the loop below only ever has to
- * skip cleared slots. This used to be interleaved with the send loop and was
- * the ONLY place it happened -- see clients_age(). */
-clients_age(now);
+    if (s_mcast_addr_ready) {
+        return;
+    }
+    s_mcast_addr.sin_family = AF_INET;
+    s_mcast_addr.sin_port = htons(SYNC_PORT);
+    inet_pton(AF_INET, CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP, &s_mcast_addr.sin_addr);
+    s_mcast_addr_ready = true;
+}
 
-client_t snapshot[MAX_CLIENTS];
-clients_snapshot(snapshot);
-
+/*
+ * One group-addressed sendto for the audio. Group frames are never acknowledged
+ * or retried, so this trades reliability for airtime that no longer scales with
+ * speaker count -- the residual loss is what the FEC redundancy attached in
+ * streamer_send_sbc() exists to recover, and what the 6 Mbps group rate
+ * (wifi_start_ap drops 11b) keeps off the 1 Mbps basic rate that could not fit
+ * the stream. A failure is counted by the same tx_fail_note the unicast path
+ * uses, so the status line tells the same story either mode.
+ */
+static void send_audio_to_group(size_t bytes)
+{
+    ensure_mcast_addr();
+    /* MSG_DONTWAIT, not flags=0: this runs in the SBC receive task that also
+     * decodes and feeds the hub's OWN local ring. A multicast sendto has no ACK
+     * and can wait for a TX slot -- a group frame is buffered and drained at the
+     * basic rate -- and blocking here starves the local feed, so the hub's own
+     * speaker underruns while it waits to send to the satellites. (Unicast does
+     * not hit this: its link-layer ACK completes the send fast.) Non-blocking
+     * returns the moment lwIP has the frame; a momentarily full queue comes back
+     * as EAGAIN, tallied by tx_fail_note like any tx-fail, and the task moves on
+     * to feed and decode the next packet. The satellites still receive: the
+     * queue drains faster than the stream fills it, so EAGAIN is the exception. */
+    if (sendto(sock, &msg, bytes, MSG_DONTWAIT,
+               (struct sockaddr *)&s_mcast_addr, sizeof(s_mcast_addr)) < 0) {
+        tx_fail_note(errno);
+    }
+}
+#else
 /*
  * Unicast to each registered listener. Multicast was removed entirely: it is
  * never acknowledged and never retried, which cost ~20% of packets at every
@@ -434,16 +493,38 @@ clients_snapshot(snapshot);
  * Airtime now scales with speaker count, which is affordable at ~42 kB/s of
  * SBC and would not have been at 179 kB/s of PCM.
  */
-for (int i = 0; i < MAX_CLIENTS; i++) {
-    if (!snapshot[i].last_seen) {
-        continue;
-    }
-    if (sendto(sock, &msg, bytes, 0,
-               (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
-        s_tx_fail++;
+static void send_audio_to_clients(size_t bytes)
+{
+    client_t snapshot[MAX_CLIENTS];
+    clients_snapshot(snapshot);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!snapshot[i].last_seen) {
+            continue;
+        }
+        if (sendto(sock, &msg, bytes, 0,
+                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
+            tx_fail_note(errno);
+        }
     }
 }
+#endif
 
+/*
+ * Send the audio packet built in streamer_send_sbc() to whoever is listening.
+ * Age the client list first so the unicast path's snapshot only ever skips a
+ * cleared slot, never acts on a stale one; telemetry.c ages it too, so under
+ * multicast -- which never snapshots -- the age is redundant but cheap. Then
+ * hand off to the one transport this build speaks.
+ */
+static void fan_out(size_t bytes, int64_t now)
+{
+    clients_age(now);
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+    send_audio_to_group(bytes);
+#else
+    send_audio_to_clients(bytes);
+#endif
 }
 
 
@@ -514,7 +595,57 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     memcpy(msg.payload, sbc, len);
 
     size_t bytes = AUDIO_MSG_BYTES(len);
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
+    /*
+     * Piggyback up to FEC_DEPTH previous payloads after this one, as far as the
+     * UDP MTU allows. Each block is an audio_red_hdr_t plus its SBC; red_seq_ofs
+     * is how many packets back it recovers (1, 2, ...). Attached only while the
+     * stored chain is contiguous -- if a packet was skipped here (an early
+     * return above left a hole in seq), the deeper slots no longer describe a
+     * run and are left off. The blocks are written into the unused tail of
+     * msg.payload[], which is AUDIO_MAX_PAYLOAD bytes and so always holds a
+     * packet that itself fits the MTU. Take is capped to what fits, so a copy is
+     * partial rather than fragmented -- the satellite decodes what arrived and
+     * pads the rest with silence.
+     */
+    {
+        const size_t mtu = 1472;
+        size_t off = AUDIO_MSG_BYTES(len);          /* where the next block goes */
+        for (int d = 0; d < CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH; d++) {
+            if (!fec_prev[d].valid) {
+                break;
+            }
+            if (fec_prev[d].seq + (uint32_t)(d + 1) != msg.seq) {
+                break;                              /* chain broken by a skip */
+            }
+            if (off + AUDIO_RED_HDR_BYTES > mtu) {
+                break;
+            }
+            size_t room = mtu - off - AUDIO_RED_HDR_BYTES;
+            uint16_t take = fec_prev[d].len < room ? fec_prev[d].len : (uint16_t)room;
+            audio_red_hdr_t rh = { .red_len = take, .red_seq_ofs = (uint8_t)(d + 1) };
+            uint8_t *dst = (uint8_t *)&msg + off;
+            memcpy(dst, &rh, AUDIO_RED_HDR_BYTES);
+            memcpy(dst + AUDIO_RED_HDR_BYTES, fec_prev[d].payload, take);
+            off += AUDIO_RED_HDR_BYTES + take;
+        }
+        bytes = off;
+    }
+#endif
     fan_out(bytes, now);
+
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
+    /* Shift the ring: this packet becomes [0], older ones move down. After the
+     * send so an early return (which never reached here) does not poison the
+     * chain with a packet that was not transmitted. */
+    for (int d = CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH - 1; d > 0; d--) {
+        fec_prev[d] = fec_prev[d - 1];
+    }
+    memcpy(fec_prev[0].payload, sbc, len);
+    fec_prev[0].len = len;
+    fec_prev[0].seq = msg.seq;
+    fec_prev[0].valid = true;
+#endif
 
     /* The timeline advances by the audio actually sent, not by wall clock --
      * stamping "now + lead" each time would fold task jitter into playback. */

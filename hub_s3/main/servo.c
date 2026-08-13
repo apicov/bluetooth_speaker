@@ -91,12 +91,21 @@ void servo_tick(void)
     static int status_left;
     if (--status_left <= 0) {
         status_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
+        /* Empty unless something failed, so a clean line is unchanged from
+         * every log captured before this instrument existed. */
+        char why[128];
+        tx_fail_summary(why, sizeof(why));
         ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
-                      "tx-fail %" PRIu32,
+                      "tx-fail %" PRIu32 "%s | ml-throt %" PRIu32 " | cong-skip %" PRIu32
+                      " | xport %s fec %d",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
-                 (long)s_phase_err_us, (long)s_err_ema, s_tx_fail);
+                 (long)s_phase_err_us, (long)s_err_ema, s_tx_fail, why,
+                 n_ml_throttled, n_tx_cong_skip,
+                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH);
         s_tx_fail = 0;
+        n_ml_throttled = 0;
+        n_tx_cong_skip = 0;
     }
 
     const int32_t target = (int32_t)(LEAD_US / 1000) *

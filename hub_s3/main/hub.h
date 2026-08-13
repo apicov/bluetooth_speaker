@@ -69,6 +69,7 @@
  */
 #pragma once
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -246,10 +247,54 @@
  */
 #define TIMELINE_SLEW_US 20
 
-/* Local playback ring. The master delays its own audio by LEAD_US exactly like a
- * satellite, otherwise it would play ahead of every other speaker. Must hold the
- * lead (~21 kB) with headroom; 64 kB is 371 ms at 44.1 kHz stereo. */
-#define LOCAL_RING_BYTES (64 * 1024)
+/*
+ * Throttles on the non-audio downlink lanes. Audio is the priority: a dropped
+ * audio datagram costs a gap, where a dropped frame or ML result costs only a
+ * slightly-stale LED. publish_frame and publish_ml can EACH run at the ~86 Hz
+ * analysis rate (Kconfig.projbuild), so together they add ~172 datagrams/s on
+ * top of ~50 audio and overflow the 26 static TX buffers (tx-fail ENOMEM,
+ * measured -- see the errno tally tx_fail_note() keeps).
+ *
+ * ML_PUBLISH_PERIOD_US caps the ML lane well under the analysis rate. TX_BACKOFF_US
+ * is how long BOTH non-audio lanes stay silent after ANY sendto() returns ENOMEM:
+ * the instant the pool is exhausted, non-audio yields, leaving the buffers audio
+ * was being refused for audio. fan_out() -- the audio path -- is never gated.
+ *
+ * Falsified by tx-fail on the servo line: throttling is working while that drops.
+ */
+#define ML_PUBLISH_PERIOD_US   100000   /* 10/s, down from up to 86/s */
+#define TX_BACKOFF_US           40000   /* ~2 audio packets: yield, then probe again */
+
+/*
+ * Local playback ring. The master delays its own audio by LEAD_US exactly like a
+ * satellite, otherwise it would play ahead of every other speaker.
+ *
+ * THE LEAD IS ~35 kB, not the ~21 kB this said until 2026-08-12. LEAD_US is
+ * 200 ms and 200 ms at 44.1 kHz stereo is 35,280 bytes; the old figure described
+ * a shorter lead and was never updated when it grew. It mattered, because it made
+ * this ring look far better provisioned than it was: 64 kB reads as three times
+ * the lead against 21 kB and is only 1.86x against the real one.
+ *
+ * 48 kB is 279 ms, DOWN FROM 64 kB / 371 ms, and the 16 kB it releases is spent
+ * on WiFi static TX buffers -- see ESP_WIFI_STATIC_TX_BUFFER_NUM in
+ * sdkconfig.defaults, which is the other half of this change. This ring was 48%
+ * of the internal heap and the only place a WiFi-sized block existed: internal
+ * ran 7,760 bytes free with a 3,584 largest block, so nothing could grow until
+ * something here shrank.
+ *
+ * WHY 48 AND NOT LESS. Measured occupancy over a full run was 31,744-39,424
+ * bytes (179-223 ms), so 48 kB leaves 9,728 bytes above the observed peak. The
+ * constraint is not the steady state but the FEED BURST: sbc_in reports
+ * `max gap` of 34.8-42.0 ms, so the decoder pauses and then delivers in a lump,
+ * and the ring has to swallow the lump or drop it. 9,728 bytes is 55 ms, which
+ * clears the worst gap measured (42 ms) and not by much. 44 kB would leave 26 ms
+ * and lose to a gap this unit has already produced.
+ *
+ * FALSIFIED BY fed-drop, which is why that counter exists. Non-zero here means
+ * the burst no longer fits and the ring was the wrong donor; put it back to 64 kB
+ * and take the TX buffers from somewhere else.
+ */
+#define LOCAL_RING_BYTES (48 * 1024)
 
 extern const char *TAG;
 
@@ -387,6 +432,28 @@ extern volatile bool s_playing;
  * like a starving ring, which is why it needs a counter. */
 extern volatile uint32_t s_feed_dropped;
 extern volatile uint32_t s_tx_fail;   /* sendto() rejections */
+
+/*
+ * Non-audio publish throttling, paired with ML_PUBLISH_PERIOD_US / TX_BACKOFF_US.
+ * tx_fail_note() raises s_tx_congested_until on ENOMEM; publish_frame/publish_ml
+ * skip while now < it and count the skip in n_tx_cong_skip. publish_ml additionally
+ * rate-limits to the period and counts drops in n_ml_throttled. fan_out() ignores
+ * both -- audio always sends. Racy exactly as s_tx_fail is (net.c): a torn read of
+ * the 64-bit deadline at worst sends or skips one non-audio datagram wrongly.
+ */
+extern volatile uint32_t n_ml_throttled;            /* ML sends dropped to the period */
+extern volatile uint32_t n_tx_cong_skip;            /* non-audio sends skipped under ENOMEM backoff */
+extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-audio yields until it */
+
+/*
+ * Every failed sendto() goes through this rather than incrementing s_tx_fail
+ * directly, so the reason is kept alongside the count. Call it with errno, at
+ * the failure, before anything else can overwrite it. tx_fail_summary() renders
+ * the tally for the status line and clears it. Both live in net.c, which owns
+ * the socket; the rationale for keeping the reason at all is there.
+ */
+void tx_fail_note(int err);
+void tx_fail_summary(char *buf, size_t len);
 
 /*
  * Cumulative totals for a long run, never reset -- deliberately separate from

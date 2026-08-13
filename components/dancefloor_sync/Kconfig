@@ -118,6 +118,62 @@ menu "Dancefloor radio pairing"
 
 endmenu
 
+menu "Dancefloor audio transport (experimental: multicast + FEC)"
+
+    comment "Audio is unicast per satellite by default. These opt into sending it to a"
+    comment "WiFi multicast group, with optional piggyback redundancy (FEC) so a single"
+    comment "lost datagram is recovered at the far end instead of becoming a gap."
+    comment "Default OFF: unset, the build is the shipped unicast+throttle path."
+
+    config DANCEFLOOR_AUDIO_MCAST
+        bool "Send audio to a multicast group instead of per-satellite unicast"
+        default n
+        help
+          One group-addressed sendto instead of one per satellite: airtime stops
+          scaling with speaker count. The cost is reliability -- group frames are
+          never acknowledged or retried -- which is why multicast was removed once
+          before (measured ~20% loss, and at the 1 Mbps basic rate the stream did
+          not even fit). Two things let us try again: IGMP is on by default in the
+          IDF v6 lwip port (satellites join with no config), and wifi_start_ap()
+          drops 11b so the group rate moves off 1 Mbps to the 6 Mbps OFDM basic
+          rate. DANCEFLOOR_AUDIO_FEC_DEPTH then recovers the residual no-ACK loss.
+
+          Only audio moves to the group. Probes, analysis frames, ML results and
+          metadata stay per-station unicast -- a satellite still probes to be
+          clock-synced and to receive them.
+
+          Coordinated: the hub sends to the group and the satellite joins it, so
+          both ends must set this the same way.
+
+    config DANCEFLOOR_AUDIO_MCAST_GROUP
+        string "Multicast group address for the audio downlink"
+        default "239.0.0.1"
+        depends on DANCEFLOOR_AUDIO_MCAST
+        help
+          IPv4 administratively-scoped group (239.x). On-link under the SoftAP, so
+          the default IP_MULTICAST_TTL of 1 is correct and no routing is involved.
+          Both ends must match.
+
+    config DANCEFLOOR_AUDIO_FEC_DEPTH
+        int "Piggyback redundancy depth (previous packets carried)"
+        default 0
+        range 0 4
+        help
+          How many previous audio payloads each packet piggybacks as trailing
+          redundancy, so a lost datagram is decoded from the next one instead of
+          becoming a silence gap. 0 disables it (measures the raw loss floor).
+          1 recovers an isolated loss; 2 recovers a two-packet burst. Bandwidth
+          scales (1+depth)x the audio -- at the ~340 kbps SBC stream that is
+          11%/17%/23% of a 6 Mbps channel for depth 1/2/3, so airtime is not the
+          limit; the UDP MTU is, and the attach path is MTU-guarded (a packet
+          carries as much redundancy as fits, never fragments).
+
+          Independent of DANCEFLOOR_AUDIO_MCAST: a receiver parses trailing
+          redundancy by length, so it recovers from any sender that attached it,
+          and an older sender that did not is read unchanged.
+
+endmenu
+
 menu "Dancefloor diagnostics"
 
     config DANCEFLOOR_LOG_PERIOD_S

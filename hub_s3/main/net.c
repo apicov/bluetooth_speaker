@@ -91,6 +91,36 @@ void wifi_start_ap(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
 
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+    /*
+     * Audio goes out by multicast -- see fan_out() in timeline.c. The one thing
+     * that made that unworkable before was the group frame rate: group-addressed
+     * frames transmit at the lowest basic rate, which is 1 Mbps while 11b is in
+     * the basic set, and at 1 Mbps a ~1 kB SBC packet costs 8.3 ms -- the stream
+     * needs more airtime than a second has, so half of it was dropped in the
+     * queue (net.c history, ~20% loss measured at every rate tried).
+     *
+     * Dropping 11b from the AP protocol leaves 11g/11n, whose basic rates start
+     * at 6 Mbps. That is an OFDM rate: the same ~1 kB packet costs ~1.4 ms, the
+     * stream fits with room to spare, and unicast keeps its g/n rate adaptation
+     * (this is not esp_wifi_internal_set_fix_rate(), which pins ALL TX and was
+     * removed for the 23% loss disabling adaptation caused). Must precede start.
+     *
+     * esp_wifi_config_80211_tx() (esp_wifi.h, IDF 6) is NOT a fallback for this.
+     * Its wifi_tx_rate_config_t has no multicast/broadcast field -- it pins the
+     * rate for the whole AP interface, unicast included, which disables rate
+     * adaptation. That is the 23% loss esp_wifi_internal_set_fix_rate() caused
+     * before it was removed, applied here all over again. Dropping 11b via
+     * set_protocol() is the fix that moves the group rate without touching
+     * unicast adaptation; there is no second lever, so the group rate must be
+     * confirmed at 6 Mbps another way -- by the loss floor, not the air rate.
+     */
+    const esp_err_t proto = esp_wifi_set_protocol(
+        WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    ESP_LOGW(TAG, "multicast audio: AP protocol 11G|11N (11b dropped, group rate "
+                  "->6 Mbps): %s", esp_err_to_name(proto));
+#endif
+
     /*
      * 20 MHz, not the 40 the driver comes up with.
      *
@@ -205,6 +235,99 @@ void wifi_start_ap(void)
 #endif
     ESP_LOGI(TAG, "SoftAP \"%s\" pass \"%s\" ch %d, radio at defaults",
              AP_SSID, AP_PASS, CONFIG_DANCEFLOOR_WIFI_CHANNEL);
+}
+
+/*
+ * WHY a sendto() failed, not just how often.
+ *
+ * s_tx_fail has read 0 in every log this unit has ever produced, so until it
+ * did not, the count alone was the whole instrument. A non-zero figure has at
+ * least two completely different causes with completely different fixes, and
+ * the count cannot tell them apart:
+ *
+ *   ENOMEM        the WiFi driver is out of TX buffers. A load or memory
+ *                 problem -- internal RAM here runs at ~8 kB free with a
+ *                 largest block of ~3.5 kB, and TX buffers must be internal.
+ *   EHOSTUNREACH  lwIP has no ARP entry and the pending-ARP queue is dropping
+ *                 its overflow. A JOIN problem, and precisely what the ARP
+ *                 seeding in client_joined() exists to prevent -- see the note
+ *                 there, and the 161 tx-fails e6f03d1 produced without it.
+ *
+ * The first is fixed by taking work or memory off this board; the second by
+ * looking at why a station was registered without a seeded entry. Guessing
+ * between them from a bare count is how an evening gets spent on the wrong one.
+ *
+ * A TALLY rather than a log line per failure: these arrive up to ~200 per 20 s
+ * window, and one line each would push the console out of the way of everything
+ * it is meant to be read beside.
+ *
+ * Raced, deliberately, exactly as the counter it sits beside already is: three
+ * tasks send (timeline, and the frame and ML publishers) and none of them take
+ * a lock to increment s_tx_fail. The cost of losing one is a diagnostic that
+ * reads 189 instead of 190, and the cost of a critical section on the send path
+ * is real. Same trade the counters in hub_state.c already make.
+ */
+#define TX_ERR_SLOTS 4
+static struct {
+    int err;
+    uint32_t n;
+} s_tx_err[TX_ERR_SLOTS];
+static uint32_t s_tx_err_other;   /* more distinct codes than slots */
+
+void tx_fail_note(int err)
+{
+    s_tx_fail++;
+    /*
+     * ENOMEM is the WiFi pool out of TX buffers, and it is the one failure a
+     * non-audio lane can do something about: back off for TX_BACKOFF_US so
+     * publish_frame/publish_ml yield and the buffers audio is being refused are
+     * left for audio. fan_out() does not check this, so audio keeps sending and,
+     * if it still hits ENOMEM, re-arms the deadline from here. The errno tally
+     * above stays the whole of the diagnosis; this is the reaction to it.
+     */
+    if (err == ENOMEM) {
+        s_tx_congested_until = esp_timer_get_time() + TX_BACKOFF_US;
+    }
+    for (int i = 0; i < TX_ERR_SLOTS; i++) {
+        if (s_tx_err[i].n == 0) {         /* free slot: claim it */
+            s_tx_err[i].err = err;
+            s_tx_err[i].n = 1;
+            return;
+        }
+        if (s_tx_err[i].err == err) {
+            s_tx_err[i].n++;
+            return;
+        }
+    }
+    s_tx_err_other++;
+}
+
+/*
+ * Render the tally and clear it, for the status line in servo.c.
+ *
+ * Writes an EMPTY string when nothing failed, so a clean run's line is byte-for
+ * byte what it has always been and stays comparable with every log captured
+ * before this instrument existed. Cleared here because the caller zeroes
+ * s_tx_fail on the same line; the two must not drift apart.
+ */
+void tx_fail_summary(char *buf, size_t len)
+{
+    size_t off = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < TX_ERR_SLOTS; i++) {
+        if (s_tx_err[i].n == 0) {
+            continue;
+        }
+        off += snprintf(buf + off, off < len ? len - off : 0, "%s%s %" PRIu32,
+                        off ? ", " : " -- ", strerror(s_tx_err[i].err),
+                        s_tx_err[i].n);
+        s_tx_err[i].n = 0;
+    }
+    if (s_tx_err_other) {
+        snprintf(buf + off, off < len ? len - off : 0, "%sother %" PRIu32,
+                 off ? ", " : " -- ", s_tx_err_other);
+        s_tx_err_other = 0;
+    }
 }
 
 void socket_start(void)

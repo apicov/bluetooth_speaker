@@ -242,20 +242,104 @@ static bool upgrade_provisional_anchor(const audio_msg_t *msg, int64_t offset)
 }
 
 /*
+ * Fill one missing packet's worth (up to want_frames) into the ring: a recovered
+ * payload first, if a trailing FEC block carried one, then silence for whatever
+ * it did not yield. Advances samples_in by exactly the frames the ring accepted
+ * -- the same accounting as decode_into_ring() and the fill below, because every
+ * marker and phase point is recorded against samples_in and an undercount would
+ * slide the whole stream.
+ *
+ * Whole SBC frames are decoded until want_frames would be overshot; the rest is
+ * silence, so the fill is length-exact even when the recovered payload was
+ * truncated by the hub's MTU guard. red == NULL means no redundancy covered this
+ * packet, so the whole fill is silence -- the behaviour this path always had.
+ */
+static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
+                                            uint32_t want_frames)
+{
+    static int16_t pcm[SBC_MAX_PCM_SAMPLES];
+    static const int16_t silence[128 * AUDIO_CHANNELS] = {0};
+    uint32_t filled = 0;
+
+    if (red && red_len) {
+        size_t off = 0;
+        while (filled < want_frames && off < red_len) {
+            size_t consumed = 0, samples = 0;
+            if (!sbc_decode_frame(red + off, red_len - off, &consumed, pcm, &samples)
+                || consumed == 0) {
+                sbc_decoder_init();          /* resync rather than wedge */
+                break;
+            }
+            off += consumed;
+            uint32_t f = (uint32_t)(samples / AUDIO_CHANNELS);
+            if (filled + f > want_frames) {
+                break;                       /* next frame would overshoot; silence the rest */
+            }
+            size_t want = samples * sizeof(int16_t);
+            size_t sent = xStreamBufferSend(ring, pcm, want, 0);
+            uint32_t got = (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
+            filled += got;
+            samples_in += (int32_t)got;
+            if (sent < want) {
+                return filled;               /* ring filled mid-packet */
+            }
+        }
+    }
+
+    while (filled < want_frames) {
+        uint32_t left = want_frames - filled;
+        uint32_t n = left > 128 ? 128 : left;
+        size_t want = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
+        size_t sent = xStreamBufferSend(ring, silence, want, 0);
+        uint32_t got = (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
+        filled += got;
+        samples_in += (int32_t)got;
+        if (sent < want) {
+            break;                           /* raced the playback task; counted above */
+        }
+    }
+    return filled;
+}
+
+/*
  * A lost packet must become silence of exactly the right length. Skipping it
  * would pull every later frame earlier and slide the whole stream against
  * the master -- a permanent error, not a momentary glitch. `frames` tells us
  * how much audio a packet was worth, so a gap can be filled accurately even
  * though SBC packets vary in size.
  */
-static bool absorb_sequence_gap(const audio_msg_t *msg)
+static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
 {
     if (have_seq && msg->seq > expect_seq) {
         uint32_t missing = msg->seq - expect_seq;
-        static const int16_t silence[128 * AUDIO_CHANNELS] = {0};
         uint32_t frames_missing = missing * msg->frames;
         n_gaps++;
         n_gap_frames += frames_missing;
+
+        /*
+         * Trailing FEC redundancy, if the hub attached any: parse every block the
+         * recv carried, so a missing packet can be decoded from the copy a later
+         * packet piggybacked instead of becoming silence. Found by length, not a
+         * flag, so this recovers from any sender that attached blocks and is a
+         * no-op for one that did not.
+         */
+        struct { uint8_t ofs; const uint8_t *p; uint16_t len; } reds[8];
+        int n_reds = 0;
+        for (size_t off = AUDIO_MSG_BYTES(msg->payload_len);
+             n_reds < (int)(sizeof(reds) / sizeof(reds[0])) &&
+             off + AUDIO_RED_HDR_BYTES <= (size_t)n; ) {
+            const audio_red_hdr_t *rh =
+                (const audio_red_hdr_t *)((const uint8_t *)msg + off);
+            if (rh->red_len == 0 ||
+                off + AUDIO_RED_HDR_BYTES + rh->red_len > (size_t)n) {
+                break;
+            }
+            reds[n_reds].ofs = rh->red_seq_ofs;
+            reds[n_reds].p = (const uint8_t *)msg + off + AUDIO_RED_HDR_BYTES;
+            reds[n_reds].len = rh->red_len;
+            n_reds++;
+            off += AUDIO_RED_HDR_BYTES + rh->red_len;
+        }
 
         /*
          * Past a point, filling the gap is the wrong answer.
@@ -332,15 +416,37 @@ static bool absorb_sequence_gap(const audio_msg_t *msg)
             n_gap_short_frames += frames_missing - can_take;
             frames_missing = can_take;
         }
-        while (frames_missing > 0) {
-            uint32_t n = frames_missing > 128 ? 128 : frames_missing;
-            size_t want = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
-            size_t sent = xStreamBufferSend(ring, silence, want, 0);
-            samples_in += (int32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
-            if (sent < want) {
-                break;                       /* raced the playback task; counted above */
+        /*
+         * Fill in sequence order. For each missing packet, decode the recovered
+         * SBC a trailing FEC block carried for it -- if one did -- then pad with
+         * silence so the timeline length stays exact. Partial recovery (the
+         * hub's MTU guard truncated the copy) decodes to fewer frames; the
+         * silence pad in fill_recovered_then_silence() makes up the difference.
+         */
+        uint32_t filled = 0;
+        for (uint32_t i = 0; i < missing && filled < frames_missing; i++) {
+            uint32_t per = frames_missing - filled;
+            if (per > msg->frames) {
+                per = msg->frames;
             }
-            frames_missing -= n;
+            uint8_t want_ofs = (uint8_t)(msg->seq - (expect_seq + i));
+            const uint8_t *red = NULL;
+            uint16_t rlen = 0;
+            for (int k = 0; k < n_reds; k++) {
+                if (reds[k].ofs == want_ofs) {
+                    red = reds[k].p;
+                    rlen = reds[k].len;
+                    break;
+                }
+            }
+            if (red) {
+                n_fec_recovered++;
+            }
+            uint32_t got = fill_recovered_then_silence(red, rlen, per);
+            filled += got;
+            if (got < per) {
+                break;                       /* ring filled mid-packet; counted above */
+            }
         }
     } else if (have_seq && msg->seq < expect_seq) {
         return false;                              /* duplicate or reorder, drop */
@@ -438,7 +544,7 @@ static void decode_into_ring(const audio_msg_t *msg)
  * between four screens of commentary, so the order could not be read without
  * reading all of it.
  */
-static void handle_audio(const audio_msg_t *msg)
+static void handle_audio(const audio_msg_t *msg, int n)
 {
     int64_t offset;
     bool by_tsf = false;
@@ -458,7 +564,7 @@ static void handle_audio(const audio_msg_t *msg)
     if (upgrade_provisional_anchor(msg, offset)) {
         return;
     }
-    if (!absorb_sequence_gap(msg)) {
+    if (!absorb_sequence_gap(msg, n)) {
         return;
     }
 
@@ -676,7 +782,7 @@ void rx_task(void *arg)
                      tsf_step, est_step, span, span_max);
             span_max = 0;
         } else if (buf[0] == MSG_AUDIO && n >= (int)AUDIO_MSG_BYTES(0)) {
-            handle_audio((const audio_msg_t *)buf);
+            handle_audio((const audio_msg_t *)buf, n);
         }
     }
 }
