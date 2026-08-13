@@ -187,17 +187,42 @@ menu "Dancefloor audio transport (multicast + FEC)"
 
     config DANCEFLOOR_AUDIO_FEC_DEPTH
         int "Piggyback redundancy depth (previous packets carried)"
-        default 1
+        default 0
         range 0 4
         help
           How many previous audio payloads each packet piggybacks as trailing
           redundancy, so a lost datagram is decoded from the next one instead of
-          becoming a silence gap. 0 disables it (measures the raw loss floor).
-          1 recovers an isolated loss; 2 recovers a two-packet burst. Bandwidth
-          scales (1+depth)x the audio -- at the ~340 kbps SBC stream that is
-          11%/17%/23% of a 6 Mbps channel for depth 1/2/3, so airtime is not the
-          limit; the UDP MTU is, and the attach path is MTU-guarded (a packet
-          carries as much redundancy as fits, never fragments).
+          becoming a silence gap.
+
+          DEFAULT 0, AND THAT IS A MEASURED RESULT, NOT CAUTION. Depth 1 was the
+          default for one afternoon and cost more audio than it saved:
+
+            mcast fec 0 (13:02, 13:30)   hub tx-fail 0
+            mcast fec 1 (14:23)          hub tx-fail 92 / 365 s
+            mcast fec 1 (17:52)          hub tx-fail 10-58 AUDIO per 20 s
+
+          The mechanism is airtime, not the MTU. A depth-1 packet is pinned at
+          the full 1472-byte MTU instead of ~851 B -- 73% more airtime for audio,
+          at the fixed 6 Mbps group rate with no aggregation -- and the hub's
+          26 static TX buffers cannot absorb it. That is 4-6% of the audio
+          discarded at the socket, against an on-air loss of 0.2-0.3% that the
+          redundancy exists to repair. It also cannot repair it fully: a whole
+          copy of an ~825-byte payload does not fit beside it, so what arrives is
+          ~75% and the satellite pads the rest, logged as
+          `fec 5 (29 ms short, 5 err)` -- about 5.8 ms of silence per recovery
+          and a decode error on every one.
+
+          So depth 1 spent ~5% of the stream to recover ~70% of 0.3%. Turning it
+          off is not giving up on loss recovery; it is declining to pay for a
+          version of it that costs more than the loss.
+
+          What would work needs the packets to get smaller, which needs the
+          packet rate to rise, which needs transmit capacity this hub does not
+          have -- see AUDIO_TX_PAYLOAD_MAX in sync_proto.h, which carries the
+          arithmetic and the run where applying it took the floor down. XOR
+          parity across a group of packets is the design that fits: one parity
+          packet per K recovers any single loss for 1/K overhead instead of 1x,
+          and leaves packets at ~851 B.
 
           Independent of DANCEFLOOR_AUDIO_MCAST: a receiver parses trailing
           redundancy by length, so it recovers from any sender that attached it,

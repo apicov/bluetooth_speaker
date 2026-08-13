@@ -453,6 +453,16 @@ extern volatile uint32_t n_fec_decode_err;
  * n_recv_err -- recvfrom() returning an error rather than a datagram. The old
  *   code spun on this at priority 7 without counting it.
  */
+/*
+ * Re-anchors forced because a gap fill did not fit the ring.
+ *
+ * Distinct from n_gap_resyncs, which is a gap longer than GAP_RESYNC_MS: that
+ * one says the air was bad, this one says the ring could not absorb a burst
+ * arriving faster than it plays. Both end in a reset and a re-anchor, and
+ * telling them apart is what says whether to spend the next effort on loss or
+ * on buffering.
+ */
+extern volatile uint32_t n_gap_short_resyncs;
 extern volatile uint32_t n_seq_dropped;
 extern volatile uint32_t n_decode_err;
 extern volatile uint32_t n_recv_err;

@@ -433,17 +433,45 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
          * failing sends, and the shortfall came out as a number nobody could
          * check against the ring's actual free space at the time.
          *
-         * What the shortfall MEANS is unchanged and is not fixed here: those
-         * frames were owed to the timeline and are not in it, so playback runs
-         * that much early until the servo walks it back. Capping only makes the
-         * amount honest and the attempt cheap.
+         * WHAT THE SHORTFALL MEANS IS NOW ACTED ON, which it was not. The note
+         * that used to end here said the owed frames "are not in it, so playback
+         * runs that much early until the servo walks it back", and the servo
+         * cannot walk it back: it trims +-100 Hz, 2.27 ms/s, against a shortfall
+         * that arrives hundreds of milliseconds at a time.
+         *
+         * Measured 2026-08-13 17:53. A hub transmit burst cost 37 audio packets
+         * in one window; the satellite met them with
+         *
+         *   gaps 18 (658 ms silence) | ring-full 15
+         *   gaps 13 (920 ms silence, 3 short by 229 ms) | ring-full 63
+         *
+         * -- 658 ms of silence written into a 464 ms ring in a few hundred ms of
+         * wall time, because a gap is filled the moment the packet AFTER it
+         * arrives rather than at the rate audio plays. The ring jammed, 229 ms
+         * went uncounted, and the timeline slid by exactly that. The unit then
+         * sat at `phase +250217 us` with `buffer 409 ms` for over two minutes,
+         * hunting with +-97 Hz retunes it had no chance of closing, and only
+         * escaped via "no anchorable packet for 5005 ms".
+         *
+         * So a fill that does not fit is treated as a gap too big to fill, which
+         * is the same fault by a different route and already has the right
+         * answer: reset and re-anchor. That costs a few hundred ms of silence
+         * once. The slide costs minutes, and takes the unit out of sync with
+         * every other speaker on the floor while it lasts.
+         *
+         * Counted separately from n_gap_resyncs so the two causes stay
+         * distinguishable -- a gap longer than GAP_RESYNC_MS says the air was
+         * bad, this says the ring could not absorb the burst.
          */
         size_t room = xStreamBufferSpacesAvailable(ring);
         uint32_t can_take = (uint32_t)(room / (AUDIO_CHANNELS * sizeof(int16_t)));
         if (can_take < frames_missing) {
             n_gap_short++;
             n_gap_short_frames += frames_missing - can_take;
-            frames_missing = can_take;
+            n_gap_short_resyncs++;
+            resync_request = true;
+            have_seq = false;
+            return false;
         }
         /*
          * Fill in sequence order. For each missing packet, decode the recovered
@@ -474,7 +502,20 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
             uint32_t got = fill_recovered_then_silence(red, rlen, per);
             filled += got;
             if (got < per) {
-                break;                       /* ring filled mid-packet; counted above */
+                /*
+                 * The ring jammed mid-fill despite having had room a moment ago
+                 * -- the space check above is a snapshot and this task is not
+                 * the only one touching the buffer. Same consequence as the
+                 * check failing outright, so the same answer: the frames owed
+                 * to the timeline are not in it, and re-anchoring is the only
+                 * way back that does not leave the unit permanently early.
+                 */
+                n_gap_short++;
+                n_gap_short_frames += per - got;
+                n_gap_short_resyncs++;
+                resync_request = true;
+                have_seq = false;
+                return false;
             }
         }
     } else if (have_seq && msg->seq < expect_seq) {
