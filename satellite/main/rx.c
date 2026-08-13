@@ -44,6 +44,44 @@ static uint32_t expect_seq;
 static bool have_seq;
 
 /*
+ * The tail of the last audio actually queued, kept so a gap can be concealed
+ * with something other than digital zero.
+ *
+ * A lost packet is ~20 ms. Filling it with zeros is correct for the TIMELINE --
+ * the length has to be exact or every later sample plays early -- and wrong for
+ * the EAR: the output jumps from whatever it was playing to zero and back, and
+ * those two discontinuities are a click at each end. The click is most of what
+ * a dropout sounds like. The missing 20 ms of music, on its own, is much less
+ * objectionable than the edges around it.
+ *
+ * So the fill starts from the last samples that really played and fades them to
+ * silence, and the audio that resumes afterwards is faded in. Nothing here
+ * invents music: past the fade it is still silence, and a long gap still sounds
+ * like a gap. What it removes is the two transients, which cost nothing to
+ * remove and are the part that carries.
+ *
+ * PLC_TAIL_FRAMES is one SBC frame's worth at the usual settings, which is the
+ * most the concealer ever repeats before it has faded out entirely.
+ */
+#define PLC_TAIL_FRAMES 128
+#define PLC_FADE_FRAMES 128          /* ~2.9 ms at 44.1 kHz, both directions */
+static int16_t s_plc_tail[PLC_TAIL_FRAMES * AUDIO_CHANNELS];
+static uint32_t s_plc_have;          /* frames held, 0 until the first decode */
+static uint32_t s_plc_fade_in;       /* frames of fade-in still owed after a gap */
+
+/* Remember the tail of what was just queued. Called with whole frames only. */
+static void plc_note(const int16_t *pcm, uint32_t frames)
+{
+    if (frames == 0) {
+        return;
+    }
+    const uint32_t take = frames > PLC_TAIL_FRAMES ? PLC_TAIL_FRAMES : frames;
+    memcpy(s_plc_tail, pcm + (frames - take) * AUDIO_CHANNELS,
+           (size_t)take * AUDIO_CHANNELS * sizeof(int16_t));
+    s_plc_have = take;
+}
+
+/*
  * Decide whether this packet can start a stream, and start it if so.
  *
  * Returns false when the packet is refused and there is nothing more to do with
@@ -167,6 +205,12 @@ static bool anchor_stream(const audio_msg_t *msg, int64_t offset, bool by_tsf)
     visualiser_flush();
 #endif
     sbc_decoder_init();
+    /* The concealer's tail belongs to the stream that just ended, and the ring
+     * is about to be reset -- fading the new stream's first samples up from
+     * whatever the old one was playing would be a discontinuity invented where
+     * there is none. Playback restarts from a clean buffer either way. */
+    s_plc_have = 0;
+    s_plc_fade_in = 0;
     stream_start_local = start_local;
     stream_offset = offset;
     offset_slew_last = 0;                /* re-seed the slew for this stream */
@@ -315,18 +359,55 @@ static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
         n_fec_short_frames += want_frames - filled;
     }
 
+    /*
+     * The rest is concealed rather than silenced: the last audio that really
+     * played, faded to zero over PLC_FADE_FRAMES, then zeros for however much
+     * gap is left. Same LENGTH as the silence it replaces -- every frame is
+     * still counted into samples_in below, so the timeline is untouched and this
+     * cannot slide the stream. Only the content differs.
+     *
+     * Before the first decode there is nothing to fade from, so it degrades to
+     * exactly the old behaviour.
+     */
+    static int16_t conceal[128 * AUDIO_CHANNELS];
+    uint32_t faded = 0;                  /* frames of fade emitted so far */
+
     while (filled < want_frames) {
         uint32_t left = want_frames - filled;
         uint32_t n = left > 128 ? 128 : left;
+        const int16_t *src = silence;
+
+        if (s_plc_have && faded < PLC_FADE_FRAMES) {
+            for (uint32_t i = 0; i < n; i++) {
+                const uint32_t pos = faded + i;
+                /* Linear ramp to zero; past the ramp the rest of this block is
+                 * zero too, which is what the multiply gives without a branch. */
+                const int32_t gain = pos < PLC_FADE_FRAMES
+                                   ? (int32_t)(PLC_FADE_FRAMES - pos) : 0;
+                const int16_t *s = &s_plc_tail[(pos % s_plc_have) * AUDIO_CHANNELS];
+                for (int c = 0; c < AUDIO_CHANNELS; c++) {
+                    conceal[i * AUDIO_CHANNELS + c] =
+                        (int16_t)((int32_t)s[c] * gain / (int32_t)PLC_FADE_FRAMES);
+                }
+            }
+            src = conceal;
+        }
+
         size_t want = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
-        size_t sent = xStreamBufferSend(ring, silence, want, 0);
+        size_t sent = xStreamBufferSend(ring, src, want, 0);
         uint32_t got = (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
         filled += got;
+        faded += got;
         samples_in += (int32_t)got;
         if (sent < want) {
             break;                           /* raced the playback task; counted above */
         }
     }
+
+    /* Whatever resumes after this gap is ramped back up, so the far edge is not
+     * a step either. Armed even when nothing was concealed: the discontinuity
+     * into real audio exists whether the gap was faded or silent. */
+    s_plc_fade_in = PLC_FADE_FRAMES;
     return filled;
 }
 
@@ -608,6 +689,32 @@ static void decode_into_ring(const audio_msg_t *msg)
         }
         off += consumed;
         size_t want = samples * sizeof(int16_t);
+
+        /*
+         * Ramp back up if a gap just ended. The concealer faded the near edge
+         * down; this is the far edge, and without it the step from silence into
+         * full-level audio is the second of the two clicks a dropout makes.
+         *
+         * In place in pcm[], before the ring sees it and before the visualiser
+         * is fed, so both get the samples that will actually be heard.
+         */
+        if (s_plc_fade_in) {
+            const uint32_t frames = (uint32_t)(samples / AUDIO_CHANNELS);
+            for (uint32_t i = 0; i < frames && s_plc_fade_in; i++) {
+                const int32_t gain =
+                    (int32_t)(PLC_FADE_FRAMES - s_plc_fade_in) + 1;
+                for (int c = 0; c < AUDIO_CHANNELS; c++) {
+                    int16_t *v = &pcm[i * AUDIO_CHANNELS + c];
+                    *v = (int16_t)((int32_t)*v * gain / (int32_t)PLC_FADE_FRAMES);
+                }
+                s_plc_fade_in--;
+            }
+        }
+
+        /* Keep the tail for the next gap, taken from the audio as it will be
+         * heard -- after any fade-in above, not before. */
+        plc_note(pcm, (uint32_t)(samples / AUDIO_CHANNELS));
+
         /* Count what the ring actually took, not what we offered: the same
          * accounting the gap filler above depends on, and a short send here
          * would otherwise bias every later position the other way. */
