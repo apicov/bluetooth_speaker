@@ -1079,6 +1079,19 @@ void visualiser_task(void *arg)
              * -- it counts results that missed the frame they named, and the
              * only fix for it is a larger present_delay_us.
              */
+            /*
+             * DF_RUNS_ANALYSERS, not just DF_ANALYSES_AUDIO. This was the one
+             * reference to the lane that carried no guard, and being the only
+             * one it decided the whole question: an undefined ml_lane_take_stats
+             * pulls ml_lane.cpp into the image on a unit that starts no lane,
+             * runs no analyser and has nothing to report. Every other ml_lane_*
+             * call already sat behind this symbol.
+             *
+             * A unit that takes results from elsewhere keeps the fast/latch half
+             * of the line below -- those are its own numbers -- and simply has no
+             * slow lane to describe.
+             */
+#if DF_RUNS_ANALYSERS
             const df::MlLaneStats ml = df::ml_lane_take_stats();
             ESP_LOGI(TAG, "ml: fast %lld/%lld us (mean/max) | slow %" PRIu32 "/%" PRIu32
                           " us | results %" PRIu32 "+%" PRIu32
@@ -1089,6 +1102,14 @@ void visualiser_task(void *arg)
                      take(s_ml_results), ml.results,
                      s_latch.take_late(), s_latch.take_overrun(),
                      ml.dropped, ml.restarts);
+#else
+            ESP_LOGI(TAG, "ml: fast %lld/%lld us (mean/max) | no local lane"
+                          " | results %" PRIu32
+                          " | late %" PRIu32 " | overrun %" PRIu32,
+                     cost_n ? cost_fast / cost_n : 0, cost_fast_max,
+                     take(s_ml_results),
+                     s_latch.take_late(), s_latch.take_overrun());
+#endif
             cost_fast = cost_fast_max = 0;
             ESP_LOGI(TAG, "cost: analysis %lld/%lld us (mean/max) | render %" PRIu32
                           "/%" PRIu32 " us | pat %" PRIu32 "/%" PRIu32

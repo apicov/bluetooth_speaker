@@ -716,3 +716,47 @@ CONFIG_DANCEFLOOR_WIFI_LOGS=y
 # n_sta_nolease is the only tell. Kept at MAX_CLIENTS so the three move
 # together.
 CONFIG_LWIP_DHCPS_MAX_STATION_NUM=15
+
+# The hub runs NO pluggable analysers, and gives up its own to buy transmit
+# capacity. Pinned here because it was not pinned anywhere: the Kconfig default
+# is DANCEFLOOR_ML_SOURCE_LOCAL, sdkconfig is gitignored, and so a clone of this
+# repo built a hub that started the slow lane while every measurement written
+# above was taken on one that did not.
+#
+# What it costs the hub: nothing it was using. The lane's two analysers are
+# ZcrRms and Mood; the periodic log read `slow 0/0 us` and `results N+0` for the
+# whole of every run captured -- the slow lane produced nothing at all -- and
+# `ml-throt` showed ~77 of the fast one's results a second being computed and
+# thrown away against a 100 ms publish period.
+#
+# What it buys: ~25 kB of INTERNAL SRAM, which is the pool the WiFi static TX
+# buffers come from and the binding constraint on this board. The lane's stream
+# buffer alone is 12.8 kB (16 kHz x 400 ms x 2 B), plus a 4 kB mlan stack and
+# its TCB, plus ~6.3 kB of resampler table and decimation buffer that
+# DF_RUNS_ANALYSERS drops with it. None of it can live in PSRAM:
+# SPIRAM_USE_CAPS_ALLOC means plain malloc and every task stack are internal.
+#
+# The analysers stay in the shared component and stay buildable -- the intent is
+# to run them on a SATELLITE, which has the audio and none of this hub's
+# transmit load. Nothing in the tree compiles that path now, so
+# `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` is what keeps it
+# from rotting.
+CONFIG_DANCEFLOOR_ML_SOURCE_LOCAL=n
+CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
+
+# Nothing to publish once no analyser runs here, so this would send an empty
+# result stream to every satellite. ~10 datagrams/s per satellite, unicast.
+CONFIG_DANCEFLOOR_PUBLISH_ML=n
+
+# Spending the SRAM the line above freed. 26 was not a tuning result, it was
+# what fitted: "26, NOT 32. Each static buffer is ~1.6 kB of INTERNAL memory --
+# the pool that had 7,760 bytes free -- so 32 would need 25.6 kB and only 16 kB
+# was freed by taking the ring from 64 kB to 48 kB." The lane's ~25 kB is the
+# rest of that arithmetic.
+#
+# 32 is the conservative step, not the ceiling. The pool is claimed once inside
+# esp_wifi_init(), long before the heap fragments, so the steady-state `largest`
+# of 3584 is not the budget -- free contiguous memory at init is. Read
+# `MEM: internal ... (min N)` on a run before raising it further; min is the
+# figure that survives the dip, and the one this file's own notes say to trust.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
