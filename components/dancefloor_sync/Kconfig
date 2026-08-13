@@ -165,7 +165,7 @@ menu "Dancefloor audio transport (multicast + FEC)"
 
             frames unicast, 26 buffers   tx-fail 0        sat gaps 0.17/s
             frames MCAST,   26 buffers   tx-fail 14-27    sat gaps 1.1/s
-            frames MCAST,   40 buffers   tx-fail 0        sat gaps 0 in 125 s
+            frames MCAST,   32 buffers   tx-fail 0        sat gaps 0 in 125 s
 
           The first attempt was argued on airtime -- 96xN unicast sends becoming
           ~96 -- and that arithmetic is right and was the wrong question. What
@@ -174,11 +174,11 @@ menu "Dancefloor audio transport (multicast + FEC)"
           immediately with rate adaptation; at dtim_period 1 on a 100 ms beacon
           that is one burst per 100 ms. Audio alone is ~5 frames a burst, and
           86 analysis frames a second makes it ~15, each holding a static TX
-          buffer until its window opens. 26 could not hold that. 40 can, and 40
+          buffer until its window opens. 26 could not hold that. 32 can, and 32
           only became affordable when the hub stopped running the ML lane and
           got ~25 kB of internal SRAM back.
 
-          So this needs ESP_WIFI_STATIC_TX_BUFFER_NUM at 40 or more, and the
+          So this needs ESP_WIFI_STATIC_TX_BUFFER_NUM at 32 or more, and the
           hub's sdkconfig.defaults sets both together for that reason. Turning
           this on without the buffers reproduces the middle row.
 

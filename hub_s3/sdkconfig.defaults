@@ -307,15 +307,28 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 # and 16 static buffers does not absorb the bursts at 222/s. The pre-fix logs
 # reading tx-fail 0 were measuring a hub with its analysis lane dead.
 #
-# 26, NOT 32. Each static buffer is ~1.6 kB of INTERNAL memory -- the pool that
-# had 7,760 bytes free -- so 32 would need 25.6 kB and only 16 kB was freed by
-# taking the ring from 64 kB to 48 kB. 26 is what that buys: +62% on the pool
-# that is actually refusing work. Going further means shrinking the ring past the
-# feed burst it has to absorb, and hub.h says why that is where the line is.
+# WAS 26, NOW 32, and the reason 26 was the ceiling has gone away. Each static
+# buffer is ~1.6 kB of INTERNAL memory; the pool had 7,760 bytes free, so 32
+# would have needed 25.6 kB against the 16 kB freed by taking the ring from
+# 64 kB to 48 kB. 26 was what that bought.
+#
+# The hub then stopped running its ML lane (DANCEFLOOR_ML_SOURCE_REMOTE below)
+# and got ~24.9 kB of internal SRAM back -- measured, `MEM: internal` min going
+# 6740 -> 22012 with the 26 -> 32 step already paid for out of it. That is what
+# 32 is spent from, not the ring, which stays at 48 kB and keeps the feed-burst
+# margin hub.h argues for.
+#
+# 32 IS WHAT WAS MEASURED, and it is enough for the DTIM burst that
+# DANCEFLOOR_MCAST_FRAMES creates: with analysis frames on the group the hub
+# reads `tx-fail 0 (0 audio)` and the satellite `gaps 0` over 125 s, where 26
+# gave `tx-fail 14-27 audio` per 20 s window. 40 was written here briefly and
+# never reached a board -- an existing sdkconfig kept 32 and the run that passed
+# was at 32. Do not raise it on the strength of that; there is headroom
+# (`min 28948` free with the log shipper off) but no measurement above 32.
 #
 # Falsified by tx-fail itself, which is the counter CACHE_TX_BUFFER_NUM is pinned
 # to 0 further down to keep honest.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=26
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
 
 # The socket's receive queue, in datagrams. IDF defaults to 6 and the boot
 # banner prints it as `udp mbox: 6`.
@@ -763,43 +776,12 @@ CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
 # result stream to every satellite. ~10 datagrams/s per satellite, unicast.
 CONFIG_DANCEFLOOR_PUBLISH_ML=n
 
-# Spending the SRAM the line above freed. 26 was not a tuning result, it was
-# what fitted: "26, NOT 32. Each static buffer is ~1.6 kB of INTERNAL memory --
-# the pool that had 7,760 bytes free -- so 32 would need 25.6 kB and only 16 kB
-# was freed by taking the ring from 64 kB to 48 kB." The lane's ~25 kB is the
-# rest of that arithmetic.
-#
-# 32 is the conservative step, not the ceiling. The pool is claimed once inside
-# esp_wifi_init(), long before the heap fragments, so the steady-state `largest`
-# of 3584 is not the budget -- free contiguous memory at init is. Read
-# `MEM: internal ... (min N)` on a run before raising it further; min is the
-# figure that survives the dip, and the one this file's own notes say to trust.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=40
-
-# 32 -> 40 on the measurement, not on the estimate. With the lane gone the hub
-# reads `MEM: internal 25032 free (min 22012, largest 13824)` against a baseline
-# of `8764 free (min 6740, largest 3584)`. min is up 15.3 kB AFTER the 26 -> 32
-# step had already spent ~9.6 kB of it, so the lane really did return ~24.9 kB --
-# the Kconfig's "about 25 kB" to the hundred bytes.
-#
-# 8 more buffers is ~12.8 kB, leaving ~9 kB of min. Not all 13 that would fit:
-# the pool is claimed at esp_wifi_init() and everything else on this unit
-# allocates after it, so spending the margin here would move a failure rather
-# than remove one. `largest` tripling to 13824 matters as much as the total --
-# a 1.6 kB contiguous request now has room it did not have.
-#
-# This exists for the DTIM BURST, not for the average. Group-addressed frames
-# leave in one burst per beacon, and 26 buffers could not hold audio plus 86
-# analysis frames a second (~15 per burst); that is what took the floor down
-# when DANCEFLOOR_MCAST_FRAMES was first tried. 40 is the pool that makes
-# retrying it a fair question.
-
-# MEASURED, AND IT WORKS AT 40 BUFFERS. Overrides the Kconfig default of n,
+# MEASURED, AND IT WORKS AT 32 BUFFERS. Overrides the Kconfig default of n,
 # which stays n because it is the right answer for a hub with the 26 static TX
-# buffers that default implies. This one has 40, which is the whole point of the
+# buffers that default implies. This one has 32, which is the whole point of the
 # two settings above -- they belong together and neither is safe alone.
 #
-# The question was narrow: does a 40-buffer pool absorb a DTIM burst of ~15
+# The question was narrow: does a 32-buffer pool absorb a DTIM burst of ~15
 # group frames, where 26 could not? It does. The run:
 #
 #   hub  tx-fail 0 (0 audio) | cong-skip 0 | 50 pkts/s | frames mcast
@@ -814,7 +796,7 @@ CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=40
 # satellites that is ~316/s against ~1490/s, and only the probe traffic still
 # scales.
 #
-# If this is ever turned on WITHOUT the 40 buffers it reproduces the failure it
+# If this is ever turned on WITHOUT the 32 buffers it reproduces the failure it
 # came from -- `tx-fail 14-27 audio` per 20 s and the satellite's gap rate
 # tracking it one for one at 1.1/s. The burst, not the average, is what empties
 # the pool, so the two settings move together or not at all.
