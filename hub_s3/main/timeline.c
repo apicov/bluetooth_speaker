@@ -438,25 +438,6 @@ s_vis_anchor_due = next_play_at;
  */
 #if CONFIG_DANCEFLOOR_AUDIO_MCAST
 /*
- * The group address audio goes to under multicast. Built once, lazily, on the
- * first send -- send_audio_to_group() is the only sender. One sendto to this
- * instead of one per satellite is the whole point of the mode: airtime stops
- * scaling with speaker count.
- */
-static struct sockaddr_in s_mcast_addr;
-static bool s_mcast_addr_ready;
-static void ensure_mcast_addr(void)
-{
-    if (s_mcast_addr_ready) {
-        return;
-    }
-    s_mcast_addr.sin_family = AF_INET;
-    s_mcast_addr.sin_port = htons(SYNC_PORT);
-    inet_pton(AF_INET, CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP, &s_mcast_addr.sin_addr);
-    s_mcast_addr_ready = true;
-}
-
-/*
  * One group-addressed sendto for the audio. Group frames are never acknowledged
  * or retried, so this trades reliability for airtime that no longer scales with
  * speaker count -- the residual loss is what the FEC redundancy attached in
@@ -467,7 +448,6 @@ static void ensure_mcast_addr(void)
  */
 static void send_audio_to_group(size_t bytes)
 {
-    ensure_mcast_addr();
     /* MSG_DONTWAIT, not flags=0: this runs in the SBC receive task that also
      * decodes and feeds the hub's OWN local ring. A multicast sendto has no ACK
      * and can wait for a TX slot -- a group frame is buffered and drained at the
@@ -479,7 +459,7 @@ static void send_audio_to_group(size_t bytes)
      * to feed and decode the next packet. The satellites still receive: the
      * queue drains faster than the stream fills it, so EAGAIN is the exception. */
     if (sendto(sock, &msg, bytes, MSG_DONTWAIT,
-               (struct sockaddr *)&s_mcast_addr, sizeof(s_mcast_addr)) < 0) {
+               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
         tx_fail_note(errno);
     }
 }

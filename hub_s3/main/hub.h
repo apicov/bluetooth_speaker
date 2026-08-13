@@ -809,6 +809,11 @@ void retune_dac(uint32_t hz);
 /* net.c -- SoftAP and the sync socket. */
 void wifi_start_ap(void);
 void socket_start(void);
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+/* The group address, resolved once and owned by net.c. Both the audio path and
+ * the analysis frames send to it; see the note beside the definition. */
+const struct sockaddr_in *mcast_addr(void);
+#endif
 
 /* clients.c -- the send list, and every fan-out over it.
  *

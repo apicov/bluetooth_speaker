@@ -262,12 +262,13 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
  * Registered as the visualiser's publisher, so it runs on the analysis task --
  * which means it must not block. sendto() on a UDP socket does not.
  *
- * Unicast, like the audio and for the same reason: group-addressed frames are
- * never acknowledged and so never retried, measured at ~20% loss here, and a
- * fifth of the frames missing is a visibly broken strip. ~5 kB/s per listener
- * against the 30-40 the audio already costs.
+ * One group send, or one per satellite -- see DANCEFLOOR_MCAST_FRAMES for why
+ * the group is now the default and why the "~20% loss" objection that kept this
+ * unicast was a measurement of the 1 Mbps basic rate rather than of multicast.
+ * The frame is identical for every listener either way, which is what makes the
+ * choice a pure transport question.
  *
- * A failed send costs a satellite one frame out of 43 a second. It is counted
+ * A failed send costs a satellite one frame out of 86 a second. It is counted
  * with the audio's own failures rather than separately -- the interesting
  * question is whether the link is dropping things, not which kind.
  */
@@ -287,6 +288,18 @@ void publish_frame(const vis_frame_t *f)
     memcpy(msg.payload, f, sizeof(*f));
     const size_t bytes = FRAME_MSG_BYTES(sizeof(*f));
 
+#if CONFIG_DANCEFLOOR_MCAST_FRAMES
+    /* Blocking (flags=0), unlike the audio group send. This runs on the analysis
+     * task, which is below playback and feeds nothing on the audio path, so a
+     * moment spent waiting for a transmit buffer costs a late frame rather than
+     * a hole in the sound -- and waiting is better than the drop that
+     * MSG_DONTWAIT would make of it. The audio path cannot make that trade
+     * because it shares a task with the hub's own ring feed. */
+    if (sendto(sock, &msg, bytes, 0,
+               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
+        tx_fail_note(errno);
+    }
+#else
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
@@ -299,6 +312,7 @@ void publish_frame(const vis_frame_t *f)
             tx_fail_note(errno);
         }
     }
+#endif
 }
 #endif
 
@@ -341,6 +355,16 @@ void publish_ml(const ml_result_t *r)
     memcpy(msg.payload, r, sizeof(*r));
     const size_t bytes = ML_MSG_BYTES(sizeof(*r));
 
+#if CONFIG_DANCEFLOOR_MCAST_FRAMES
+    /* Rides the same switch as the frames: a result is identical for every
+     * listener for exactly the same reason, and the two would be perverse to
+     * separate -- the smaller, rarer message is not the one worth keeping ACKed
+     * once the larger, faster one is not. */
+    if (sendto(sock, &msg, bytes, 0,
+               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
+        tx_fail_note(errno);
+    }
+#else
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
@@ -353,5 +377,6 @@ void publish_ml(const ml_result_t *r)
             tx_fail_note(errno);
         }
     }
+#endif
 }
 #endif

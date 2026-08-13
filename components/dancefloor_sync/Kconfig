@@ -154,6 +154,37 @@ menu "Dancefloor audio transport (multicast + FEC)"
           the default IP_MULTICAST_TTL of 1 is correct and no routing is involved.
           Both ends must match.
 
+    config DANCEFLOOR_MCAST_FRAMES
+        bool "Send LED analysis frames to the group too"
+        default y
+        depends on DANCEFLOOR_AUDIO_MCAST
+        help
+          An analysis frame is byte-identical for every satellite -- the whole
+          point of computing it in one place is that no algorithm has to be proved
+          deterministic across units -- and it was still sent once per satellite.
+          At ~86 frames a second that made the hub's transmit rate 50 + ~96xN
+          packets, so the analysis traffic passed the audio at two satellites and
+          buried it at ten. This makes it ~96, flat, and it is what lets a floor
+          scale past the handful the bench has run.
+
+          THE OBJECTION IN THE CODE WAS REAL AND IS NOW OBSOLETE. publish_frame()
+          carried "group-addressed frames are never acknowledged, measured at ~20%
+          loss here, and a fifth of the frames missing is a visibly broken strip".
+          That measurement was taken at the 1 Mbps 11b basic rate, which is also
+          what made audio multicast fail the first time. wifi_start_ap() drops 11b
+          now, the group rate is the 6 Mbps OFDM basic rate, and measured group
+          loss is 0.2-0.3%. One frame in ~400 is not a visibly broken strip.
+
+          Separate from DANCEFLOOR_AUDIO_MCAST, which it depends on for the
+          group membership, because the two have different loss tolerances: a lost
+          audio packet is a hole in the sound and a lost frame is one dropped
+          video frame on a strip redrawn 86 times a second. Turning this off
+          returns the strips to ACKed unicast without giving up the audio
+          transport, which is the experiment worth being able to run separately.
+
+          No satellite change: a satellite already joins the group for audio and
+          already receives MSG_FRAME on that socket.
+
     config DANCEFLOOR_AUDIO_FEC_DEPTH
         int "Piggyback redundancy depth (previous packets carried)"
         default 1

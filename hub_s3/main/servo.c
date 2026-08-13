@@ -97,12 +97,13 @@ void servo_tick(void)
         tx_fail_summary(why, sizeof(why));
         ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us (smoothed %+ld us) | "
                       "tx-fail %" PRIu32 "%s | ml-throt %" PRIu32 " | cong-skip %" PRIu32
-                      " | xport %s fec %d",
+                      " | xport %s fec %d frames %s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
                  (long)s_phase_err_us, (long)s_err_ema, s_tx_fail, why,
                  n_ml_throttled, n_tx_cong_skip,
-                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH);
+                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
+                 FRAMES_TRANSPORT_TAG);
         s_tx_fail = 0;
         n_ml_throttled = 0;
         n_tx_cong_skip = 0;

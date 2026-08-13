@@ -342,3 +342,34 @@ void socket_start(void)
     };
     assert(bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0);
 }
+
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+/*
+ * The group every satellite is listening to, resolved once.
+ *
+ * Lives here, beside the socket it is sent on, because it now has two senders:
+ * the audio path in timeline.c and the analysis frames in clients.c. It began as
+ * a static in timeline.c when audio was the only thing addressed to the group,
+ * and a second copy in clients.c would be two parses of one Kconfig string that
+ * nothing checks agree -- the same shape of fault as the SSID that used to be
+ * #defined once per firmware.
+ *
+ * Built lazily rather than in socket_start() so it stays independent of start
+ * order; inet_pton on a compile-time constant is not worth guarding beyond the
+ * once-only flag.
+ */
+static struct sockaddr_in s_mcast_addr;
+static bool s_mcast_addr_ready;
+
+const struct sockaddr_in *mcast_addr(void)
+{
+    if (!s_mcast_addr_ready) {
+        s_mcast_addr.sin_family = AF_INET;
+        s_mcast_addr.sin_port = htons(SYNC_PORT);
+        inet_pton(AF_INET, CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP,
+                  &s_mcast_addr.sin_addr);
+        s_mcast_addr_ready = true;
+    }
+    return &s_mcast_addr;
+}
+#endif

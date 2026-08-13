@@ -557,6 +557,21 @@ typedef struct __attribute__((packed)) {
 #define AUDIO_TRANSPORT_TAG "unicast"
 #endif
 
+/*
+ * The same for the analysis frames, which are a separate switch
+ * (DANCEFLOOR_MCAST_FRAMES) because they are a separate loss budget. Printed by
+ * the hub only -- a satellite receives frames and has no transport to report --
+ * and printed for the same reason as the audio tag: at 86 frames a second per
+ * satellite this is the difference between a hub that transmits ~146 packets a
+ * second and one that transmits over a thousand, which is far too large a
+ * difference to have to infer from a boot line that has scrolled away.
+ */
+#if CONFIG_DANCEFLOOR_MCAST_FRAMES
+#define FRAMES_TRANSPORT_TAG "mcast"
+#else
+#define FRAMES_TRANSPORT_TAG "unicast"
+#endif
+
 typedef struct __attribute__((packed)) {
     uint16_t red_len;        /* bytes of red_payload that follow; 0 == none */
     uint8_t  red_seq_ofs;    /* this recovers the packet (seq - red_seq_ofs) */
