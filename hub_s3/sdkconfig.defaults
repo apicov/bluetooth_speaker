@@ -759,4 +759,45 @@ CONFIG_DANCEFLOOR_PUBLISH_ML=n
 # of 3584 is not the budget -- free contiguous memory at init is. Read
 # `MEM: internal ... (min N)` on a run before raising it further; min is the
 # figure that survives the dip, and the one this file's own notes say to trust.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=40
+
+# 32 -> 40 on the measurement, not on the estimate. With the lane gone the hub
+# reads `MEM: internal 25032 free (min 22012, largest 13824)` against a baseline
+# of `8764 free (min 6740, largest 3584)`. min is up 15.3 kB AFTER the 26 -> 32
+# step had already spent ~9.6 kB of it, so the lane really did return ~24.9 kB --
+# the Kconfig's "about 25 kB" to the hundred bytes.
+#
+# 8 more buffers is ~12.8 kB, leaving ~9 kB of min. Not all 13 that would fit:
+# the pool is claimed at esp_wifi_init() and everything else on this unit
+# allocates after it, so spending the margin here would move a failure rather
+# than remove one. `largest` tripling to 13824 matters as much as the total --
+# a 1.6 kB contiguous request now has room it did not have.
+#
+# This exists for the DTIM BURST, not for the average. Group-addressed frames
+# leave in one burst per beacon, and 26 buffers could not hold audio plus 86
+# analysis frames a second (~15 per burst); that is what took the floor down
+# when DANCEFLOOR_MCAST_FRAMES was first tried. 40 is the pool that makes
+# retrying it a fair question.
+
+# UNDER TEST. Overrides the Kconfig default of n, which stays n because it is
+# the right answer for a hub with the 26 static TX buffers that default implies.
+# This one has 40, which is the whole point of the two settings above.
+#
+# The question is narrow: does a 40-buffer pool absorb a DTIM burst of ~15
+# group frames, where 26 could not? Group-addressed frames are held and released
+# once per beacon, so audio (~5 per burst) plus 86 analysis frames a second
+# (~10 more) is what emptied the pool on 2026-08-13 -- `tx-fail 14-27 audio` per
+# 20 s window and the satellite's gap rate tracking it one for one at 1.1/s.
+#
+# It is worth retrying because it is the only change that makes the hub's
+# transmit rate FLAT in speaker count: 50 + 96xN packets/s becomes ~146,
+# whatever N is. Unicast frames are affordable at two satellites and arithmetic
+# says they are not at fifteen.
+#
+# READ tx-fail AND the satellite's gaps together, not tx-fail alone. Baseline to
+# beat, from the run that measured the freed SRAM: `tx-fail 0 (0 audio)`,
+# `50 pkts/s`, satellite `gaps 8` in 545 s. If tx-fail leaves zero, this goes
+# back out and the answer is that the burst -- not the buffer count -- is the
+# wall, and 10+ satellites needs a longer beacon interval or a smaller frame
+# rather than a bigger number.
+CONFIG_DANCEFLOOR_MCAST_FRAMES=y
