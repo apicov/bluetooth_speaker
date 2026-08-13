@@ -698,11 +698,26 @@ CONFIG_ESP_WIFI_RX_BA_WIN=6
 CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
-# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
-# production flash, where the shipper compiles out entirely. The hub also
-# relays every satellite's logs to the collector, so this is the one unit that
-# must have it on for centralised capture to work.
-CONFIG_DANCEFLOOR_WIFI_LOGS=y
+# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only, and now OFF by
+# default -- which is what the line above always said and what this setting
+# contradicted. The Kconfig default is n; these two files were the only thing
+# turning it on.
+#
+# Off because it is not free on the resource this hub is short of. Every
+# ESP_LOG line becomes a datagram, and the hub relays every satellite's as well,
+# so it is bursty unicast traffic drawn from the same static TX buffer pool that
+# the audio and the analysis frames are competing for -- and a burst of log
+# lines is exactly what a fault produces, so the instrument gets loudest at the
+# moment it can least afford to. The satellite's own Kconfig help records the
+# sharper version of this: a blocking log write in the receive path "starves the
+# UDP mailbox and causes the very loss it was logging".
+#
+# WHAT TURNING IT OFF COSTS: tools/log_collector/collect.py stops working, and a
+# satellite's log is then only readable on that satellite's own serial port.
+# Turn it back on -- here and on every satellite, they must agree -- for any run
+# where centralised capture is worth the airtime. It compiles out entirely when
+# unset: no shipper task, no queue, no wifi_log symbols.
+CONFIG_DANCEFLOOR_WIFI_LOGS=n
 
 # How many DHCP leases the SoftAP can hand out. IDF's default is 8, which was
 # invisible while MAX_CLIENTS was also 8: it agreed by coincidence rather than

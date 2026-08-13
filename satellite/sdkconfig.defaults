@@ -153,7 +153,20 @@ CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
 CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=y
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
-# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only -- off in a
-# production flash, where the shipper compiles out entirely. Each satellite
-# ships to the hub, which relays to the collector.
-CONFIG_DANCEFLOOR_WIFI_LOGS=y
+# laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only, and now OFF by
+# default -- which is what the line above always said and what this setting
+# contradicted. The Kconfig default is n; this file was the only thing turning
+# it on here.
+#
+# The reason is sharper on this unit than on the hub. The shipper is already
+# built to be safe -- a low-priority task behind a drop-on-full queue, precisely
+# because a blocking log write in rx_task starves the UDP mailbox and causes the
+# very loss it was logging -- but safe is not free: the datagrams still go out
+# over the radio the audio arrives on, and they are burstiest exactly when
+# something has gone wrong.
+#
+# Must agree with the hub's setting for centralised capture to work at all: this
+# unit ships to the hub and the hub relays. Turn both on together for a run
+# where that is worth the airtime; otherwise this unit's log is on its own
+# serial port.
+CONFIG_DANCEFLOOR_WIFI_LOGS=n
