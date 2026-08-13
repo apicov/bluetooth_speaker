@@ -247,20 +247,24 @@ static void rx_task(void *arg)
              * with it, and why there are two of them. */
             static int16_t pcm[SBC_MAX_PCM_SAMPLES];
             /*
-             * Sent in spans of at most AUDIO_TX_PAYLOAD_MAX, cut on SBC frame
-             * boundaries, rather than one packet per A2DP payload.
+             * Normally one packet per A2DP payload, exactly as before. The span
+             * machinery exists for the one case that could never have worked: a
+             * payload too large for one datagram, which is AUDIO_TX_PAYLOAD_MTU_MAX
+             * at 1446 bytes and which a phone sending ~825 does not reach. It
+             * does not bind, so the packet rate is what every captured log shows.
              *
-             * The cap is what lets the FEC attach a WHOLE copy of a previous
-             * payload inside the MTU. At ~825-byte payloads there was room for
-             * only ~618 bytes of copy, so every "recovered" packet still ended
-             * in silence; capping at 721 costs ~8 more packets a second and
-             * removes it. It also stops the no-FEC path fragmenting: a 1500-byte
-             * A2DP payload used to become a 1526-byte datagram, over the MTU,
-             * because the only ceiling checked was AUDIO_MAX_PAYLOAD at 2048.
+             * IT WAS AUDIO_TX_PAYLOAD_MAX -- 721 at depth 1, the cap whole-copy
+             * redundancy needs -- and that binds on every payload, so every one
+             * became two datagrams and the audio packet rate doubled. See that
+             * macro for what the hub did under it; the short version is 15% of
+             * its own audio discarded at the socket, and a timeline slewing at
+             * twice the rate the satellites could follow. The threshold is the
+             * whole difference between the two behaviours, which is why it is
+             * named for what it protects rather than for a number.
              *
-             * The split is free here. This loop already walks SBC frames and
-             * already knows each one's byte length, so nothing has to parse SBC
-             * a second time to find a boundary it is safe to cut on.
+             * The split is free where it is. This loop already walks SBC frames
+             * and knows each one's length, so nothing parses SBC twice to find a
+             * boundary it is safe to cut on.
              */
             size_t off = 0;
             size_t span_off = 0;        /* first byte not yet sent */
@@ -297,7 +301,7 @@ static void rx_task(void *arg)
                  * position would be dated to audio already fed.
                  */
                 if (span_frames > 0 &&
-                    (off - span_off) + consumed > AUDIO_TX_PAYLOAD_MAX) {
+                    (off - span_off) + consumed > AUDIO_TX_PAYLOAD_MTU_MAX) {
                     streamer_send_sbc(payload + span_off,
                                       (uint16_t)(off - span_off),
                                       span_frames, first_span && tagged);

@@ -41,6 +41,7 @@ volatile bool s_playing;
 volatile uint32_t s_feed_dropped;
 volatile uint32_t s_tx_fail;
 volatile uint32_t s_tx_fail_audio;
+volatile uint32_t s_audio_pkts;
 volatile uint32_t n_ml_throttled;
 volatile uint32_t n_tx_cong_skip;
 volatile int64_t s_tx_congested_until;

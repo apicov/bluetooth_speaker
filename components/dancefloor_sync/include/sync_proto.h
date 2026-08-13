@@ -517,31 +517,55 @@ typedef struct __attribute__((packed)) {
 #endif
 
 /*
- * The largest payload a sender may put in one packet, so that DEPTH whole
- * copies of previous payloads still fit beside it.
+ * The largest payload for which DEPTH whole copies would still fit one datagram.
  *
- * This is what makes the depth knob mean something. DANCEFLOOR_AUDIO_FEC_DEPTH
- * offers 0-4 and, before this existed, delivered 0-or-1: one truncated copy
- * already filled the MTU, so depths 2-4 attached nothing and the Kconfig range
- * was decoration. Deriving the payload cap FROM the depth inverts that -- ask
- * for depth 2 and packets get smaller until two whole copies fit.
+ *   depth 0 -> 1446 B      depth 1 -> 721 B      depth 2 -> 480 B
  *
- *   depth 0 -> 1446 B   (no redundancy; the cap is the MTU and never binds)
- *   depth 1 ->  721 B   (~58 packets/s, ~85 kB/s on the wire)
- *   depth 2 ->  480 B   (~100 packets/s, and twice the TX-buffer pressure)
+ * NOT APPLIED, AND THE REASON IS THE POINT. Capping the payload at 721 is what
+ * whole-copy redundancy at depth 1 would require, and it was tried: a phone
+ * sends ~825-byte payloads, so the cap binds on EVERY one, and every payload
+ * becomes two datagrams instead of one. That doubles the audio packet rate,
+ * 50/s to ~100/s, and the hub has 26 static TX buffers in ~6.7 kB of free
+ * internal SRAM. Measured consequence, 2026-08-13: `tx-fail 370 (312 audio)` in
+ * a 20 s window -- about 15% of the hub's own audio discarded before it reached
+ * the air, where the baseline was 92 failures in 365 s.
  *
- * The cap is on the payload a sender OFFERS, not on what a receiver accepts: a
- * receiver still reads payload_len and trailing blocks by length, so it reads an
- * uncapped sender unchanged. AUDIO_MAX_PAYLOAD stays at 2048 for that reason --
- * it is the buffer ceiling, this is the packetisation policy.
+ * It broke synchronisation too, by a second route nobody would have predicted
+ * from the packet size alone. TIMELINE_SLEW_US is 20 us PER PACKET, sized
+ * against ~50 packets/s to give 1 ms/s inside the servo's 2.27 ms/s ceiling.
+ * Doubling the packet rate doubled the slew to ~2 ms/s, which is the ceiling,
+ * and the satellites could no longer follow: phase ran to +271 ms, anchors were
+ * refused 40 at a time, and the units re-anchored every few seconds.
  *
- * Parameterised by depth as well as fixed, so the host test can check all three
- * rows above without three builds.
+ * So this stays as arithmetic, not as policy. Whole-copy FEC needs
+ * 2 x 825 + 29 = 1679 bytes against a 1472-byte MTU -- it CANNOT fit, at any
+ * bitpool a phone is likely to negotiate -- so it requires smaller packets,
+ * which require more packets, which require transmit capacity this hub does not
+ * have. Fix the capacity first (ESP_WIFI_CACHE_TX_BUFFER_NUM, and internal SRAM
+ * for more static buffers); then this constant becomes usable, and anything
+ * that starts applying it must also make TIMELINE_SLEW_US per-unit-of-audio
+ * rather than per-packet.
+ *
+ * Parameterised by depth so the host test can check every row without three
+ * builds, and kept compiled so the relationship cannot rot while it waits.
  */
 #define AUDIO_TX_PAYLOAD_MAX_AT(depth)                                        \
     ((AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0) - (depth) * AUDIO_RED_HDR_BYTES)     \
      / ((depth) + 1))
 #define AUDIO_TX_PAYLOAD_MAX AUDIO_TX_PAYLOAD_MAX_AT(AUDIO_FEC_DEPTH)
+
+/*
+ * What IS applied: the cap that stops a datagram exceeding the MTU at all.
+ *
+ * This is AUDIO_TX_PAYLOAD_MAX_AT(0) -- header plus payload, no redundancy --
+ * and at ~825-byte payloads it never binds, so the packet rate is unchanged from
+ * every log ever captured. It exists for the case that always could have
+ * fragmented and never had a guard: a 1500-byte A2DP payload becoming a
+ * 1526-byte datagram, since the only ceiling checked was AUDIO_MAX_PAYLOAD at
+ * 2048. The FEC attach path clamps its own copies to what is left, so it cannot
+ * push a packet over on its own.
+ */
+#define AUDIO_TX_PAYLOAD_MTU_MAX AUDIO_TX_PAYLOAD_MAX_AT(0)
 
 /*
  * Which downlink this build speaks, as a short tag for the periodic status

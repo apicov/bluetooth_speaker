@@ -122,6 +122,7 @@ void servo_tick(void)
                       "(median %+ld%s, smoothed %+ld us) | "
                       "tx-fail %" PRIu32 " (%" PRIu32 " audio)%s | ml-throt %" PRIu32
                       " | cong-skip %" PRIu32
+                      " | %lu pkts/s"
                       " | xport %s fec %d frames %s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
@@ -130,10 +131,12 @@ void servo_tick(void)
                  s_phase_med_valid ? "" : " n/a",
                  (long)s_err_ema, s_tx_fail, s_tx_fail_audio, why,
                  n_ml_throttled, n_tx_cong_skip,
+                 (unsigned long)(s_audio_pkts / (uint32_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S),
                  AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
                  FRAMES_TRANSPORT_TAG);
         s_tx_fail = 0;
         s_tx_fail_audio = 0;   /* same window as the total it is a subset of */
+        s_audio_pkts = 0;
         n_ml_throttled = 0;
         n_tx_cong_skip = 0;
     }

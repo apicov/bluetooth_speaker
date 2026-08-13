@@ -448,6 +448,23 @@ extern volatile bool s_playing;
  * like a starving ring, which is why it needs a counter. */
 extern volatile uint32_t s_feed_dropped;
 extern volatile uint32_t s_tx_fail;   /* sendto() rejections */
+/*
+ * Audio datagrams handed to fan_out() this window, printed as a rate.
+ *
+ * The packet RATE is a load-bearing number that nothing reported. Two constants
+ * are sized against it -- TIMELINE_SLEW_US is per packet and assumes ~50/s, and
+ * the TX buffer pool is consumed per packet -- so a change to packetisation
+ * moves the timeline slew and the transmit pressure together, silently. A commit
+ * that doubled it got through review, a build and two test suites, and was only
+ * caught by a floor that stopped working. `pkts/s` on the status line is what
+ * would have caught it in the first log window.
+ *
+ * Note this is NOT sbc_in's `pkts`, which counts SPI frames from the bridge:
+ * that stayed at ~250 per window throughout, because the fault was downstream of
+ * it. The two numbers were equal until packetisation stopped being one-to-one,
+ * which is exactly when it mattered that they are different questions.
+ */
+extern volatile uint32_t s_audio_pkts;
 /* ... and the subset of them that were AUDIO, which is the only subset that is
  * audible. See tx_fail_note_audio(). */
 extern volatile uint32_t s_tx_fail_audio;

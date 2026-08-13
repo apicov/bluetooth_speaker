@@ -502,6 +502,10 @@ static void send_audio_to_clients(size_t bytes)
  */
 static void fan_out(size_t bytes, int64_t now)
 {
+    /* Counted here rather than at either sendto, so it is the rate the
+     * timeline slews at and the rate the TX pool sees, not the rate that
+     * happened to succeed. See s_audio_pkts. */
+    s_audio_pkts++;
     clients_age(now);
 #if CONFIG_DANCEFLOOR_AUDIO_MCAST
     send_audio_to_group(bytes);
