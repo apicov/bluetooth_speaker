@@ -118,16 +118,16 @@ menu "Dancefloor radio pairing"
 
 endmenu
 
-menu "Dancefloor audio transport (experimental: multicast + FEC)"
+menu "Dancefloor audio transport (multicast + FEC)"
 
-    comment "Audio is unicast per satellite by default. These opt into sending it to a"
-    comment "WiFi multicast group, with optional piggyback redundancy (FEC) so a single"
-    comment "lost datagram is recovered at the far end instead of becoming a gap."
-    comment "Default OFF: unset, the build is the shipped unicast+throttle path."
+    comment "Audio goes to a WiFi multicast group by default, with piggyback redundancy"
+    comment "(FEC) so a single lost datagram is recovered at the far end instead of"
+    comment "becoming a gap. Unsetting DANCEFLOOR_AUDIO_MCAST restores the per-satellite"
+    comment "unicast downlink -- ACKed and retried, but airtime scales with speaker count."
 
     config DANCEFLOOR_AUDIO_MCAST
         bool "Send audio to a multicast group instead of per-satellite unicast"
-        default n
+        default y
         help
           One group-addressed sendto instead of one per satellite: airtime stops
           scaling with speaker count. The cost is reliability -- group frames are
@@ -156,7 +156,7 @@ menu "Dancefloor audio transport (experimental: multicast + FEC)"
 
     config DANCEFLOOR_AUDIO_FEC_DEPTH
         int "Piggyback redundancy depth (previous packets carried)"
-        default 0
+        default 1
         range 0 4
         help
           How many previous audio payloads each packet piggybacks as trailing
