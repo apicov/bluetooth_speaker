@@ -156,9 +156,33 @@ menu "Dancefloor audio transport (multicast + FEC)"
 
     config DANCEFLOOR_MCAST_FRAMES
         bool "Send LED analysis frames to the group too"
-        default y
+        default n
         depends on DANCEFLOOR_AUDIO_MCAST
         help
+          DEFAULT n, AND THE ORIGINAL OBJECTION WAS RIGHTER THAN THE REASON GIVEN
+          FOR OVERRIDING IT. Turning this on cost audio rather than saving it:
+
+            frames unicast, fec 0 (13:02, 13:30)   hub tx-fail 0
+            frames MCAST,   fec 0 (18:14)          tx-fail 14-27 AUDIO per 20 s
+
+          and the satellite's gap rate tracked that almost one for one -- 1.1
+          gaps/s against ~1 audio packet a second discarded at the hub, which is
+          three times the loss of the run this was supposed to improve.
+
+          The mechanism is not airtime, which is what the change was argued on.
+          A SoftAP buffers GROUP-addressed frames and releases them in a burst
+          after each DTIM beacon, while unicast goes out immediately with rate
+          adaptation. At dtim_period 1 and a 100 ms beacon that is one burst per
+          100 ms: with audio alone on the group it was ~5 frames a burst, and
+          adding 86 analysis frames and the ML results a second makes it ~15,
+          each holding one of the hub's 26 static TX buffers until its window
+          opens. The pool empties on the burst, not on the average.
+
+          So the airtime arithmetic below is correct and was the wrong question.
+          Keep it for whoever revisits this with a bigger buffer pool or a longer
+          DTIM period, where the scaling argument still holds.
+
+
           An analysis frame is byte-identical for every satellite -- the whole
           point of computing it in one place is that no algorithm has to be proved
           deterministic across units -- and it was still sent once per satellite.
