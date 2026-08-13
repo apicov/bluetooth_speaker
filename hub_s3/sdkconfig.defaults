@@ -794,25 +794,32 @@ CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=40
 # when DANCEFLOOR_MCAST_FRAMES was first tried. 40 is the pool that makes
 # retrying it a fair question.
 
-# UNDER TEST. Overrides the Kconfig default of n, which stays n because it is
-# the right answer for a hub with the 26 static TX buffers that default implies.
-# This one has 40, which is the whole point of the two settings above.
+# MEASURED, AND IT WORKS AT 40 BUFFERS. Overrides the Kconfig default of n,
+# which stays n because it is the right answer for a hub with the 26 static TX
+# buffers that default implies. This one has 40, which is the whole point of the
+# two settings above -- they belong together and neither is safe alone.
 #
-# The question is narrow: does a 40-buffer pool absorb a DTIM burst of ~15
-# group frames, where 26 could not? Group-addressed frames are held and released
-# once per beacon, so audio (~5 per burst) plus 86 analysis frames a second
-# (~10 more) is what emptied the pool on 2026-08-13 -- `tx-fail 14-27 audio` per
-# 20 s window and the satellite's gap rate tracking it one for one at 1.1/s.
+# The question was narrow: does a 40-buffer pool absorb a DTIM burst of ~15
+# group frames, where 26 could not? It does. The run:
 #
-# It is worth retrying because it is the only change that makes the hub's
-# transmit rate FLAT in speaker count: 50 + 96xN packets/s becomes ~146,
-# whatever N is. Unicast frames are affordable at two satellites and arithmetic
-# says they are not at fifteen.
+#   hub  tx-fail 0 (0 audio) | cong-skip 0 | 50 pkts/s | frames mcast
+#   sat  gaps 0 (0 short, 0 too big) ring-full 0        -- at 65 s AND 125 s
+#   sat  leds remote hop 512 (rx 5012 -> 10181, bad 0)  -- 86.1 frames/s, none bad
 #
-# READ tx-fail AND the satellite's gaps together, not tx-fail alone. Baseline to
-# beat, from the run that measured the freed SRAM: `tx-fail 0 (0 audio)`,
-# `50 pkts/s`, satellite `gaps 8` in 545 s. If tx-fail leaves zero, this goes
-# back out and the answer is that the burst -- not the buffer count -- is the
-# wall, and 10+ satellites needs a longer beacon interval or a smaller frame
-# rather than a bigger number.
+# Zero audio gaps across the whole run, against 8 in 545 s on the unicast-frames
+# build and 0.17/s when this branch started. The strips get every frame.
+#
+# What it buys is the only thing that makes the hub's transmit rate FLAT in
+# speaker count: 50 + 96xN packets/s becomes ~146, whatever N is. At fifteen
+# satellites that is ~316/s against ~1490/s, and only the probe traffic still
+# scales.
+#
+# If this is ever turned on WITHOUT the 40 buffers it reproduces the failure it
+# came from -- `tx-fail 14-27 audio` per 20 s and the satellite's gap rate
+# tracking it one for one at 1.1/s. The burst, not the average, is what empties
+# the pool, so the two settings move together or not at all.
+#
+# STILL ONLY MEASURED AT TWO SATELLITES. The arithmetic says the frames stop
+# scaling; nothing has put more than two on the floor to check it, and the
+# probe traffic that does still scale has never been measured past two either.
 CONFIG_DANCEFLOOR_MCAST_FRAMES=y

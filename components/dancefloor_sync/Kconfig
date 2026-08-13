@@ -159,28 +159,33 @@ menu "Dancefloor audio transport (multicast + FEC)"
         default n
         depends on DANCEFLOOR_AUDIO_MCAST
         help
-          DEFAULT n, AND THE ORIGINAL OBJECTION WAS RIGHTER THAN THE REASON GIVEN
-          FOR OVERRIDING IT. Turning this on cost audio rather than saving it:
+          WORKS, BUT ONLY WITH ENOUGH TRANSMIT BUFFERS -- which is why the
+          default is still n, since the default buffer count cannot carry it.
+          The measurements, in the order they were taken:
 
-            frames unicast, fec 0 (13:02, 13:30)   hub tx-fail 0
-            frames MCAST,   fec 0 (18:14)          tx-fail 14-27 AUDIO per 20 s
+            frames unicast, 26 buffers   tx-fail 0        sat gaps 0.17/s
+            frames MCAST,   26 buffers   tx-fail 14-27    sat gaps 1.1/s
+            frames MCAST,   40 buffers   tx-fail 0        sat gaps 0 in 125 s
 
-          and the satellite's gap rate tracked that almost one for one -- 1.1
-          gaps/s against ~1 audio packet a second discarded at the hub, which is
-          three times the loss of the run this was supposed to improve.
+          The first attempt was argued on airtime -- 96xN unicast sends becoming
+          ~96 -- and that arithmetic is right and was the wrong question. What
+          decides it is the BURST. A SoftAP buffers group-addressed frames and
+          releases them after each DTIM beacon, while unicast goes out
+          immediately with rate adaptation; at dtim_period 1 on a 100 ms beacon
+          that is one burst per 100 ms. Audio alone is ~5 frames a burst, and
+          86 analysis frames a second makes it ~15, each holding a static TX
+          buffer until its window opens. 26 could not hold that. 40 can, and 40
+          only became affordable when the hub stopped running the ML lane and
+          got ~25 kB of internal SRAM back.
 
-          The mechanism is not airtime, which is what the change was argued on.
-          A SoftAP buffers GROUP-addressed frames and releases them in a burst
-          after each DTIM beacon, while unicast goes out immediately with rate
-          adaptation. At dtim_period 1 and a 100 ms beacon that is one burst per
-          100 ms: with audio alone on the group it was ~5 frames a burst, and
-          adding 86 analysis frames and the ML results a second makes it ~15,
-          each holding one of the hub's 26 static TX buffers until its window
-          opens. The pool empties on the burst, not on the average.
+          So this needs ESP_WIFI_STATIC_TX_BUFFER_NUM at 40 or more, and the
+          hub's sdkconfig.defaults sets both together for that reason. Turning
+          this on without the buffers reproduces the middle row.
 
-          So the airtime arithmetic below is correct and was the wrong question.
-          Keep it for whoever revisits this with a bigger buffer pool or a longer
-          DTIM period, where the scaling argument still holds.
+          What it buys is the only thing that makes the hub's transmit rate FLAT
+          in speaker count: 50 + 96xN packets/s becomes ~146 whatever N is. At
+          fifteen satellites that is ~316/s against ~1490/s, and the analysis
+          frames stop scaling entirely -- only the probe traffic still does.
 
 
           An analysis frame is byte-identical for every satellite -- the whole
