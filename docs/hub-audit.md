@@ -1232,3 +1232,41 @@ Two things this corrected:
   minute or two — twenty times the crystals' own difference, and within striking
   distance of the depth net's 20/s. Nothing was audible at that rate on music,
   which is the closest thing to evidence the net has.
+
+### 14.4 The drop path, and a source stall that looked like a regression
+
+A ~15 minute run answered the open item in 14.3. **The drop path works and is now
+exercised**: with the trim at +2 Hz the hub logged 598 -> 718 -> 838 dropped
+frames across consecutive 60 s HEALTH windows, 120 each, which is 2/s and is
+exactly `|trim_hz|`. Both directions now match the arithmetic on hardware.
+
+`retunes 0 (0 refused)` across 900 s. Phase settled and held between +824 and
+-2684 us. `tx-fail 0 (0 audio)` throughout.
+
+The run also contained audible silences, and they were not this. The source
+stopped:
+
+```
+I (751921) sbc_in: pkts 251 | eff 44120 Hz | max gap 42297 us
+W (761413) stream: local underrun, restarting timeline
+I (771948) sbc_in: pkts 0 | eff 0 Hz         <- and for three more windows
+I (836961) sbc_in: pkts 109 | eff 19175 Hz | max gap 74084470 us
+```
+
+**74 seconds with no SBC packet**, then a second stall of 19.8 s. `sbc_in` is the
+input from the bridge, upstream of the radio and of everything the rate trim
+touches. The hub's ring drained, it underran, it restarted the timeline, and the
+satellite -- with nothing arriving -- drained and parked. That is the whole chain.
+
+Worth knowing for next time, because both units' counters look alarming and mean
+one thing: **`dma-starve` reads ~81 per underrun on either unit**, and that is
+arithmetic rather than a fault. The play task blocks on its 500 ms ring timeout
+and the channel starves once per descriptor meanwhile: 500 / 5.8 = 86. Two
+underruns read 162. One `short-read` accompanies each, being the partial chunk
+before the ring went dry.
+
+This is distinct from the ~118 ms delivery pause in architecture.md 16, which is
+three orders of magnitude smaller. A 74 s stall is the phone or the A2DP link,
+not delivery jitter. What makes it audible for longer than the stall itself is
+that a satellite parks on underrun and waits for an anchor; recovery is bounded
+by when the hub next restarts its timeline, not by when audio comes back.
