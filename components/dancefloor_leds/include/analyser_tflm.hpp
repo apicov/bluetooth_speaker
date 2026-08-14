@@ -25,9 +25,16 @@
  *    `alignas(16) const unsigned char ...[]`.
  *
  * 4. Subclass TflmAnalyser, fill in the four hooks, and add it to s_analysers[]
- *    in analysers.cpp. The spec is the same one every analyser declares -- the
- *    lane, the window, the hop, and above all present_delay_us, whose rule is
+ *    in analysers.cpp. The spec is the same one every analyser declares -- a
+ *    name, a model_id, the lane, and above all present_delay_us, whose rule is
  *    on AnalyserSpec and is the thing most likely to be got wrong.
+ *
+ * 5. process() is handed one frame's SPEC_BINS quantised spectrum, not audio.
+ *    A model wanting a spectrogram accumulates frames itself and returns false
+ *    until it has enough -- Mood in analysers.cpp is the worked example, and
+ *    init() is told how many frames a second arrive so a context can be sized
+ *    in time. The bins are already uint8 on a fixed compression curve, which is
+ *    most of the way to the int8 input a quantised model wants.
  *
  * ---------------------------------------------------------------------------
  * The model must be INT8, and that is not about size
@@ -43,10 +50,12 @@
  * the way that takes an evening to find: two strips that agree on the bench and
  * drift apart over a set. Use full-integer quantisation.
  *
- * A float model is still fine on a floor where exactly one unit runs it and
- * everyone else is DANCEFLOOR_ML_SOURCE_REMOTE -- there is only one copy of the
- * decision then, which is the same argument that lets the hub run any algorithm
- * at all. Say so in a comment if you rely on it.
+ * A float model is still fine on a floor where exactly one unit runs it at all
+ * -- there is only one copy of the decision then, so there is nothing for it to
+ * disagree with. That was previously arranged by building the other units
+ * DANCEFLOOR_ML_SOURCE_REMOTE; with that setting gone it means, literally, that
+ * only one unit has DANCEFLOOR_ML_TFLM. Say so in a comment if you rely on it,
+ * because nothing enforces it.
  */
 #pragma once
 
@@ -82,7 +91,7 @@ public:
      * diagnose than a silent absence, and the unit still draws whatever its
      * neighbours send it.
      */
-    bool init(int stream_rate_hz) final;
+    bool init(int frames_per_s) final;
 
 protected:
     /* The .tflite flatbuffer, 16-byte aligned. */
@@ -102,9 +111,9 @@ protected:
      */
     virtual tflite::MicroOpResolver &ops() = 0;
 
-    /* Called after the interpreter is ready, and again whenever the stream rate
+    /* Called after the interpreter is ready, and again whenever the frame rate
      * changes. Return false to retire the analyser. */
-    virtual bool on_rate(int stream_rate_hz) { (void)stream_rate_hz; return true; }
+    virtual bool on_rate(int frames_per_s) { (void)frames_per_s; return true; }
 
     /* Run it. False means the interpreter refused, which is counted by the
      * caller and should not be treated as a result. */

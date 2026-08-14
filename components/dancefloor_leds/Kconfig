@@ -236,57 +236,32 @@ menu "Dancefloor LEDs"
             bool "256 -- 75% overlap, 172 frames/s"
     endchoice
 
-    choice DANCEFLOOR_ML_SOURCE
-        prompt "Where this unit's analyser results come from"
-        default DANCEFLOOR_ML_SOURCE_LOCAL
+    config DANCEFLOOR_ML
+        bool "Run the pluggable analysers on this unit"
+        default n
         depends on DANCEFLOOR_ENABLE_VISUALISER
         help
-            The same question DANCEFLOOR_LED_SOURCE asks about analysis frames,
-            asked separately about the pluggable analysers -- and separately on
-            purpose.
+            Whether this unit runs the registered analysers beside the FFT, and
+            therefore whether the lane, its task and its buffers are built at
+            all. Off means the analysers are compiled by nobody and Frame::ml
+            stays empty; the strip still lights from the FFT exactly as before.
 
-            A unit can compute its own FFT frames and still be GIVEN a model's
-            results. The FFT is cheap and provably identical everywhere; a model
-            is neither, and a classic-ESP32 satellite that cannot hold a tensor
-            arena can still light up in step with a hub that can. That
-            combination is the reason this is not one setting.
+            THIS REPLACED A CHOICE, and the difference matters. There used to be
+            DANCEFLOOR_ML_SOURCE -- local or remote -- because a unit that could
+            not hold a model could be GIVEN one's results by the hub. Nothing is
+            given any more: analysers read the spectrum every unit already has,
+            so a unit either runs them or does without them, and this is that
+            question.
 
-            The reverse does not exist: a unit taking frames from the hub
-            analyses no audio at all, so there is nothing for an analyser to run
-            on. Choosing Local there is not offered.
-
-            WHAT IS GUARANTEED is the same narrow thing DANCEFLOOR_LED_SOURCE
-            promises: units taking results from the same source agree. Two units
-            both on Local agree only if they run the same analyser, built from
-            the same source, with the same model_id -- which across an LX6
-            satellite and an LX7 hub additionally requires the arithmetic to be
-            integer. A mismatch is detected from model_id and logged once.
-
-        config DANCEFLOOR_ML_SOURCE_LOCAL
-            bool "Local -- this unit runs the analysers"
-            depends on DANCEFLOOR_LED_SOURCE_LOCAL
-            help
-                Costs whatever the analysers cost. A fast one runs on the
-                analysis task beside the FFT; a slow one brings up its own task
-                on the other core, a resampler and its buffers -- about 25 kB
-                for the shipped example, against the ~52 kB a satellite has
-                free while analysing.
-
-        config DANCEFLOOR_ML_SOURCE_REMOTE
-            bool "Remote -- this unit is given the results"
-            help
-                No analyser runs here, no slow lane starts, and no resampler is
-                built. Results arrive as MSG_ML and are shown at the instant
-                they name, exactly like ones computed locally.
-
-                This is what lets the floor run a model only the hub can hold.
-
-    endchoice
+            Default n so that turning it on is a decision each build makes.
+            The hub in particular must stay off: it gave up ~25 kB of internal
+            SRAM to stop running this lane, which is the pool its WiFi TX buffers
+            come from, and hub_s3/sdkconfig.defaults records what that bought.
 
     config DANCEFLOOR_ML_TFLM
         bool "Build the TensorFlow Lite Micro analyser base"
         default n
-        depends on DANCEFLOOR_ENABLE_VISUALISER
+        depends on DANCEFLOOR_ML && SPIRAM
         help
             Compiles analyser_tflm.cpp, which removes the boilerplate every
             TFLM-backed analyser would otherwise repeat: the arena, the schema
@@ -298,6 +273,24 @@ menu "Dancefloor LEDs"
             uncommenting the dependency in
             components/dancefloor_leds/idf_component.yml -- the exact lines are
             there.
+
+            DEPENDS ON SPIRAM, WHICH IS A STATEMENT ABOUT THE ARENA rather than
+            about a part number. ml_arena.c prefers PSRAM and falls back to
+            internal SRAM, and the fallback is the dangerous path: a 64 kB arena
+            does not fail at the allocation on a board without PSRAM, it fails an
+            hour later as an audio dropout nobody connects to the model. A
+            classic-ESP32 satellite is already holding an 80 kB ring in the same
+            pool.
+
+            So the guard is here rather than on the target. That keeps the rule
+            the rest of this component follows -- gate on what a unit can do, not
+            on what chip it is -- and it means a future part with PSRAM is
+            allowed without editing this line. The practical effect today is that
+            models run on the XIAO S3 satellite and nowhere else.
+
+            Note it does NOT gate DANCEFLOOR_ML. The shipped analysers need no
+            arena at all, so a board without PSRAM can still run those; it just
+            cannot host a model.
 
             Read the note at the top of analyser_tflm.hpp before converting a
             model. The short version: quantise it to int8. On a floor where more
@@ -337,12 +330,12 @@ menu "Dancefloor LEDs"
             `tx-fail` are the four numbers that would show it, and enabling the
             two one at a time is what makes the answer attributable.
 
-            A classic-ESP32 satellite has no PSRAM at all and about 52 kB free
-            while analysing, so an arena sized for the hub does not fail at the
-            allocation there -- it fails an hour later as an audio dropout. If
-            the startup line says "internal" and the margin looks thin, it is:
-            use a smaller model on that unit, or build it
-            DANCEFLOOR_ML_SOURCE_REMOTE and let the hub decide.
+            A classic-ESP32 satellite has no PSRAM at all, so an arena of any
+            size comes out of internal SRAM and does not fail at the allocation
+            -- it fails an hour later as an audio dropout. That is why
+            DANCEFLOOR_ML_TFLM depends on SPIRAM: there is no longer a "let some
+            other unit decide" option to fall back to, so the board either has
+            somewhere to put an arena or it does not run models at all.
 
     config DANCEFLOOR_ML_SLOTS
         int "Pluggable analysers that may run at once"

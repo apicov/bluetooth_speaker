@@ -36,10 +36,11 @@ of the 1 Mbps basic rate 802.11b forces; see
 | `hub_s3/` | Chip B, on an ESP32-S3. SoftAP, the presentation timeline every unit obeys, its own speaker and strip. The only hub; the classic-ESP32 `hub/` it superseded was retired on 2026-08-12. |
 | `satellite/` | Joins the hub's SoftAP, plays the stream, drives a strip. Any number of these. |
 | `components/dancefloor_sync/` | Wire format and the clock estimator. No ESP-IDF dependencies, host-testable. |
-| `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver. Shared by hub and satellites. |
+| `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver, and the pluggable analysers. Shared by hub and satellites. |
 | `components/sbc_decoder/` | Vendored SBC decoder. |
 | `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources. |
 | `tools/tuning/` | The detector's tuning harness — sweeps, the negative control, the corpus manifest. |
+| `tools/sat.py` | Builds, flashes and monitors either satellite; one source tree, two images. |
 
 The master is two chips because Bluetooth and WiFi on one ESP32 fight over the
 radio, the memory and the CPU. See [`docs/two-chip-master.md`](docs/two-chip-master.md).
@@ -178,17 +179,20 @@ Every unit drives its own DAC — the hub is a full speaker, not a base station 
 and in every case **the ESP32 is the I2S master**, generating the clocks the DAC
 follows.
 
-| PCM5102A | classic hub | classic satellite | S3 hub (`hub_s3/`) |
-|---|---|---|---|
-| BCK | GPIO 26 | GPIO 26 | **GPIO 7**, pad `D8` |
-| LRCK | GPIO 27 | GPIO 27 | **GPIO 8**, pad `D9` |
-| DIN | GPIO 25 | GPIO 25 | **GPIO 9**, pad `D10` |
-| VIN | 3V3 | 3V3 | 3V3 |
-| GND | GND | GND | GND |
-| SCK | GND | GND | GND |
+| PCM5102A | classic hub | classic satellite | S3 hub (`hub_s3/`) | S3 satellite |
+|---|---|---|---|---|
+| BCK | GPIO 26 | GPIO 26 | **GPIO 7**, pad `D8` | **GPIO 7**, pad `D8` |
+| LRCK | GPIO 27 | GPIO 27 | **GPIO 8**, pad `D9` | **GPIO 8**, pad `D9` |
+| DIN | GPIO 25 | GPIO 25 | **GPIO 9**, pad `D10` | **GPIO 9**, pad `D10` |
+| VIN | 3V3 | 3V3 | 3V3 | 3V3 |
+| GND | GND | GND | GND | GND |
+| SCK | GND | GND | GND | GND |
 
-There is no S3 satellite build. If you make one, the pins above are what it
-would take — `hub_s3/` and `satellite/` read the same three Kconfig symbols.
+The last two columns are the same three pins because `hub_s3/` and `satellite/`
+read the same three Kconfig symbols, and the satellite's S3 defaults pin them to
+the hub's values on purpose — a hub and a satellite on a XIAO are wired
+identically. An S3 satellite is `idf.py set-target esp32s3` in `satellite/`, not
+a separate app; see [`satellite/README.md`](satellite/README.md).
 
 Four things that are not obvious from the table:
 
@@ -229,9 +233,9 @@ Every unit drives its own strip — the hub is a full speaker, not a base statio
 — so this is identical on a hub, an S3 hub and a satellite except for the data
 pin.
 
-| | classic hub | S3 hub | satellite |
-|---|---|---|---|
-| WS2812 data | **GPIO 18** | **GPIO 1**, pad `D0` | GPIO 18 |
+| | classic hub | S3 hub | classic satellite | S3 satellite |
+|---|---|---|---|---|
+| WS2812 data | **GPIO 18** | **GPIO 1**, pad `D0` | GPIO 18 | **GPIO 1**, pad `D0` |
 
 ```
    ESP32 / XIAO            74AHCT125            WS2812 strip

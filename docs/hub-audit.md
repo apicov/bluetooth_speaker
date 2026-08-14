@@ -1115,7 +1115,9 @@ was added *after* it.
   audio that played and the resuming audio fades in. The missing ~20 ms cannot be
   invented; the two discontinuities around it — which are most of what a dropout
   *sounds* like — are gone for nothing.
-- **The ML lane off the hub** (`DANCEFLOOR_ML_SOURCE_REMOTE`), which returned
+- **The ML lane off the hub** (`DANCEFLOOR_ML_SOURCE_REMOTE`, since replaced by
+  `DANCEFLOOR_ML=n` — the setting was renamed when analyser results stopped
+  being distributed; the measurement below stands), which returned
   ~24.9 kB of internal SRAM: `MEM: internal` min 6740 → 22012. The Kconfig's
   "about 25 kB" was exact. Nothing was lost — the slow lane had logged
   `slow 0/0 us` and `results N+0` in every run ever captured, producing nothing,

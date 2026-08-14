@@ -79,7 +79,15 @@ static void drift_task(void *arg)
 
 /* Printed at boot so a log immediately identifies which build produced it --
  * compile time and ELF hash both change on every rebuild. Saves guessing
- * whether a reflash actually landed. */
+ * whether a reflash actually landed.
+ *
+ * The TARGET is on it because this app is now built two ways from one tree, and
+ * the two images are different units rather than the same one with different
+ * pins: the S3 runs the analyser lane and the classic does not. Without it the
+ * line says a reflash landed but not WHICH kind landed, which on a bench with
+ * both boards attached is the question actually being asked. What the unit does
+ * with its frames is already on the telemetry line -- see
+ * visualiser_source_name() -- so it is not repeated here. */
 static void log_build_stamp(const char *tag)
 {
     const esp_app_desc_t *d = esp_app_get_description();
@@ -87,7 +95,8 @@ static void log_build_stamp(const char *tag)
     for (int i = 0; i < 8; i++) {
         sprintf(sha + i * 2, "%02x", d->app_elf_sha256[i]);
     }
-    ESP_LOGW(tag, "BUILD %s %s  elf:%s", d->date, d->time, sha);
+    ESP_LOGW(tag, "BUILD %s %s  %s  elf:%s",
+             d->date, d->time, CONFIG_IDF_TARGET, sha);
 }
 
 #define TASK_ANY_CORE (-1)

@@ -1,4 +1,4 @@
-# Satellite on an ESP32-S3 (Seeed XIAO ESP32-S3).
+# Satellite on an ESP32-S3 (Seeed XIAO ESP32-S3, plain / Sense / Plus).
 #
 # ESP-IDF reads this IN ADDITION to sdkconfig.defaults when the target is
 # esp32s3, and after it, so anything here wins. Everything portable -- the tick
@@ -17,6 +17,13 @@
 # (docs/hub-s3-gap-list.md) to track what each owed the other. The classic hub
 # was eventually retired rather than reconciled. See docs/satellite-audit.md F1;
 # this file is the alternative that finding argues for.
+#
+# WHICH XIAO. The pad numbering -- D0=1 D1=2 D2=3 D3=4 D4=5 D5=6 D6=43 D7=44
+# D8=7 D9=8 D10=9 -- is identical across the plain XIAO ESP32-S3, the Sense and
+# the Plus, so every pin below is right on all three and this file is not
+# Plus-only. Flash size is the one line that is not (see FLASHSIZE below); the
+# Plus additionally brings D11-D18 out on rear pads as GPIO 38, 39, 40, 41, 42,
+# 10, 13, 12, 11, none of which this build uses.
 
 # The XIAO ESP32-S3's D8/D9/D10. These match hub_s3, so a satellite and a hub on
 # that board are wired identically.
@@ -35,31 +42,173 @@ CONFIG_DANCEFLOOR_I2S_DATA_PIN=9
 # this board brings out.
 CONFIG_DANCEFLOOR_LED_GPIO=1
 
-# The LED sync marker. The classic default is GPIO 2, which on the XIAO S3 is
-# D1 and not the onboard LED -- that is GPIO 21, and it is active-low, which the
-# shared default already is. Set explicitly because a marker that flashes an
-# unconnected pin looks exactly like a marker that is not firing.
-CONFIG_DANCEFLOOR_LED_MARKER_GPIO=21
-
-# 8 MB octal PSRAM, as on the XIAO S3.
+# THE LED SYNC MARKER IS DELIBERATELY NOT SET HERE, and this comment is the
+# reason so that nobody adds it back.
 #
-# Nothing in the satellite asks for it today: the audio ring is
-# DANCEFLOOR_RING_KB of internal SRAM by choice, since a StreamBuffer the DMA
-# path feeds from wants internal memory, and the analysis is remote on this
-# floor. It is enabled because leaving it off is not neutral -- the heap figures
-# on the HEALTH line would then describe a board configured smaller than it is,
-# and the internal-vs-total split that MEM prints is only informative when both
-# pools exist. See CAP_USABLE_INTERNAL in sat.h for why that distinction has
+# This file used to pin DANCEFLOOR_LED_MARKER_GPIO=21 on the grounds that 21 is
+# the XIAO's onboard LED. It is documented as that, and it did not light when
+# pointed at -- components/dancefloor_leds/Kconfig:106-113 records the attempt,
+# and hub_s3/sdkconfig.defaults:518 says "Do NOT point it at 21" outright. The
+# satellite was the last build still aiming there, and since
+# DANCEFLOOR_ENABLE_LED_MARKER=y in sdkconfig.defaults it fired on every S3
+# satellite. A marker flashing a pin that does not light is indistinguishable
+# from a marker that is not firing, which is the exact confusion the setting
+# exists to avoid.
+#
+# The right pin is 2 -- pad D1, with an external LED on it -- and 2 is already
+# the shared default in components/dancefloor_leds/Kconfig. hub_s3 arrives at it
+# by not overriding it (see hub_s3/sdkconfig.defaults:507), so the satellite does
+# the same and the two S3 builds cannot drift apart again. That is the one place
+# this file departs from the "pin it anyway" rule above: the value would be a
+# copy of the shared default rather than a departure from it, and the hub's route
+# is worth matching more than the local convention is.
+
+# 8 MB octal PSRAM, as on every XIAO ESP32-S3 including the Plus. (The FLASH is
+# quad on all of them -- see FLASHSIZE below. The octal part is the PSRAM, and it
+# is where GPIO 33-37 go, which is why those pads do not exist on the board.)
+#
+# Nothing in the satellite asked for it before the WiFi line below: the audio
+# ring is DANCEFLOOR_RING_KB of internal SRAM by choice, since a StreamBuffer the
+# DMA path feeds from wants internal memory, and the analysis is remote on this
+# floor. It was enabled anyway because leaving it off is not neutral -- the heap
+# figures on the HEALTH line would then describe a board configured smaller than
+# it is, and the internal-vs-total split that MEM prints is only informative when
+# both pools exist. See CAP_USABLE_INTERNAL in sat.h for why that distinction has
 # already cost an evening once.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
-# 8 MB flash on the XIAO S3, against the classic boards' 4.
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# WiFi and lwIP buffers out of internal SRAM and into the PSRAM above.
+#
+# Taken from hub_s3, where it is the current answer to a transmit-path fault
+# (hub_s3/sdkconfig.defaults:661 and the ~200 lines above it). THE FAULT IT WAS
+# AIMED AT IS NOT THIS UNIT'S: a satellite receives audio and transmits almost
+# nothing, so what it buys here is not tx headroom but internal SRAM headroom --
+# the pool the 80 kB ring, every task stack and every plain malloc come out of,
+# since SPIRAM_USE_CAPS_ALLOC means PSRAM is opt-in per allocation.
+#
+# So this is worth having for the MEM/HEALTH minima rather than for a known
+# symptom, and it is the first thing to take back out if the S3 satellite shows
+# receive-side trouble the classic one does not. PSRAM is slower than internal
+# SRAM and the WiFi driver now reaches it through the cache.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# THE THREE BELOW ARE PINNED AT THE VALUES EVERY BUILD ALREADY HAS, NOT TUNED.
+# The symbol above would otherwise move all three, and one of them is not a
+# local matter.
+#
+# STATIC_RX_BUFFER_NUM would go 10 -> 16 and RX_BA_WIN 6 -> 16 (esp_wifi/Kconfig
+# defaults them per SPIRAM_TRY_ALLOCATE_WIFI_LWIP). THE BA WINDOW IS NEGOTIATED
+# ON THE AIR, not just allocated in RAM: hub_s3 pins it at 6 for exactly this
+# reason and names the satellite while doing so
+# (hub_s3/sdkconfig.defaults:669-672). Letting this end drift to 16 would change
+# what the two agree on, on a link whose loss behaviour is the thing this whole
+# project measures -- and it would arrive as a side effect of a memory setting,
+# which is the worst way for an on-air change to happen. The classic satellite
+# is at 10/6 too, so pinning here also keeps the two targets comparable.
+#
+# CACHE_TX_BUFFER_NUM only exists when the symbol above is set, and defaults to
+# 32: it queues upper-layer packets in PSRAM when no static TX buffer is free.
+# hub_s3 measured it as a negative result on the unit that actually transmits
+# (tx-fail did not go away; the constraint was airtime) and set it to 0. A
+# satellite transmits only clock-sync probe replies, so 0 here is about not
+# quietly acquiring a PSRAM queue nobody asked for, and about the two S3 builds
+# reading the same.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
+
+# 32 kB instruction cache, up from the IDF default of 16.
+#
+# The application is mapped from flash and pulled through this cache, and a miss
+# stalls the CPU on a SPI fetch. hub_s3/sdkconfig.defaults:250-264 has the
+# argument from the hub's side, where the stalls were landing in the transmit
+# path. The satellite runs a smaller mix -- SBC decode, the ring, the servo and
+# the LED render, with analysis remote on this floor -- but rx_task must drain
+# the UDP mailbox and decode without falling behind, and that is the same kind of
+# deadline.
+#
+# Costs 16 kB of heap: the unused half of the cache is handed to the allocator at
+# 16 kB and is not at 32. On this unit that comes out of a pool the PSRAM line
+# above has just widened, which is why the two belong in the same change.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+
+# 16 MB flash on the XIAO ESP32-S3 Plus, against the plain/Sense XIAO's 8 and the
+# classic boards' 4. THIS IS THE ONE LINE IN THIS FILE THAT IS PLUS-SPECIFIC.
+#
+# Nothing here needs the capacity -- the image is ~887 kB and the partition table
+# is SINGLE_APP -- so this is about the image header describing the part it is
+# on. An 8 MB setting on a 16 MB board boots and runs; it just understates the
+# flash and caps anything later that wants a bigger app partition. Set it back to
+# CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y for a plain or Sense XIAO.
+#
+# The flash is QUAD on all three boards and always will be -- octal needs eight
+# data lines and a module built for them. QIO at 80 MHz, set in sdkconfig.defaults
+# and shared with the classic target, is this board's ceiling.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
 # The S3 reaches the console over the built-in USB Serial/JTAG, not a UART
 # bridge -- there is no CP2102 on this board. Without this the boot log goes to
 # pins nobody has wired and the unit looks dead on the bench.
+#
+# THIS IS THE BRING-UP SETTING, AND IT COSTS RADIO PERFORMANCE.
+# SOC_WIFI_PHY_NEEDS_USB_WORKAROUND is set on this part -- the USB and WiFi PHYs
+# interfere -- and IDF's fix is to disable the USB PHY when WiFi initialises.
+# ESP_PHY_ENABLE_USB overrides that fix and defaults to y whenever the console is
+# USB Serial/JTAG, so a USB console means running the radio with IDF's own
+# mitigation switched off. hub_s3 abandoned it for that reason and
+# hub_s3/sdkconfig.defaults:56-104 has the full argument.
+#
+# Once this unit joins the hub and plays audio, comment out the line below and
+# uncomment the seven under it, then re-measure -- the point of the switch is
+# radio performance, so it is worth a before and an after on a receiver rather
+# than taking the hub's transmit-side result on faith. SECONDARY_NONE and
+# ESP_PHY_ENABLE_USB are both load-bearing: the secondary console defaults back
+# to USB_SERIAL_JTAG the moment the primary is not USB, and ESP_PHY_ENABLE_USB
+# defaults to y on the S3 regardless of what the console is doing.
+#
+# What it costs at the bench: the USB PHY is down from the moment WiFi starts, so
+# the port vanishes a few hundred ms into boot and esptool cannot reset the board
+# itself. Flashing then means holding BOOT and tapping RESET first, every time,
+# and the log comes off a wire -- adapter RX <- GPIO 43 (pad D6), adapter GND <-
+# board GND, nothing else.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+# CONFIG_ESP_CONSOLE_UART_NUM=0
+# CONFIG_ESP_CONSOLE_UART_TX_GPIO=43
+# CONFIG_ESP_CONSOLE_UART_RX_GPIO=-1
+# CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+# CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# CONFIG_ESP_PHY_ENABLE_USB=n
+
+# THIS IS THE TINYML BOARD, and these two lines are the whole of what makes it
+# one. Everything else in this file is about the XIAO S3 Plus as a satellite.
+#
+# DANCEFLOOR_ML runs the pluggable analysers here. It does NOT require this unit
+# to analyse audio: LED_SOURCE stays REMOTE above, so this satellite still draws
+# the frames the hub sends it, and the analysers read the quantised spectrum
+# those frames already carry. That is the point of the whole arrangement -- the
+# model gets the hub's FFT for free and this board never runs one of its own.
+#
+# Computing the FFT locally is still available and independent of this: set
+# LED_SOURCE_LOCAL and the analysers see a locally-computed spectrum instead,
+# with no change to any analyser. It costs ~33 kB of internal SRAM here, which is
+# what commit 82f4e8d spent on a classic ESP32 before running out; measure the
+# MEM line before assuming an S3 has it spare.
+CONFIG_DANCEFLOOR_ML=y
+
+# The TFLM base -- the arena, the schema check and the interpreter. Nothing in
+# the tree has a model yet, so today this compiles the scaffolding and runs the
+# two analysers that need no weights.
+#
+# It depends on SPIRAM, which this board has and a classic satellite does not:
+# ml_arena falls back to internal SRAM rather than failing, and that fallback
+# surfaces an hour later as an audio dropout. See the Kconfig help.
+#
+# Fetches esp-tflite-micro on the next build. The dependency is guarded by
+# `rules: - if: $CONFIG{DANCEFLOOR_ML_TFLM}` in
+# components/dancefloor_leds/idf_component.yml, so the hub and the bridge do not
+# pull it in. Expect a long first build and a much larger image.
+CONFIG_DANCEFLOOR_ML_TFLM=y

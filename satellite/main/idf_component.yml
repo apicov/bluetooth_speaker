@@ -1,0 +1,26 @@
+# TensorFlow Lite Micro, for the S3 satellite's CONFIG_DANCEFLOOR_ML_TFLM.
+#
+# HERE RATHER THAN WITH THE CODE IT BELONGS TO. analyser_tflm.cpp lives in
+# components/dancefloor_leds, and that component's manifest is where a reader
+# will look first -- there is a note there explaining why it is not, and the
+# short version is that no Kconfig symbol from that component can be referenced
+# from its own manifest: an unmet `depends on` omits the symbol from
+# sdkconfig.json entirely rather than setting it false, and bt_bridge resolves
+# that manifest without ever loading that component's Kconfig.
+#
+# GUARDED ON THE TARGET, NOT ON THE SETTING, and that is a compromise worth
+# naming. `target` is always available to an if-clause where a Kconfig symbol may
+# not be, so this is what can actually be tested. It is honest today because the
+# two coincide exactly -- DANCEFLOOR_ML_TFLM is set in
+# sdkconfig.defaults.esp32s3 and nowhere else -- but they are two facts rather
+# than one, and turning TFLM off without editing this file would leave the
+# component fetched and compiled for nothing.
+#
+# The classic satellite shares this manifest and this app: the rule is what keeps
+# a 4 MB classic ESP32 from pulling in a machine-learning runtime it has no PSRAM
+# to hold an arena for.
+dependencies:
+  espressif/esp-tflite-micro:
+    version: "*"
+    rules:
+      - if: 'target == esp32s3'

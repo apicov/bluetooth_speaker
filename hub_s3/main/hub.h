@@ -250,21 +250,24 @@
 #define TIMELINE_SLEW_US 20
 
 /*
- * Throttles on the non-audio downlink lanes. Audio is the priority: a dropped
- * audio datagram costs a gap, where a dropped frame or ML result costs only a
- * slightly-stale LED. publish_frame and publish_ml can EACH run at the ~86 Hz
- * analysis rate (Kconfig.projbuild), so together they add ~172 datagrams/s on
- * top of ~50 audio and overflow the 26 static TX buffers (tx-fail ENOMEM,
- * measured -- see the errno tally tx_fail_note() keeps).
+ * Throttle on the non-audio downlink. Audio is the priority: a dropped audio
+ * datagram costs a gap, where a dropped frame costs only a slightly-stale LED.
+ * publish_frame runs at the ~86 Hz analysis rate (Kconfig.projbuild), on top of
+ * ~50 audio, and overflowed the 26 static TX buffers this was written against
+ * (tx-fail ENOMEM, measured -- see the errno tally tx_fail_note() keeps).
  *
- * ML_PUBLISH_PERIOD_US caps the ML lane well under the analysis rate. TX_BACKOFF_US
- * is how long BOTH non-audio lanes stay silent after ANY sendto() returns ENOMEM:
- * the instant the pool is exhausted, non-audio yields, leaving the buffers audio
- * was being refused for audio. fan_out() -- the audio path -- is never gated.
+ * There was a second lane here, publish_ml, capped by its own
+ * ML_PUBLISH_PERIOD_US at 10/s against a possible 86. It is gone: analysers read
+ * the spectrum every unit already receives, so results are computed where they
+ * are needed rather than shipped. That halves what this backoff is protecting.
+ *
+ * TX_BACKOFF_US is how long the non-audio lane stays silent after ANY sendto()
+ * returns ENOMEM: the instant the pool is exhausted, non-audio yields, leaving
+ * the buffers audio was being refused for audio. fan_out() -- the audio path --
+ * is never gated.
  *
  * Falsified by tx-fail on the servo line: throttling is working while that drops.
  */
-#define ML_PUBLISH_PERIOD_US   100000   /* 10/s, down from up to 86/s */
 #define TX_BACKOFF_US           40000   /* ~2 audio packets: yield, then probe again */
 
 /*
@@ -472,14 +475,12 @@ extern volatile uint32_t s_audio_pkts;
 extern volatile uint32_t s_tx_fail_audio;
 
 /*
- * Non-audio publish throttling, paired with ML_PUBLISH_PERIOD_US / TX_BACKOFF_US.
- * tx_fail_note() raises s_tx_congested_until on ENOMEM; publish_frame/publish_ml
- * skip while now < it and count the skip in n_tx_cong_skip. publish_ml additionally
- * rate-limits to the period and counts drops in n_ml_throttled. fan_out() ignores
- * both -- audio always sends. Racy exactly as s_tx_fail is (net.c): a torn read of
- * the 64-bit deadline at worst sends or skips one non-audio datagram wrongly.
+ * Non-audio publish throttling, paired with TX_BACKOFF_US. tx_fail_note() raises
+ * s_tx_congested_until on ENOMEM; publish_frame skips while now < it and counts
+ * the skip in n_tx_cong_skip. fan_out() ignores it -- audio always sends. Racy
+ * exactly as s_tx_fail is (net.c): a torn read of the 64-bit deadline at worst
+ * sends or skips one non-audio datagram wrongly.
  */
-extern volatile uint32_t n_ml_throttled;            /* ML sends dropped to the period */
 extern volatile uint32_t n_tx_cong_skip;            /* non-audio sends skipped under ENOMEM backoff */
 extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-audio yields until it */
 
@@ -970,11 +971,12 @@ void client_gone(const uint8_t mac[6]);
  * Snapshot the send list under the spinlock.
  *
  * Four call sites open-coded this identically -- streamer_send_meta,
- * publish_frame, publish_ml and streamer_send_sbc. The duplication publish_ml's
- * comment defends is the MESSAGE BUILDING, which is untouched: those stay
- * separate because they are on different cadences and each is likely to grow
- * its own rate limit. This is only the copy, which was byte-identical in all
- * four and is where MAX_CLIENTS scaling lands.
+ * publish_frame, publish_ml and streamer_send_sbc. (publish_ml has since gone
+ * with the rest of the result-distribution path; three remain.) What was
+ * deliberately NOT shared is the MESSAGE BUILDING: those stay separate because
+ * they are on different cadences and each is likely to grow its own rate limit.
+ * This is only the copy, which was byte-identical in all of them and is where
+ * MAX_CLIENTS scaling lands.
  *
  * Returns how many slots were copied (always MAX_CLIENTS); the caller still
  * tests last_seen, because a zeroed slot is how "not listening" is spelled.
@@ -992,9 +994,6 @@ void clients_age(int64_t now);
  * registers it. */
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 void publish_frame(const vis_frame_t *f);
-#endif
-#if CONFIG_DANCEFLOOR_PUBLISH_ML
-void publish_ml(const ml_result_t *r);
 #endif
 
 /* play.c, probe.c -- tasks. */

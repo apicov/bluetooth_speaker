@@ -30,8 +30,8 @@
  * both do.
  *
  * So: quantised integer models are a CORRECTNESS requirement here, not a size
- * optimisation. See docs/architecture.md and the note in Kconfig under
- * DANCEFLOOR_ML_SOURCE for what a mixed floor is and is not promised.
+ * optimisation. See docs/architecture.md, and the note in Kconfig under
+ * DANCEFLOOR_ML_TFLM for what a mixed floor is and is not promised.
  */
 #pragma once
 
@@ -40,6 +40,10 @@
 #include "analysis_config.h"
 
 namespace df {
+
+/* The portable spectrum's width, from analysis_config.h so that this header and
+ * analysis.hpp cannot disagree about it -- analysis.hpp includes this one. */
+constexpr int SPEC_BINS = DF_SPEC_BINS;
 
 /*
  * How many analysers may run at once. One slot per registered analyser, at the
@@ -68,9 +72,10 @@ constexpr uint8_t RESULT_NONE = 0xFF;
  * One analyser's answer about one window of audio.
  *
  * Deliberately small and deliberately plain data. It is copied into every
- * df::Frame that carries it, it goes on the wire as ml_result_t, and it is
- * latched across tasks -- three places where a pointer would need a lifetime
- * rule, which Frame::mag already demonstrates the cost of.
+ * df::Frame that carries it and latched across tasks -- two places where a
+ * pointer would need a lifetime rule, which Frame::mag already demonstrates the
+ * cost of. It used to travel between units as ml_result_t as well; results are
+ * now computed wherever they are wanted, so nothing serialises one.
  */
 struct Result {
     /* Window number on this analyser's own grid, from an origin all units
@@ -153,27 +158,23 @@ struct AnalyserSpec {
     uint8_t model_id;
 
     /*
-     * The rate the audio must be at when it reaches process(), or 0 for
-     * "whatever the stream is".
+     * FRAMES, NOT SAMPLES, is what an analyser is handed now.
      *
-     * 0 is the only value a Fast analyser may use: it is handed the window
-     * df::Analysis just used, at the stream rate, and resampling that would
-     * mean doing it twice per frame for no gain.
+     * There used to be rate_hz, window_n and hop_n here, describing a PCM
+     * windowing grid the lane cut for each analyser -- a Slow one normally asked
+     * for 16 kHz and got there through the fixed-point resampler.
      *
-     * A Slow analyser normally wants 16000 -- almost every published audio
-     * model does -- and gets there through the fixed-point resampler in
-     * resample.h. The stream is 44.1 kHz stereo by default but the bridge
-     * advertises 16, 32, 44.1 and 48 kHz and takes what the phone gives it, so
-     * the resampler's ratio is a runtime value even though this field is not.
+     * None of that exists any more. Every analyser sees the quantised spectrum
+     * of one analysis frame, on the grid the FFT already cut, and an analyser
+     * wanting more context accumulates frames itself. Mood shows the shape:
+     * short frames in, a rolling buffer of FEATURES, the answer over those --
+     * which is how a mel front end feeds a real model anyway, and which is what
+     * lets a unit run models on audio it never had.
+     *
+     * What the grid is, is therefore not this struct's business. init() is told
+     * how many frames a second arrive, which is the only rate an analyser can
+     * still meaningfully want.
      */
-    int rate_hz;
-
-    /* Samples handed to process(), at rate_hz. Always MONO. */
-    int window_n;
-
-    /* Samples advanced between calls to process(), at rate_hz. Equal to
-     * window_n for non-overlapping windows. */
-    int hop_n;
 
     /*
      * How long after a window's audio is heard its Result is shown.
@@ -196,24 +197,26 @@ struct AnalyserSpec {
      * So a result is shown late on purpose, by exactly this much, and the
      * amount is DECLARED rather than measured. It must satisfy
      *
-     *     present_delay_us >= window_n * 1e6 / rate_hz      (the window must arrive)
+     *     present_delay_us >= context_frames * 1e6 / frames_per_s   (it must arrive)
      *                         + worst_case_compute_us
      *                         + publish_latency_us
      *                         - LEAD_US                     (the audio arrives early)
      *
      * and it must be the same number on every unit running this analyser.
      *
-     * The whole window, not the window minus the hop: nothing can be computed
-     * until the window's LAST sample has arrived, and that sample is heard
-     * `window_n / rate_hz` after the instant the window is labelled with.
+     * The whole context, not the context minus one frame: nothing can be
+     * computed until the LAST frame of it has arrived, and that frame is heard
+     * `context_frames / frames_per_s` after the instant the answer is labelled
+     * with -- unless the analyser labels by its last frame, as Mood does, in
+     * which case the context is already behind and the bound is slack.
      *
      * Worked, for the FFT: 1024 samples at 44.1 kHz is 23 ms against a 200 ms
      * lead, so the bound is negative and zero is correct -- which is why the
      * fast lane needs no delay and why this whole field could be ignored until
      * something with a real context window arrived.
      *
-     * Worked, for a one-second model at 16 kHz: 1000 - 200 = 800 ms before
-     * compute is counted at all.
+     * Worked, for a one-second model labelled by the FIRST frame of its context:
+     * 1000 - 200 = 800 ms before compute is counted at all.
      *
      * Using the MEASURED inference time instead is the trap. It is different on
      * an LX6 and an LX7, it is different on a busy board and an idle one, and
@@ -249,15 +252,20 @@ public:
     virtual const AnalyserSpec &spec() const = 0;
 
     /*
-     * `stream_rate_hz` is the rate of the audio arriving, which is NOT
-     * necessarily spec().rate_hz -- the lane resamples between them. It is
-     * passed because an analyser may need to know what it was derived from.
+     * `frames_per_s` is how many analysis frames arrive each second -- the
+     * stream rate divided by the hop, so 86 at 44.1 kHz and hop 512. An analyser
+     * sizing a context in TIME converts through it; one counting frames can
+     * ignore it.
+     *
+     * It is a runtime value even though the hop is compiled in, because the
+     * bridge advertises 16, 32, 44.1 and 48 kHz and takes what the phone gives.
+     * An analyser that hard-codes 86 is wrong on three of those four.
      *
      * Return false if this analyser cannot run on this build -- no arena, no
      * model linked in, a rate it cannot serve. The lane then skips it and says
      * so once, which is a great deal easier to diagnose than a silent absence.
      */
-    virtual bool init(int stream_rate_hz) = 0;
+    virtual bool init(int frames_per_s) = 0;
 
     /* Drop accumulated state. Called on a timeline restart, a rate change, and
      * a realignment -- anything after which previous audio no longer precedes
@@ -276,12 +284,24 @@ public:
     virtual const char *label_name(uint8_t label) const { (void)label; return nullptr; }
 
     /*
-     * `in` is exactly spec().window_n mono int16 samples at spec().rate_hz.
+     * `spec` is one analysis frame's quantised spectrum: SPEC_BINS log-spaced
+     * bins from 40 Hz to 16 kHz, 0 for silence and 255 for the top of the
+     * normalised range, on exactly the scale Frame::band uses.
      *
-     * `index` and `due_us` are the lane's statement of where this window sits
-     * on the shared grid: due_us names the instant the window's FIRST sample is
-     * heard, in master-clock microseconds, derived by counting from an origin
-     * every unit shares. Never read a clock in here -- see the rule at the top.
+     * IT DOES NOT MATTER WHERE IT CAME FROM. The identical bytes are produced by
+     * a unit analysing its own audio and unpacked from a frame off the radio --
+     * visualiser.cpp static_asserts that the two widths agree, and packs and
+     * unpacks the same array. That is what lets a unit with no audio at all run
+     * models, and it is the property this interface exists to expose.
+     *
+     * The compression is fixed (`raw / (1 + raw)`, beat_normalise) rather than
+     * an AGC against a running maximum, so absolute level survives it,
+     * monotonically. A feature wanting loudness may take it from these bins.
+     *
+     * `index` and `due_us` place the frame on the shared grid: due_us names the
+     * instant this frame's window is heard, in master-clock microseconds,
+     * derived by counting from an origin every unit shares. Never read a clock
+     * in here -- see the rule at the top.
      *
      * Return true if *out was filled. Returning false is normal and expected:
      * a model that accumulates context returns false on every call until its
@@ -291,8 +311,8 @@ public:
      * The lane fills out->show_at_us, out->analyser and out->model_id from the
      * spec. An implementation sets index, n, label[] and score[].
      */
-    virtual bool process(const int16_t *in, int64_t index, int64_t due_us,
-                         Result *out) = 0;
+    virtual bool process(const uint8_t (&spec)[SPEC_BINS], int64_t index,
+                         int64_t due_us, Result *out) = 0;
 };
 
 /*
@@ -311,9 +331,8 @@ Analyser *analyser_by_name(const char *name);
  * analyser lane reimplemented on the laptop would quietly break it the first
  * time one of the two was changed.
  *
- * `mono` is `window_n` samples -- the same window the FFT was handed, downmixed
- * by df::downmix(). The caller does the downmix because the slow lane needs the
- * same buffer and doing it twice per frame would be pure cost.
+ * `spec` is the frame's quantised spectrum, whether this unit computed it or
+ * took it off the radio -- see Analyser::process().
  *
  * `skip[i]` is true for a slot this unit does not compute itself -- a slow
  * analyser, an absent one, or any slot at all on a unit that is given its
@@ -327,7 +346,7 @@ Analyser *analyser_by_name(const char *name);
  *
  * Called from one task only -- the analysis task in the firmware.
  */
-void run_fast_lane(const int16_t *mono, int window_n, int64_t index,
+void run_fast_lane(const uint8_t (&spec)[SPEC_BINS], int64_t index,
                    int64_t due_us, const bool skip[ML_SLOTS], Result out[ML_SLOTS]);
 
 /*

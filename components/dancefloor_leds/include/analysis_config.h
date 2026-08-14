@@ -71,6 +71,19 @@
 #define DF_TAIL_N (DF_FFT_N - DF_HOP_N)
 
 /*
+ * Bins in the portable spectrum -- Frame::spec, and what every analyser is
+ * handed. 64 log-spaced bins from 40 Hz to 16 kHz; analysis.hpp has the
+ * reasoning for the spacing and owns the two edge frequencies.
+ *
+ * HERE rather than in analysis.hpp because analyser.hpp needs it for
+ * Analyser::process() and analysis.hpp includes analyser.hpp, not the other way
+ * round. It is also the width of the array on the wire, which visualiser.cpp
+ * static_asserts against VIS_SPEC_BINS -- three headers agreeing on one number,
+ * which is exactly what this file is for.
+ */
+#define DF_SPEC_BINS 64
+
+/*
  * How many pluggable analysers may run at once, and therefore how many Results
  * every frame carries.
  *

@@ -98,9 +98,6 @@ void streamer_start(void)
 #if CONFIG_DANCEFLOOR_PUBLISH_FRAMES
     visualiser_set_publish(publish_frame);
 #endif
-#if CONFIG_DANCEFLOOR_PUBLISH_ML
-    visualiser_set_ml_publish(publish_ml);
-#endif
 #endif
     ESP_LOGI(TAG, "streaming on port %d, unicast to registered listeners", SYNC_PORT);
 }

@@ -2,16 +2,27 @@ dependencies:
   espressif/led_strip: "^3"
   espressif/esp-dsp: "*"
 
-  # TensorFlow Lite Micro, for CONFIG_DANCEFLOOR_ML_TFLM.
+  # esp-tflite-micro is NOT here, and this note is so nobody puts it back.
   #
-  # Commented rather than conditional on purpose. The component manager does
-  # support `rules: - if: "$CONFIG{...}"`, but this tree has no model yet, and a
-  # dependency rule that cannot be tested here is not worth risking a working
-  # build over. Uncomment these three lines when you turn the option on -- the
-  # `rules` form below then keeps every other build from fetching and compiling
-  # a large component it does not use.
+  # It is the dependency of CONFIG_DANCEFLOOR_ML_TFLM, so this file -- which owns
+  # the code that setting compiles -- is the obvious home for it, guarded by
+  # `rules: - if: '$CONFIG{DANCEFLOOR_ML_TFLM}'`. That does not work, in two
+  # separate ways, both of which were reached by trying it:
   #
-  # espressif/esp-tflite-micro:
-  #   version: "*"
-  #   rules:
-  #     - if: '$CONFIG{DANCEFLOOR_ML_TFLM}'
+  #   1. A bare `$CONFIG{X}` is not valid syntax. The if-clause grammar wants a
+  #      comparison, and `== y` parses but is always false, because
+  #      sdkconfig.json stores a bool as a JSON boolean and not as "y". The
+  #      working form is `== True`.
+  #
+  #   2. Which does not help, because a symbol whose `depends on` is unmet is
+  #      OMITTED from sdkconfig.json rather than emitted as false -- so on the
+  #      hub, where DANCEFLOOR_ML is n, referencing DANCEFLOOR_ML_TFLM raises
+  #      MissingKconfigError and the build fails outright. Worse, bt_bridge does
+  #      not REQUIRE dancefloor_leds, so this component's Kconfig is never loaded
+  #      there at all while this manifest still IS resolved: on that build not
+  #      even DANCEFLOOR_ENABLE_VISUALISER exists. No symbol from this component
+  #      can be referenced here safely.
+  #
+  # So the dependency lives with the application that turns the feature on --
+  # satellite/main/idf_component.yml -- where it is guarded on the target, which
+  # is always available. See the note there.

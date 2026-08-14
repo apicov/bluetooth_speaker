@@ -724,11 +724,23 @@ nothing writes. That reads 0 now.
 - **`wide-span` is still climbing and still unexplained.** Sixth run. `span max`
   reaches 300–400 µs against a `TSF_SPAN_MAX_US` of 100, while the typical case
   stays at 70–100 µs. Nothing acts on it; enforcing it is still not free.
-- **No S3 satellite has ever been run on a bench.**
-- Both units are now `ML_SOURCE_REMOTE`, so **nothing in the tree compiles the
-  analyser lane**. The intent is to run it on a satellite later;
-  `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` and a full build of
-  that branch are what keep it from rotting until then.
+- **No S3 satellite has ever been run on a bench.** Still true, and now more
+  load-bearing than it was: that board is the one carrying the analyser lane and
+  TFLM, so the first bench session has to read the allocation report and the
+  arena's "N of M B used" before anything else. `82f4e8d` is the shape of the
+  failure to watch for — a unit that associates, takes a lease, looks healthy
+  from the hub, and produces nothing.
+- **The analyser lane IS compiled now**, on the S3 satellite
+  (`DANCEFLOOR_ML=y`, `DANCEFLOOR_ML_TFLM=y` in `sdkconfig.defaults.esp32s3`).
+  It no longer needs audio: analysers read the quantised spectrum every frame
+  carries, so that unit stays `LED_SOURCE_REMOTE` and runs models on the hub's
+  FFT. The `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` invocation
+  named here previously is gone with the setting; a build of the S3 target is
+  what exercises the lane now.
+- **There is still no model.** TFLM compiles the interpreter, the arena and the
+  schema check, and the two shipped analysers need no weights, so the image grew
+  ~3.3 kB rather than megabytes. The real size and timing questions arrive with
+  the first model, not before.
 
 ---
 

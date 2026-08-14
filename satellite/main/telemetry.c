@@ -182,8 +182,7 @@ void telemetry_tick(void)
                       " | dma-starve %" PRIu32 " short-resync %" PRIu32
                       " | seq-drop %" PRIu32 " decode-err %" PRIu32
                       " recv-err %" PRIu32
-                 " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")"
-                      " | ml %s (rx %" PRIu32 ", bad %" PRIu32 ")",
+                 " | leds %s hop %d (rx %" PRIu32 ", bad %" PRIu32 ")",
                  (unsigned long long)(esp_timer_get_time() / 1000000),
                  esp_get_free_heap_size(), esp_get_minimum_free_heap_size(),
                  heap_win == UINT32_MAX ? 0 : heap_win,
@@ -198,8 +197,7 @@ void telemetry_tick(void)
                  dma_starve_count(), n_gap_short_resyncs,
                  n_seq_dropped, n_decode_err, n_recv_err,
                  visualiser_source_name(), visualiser_hop(),
-                 n_frames_rx, n_frames_bad,
-                 visualiser_ml_source_name(), n_ml_rx, n_ml_bad);
+                 n_frames_rx, n_frames_bad);
 
         /*
          * Its own line for the same reason MEM has one -- see the hub's copy.

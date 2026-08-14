@@ -42,10 +42,9 @@ SRCS := main.cpp wav.cpp out_png.cpp out_tty.cpp $(LEDS)/analysis.cpp $(LEDS)/pa
 HDRS := wav.hpp out_png.hpp out_tty.hpp $(LEDS)/include/analysis.hpp \
         $(LEDS)/include/patterns.hpp $(LEDS)/include/analyser.hpp \
         $(LEDS)/include/result_latch.hpp \
-        $(LEDS)/include/ml_window.hpp $(LEDS)/include/resample.h
 
-pattern_lab: $(SRCS) $(HDRS) fft_host.o beat_detect.o resample.o
-	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) $(SRCS) fft_host.o beat_detect.o resample.o -o $@ $(LDLIBS)
+pattern_lab: $(SRCS) $(HDRS) fft_host.o beat_detect.o
+	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) $(SRCS) fft_host.o beat_detect.o -o $@ $(LDLIBS)
 
 # Compiled AS C: fft_host.c has no extern "C" guarding it, so building it as C++
 # mangles df_fft_radix2 and analysis.cpp cannot find it.
@@ -53,10 +52,6 @@ fft_host.o: $(LEDS)/fft_host.c
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) -c $< -o $@
 
 beat_detect.o: $(LEDS)/beat_detect.c $(LEDS)/include/beat_detect.h
-	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) -c $< -o $@
-
-# Plain C, like the two above, and for the same reason: no extern "C" guard.
-resample.o: $(LEDS)/resample.c $(LEDS)/include/resample.h
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) -c $< -o $@
 
 .PHONY: clean

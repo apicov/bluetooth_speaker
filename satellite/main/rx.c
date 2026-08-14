@@ -874,36 +874,6 @@ void rx_task(void *arg)
                 n_frames_bad++;
             }
 #endif
-        } else if (buf[0] == MSG_ML && n >= (int)ML_MSG_BYTES(0)) {
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-            /*
-             * One analyser's result, computed by the hub. Shown at the instant
-             * it names, exactly like one this unit computed itself -- which is
-             * what lets the hub run a model no satellite could hold.
-             *
-             * Length-checked for the same reason a frame is, and complained
-             * about once for the same reason. The sharper mismatch -- the right
-             * SIZE carrying a different MODEL -- is checked inside
-             * visualiser_submit_ml(), which knows what this build expects.
-             */
-            const ml_msg_t *mm = (const ml_msg_t *)buf;
-            if (mm->len == sizeof(ml_result_t) &&
-                n >= (int)ML_MSG_BYTES(mm->len)) {
-                ml_result_t r;
-                memcpy(&r, mm->payload, sizeof(r));
-                visualiser_submit_ml(&r);
-                n_ml_rx++;
-            } else {
-                static bool told;
-                if (!told) {
-                    told = true;
-                    ESP_LOGE(TAG, "ml result of %u bytes, expected %u -- hub and "
-                                  "satellite are not the same build",
-                             mm->len, (unsigned)sizeof(ml_result_t));
-                }
-                n_ml_bad++;
-            }
-#endif
         } else if (buf[0] == MSG_TSF && n >= (int)sizeof(tsf_msg_t)) {
             /*
              * This is the CLOCK SOURCE, not a measurement. It was one, and this

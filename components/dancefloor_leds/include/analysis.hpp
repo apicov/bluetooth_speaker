@@ -134,7 +134,9 @@ static_assert(band_bin(BAND_EDGE_HZ[3], RATE) == 117, "band 3 moved");
  * length, and preferable to spacing them linearly and spending 90% of the strip
  * on the top two octaves.
  */
-constexpr int   SPEC_BINS   = 64;
+/* SPEC_BINS itself is in analyser.hpp, from DF_SPEC_BINS -- process() needs
+ * it and this header includes that one. These two edges stay here, with the
+ * code that turns FFT bins into them. */
 constexpr float SPEC_LO_HZ  = 40.0f;
 constexpr float SPEC_HI_HZ  = 16000.0f;
 

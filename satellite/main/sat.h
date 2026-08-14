@@ -584,8 +584,6 @@ extern volatile int64_t rejoined_at;  /* 0 = the next anchor is not the first */
 extern volatile int64_t est_newest_at;  /* when the newest probe landed */
 extern volatile uint32_t n_frames_rx;  /* analysis frames taken from the hub */
 extern volatile uint32_t n_frames_bad;  /* ... and rejected, wrong size */
-extern volatile uint32_t n_ml_rx;  /* analyser results taken from the hub */
-extern volatile uint32_t n_ml_bad;  /* ... and rejected, wrong size */
 extern volatile uint32_t hw_play;  /* stack headroom, sampled in-task */
 extern volatile uint32_t hw_drift;
 
