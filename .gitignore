@@ -32,6 +32,11 @@ components/dancefloor_leds/test/*.o
 # Python bytecode from running tools/
 __pycache__/
 
+# clangd's index, one per project because each has its own compile_commands.json.
+# Regenerated from the build on demand and machine-specific, so there is nothing
+# in it another checkout could use.
+.cache/
+
 # A separate project, kept here for reference: components/led_strip_wrapper is
 # vendored from it. It has its own git repository, so it must not be committed
 # into this one -- a nested repo would go in as an unusable gitlink.
