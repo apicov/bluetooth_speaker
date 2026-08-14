@@ -38,9 +38,17 @@ line in EXTRA.
 Requires pyserial (pip install pyserial). pandas is NOT required to capture --
 only to analyse afterwards.
 
+BAUD IS PER UNIT, AND THE HUB IS NOT THE DEFAULT. hub_s3/sdkconfig.defaults sets
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600 on a custom UART (GPIO 43, because the
+console was deliberately moved off USB); the satellite and the bridge are on the
+IDF default of 115200. Reading the hub at 115200 produces a screen of accented
+punctuation rather than an error, which is how this was found. Append `:BAUD` to
+any unit that differs.
+
 Usage:
-    tools/soak/capture.py --unit hub=/dev/ttyUSB0 --unit sat=/dev/ttyUSB1
-    tools/soak/capture.py --unit hub=/dev/ttyUSB0 --unit sat=/dev/ttyUSB1 \
+    tools/soak/capture.py --unit hub=/dev/ttyUSB0:921600 --unit sat=/dev/ttyUSB1
+    tools/soak/capture.py --unit hub=/dev/ttyUSB0:921600 \
+                          --unit sat=/dev/ttyUSB1 \
                           --unit bridge=/dev/ttyUSB2 --out /tmp/soak
 
 Stop with Ctrl-C; the files are flushed as it goes, so an interrupted or
@@ -261,11 +269,18 @@ def reader(session, unit, port, baud):
 def main():
     ap = argparse.ArgumentParser(
         description="Capture every unit's console to CSV for a soak run.",
-        epilog="example: %(prog)s --unit hub=/dev/ttyUSB0 --unit sat=/dev/ttyUSB1")
-    ap.add_argument("--unit", action="append", required=True, metavar="NAME=PORT",
-                    help="repeatable, one per board: hub=/dev/ttyUSB0")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="example:\n"
+               "  %(prog)s --unit hub=/dev/ttyUSB0:921600 --unit sat=/dev/ttyUSB1\n\n"
+               "The hub's console is 921600 in this repo's sdkconfig.defaults, on a\n"
+               "custom UART; the satellite and bridge are the IDF default 115200.\n"
+               "Reading a board at the wrong baud prints garbage, not an error.")
+    ap.add_argument("--unit", action="append", required=True,
+                    metavar="NAME=PORT[:BAUD]",
+                    help="repeatable, one per board: hub=/dev/ttyUSB0:921600")
     ap.add_argument("--baud", type=int, default=115200,
-                    help="console baud (default 115200, the IDF default)")
+                    help="baud for units that do not name their own "
+                         "(default 115200, the IDF default)")
     ap.add_argument("--out", default=None,
                     help="session directory (default logs-soak-<timestamp>/, "
                          "which .gitignore already covers)")
@@ -274,22 +289,30 @@ def main():
     units = []
     for spec in args.unit:
         if "=" not in spec:
-            ap.error(f"--unit wants NAME=PORT, got {spec!r}")
+            ap.error(f"--unit wants NAME=PORT[:BAUD], got {spec!r}")
         name, port = spec.split("=", 1)
-        units.append((name.strip(), port.strip()))
+        port = port.strip()
+        baud = args.baud
+        # Only a trailing all-digit field is a baud; a device path could in
+        # principle carry a colon and must not be truncated into one.
+        if ":" in port:
+            head, _, tail = port.rpartition(":")
+            if head and tail.isdigit():
+                port, baud = head, int(tail)
+        units.append((name.strip(), port, baud))
 
     outdir = args.out or time.strftime("logs-soak-%Y%m%d-%H%M%S")
     session = Session(outdir)
 
     print(f"capturing {len(units)} unit(s) into {outdir}/", file=sys.stderr)
-    for name, port in units:
-        print(f"  {name:8s} {port}", file=sys.stderr)
+    for name, port, baud in units:
+        print(f"  {name:8s} {port} @ {baud}", file=sys.stderr)
     print("Ctrl-C to stop\n", file=sys.stderr)
 
     threads = [threading.Thread(target=reader,
-                                args=(session, name, port, args.baud),
+                                args=(session, name, port, baud),
                                 daemon=True)
-               for name, port in units]
+               for name, port, baud in units]
     for t in threads:
         t.start()
 
