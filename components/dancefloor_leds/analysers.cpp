@@ -37,76 +37,79 @@ uint32_t isqrt64(uint64_t v)
 }
 
 /*
- * Level and brightness, from the time domain alone.
+ * Level and brightness, from one frame's spectrum.
  *
  * This is not a model and does not pretend to be one. It exists so that the
- * whole path -- registry, lane, latch, wire format, pattern -- can be built and
- * proved with an analyser that has no arena, no weights and no dependencies, so
- * that when a real model is dropped in the only new thing to debug is the
- * model. It is also a genuinely useful pair of features: RMS and zero-crossing
- * rate are the oldest two in audio classification and still the first two most
- * front ends compute.
+ * whole path -- registry, lane, latch, pattern -- can be built and proved with
+ * an analyser that has no arena, no weights and no dependencies, so that when a
+ * real model is dropped in the only new thing to debug is the model.
+ *
+ * WAS "zcr-rms", AND THE RENAME IS THE POINT. It used to compute RMS and a
+ * zero-crossing rate from the PCM window. Analysers are handed the spectrum
+ * now, and the two features have frequency-domain twins that are better rather
+ * than merely equivalent: level is the mean bin, and zero-crossing rate is a
+ * crude time-domain estimate of the spectral centroid, which can now simply be
+ * computed. model_id moved 1 -> 3 rather than being bumped by one, so that a
+ * board still running the old firmware cannot collide with the new answer.
+ *
+ * Level survives the change because the spectrum's compression is fixed --
+ * beat_normalise is `raw / (1 + raw)`, not an AGC against a running maximum --
+ * so a quiet passage stays quiet in these bins. See Analyser::process().
  *
  * All-integer, so it is bit-identical on an LX6 and an LX7 by construction
  * rather than by argument.
  *
- * Fast lane: it is a single pass over the window that df::Analysis has just
- * transformed anyway, which is nothing beside the FFT sharing the task.
+ * Fast lane: it is two passes over 64 bytes, which is nothing beside the FFT
+ * that produced them.
  */
-class ZcrRms final : public Analyser {
+class LevelTilt final : public Analyser {
 public:
     const AnalyserSpec &spec() const override { return spec_; }
 
-    bool init(int stream_rate_hz) override
-    {
-        rate_ = stream_rate_hz > 0 ? stream_rate_hz : DF_RATE_FALLBACK;
-        return true;
-    }
+    bool init(int) override { return true; }
 
-    bool process(const int16_t *in, int64_t index, int64_t due_us,
+    bool process(const uint8_t (&spec)[SPEC_BINS], int64_t index, int64_t due_us,
                  Result *out) override
     {
         (void)due_us;
 
-        uint64_t sum_sq = 0;
-        uint32_t crossings = 0;
-        for (int i = 0; i < DF_FFT_N; i++) {
-            const int32_t s = in[i];
-            sum_sq += static_cast<uint64_t>(s * s);
-            /* A crossing is a sign change between consecutive samples. Zero
-             * counts as positive so that silence reports no crossings rather
-             * than one per sample. */
-            if (i > 0 && ((in[i - 1] < 0) != (s < 0))) {
-                crossings++;
-            }
+        uint32_t sum = 0, weighted = 0;
+        for (int i = 0; i < SPEC_BINS; i++) {
+            sum      += spec[i];
+            weighted += static_cast<uint32_t>(spec[i]) * static_cast<uint32_t>(i);
         }
 
-        const uint32_t rms = isqrt64(sum_sq / DF_FFT_N);
+        /* Level is the mean bin, already on the 0..255 scale a strip wants.
+         * Linear in the normalised spectrum, not in dB: a pattern wanting a
+         * curve can apply its own, and doing it here would bake one choice into
+         * everything downstream. */
+        const uint32_t level = sum / SPEC_BINS;
 
         /*
-         * Crossings expressed as a frequency, so the thresholds below mean the
-         * same thing at 16, 32, 44.1 and 48 kHz -- all four of which the bridge
-         * advertises to the phone. A rate-dependent threshold here would have
-         * been a repeat of the band-edge bug analysis.hpp records.
+         * The spectral centroid, in BIN INDEX rather than in Hz.
+         *
+         * The bins are log-spaced, so an index is already a log frequency and
+         * the centroid of the indices is the geometric-ish centre of the
+         * spectrum -- which is what "brightness" means to an ear, and what the
+         * zero-crossing rate was reaching for. Working in Hz would mean an
+         * exp() per frame to get back a number the thresholds below would only
+         * convert again.
+         *
+         * Undefined for silence, where the sum is zero. Reported as the bottom
+         * bin, which the QUIET test below catches first anyway.
          */
-        const uint32_t zcr_hz =
-            static_cast<uint32_t>(static_cast<uint64_t>(crossings) * rate_ / DF_FFT_N);
+        const uint32_t centroid = sum ? weighted / sum : 0;
 
         uint8_t label;
-        if (rms < QUIET_RMS)         label = LABEL_QUIET;
-        else if (zcr_hz < LOW_HZ)    label = LABEL_LOW;
-        else if (zcr_hz < BRIGHT_HZ) label = LABEL_MID;
-        else                         label = LABEL_BRIGHT;
-
-        /* Level, as a 0..255 the strip can use directly. Linear in amplitude,
-         * not in dB: a pattern wanting a curve can apply its own, and doing it
-         * here would bake one choice into everything downstream. */
-        const uint32_t level = rms > 32767 ? 255u : (rms * 255u) / 32767u;
+        if (level < QUIET_LEVEL)        label = LABEL_QUIET;
+        else if (centroid < LOW_BIN)    label = LABEL_LOW;
+        else if (centroid < BRIGHT_BIN) label = LABEL_MID;
+        else                            label = LABEL_BRIGHT;
 
         out->index = index;
         out->n = 1;
         out->label[0] = label;
-        out->score[0] = static_cast<uint8_t>(level);
+        out->score[0] = static_cast<uint8_t>(level > 255 ? 255u : level);
         return true;
     }
 
@@ -124,29 +127,39 @@ public:
 private:
     enum : uint8_t { LABEL_QUIET = 0, LABEL_LOW = 1, LABEL_MID = 2, LABEL_BRIGHT = 3 };
 
-    /* Below this RMS the crossing rate is measuring dither and the room, not
-     * the music, so the classification is not reported as one. */
-    static constexpr uint32_t QUIET_RMS = 300;
-    /* Roughly where a bass line stops dominating the waveform, and roughly
-     * where cymbals and consonants start to. Both are one octave wide as
-     * decisions go; nothing downstream should treat them as precise. */
-    static constexpr uint32_t LOW_HZ    = 400;
-    static constexpr uint32_t BRIGHT_HZ = 3000;
+    /*
+     * Below this mean bin the centroid is describing dither and the room rather
+     * than the music, so the classification is not reported as one.
+     *
+     * NOT A TRANSLATION OF THE OLD RMS THRESHOLD, and the honest thing is to say
+     * so. The old value was 300 of 32767 in the time domain; the compression
+     * between here and there is fixed but not linear, so there is no exact
+     * equivalent. This is a bench starting point -- read the score on a quiet
+     * passage and on silence, and set it between them.
+     */
+    static constexpr uint32_t QUIET_LEVEL = 4;
 
-    /* Used only if the lane calls init() before any rate is known. */
-    static constexpr int DF_RATE_FALLBACK = 44100;
+    /*
+     * The old LOW_HZ of 400 and BRIGHT_HZ of 3000, converted once and written
+     * down as bins so nothing converts at runtime:
+     *
+     *   bin(f) = (SPEC_BINS - 1) * ln(f / 40) / ln(16000 / 40)
+     *   400 Hz  -> 24.2      3000 Hz -> 45.4
+     *
+     * Both are one octave wide as decisions go; nothing downstream should treat
+     * them as precise. If SPEC_LO_HZ, SPEC_HI_HZ or SPEC_BINS ever move, these
+     * two are what has to be recomputed -- which is why the formula is here and
+     * not only in a commit message.
+     */
+    static constexpr uint32_t LOW_BIN    = 24;
+    static constexpr uint32_t BRIGHT_BIN = 45;
 
     static constexpr AnalyserSpec spec_ = {
-        /* name             */ "zcr-rms",
-        /* model_id         */ 1,
-        /* rate_hz          */ 0,           /* the stream's own rate */
-        /* window_n         */ DF_FFT_N,
-        /* hop_n            */ DF_HOP_N,
-        /* present_delay_us */ 0,           /* the answer exists when the window does */
+        /* name             */ "level-tilt",
+        /* model_id         */ 3,
+        /* present_delay_us */ 0,           /* the answer exists when the frame does */
         /* lane             */ Lane::Fast,
     };
-
-    int rate_ = DF_RATE_FALLBACK;
 };
 
 /*
@@ -155,22 +168,24 @@ private:
  * The point of this one is the SHAPE, which is the shape every real audio model
  * uses and which the interface was built around:
  *
- *   it declares a SHORT window (25 ms) and a short hop (10 ms), and
- *   accumulates its context internally, returning false until a second of them
- *   has arrived.
+ *   it summarises each frame into a few bytes, accumulates a second of those
+ *   summaries internally, and returns false until the second is complete.
  *
- * That matters for RAM, and it is the difference between fitting on a satellite
- * and not. Declaring a one-second window would make the lane hold 16000 samples
- * -- 32 kB against the ~52 kB a classic ESP32 has free while analysing. Holding
- * a hundred four-byte summaries instead costs 400 bytes. A mel front end feeding
- * a real model works exactly this way: short frames in, a rolling buffer of
+ * That is what makes it cheap. Holding a second of AUDIO would be 16000 samples
+ * at 16 kHz -- 32 kB, and the reason the lane used to carry a resampler and a
+ * 12.8 kB stream buffer. Holding a second of four-byte summaries is under a
+ * kilobyte, and it is why this analyser now runs on a unit that has no audio at
+ * all: the frames arrive over the radio already reduced. A mel front end feeding
+ * a real model works exactly this way -- short frames in, a rolling buffer of
  * FEATURES, the model over those.
  *
- * It also shows why present_delay_us is small here despite the second of
- * context. The result is labelled with the LAST window of that second, not the
- * first, so the context is already behind us when the answer appears -- the
- * audio for it arrived a presentation lead ago. An analyser that labelled by
- * the START of its context would need the full delay the field describes.
+ * model_id moved 2 -> 4 with the change of input, for the reason level-tilt's
+ * did: a board still running the old firmware must not appear to agree.
+ *
+ * present_delay_us is small despite the second of context because the result is
+ * labelled with the LAST frame of that second, not the first -- so the context
+ * is already behind us when the answer appears. An analyser labelling by the
+ * START of its context would need the full delay AnalyserSpec describes.
  *
  * All-integer, so it is bit-identical on an LX6 and an LX7 by construction.
  */
@@ -178,7 +193,22 @@ class Mood final : public Analyser {
 public:
     const AnalyserSpec &spec() const override { return spec_; }
 
-    bool init(int) override { reset(); return true; }
+    bool init(int frames_per_s) override
+    {
+        /*
+         * A second of context, in frames, from the rate the lane actually sees.
+         *
+         * Not a constant, because the hop is compiled in but the stream rate is
+         * not: 44.1 kHz at hop 512 is 86 frames a second, 48 kHz at hop 256 is
+         * 187. Sizing this from a hard-coded 86 would give a "one second" that
+         * was 2.2 seconds on one of the four rates the bridge advertises.
+         */
+        context_n_ = frames_per_s > 0 ? frames_per_s : 86;
+        if (context_n_ > CONTEXT_MAX) context_n_ = CONTEXT_MAX;
+        if (context_n_ < 1)           context_n_ = 1;
+        reset();
+        return true;
+    }
 
     void reset() override
     {
@@ -187,30 +217,26 @@ public:
         since_report_ = 0;
     }
 
-    bool process(const int16_t *in, int64_t index, int64_t due_us,
+    bool process(const uint8_t (&spec)[SPEC_BINS], int64_t index, int64_t due_us,
                  Result *out) override
     {
         (void)due_us;
 
-        uint64_t sum_sq = 0;
-        uint32_t crossings = 0;
-        for (int i = 0; i < WINDOW_N; i++) {
-            const int32_t s = in[i];
-            sum_sq += static_cast<uint64_t>(s * s);
-            if (i > 0 && ((in[i - 1] < 0) != (s < 0))) {
-                crossings++;
-            }
+        uint32_t sum = 0, weighted = 0;
+        for (int i = 0; i < SPEC_BINS; i++) {
+            sum      += spec[i];
+            weighted += static_cast<uint32_t>(spec[i]) * static_cast<uint32_t>(i);
         }
 
-        hist_[next_].rms = static_cast<uint16_t>(isqrt64(sum_sq / WINDOW_N));
-        hist_[next_].zcr = static_cast<uint16_t>(crossings);
-        next_ = (next_ + 1) % CONTEXT_N;
-        if (n_ < CONTEXT_N) n_++;
+        hist_[next_].level    = static_cast<uint16_t>(sum / SPEC_BINS);
+        hist_[next_].centroid = static_cast<uint16_t>(sum ? weighted / sum : 0);
+        next_ = (next_ + 1) % context_n_;
+        if (n_ < context_n_) n_++;
 
         /* One report per full context, and none until the first one is full --
          * an answer from a partial second would describe less music than every
          * later answer, and nothing downstream could tell. */
-        if (++since_report_ < CONTEXT_N || n_ < CONTEXT_N) {
+        if (++since_report_ < context_n_ || n_ < context_n_) {
             return false;
         }
         since_report_ = 0;
@@ -222,38 +248,36 @@ public:
          * the same reason: two units that joined at different moments must add
          * the same numbers in the same order.
          */
-        uint64_t sum = 0, sum_sq_r = 0, sum_zcr = 0;
-        for (int k = 0; k < CONTEXT_N; k++) {
-            const uint32_t v = hist_[(next_ + k) % CONTEXT_N].rms;
-            sum      += v;
-            sum_sq_r += static_cast<uint64_t>(v) * v;
-            sum_zcr  += hist_[(next_ + k) % CONTEXT_N].zcr;
+        uint64_t sum_l = 0, sum_sq_l = 0, sum_c = 0;
+        for (int k = 0; k < context_n_; k++) {
+            const uint32_t v = hist_[(next_ + k) % context_n_].level;
+            sum_l    += v;
+            sum_sq_l += static_cast<uint64_t>(v) * v;
+            sum_c    += hist_[(next_ + k) % context_n_].centroid;
         }
 
-        const uint32_t mean = static_cast<uint32_t>(sum / CONTEXT_N);
+        const uint32_t mean = static_cast<uint32_t>(sum_l / context_n_);
         /* Population variance, integer: E[x^2] - E[x]^2, floored at zero
          * against the rounding in the two means. */
-        const uint64_t mean_sq = sum_sq_r / CONTEXT_N;
+        const uint64_t mean_sq = sum_sq_l / context_n_;
         const uint64_t sq_mean = static_cast<uint64_t>(mean) * mean;
         const uint32_t sd = isqrt64(mean_sq > sq_mean ? mean_sq - sq_mean : 0);
 
         /* Spread as a percentage of level, which is what makes it a statement
          * about dynamics rather than about volume. */
         const uint32_t dynamics = mean ? (sd * 100u) / mean : 0;
-        const uint32_t zcr_hz =
-            static_cast<uint32_t>(sum_zcr * RATE_HZ / (CONTEXT_N * WINDOW_N));
+        const uint32_t centroid = static_cast<uint32_t>(sum_c / context_n_);
 
         uint8_t label;
-        if (mean < QUIET_RMS)          label = LABEL_CALM;
+        if (mean < QUIET_LEVEL)          label = LABEL_CALM;
         else if (dynamics > DYNAMIC_PCT) label = LABEL_PEAK;
-        else if (zcr_hz > BUSY_HZ)     label = LABEL_BUSY;
-        else                           label = LABEL_GROOVE;
+        else if (centroid > BUSY_BIN)    label = LABEL_BUSY;
+        else                             label = LABEL_GROOVE;
 
         out->index = index;
         out->n = 1;
         out->label[0] = label;
-        out->score[0] = static_cast<uint8_t>(mean > 32767 ? 255u
-                                                          : (mean * 255u) / 32767u);
+        out->score[0] = static_cast<uint8_t>(mean > 255 ? 255u : mean);
         return true;
     }
 
@@ -271,20 +295,23 @@ public:
 private:
     enum : uint8_t { LABEL_CALM = 0, LABEL_GROOVE = 1, LABEL_BUSY = 2, LABEL_PEAK = 3 };
 
-    static constexpr int RATE_HZ   = 16000;
-    static constexpr int WINDOW_N  = 400;    /* 25 ms */
-    static constexpr int HOP_N     = 160;    /* 10 ms */
-    static constexpr int CONTEXT_N = 100;    /* 100 hops = 1 s of context */
+    /* Frames of context the ring can hold: 48 kHz at hop 256 is 187.5 a second,
+     * which is the fastest any supported combination produces. 4 bytes each, so
+     * the whole ring is 768 B against the 32 kB a second of audio would be. */
+    static constexpr int CONTEXT_MAX = 192;
 
-    static constexpr uint32_t QUIET_RMS   = 300;
+    /* Same scale and the same caveat as level-tilt's QUIET_LEVEL -- a bench
+     * starting point, not a conversion of the old time-domain threshold. */
+    static constexpr uint32_t QUIET_LEVEL = 4;
     static constexpr uint32_t DYNAMIC_PCT = 60;
-    static constexpr uint32_t BUSY_HZ     = 2500;
+    /* The old BUSY_HZ of 2500, converted by the formula in level-tilt: 43.5. */
+    static constexpr uint32_t BUSY_BIN    = 43;
 
     /*
      * A hundred milliseconds of margin, not a hundred milliseconds of need.
      *
      * The bound in AnalyserSpec is satisfied by zero here: the context ends at
-     * the window this is labelled with, so its audio arrived a presentation lead
+     * the frame this is labelled with, so its audio arrived a presentation lead
      * ago and the answer is ready well before the frame is drawn. The margin
      * exists because compute is not constant -- a board that stalls for 150 ms
      * would otherwise miss the frame it named and differ from its neighbours
@@ -296,23 +323,21 @@ private:
 
     static constexpr AnalyserSpec spec_ = {
         /* name             */ "mood",
-        /* model_id         */ 2,
-        /* rate_hz          */ RATE_HZ,
-        /* window_n         */ WINDOW_N,
-        /* hop_n            */ HOP_N,
+        /* model_id         */ 4,
         /* present_delay_us */ PRESENT_DELAY_US,
         /* lane             */ Lane::Slow,
     };
 
-    struct Sub { uint16_t rms, zcr; };
-    Sub hist_[CONTEXT_N];
+    struct Sub { uint16_t level, centroid; };
+    Sub hist_[CONTEXT_MAX];
+    int context_n_ = 86;
     int n_ = 0, next_ = 0, since_report_ = 0;
 };
 
-ZcrRms s_zcr_rms;
-Mood   s_mood;
+LevelTilt s_level_tilt;
+Mood      s_mood;
 
-Analyser *const s_analysers[] = { &s_zcr_rms, &s_mood };
+Analyser *const s_analysers[] = { &s_level_tilt, &s_mood };
 
 /*
  * A registered analyser must have a slot in every Frame, because the slot index
@@ -354,11 +379,9 @@ void downmix(const int16_t *stereo, int n, int16_t *mono)
     }
 }
 
-void run_fast_lane(const int16_t *mono, int window_n, int64_t index,
+void run_fast_lane(const uint8_t (&spec)[SPEC_BINS], int64_t index,
                    int64_t due_us, const bool skip[ML_SLOTS], Result out[ML_SLOTS])
 {
-    (void)window_n;
-
     for (int i = 0; i < ML_SLOTS; i++) {
         out[i] = result_none();
 
@@ -368,7 +391,7 @@ void run_fast_lane(const int16_t *mono, int window_n, int64_t index,
         }
 
         Result r{};
-        if (a->process(mono, index, due_us, &r)) {
+        if (a->process(spec, index, due_us, &r)) {
             const AnalyserSpec &sp = a->spec();
             r.analyser   = static_cast<uint8_t>(i);
             r.model_id   = sp.model_id;

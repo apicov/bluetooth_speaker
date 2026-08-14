@@ -35,10 +35,10 @@ TflmAnalyser::~TflmAnalyser()
     ml_arena_give(&arena_);
 }
 
-bool TflmAnalyser::init(int stream_rate_hz)
+bool TflmAnalyser::init(int frames_per_s)
 {
     if (ready_) {
-        return on_rate(stream_rate_hz);
+        return on_rate(frames_per_s);
     }
 
     const char *name = spec().name;
@@ -110,7 +110,7 @@ bool TflmAnalyser::init(int stream_rate_hz)
     }
 
     ready_ = true;
-    return on_rate(stream_rate_hz);
+    return on_rate(frames_per_s);
 }
 
 bool TflmAnalyser::invoke()

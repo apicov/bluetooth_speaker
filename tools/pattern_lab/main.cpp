@@ -29,8 +29,6 @@
 
 #include "analyser.hpp"
 #include "analysis.hpp"
-#include "ml_window.hpp"
-#include "resample.h"
 #include "result_latch.hpp"
 #include "patterns.hpp"
 #include "wav.hpp"
@@ -182,34 +180,30 @@ int main(int argc, char **argv)
 
     /*
      * The slow lane, driven inline rather than on a task -- there is no audio
-     * clock here, so a window is processed the moment its samples exist. The
-     * GRID is the firmware's, from ml_window.hpp, and so is the resampler, so
-     * the windows cut here are the windows the boards cut.
+     * clock here, so a frame is processed the moment it exists.
+     *
+     * There is no grid and no resampler to match any more. Analysers read the
+     * frame's spectrum, and a frame is a frame: the firmware's lane does the
+     * same call on its own task purely so a long inference does not stall the
+     * analysis one, which is not a concern on a laptop.
      */
-    df::SlowWindow  slow_grid;
-    resampler_t     slow_rs;
-    df::Analyser   *slow = nullptr;
-    int             slow_slot = -1;
+    df::Analyser *slow = nullptr;
+    int           slow_slot = -1;
     for (int i = 0; i < df::ML_SLOTS; i++) {
         df::Analyser *a = df::analyser_at(i);
-        if (a && a->spec().lane == df::Lane::Slow && a->spec().rate_hz <= wav.rate) {
+        if (a && a->spec().lane == df::Lane::Slow) {
             slow = a;
             slow_slot = i;
             break;
         }
     }
+    /* Frames a second, as the firmware computes it and hands it to init(). */
+    const int frames_per_s = wav.rate / df::HOP_N;
     if (slow) {
-        const df::AnalyserSpec &sp = slow->spec();
-        slow->init(wav.rate);
-        slow_grid.configure(sp.window_n, sp.hop_n, sp.rate_hz);
-        resample_init(&slow_rs, wav.rate, sp.rate_hz);
-        std::fprintf(stderr, "slow lane: \"%s\" %d -> %d Hz, filter 0x%08x\n",
-                     sp.name, wav.rate, sp.rate_hz,
-                     resample_table_checksum(&slow_rs));
+        slow->init(frames_per_s);
+        std::fprintf(stderr, "slow lane: \"%s\" over %d frames/s\n",
+                     slow->spec().name, frames_per_s);
     }
-
-    std::vector<int16_t> mono(size_t(df::FFT_N));
-    std::vector<int16_t> dec(size_t(df::FFT_N) + 8);
 
     std::vector<uint8_t> rgb(size_t(leds) * 3);
     std::vector<uint8_t> image;          /* blocks x leds, RGB */
@@ -258,34 +252,20 @@ int main(int argc, char **argv)
         if (f.onset) onsets++;
         if (f.boom)  booms++;
 
-        /* The same lanes the boards run, from the same source files. */
-        df::downmix(chunk, df::FFT_N, mono.data());
-        df::run_fast_lane(mono.data(), df::FFT_N, int64_t(b), due_us, ml_skip, f.ml);
+        /* The same lanes the boards run, from the same source files, over the
+         * same bytes -- f.spec is what travels to a satellite, so this drives
+         * analysers on exactly what one of those would see. */
+        df::run_fast_lane(f.spec, int64_t(b), due_us, ml_skip, f.ml);
 
         if (slow) {
-            /* New audio only: window b overlaps window b-1 by TAIL_N, so after
-             * the first only the last hop is fresh. Feeding the overlap again
-             * would advance the lane's grid twice as fast as the boards'. */
-            const int16_t *src = mono.data() + (df::FFT_N - df::HOP_N);
-            int n = df::HOP_N;
-            if (b == 0) {
-                slow_grid.restart(due_us);
-                resample_reset(&slow_rs);
-                src = mono.data();
-                n = df::FFT_N;
-            }
-            const int m = resample_push(&slow_rs, src, n, dec.data(), int(dec.size()));
             const df::AnalyserSpec &sp = slow->spec();
-            slow_grid.push(dec.data(), m,
-                [&](const int16_t *w, int64_t index, int64_t wdue) {
-                    df::Result r{};
-                    if (slow->process(w, index, wdue, &r)) {
-                        r.analyser   = uint8_t(slow_slot);
-                        r.model_id   = sp.model_id;
-                        r.show_at_us = wdue + sp.present_delay_us;
-                        latch.publish(slow_slot, r);
-                    }
-                });
+            df::Result r{};
+            if (slow->process(f.spec, int64_t(b), due_us, &r)) {
+                r.analyser   = uint8_t(slow_slot);
+                r.model_id   = sp.model_id;
+                r.show_at_us = due_us + sp.present_delay_us;
+                latch.publish(slow_slot, r);
+            }
         }
         /* And the same latch, so a slot waiting on a result behaves here the
          * way it behaves on a strip. */

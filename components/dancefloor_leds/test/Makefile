@@ -27,7 +27,7 @@ CXXFLAGS += -DBEAT_HIST=$(HIST)
 endif
 
 BINS := test_align test_pattern test_beat_detect test_fft test_pattern_sync \
-        test_result_latch test_resample test_ml_window
+        test_result_latch test_resample
 
 test_align: test_align.c
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) $< -o $@
@@ -49,9 +49,6 @@ fft_host.o: ../fft_host.c
 
 beat_detect.o: ../beat_detect.c ../include/beat_detect.h
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) -c ../beat_detect.c -o $@
-
-test_ml_window: test_ml_window.cpp ../include/ml_window.hpp
-	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) test_ml_window.cpp -o $@
 
 test_resample: test_resample.c ../resample.c ../include/resample.h
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) test_resample.c ../resample.c -o $@ -lm
@@ -98,7 +95,6 @@ check: $(BINS)
 	@echo
 	@./test_resample
 	@echo
-	@./test_ml_window
 
 clean:
 	rm -f $(BINS) fft_host.o beat_detect.o

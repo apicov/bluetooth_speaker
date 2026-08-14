@@ -273,7 +273,8 @@ public:
     const df::AnalyserSpec &spec() const override { return spec_; }
     bool init(int) override { return true; }
     void reset() override {}
-    bool process(const int16_t *, int64_t index, int64_t, df::Result *out) override
+    bool process(const uint8_t (&)[df::SPEC_BINS], int64_t index, int64_t,
+                 df::Result *out) override
     {
         out->index = index;
         out->n = 1;
@@ -283,7 +284,7 @@ public:
     }
 private:
     static constexpr df::AnalyserSpec spec_ = {
-        "window", 1, 0, DF_FFT_N, DF_HOP_N, 0, df::Lane::Fast };
+        "window", 1, 0, df::Lane::Fast };
 };
 
 /*
@@ -301,7 +302,8 @@ public:
     const df::AnalyserSpec &spec() const override { return spec_; }
     bool init(int) override { calls_ = 0; return true; }
     void reset() override { calls_ = 0; }
-    bool process(const int16_t *, int64_t index, int64_t, df::Result *out) override
+    bool process(const uint8_t (&)[df::SPEC_BINS], int64_t index, int64_t,
+                 df::Result *out) override
     {
         out->index = index;
         out->n = 1;
@@ -311,19 +313,21 @@ public:
     }
 private:
     static constexpr df::AnalyserSpec spec_ = {
-        "counting", 2, 0, DF_FFT_N, DF_HOP_N, 0, df::Lane::Fast };
+        "counting", 2, 0, df::Lane::Fast };
     int64_t calls_ = 0;
 };
 
 /* Every window from `join` to `frames`, as one unit would see them. */
 std::vector<int> run_analyser(df::Analyser &a, int64_t frames, int64_t join)
 {
-    a.init(RATE);
+    a.init(RATE / DF_HOP_N);
     std::vector<int> labels;
-    const int16_t window[DF_FFT_N] = {};
+    /* Silence, and identical on both units -- what this test varies is WHEN a
+     * unit joined, not what it heard. */
+    const uint8_t spec[df::SPEC_BINS] = {};
     for (int64_t n = join; n < frames; n++) {
         df::Result r = df::result_none();
-        if (a.process(window, n, frame_due(n), &r)) {
+        if (a.process(spec, n, frame_due(n), &r)) {
             labels.push_back(r.label[0]);
         }
     }

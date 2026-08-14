@@ -9,49 +9,54 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/stream_buffer.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
 #include "analyser.hpp"
-#include "ml_window.hpp"
 
 namespace df {
 namespace {
 
 constexpr const char *TAG = "mlan";
 
-Analyser   *s_slow = nullptr;
-int         s_slot = -1;
+Analyser    *s_slow = nullptr;
+int          s_slot = -1;
 ResultLatch *s_latch = nullptr;
 
-StreamBufferHandle_t s_stream = nullptr;
+/*
+ * One frame, as the lane carries it.
+ *
+ * `gen` is what makes a restart safe without any byte arithmetic. The feeder
+ * stamps the current generation; the task drops anything stamped with an older
+ * one and resets the analyser when it sees the number move. The audio lane this
+ * replaces had to publish an origin and a byte count and compare against a
+ * running total, because its grid was derived by counting -- visualiser.cpp
+ * records how a byte-index reader mislabelled half its blocks. A frame carries
+ * its own index and due_us, so none of that is needed.
+ */
+struct LaneFrame {
+    uint8_t  spec[SPEC_BINS];
+    int64_t  index;
+    int64_t  due_us;
+    uint32_t gen;
+};
 
 /*
- * How much decimated audio the lane will hold.
+ * How many frames of slack between the task producing one and this task getting
+ * round to it, bounded by one inference.
  *
- * It only has to cover the gap between the analysis task producing a hop and
- * this task getting round to it, which is bounded by one inference. 400 ms at
- * 16 kHz mono is 12.8 kB -- generous against a model that must finish inside a
- * presentation lead of 200 ms to be useful at all, and small enough to fit the
- * satellite that has ~52 kB free.
- *
- * Sized in TIME rather than samples, so a different model rate does not quietly
- * change how much slack there is.
+ * 32 frames is 372 ms at hop 512 and 44.1 kHz -- generous against a model that
+ * must finish inside a presentation lead of 200 ms to be useful at all. At 88
+ * bytes each that is 2.8 kB, against the 12.8 kB the decimated-audio buffer
+ * cost for the same 400 ms of slack. That reduction is most of why this lane
+ * now fits a unit which is also holding an 80 kB audio ring.
  */
-constexpr int STREAM_MS = 400;
+constexpr int QUEUE_FRAMES = 32;
 
-/*
- * The origin handshake, in the shape visualiser.cpp already uses for its block
- * grid: publish the new origin and the byte count it starts at, then bump a
- * generation with release ordering. The reader adopts it by generation, not by
- * byte index -- visualiser.cpp records why a byte-index reader mislabelled half
- * its blocks.
- */
+QueueHandle_t s_q = nullptr;
+
 std::atomic<uint32_t> s_gen{0};
-std::atomic<int64_t>  s_pending_origin{0};
-std::atomic<uint32_t> s_pending_at_byte{0};
-uint32_t s_fed_total = 0;          /* feeder-side only */
 
 std::atomic<uint32_t> s_results{0}, s_dropped{0}, s_restarts{0};
 std::atomic<uint32_t> s_cost_sum{0}, s_cost_n{0}, s_cost_max{0};
@@ -62,70 +67,67 @@ void bump(std::atomic<uint32_t> &c, uint32_t n = 1)
 }
 
 /*
- * One window: run the analyser, time it, and publish anything it produced.
+ * One frame: run the analyser, time it, and publish anything it produced.
  *
  * show_at_us, analyser and model_id come from the spec rather than from the
  * analyser -- an analyser that could set them could date its own results, which
  * is the one thing the presentation-delay rule forbids.
  */
-void feed(SlowWindow &grid, const AnalyserSpec &sp, const int16_t *in, int n)
+void run_one(const AnalyserSpec &sp, const LaneFrame &f)
 {
-    grid.push(in, n, [&sp](const int16_t *window, int64_t index, int64_t due_us) {
-        Result r{};
-        const int64_t t0 = esp_timer_get_time();
-        const bool produced = s_slow->process(window, index, due_us, &r);
-        const int64_t took = esp_timer_get_time() - t0;
+    Result r{};
+    const int64_t t0 = esp_timer_get_time();
+    const bool produced = s_slow->process(f.spec, f.index, f.due_us, &r);
+    const int64_t took = esp_timer_get_time() - t0;
 
-        bump(s_cost_sum, (uint32_t)took);
-        bump(s_cost_n);
-        uint32_t prev = s_cost_max.load(std::memory_order_relaxed);
-        while (took > (int64_t)prev &&
-               !s_cost_max.compare_exchange_weak(prev, (uint32_t)took,
-                                                 std::memory_order_relaxed)) {
+    bump(s_cost_sum, (uint32_t)took);
+    bump(s_cost_n);
+    uint32_t prev = s_cost_max.load(std::memory_order_relaxed);
+    while (took > (int64_t)prev &&
+           !s_cost_max.compare_exchange_weak(prev, (uint32_t)took,
+                                             std::memory_order_relaxed)) {
+    }
+
+    if (!produced) {
+        return;
+    }
+
+    r.analyser   = (uint8_t)s_slot;
+    r.model_id   = sp.model_id;
+    r.show_at_us = f.due_us + sp.present_delay_us;
+    s_latch->publish(s_slot, r);
+    bump(s_results);
+
+    /*
+     * Say what changed, and only what changed.
+     *
+     * This is what reaches the laptop collector, which forwards ESP_LOG, so it
+     * is also the record you read afterwards against the audio. Logging every
+     * result would be one line a second per analyser -- five times the rate of
+     * the periodic lines already here, for a value that mostly repeats. Logging
+     * the TRANSITIONS gives a track's shape in a dozen lines and stays silent
+     * through a steady passage.
+     *
+     * The instant printed is show_at_us, not now: it is the moment the strips
+     * act on this, which is the only one worth lining up against a recording.
+     * The counts in the periodic `ml:` line cover the results this does not
+     * print.
+     */
+    static uint8_t last_label = 0xFF;
+    static bool    have_last;
+    if (!have_last || r.label[0] != last_label) {
+        have_last = true;
+        last_label = r.label[0];
+        const char *nm = s_slow->label_name(r.label[0]);
+        if (nm) {
+            ESP_LOGI(TAG, "%s: %s (%u) at %lld us",
+                     sp.name, nm, (unsigned)r.score[0], (long long)r.show_at_us);
+        } else {
+            ESP_LOGI(TAG, "%s: label %u (%u) at %lld us",
+                     sp.name, (unsigned)r.label[0], (unsigned)r.score[0],
+                     (long long)r.show_at_us);
         }
-
-        if (produced) {
-            r.analyser   = (uint8_t)s_slot;
-            r.model_id   = sp.model_id;
-            r.show_at_us = due_us + sp.present_delay_us;
-            s_latch->publish(s_slot, r);
-            bump(s_results);
-            /* After the latch, so the local strip is served before the radio. */
-
-            /*
-             * Say what changed, and only what changed.
-             *
-             * This is what reaches the laptop collector, which forwards
-             * ESP_LOG, so it is also the record you read afterwards against the
-             * audio. Logging every result would be one line a second per
-             * analyser -- five times the rate of the periodic lines already
-             * here, for a value that mostly repeats. Logging the TRANSITIONS
-             * gives a track's shape in a dozen lines and stays silent through a
-             * steady passage.
-             *
-             * The instant printed is show_at_us, not now: it is the moment the
-             * strips act on this, which is the only one worth lining up against
-             * a recording. The counts in the periodic `ml:` line cover the
-             * results this does not print.
-             */
-            static uint8_t last_label = 0xFF;
-            static bool    have_last;
-            if (!have_last || r.label[0] != last_label) {
-                have_last = true;
-                last_label = r.label[0];
-                const char *nm = s_slow->label_name(r.label[0]);
-                if (nm) {
-                    ESP_LOGI(TAG, "%s: %s (%u) at %lld us",
-                             sp.name, nm, (unsigned)r.score[0],
-                             (long long)r.show_at_us);
-                } else {
-                    ESP_LOGI(TAG, "%s: label %u (%u) at %lld us",
-                             sp.name, (unsigned)r.label[0], (unsigned)r.score[0],
-                             (long long)r.show_at_us);
-                }
-            }
-        }
-    });
+    }
 }
 
 void ml_task(void *arg)
@@ -133,62 +135,33 @@ void ml_task(void *arg)
     (void)arg;
 
     const AnalyserSpec &sp = s_slow->spec();
+    uint32_t seen_gen = s_gen.load(std::memory_order_acquire);
 
-    /* The grid lives in ml_window.hpp, so pattern_lab cuts the same windows.
-     * All that is here is getting bytes to it and results away from it. */
-    static SlowWindow grid;
-    grid.configure(sp.window_n, sp.hop_n, sp.rate_hz);
-
-    static int16_t chunk[256];
-    uint32_t recv_total = 0;        /* bytes taken from the stream */
-    uint32_t seen_gen = 0;
-
+    LaneFrame f;
     while (true) {
-        const size_t got = xStreamBufferReceive(s_stream, chunk, sizeof(chunk),
-                                                pdMS_TO_TICKS(200));
-
-        /*
-         * A new timeline, adopted by GENERATION rather than by byte index --
-         * visualiser.cpp records why a byte-index reader mislabelled half its
-         * blocks. Everything before the published byte is from the old timeline
-         * and is dropped, this partial window included.
-         */
-        const uint32_t gen = s_gen.load(std::memory_order_acquire);
-        if (gen != seen_gen) {
-            const uint32_t at = s_pending_at_byte.load(std::memory_order_relaxed);
-            const int32_t ahead = (int32_t)(recv_total + (uint32_t)got - at);
-            if (ahead < 0) {
-                recv_total += (uint32_t)got;
-                continue;               /* still draining the old timeline */
-            }
-            seen_gen = gen;
-            s_slow->reset();
-            grid.restart(s_pending_origin.load(std::memory_order_relaxed));
-            /* Keep only what arrived at or after the new origin. */
-            const size_t keep = (size_t)ahead < got ? (size_t)ahead : got;
-            std::memmove(chunk, (uint8_t *)chunk + (got - keep), keep);
-            recv_total += (uint32_t)got;
-            feed(grid, sp, chunk, (int)(keep / sizeof(int16_t)));
+        if (xQueueReceive(s_q, &f, pdMS_TO_TICKS(200)) != pdTRUE) {
             continue;
         }
 
-        recv_total += (uint32_t)got;
-        feed(grid, sp, chunk, (int)(got / sizeof(int16_t)));
+        /*
+         * A frame from before a restart. Drop it, and reset the analyser once
+         * on the transition: a context spanning a splice describes audio that
+         * was never played in that order.
+         */
+        if (f.gen != seen_gen) {
+            if ((int32_t)(f.gen - seen_gen) > 0) {
+                seen_gen = f.gen;
+                s_slow->reset();
+            } else {
+                continue;               /* older than the current timeline */
+            }
+        }
+
+        run_one(sp, f);
     }
 }
 
 }  // namespace
-
-int ml_lane_rate()
-{
-    for (int i = 0; i < ML_SLOTS; i++) {
-        Analyser *a = analyser_at(i);
-        if (a && a->spec().lane == Lane::Slow) {
-            return a->spec().rate_hz;
-        }
-    }
-    return 0;
-}
 
 int ml_lane_slot()
 {
@@ -201,14 +174,14 @@ int ml_lane_slot()
     return -1;
 }
 
-void ml_lane_start(ResultLatch *latch, int stream_rate_hz)
+void ml_lane_start(ResultLatch *latch, int frames_per_s)
 {
     s_slot = ml_lane_slot();
     if (s_slot < 0) {
         return;                     /* no slow analyser in this build */
     }
-    s_slow      = analyser_at(s_slot);
-    s_latch     = latch;
+    s_slow  = analyser_at(s_slot);
+    s_latch = latch;
 
     const AnalyserSpec &sp = s_slow->spec();
 
@@ -222,32 +195,25 @@ void ml_lane_start(ResultLatch *latch, int stream_rate_hz)
         }
     }
 
-    if (sp.rate_hz <= 0) {
-        ESP_LOGE(TAG, "analyser \"%s\" is slow but asks for the stream rate -- "
-                      "not started", sp.name);
-        s_slot = -1;
-        return;
-    }
-    if (!s_slow->init(stream_rate_hz)) {
+    if (!s_slow->init(frames_per_s)) {
         ESP_LOGE(TAG, "analyser \"%s\" refused to start -- lane idle", sp.name);
         s_slot = -1;
         return;
     }
 
-    const size_t bytes = (size_t)sp.rate_hz * STREAM_MS / 1000 * sizeof(int16_t);
-    s_stream = xStreamBufferCreate(bytes, (size_t)sp.hop_n * sizeof(int16_t));
-    if (!s_stream) {
-        ESP_LOGE(TAG, "no memory for a %u byte lane buffer -- \"%s\" will not run",
-                 (unsigned)bytes, sp.name);
+    s_q = xQueueCreate(QUEUE_FRAMES, sizeof(LaneFrame));
+    if (!s_q) {
+        ESP_LOGE(TAG, "no memory for a %u frame lane queue -- \"%s\" will not run",
+                 (unsigned)QUEUE_FRAMES, sp.name);
         s_slot = -1;
         return;
     }
 
-    ESP_LOGI(TAG, "slot %d: \"%s\" model %u | %d Hz mono from %d | window %d, hop %d "
-                  "| reports every %d ms | shown %lld us late | buffer %u B",
-             s_slot, sp.name, (unsigned)sp.model_id, sp.rate_hz, stream_rate_hz,
-             sp.window_n, sp.hop_n, sp.hop_n * 1000 / sp.rate_hz,
-             (long long)sp.present_delay_us, (unsigned)bytes);
+    ESP_LOGI(TAG, "slot %d: \"%s\" model %u | %d frames/s of %d bins "
+                  "| shown %lld us late | queue %u frames (%u B)",
+             s_slot, sp.name, (unsigned)sp.model_id, frames_per_s, SPEC_BINS,
+             (long long)sp.present_delay_us,
+             (unsigned)QUEUE_FRAMES, (unsigned)(QUEUE_FRAMES * sizeof(LaneFrame)));
 
     /*
      * Core 0, priority 3.
@@ -262,38 +228,37 @@ void ml_lane_start(ResultLatch *latch, int stream_rate_hz)
      * 4 kB of stack because a model's working set is in its arena, not here.
      */
     if (xTaskCreatePinnedToCore(ml_task, "mlan", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
-        /* Checked: without it the lane's stream buffer fills once and every
-         * feed is refused from then on, which reads as a starved model rather
-         * than a missing one. */
+        /* Checked: without it the lane's queue fills once and every feed is
+         * refused from then on, which reads as a starved model rather than a
+         * missing one. */
         ESP_LOGE(TAG, "TASK \"mlan\" FAILED TO START -- the slow lane will "
                       "report nothing");
     }
 }
 
-bool ml_lane_feed(const int16_t *mono, int n)
+bool ml_lane_feed(const uint8_t (&spec)[SPEC_BINS], int64_t index, int64_t due_us)
 {
-    if (!s_stream || n <= 0) {
+    if (!s_q) {
         return true;
     }
-    const size_t want = (size_t)n * sizeof(int16_t);
-    const size_t sent = xStreamBufferSend(s_stream, mono, want, 0);
-    s_fed_total += (uint32_t)sent;
-    if (sent < want) {
-        bump(s_dropped, (uint32_t)((want - sent) / sizeof(int16_t)));
+    LaneFrame f;
+    std::memcpy(f.spec, spec, sizeof(f.spec));
+    f.index  = index;
+    f.due_us = due_us;
+    f.gen    = s_gen.load(std::memory_order_relaxed);
+
+    if (xQueueSend(s_q, &f, 0) != pdTRUE) {
+        bump(s_dropped);
         return false;
     }
     return true;
 }
 
-void ml_lane_restart(int64_t origin_us)
+void ml_lane_restart()
 {
-    if (!s_stream) {
+    if (!s_q) {
         return;
     }
-    s_pending_origin.store(origin_us, std::memory_order_relaxed);
-    s_pending_at_byte.store(s_fed_total, std::memory_order_relaxed);
-    /* Release last, against the acquire in the task: both values above must be
-     * visible before the generation that publishes them changes. */
     s_gen.fetch_add(1, std::memory_order_release);
     bump(s_restarts);
 }
