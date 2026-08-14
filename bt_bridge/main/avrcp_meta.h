@@ -15,3 +15,7 @@ void avrcp_meta_start(void);
 /* Signature matches esp_avrc_ct_cb_t exactly -- casting a differently-typed
  * function pointer is undefined behaviour, and the compiler rejects it. */
 void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
+
+/* The target half: absolute volume, forwarded to the speakers rather than
+ * acted on here. Same signature rule as the controller callback above. */
+void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param);

@@ -43,6 +43,17 @@ static IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *fu
 
 void telemetry_tick(void)
 {
+    /*
+     * Repeat the volume to every listener once per window.
+     *
+     * Not because it changes -- sbc_in sends it the instant the phone moves it
+     * -- but because a satellite that joined afterwards, or missed that one
+     * packet, would otherwise play at a stale level until the next time somebody
+     * touched the slider. Two bytes per client at 0.2/s is cheaper than a join
+     * handshake and cannot get out of step.
+     */
+    streamer_send_vol(audio_volume);
+
     /* Age the send list even when nothing is playing. Aging used to happen only
      * inside the audio send loop, so a satellite that vanished while the stream
      * was stopped stayed on the list until audio resumed. */
@@ -203,8 +214,9 @@ void telemetry_tick(void)
          * zero. See n_trim_drops.
          */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
-                      " frames | retunes %" PRIu32 " coarse",
-                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes);
+                      " frames | retunes %" PRIu32 " coarse | volume %u/%d",
+                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes,
+                 audio_volume, AUDIO_VOL_MAX);
 
         ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
                       ", largest %u) | total %" PRIu32 " (largest %u)",

@@ -611,6 +611,10 @@ static void write_chunk(void)
      * so samples_played and the phase queue are looking at the same
      * timeline whatever this unit's speaker is placed as. */
     audio_apply_channel_mode((int16_t *)chunk, AUDIO_FRAMES);
+    /* Beside the channel mode and for the same reasons: in place, on the last
+     * buffer before the output, frame count untouched. What went to the
+     * satellites was full scale; each unit attenuates its own. */
+    audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, audio_volume);
     size_t written = 0;
     const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
     if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,

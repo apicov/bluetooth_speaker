@@ -41,6 +41,7 @@ typedef enum {
     MSG_HEALTH   = 10,  /* any wifi unit -> collector, the structured HEALTH snapshot */
     MSG_LOG_SUB  = 11,  /* collector -> hub: "send logs here" (see log_sub_msg_t) */
     MSG_ML       = 12,  /* master -> listeners, one analyser result */
+    MSG_VOL      = 13,  /* master -> listeners, playback volume (see vol_msg_t) */
 } msg_type_t;
 
 /*
@@ -344,6 +345,25 @@ typedef struct __attribute__((packed)) {
 
 /* The two definitions must not drift apart; sbc_link.h owns the fields. */
 _Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.payload");
+
+/*
+ * Playback volume, hub -> listeners. Applied at each unit's output by
+ * audio_apply_volume(); see that for the taper and why it lives there.
+ *
+ * Sent when the phone changes it AND repeated every telemetry window, which is
+ * what makes a satellite that joined late, or missed the change, converge on
+ * the right level rather than sitting at a stale one forever. Two bytes at
+ * 0.2/s is not worth a smarter scheme, and this way there is no join handshake
+ * to get wrong.
+ *
+ * Unicast per client, like meta and unlike audio: it is rare, it must not be
+ * held for a DTIM burst behind the audio it would delay, and a satellite that
+ * missed one gets the next within the window.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t type;           /* MSG_VOL */
+    uint8_t volume;         /* 0-127, 127 = unity */
+} vol_msg_t;
 
 /*
  * One formatted log line, shipped off-board for centralised analysis.

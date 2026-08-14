@@ -21,3 +21,7 @@ void sbc_link_send(const uint8_t *sbc, uint16_t len);
 /* Occasional, small, and not on the audio path -- safe to send from the AVRCP
  * callback. */
 void sbc_link_send_meta(const link_meta_t *meta);
+
+/* Absolute volume, 0-127. Same properties as the metadata send: rare, tiny, and
+ * called from the AVRCP callback. */
+void sbc_link_send_vol(uint8_t volume);
