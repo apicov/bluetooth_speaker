@@ -191,6 +191,21 @@ void telemetry_tick(void)
          * of this line proves the figures are reading a real pool rather
          * than printing a constant.
          */
+        /*
+         * Its own line for the same reason MEM has one, and short enough to
+         * survive the collector.
+         *
+         * This is what says the fine rate trim is running at all. `trim` is
+         * what the servo asked for; the two totals are what playback actually
+         * did about it, which is the only pair that can disagree. Expect one
+         * frame per ~1.6 s in one direction at ~14 ppm of real drift; flat
+         * means the trim is off, and both climbing means it is hunting across
+         * zero. See n_trim_drops.
+         */
+        ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
+                      " frames | retunes %" PRIu32 " coarse",
+                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes);
+
         ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
                       ", largest %u) | total %" PRIu32 " (largest %u)",
                  (unsigned)heap_caps_get_free_size(CAP_USABLE_INTERNAL),

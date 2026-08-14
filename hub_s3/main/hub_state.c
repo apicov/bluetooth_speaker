@@ -14,6 +14,7 @@ int sock = -1;
 volatile uint32_t sample_rate = 44100;
 uint32_t tx_rate = 44100;
 uint32_t rate_ema;
+volatile int32_t rate_trim_hz;
 #if CONFIG_DANCEFLOOR_ENABLE_MARKER
 volatile int64_t s_marker_at;
 #endif
@@ -64,6 +65,8 @@ volatile uint32_t n_phase_drop;
 volatile uint32_t n_refill_withheld;
 volatile uint32_t n_short_reads;
 volatile uint32_t n_short_frames;
+volatile uint32_t n_trim_drops;
+volatile uint32_t n_trim_dups;
 bool s_refill_active;
 int32_t s_refill_frames;
 client_t s_clients[MAX_CLIENTS];

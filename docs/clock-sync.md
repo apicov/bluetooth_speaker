@@ -515,6 +515,57 @@ speaker — remains unmeasured, and by construction always will be from inside t
 firmware: every reading derived from `samples_played` agrees those frames were
 played. Only the marker GPIO can see it.
 
+### Paying it once per stream instead of twice a minute
+
+That cost is now mostly not paid at all. Across many runs the outage measured
+**1.7 to 6.2 ms, mean ~3.6 ms, once every 20–45 s per unit** — to apply ±4 Hz
+against ~14 ppm of real crystal drift. On the hub it was the last remaining
+self-inflicted interruption in the audio path: `tx-fail 0`, no underruns,
+`dma-starve 0`, everything else it interrupts it interrupts on purpose.
+
+Since 2026-08-14 the servo has two actuators and picks between them by size:
+
+- **Fine, `|trim| ≤ RATE_TRIM_MAX_HZ` (100 Hz).** `rate_trim_hz` names a rate the
+  DAC is *not* running at, and playback consumes the ring at that rate instead —
+  dropping one frame when it needs to get through the stream faster, duplicating
+  one when it needs to get through it slower. At 14 ppm that is one frame in
+  ~71,000, about one every 1.6 s. No channel-down, and continuous where the
+  clock was stepped.
+- **Coarse, beyond it.** The clock still moves, because software cannot absorb a
+  source measured at ~42,600 against a 44,100 output — 40,000 ppm drains a 250 ms
+  buffer in five seconds. On the hub that is `streamer_set_sample_rate()`'s 1%
+  test; on the satellite it is the servo itself, because `i2s_start()` runs with
+  a hardcoded 44100 before any stream exists, so the first match arrives as a
+  ~1500 Hz step. Coarse retunes happen about once per stream.
+
+**The control loop did not change.** Same input, same gain, same
+`PHASE_DEADBAND_US`, same cooldown; the deadband simply moved from comparing
+`desired` against `tx_rate` to comparing the requested trim against the trim
+already applied. That was deliberate — the point was to remove an interruption
+without moving the sync behaviour, so that a change in `TRACK DIVERGENCE` could
+only be attributed to the actuator.
+
+Two consequences worth recording:
+
+- **The deadband's floor is gone.** It was "retuning happens in whole Hz, 22.7 ppm
+  at 44.1 kHz, so ~2.3 ms is the smallest expressible correction". That was a
+  property of the clock. The software path has no such floor, which is what makes
+  tightening `PHASE_DEADBAND_US` — the lever named in §9 as affordable-but-untested
+  — a genuinely one-line experiment now. It is deliberately *not* taken here.
+- **`TIMELINE_SLEW_US` is unaffected.** The 2.27 ms/s ceiling it is sized against
+  is `RATE_TRIM_MAX_HZ / 44100`, and that is unchanged, as is the packet rate.
+
+`samples_played` advances by frames **consumed from the ring** — 257 on a drop,
+255 on a duplicate. It is a position in the ring stream, compared against
+`samples_in`, so it must count what was consumed rather than what was handed to
+the DAC; getting that backwards would make the servo chase its own correction.
+The hub always counted it that way. The satellite did not, and was fixed first
+and separately, because it also had the short-read bias `n_short_frames` counts.
+
+`TRIM:` on each unit's console is the instrument: the trim the servo asked for,
+and the frames playback actually dropped and duplicated. They are the only pair
+that can disagree.
+
 ---
 
 ## 9. What is still unsolved
@@ -571,13 +622,15 @@ produces exactly 900 µs of error.
 **Mid-track divergence.** Cross-unit error resets at every track boundary and
 grows to a few ms by the end of a long track. That growth is deadband-bound, so
 the lever is `PHASE_DEADBAND_US`, and tightening it is now affordable in a way
-it was not: a retune costs a few ms rather than fifty, and no longer drains the
-ring. Untested. Before touching it, put a per-track divergence number in the
-logs — the hub and satellite each print their splice size at a boundary, and the
-difference between those two is how far apart they had drifted, condensed to one
-figure per track. That is the metric to compare builds on; a glance at a log
-window is not, and twice here it produced a confident diagnosis of a regression
-that did not exist.
+it was not — twice over. A retune costs a few ms rather than fifty and no longer
+drains the ring; and since the software rate trim (§8) a *fine* correction costs
+no outage at all, which also removes the whole-Hz floor of ~2.3 ms that used to
+sit under the deadband. Both obstacles are gone and it is still **untested**.
+Before touching it, put a per-track divergence number in the logs — the hub and
+satellite each print their splice size at a boundary, and the difference between
+those two is how far apart they had drifted, condensed to one figure per track.
+That is the metric to compare builds on; a glance at a log window is not, and
+twice here it produced a confident diagnosis of a regression that did not exist.
 
 **The hub's phase noise.** 15.7 ms between consecutive reads, cause unknown. It
 is filtered rather than understood. Most of it turned out to be quantisation --

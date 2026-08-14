@@ -729,3 +729,50 @@ nothing writes. That reads 0 now.
   analyser lane**. The intent is to run it on a satellite later;
   `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` and a full build of
   that branch are what keep it from rotting until then.
+
+---
+
+## 9. The rate servo's actuator (2026-08-14)
+
+Two changes, flashed separately. See clock-sync.md §8 for the mechanism and
+hub-audit.md §14 for the hub's half.
+
+### 9.1 samples_played counted the pad
+
+`sat.h` has carried a counter and a warning about this since the short-read
+counters went in: a ring read that came back short was zero-padded to a full
+chunk, and `samples_played` advanced by `AUDIO_FRAMES` regardless. It is a
+position in the ring stream, compared against `phase_q[].pos`, `marker_sample`
+and `restart_pos`, every one of which comes from `samples_in` — which counts only
+frames actually written to the ring. The pad was never in the ring, so counting
+it displaced all three, permanently and cumulatively.
+
+The hub had counted its receive's return value since `play.c` was written. The
+comment there is the clearest statement of the rule in the tree. This unit now
+matches it. `n_short_reads` and `n_short_frames` stay as the instrument for
+whether it ever mattered; they have read 0 on every run captured, so the fix was
+expected to change nothing visible, which is why it was flashed on its own.
+
+### 9.2 This unit had no coarse rate path
+
+Worth recording because it was not obvious and it shaped the design. The hub
+splits coarse from fine in `streamer_set_sample_rate()`, on a 1% test against the
+measured source rate. This unit has no equivalent: `main.c` calls
+`i2s_start(44100)` with a hardcoded rate before any stream exists, and the
+*servo* is what walks `tx_rate` to a 42,600 Hz stream — `desired = stream_rate +
+adj` against `tx_rate` arrives as a ~1500 Hz step through `retune_output()`.
+
+So the coarse/fine split had to live inside the servo on both units rather than
+only in the hub's rate path, and it is stated as one rule in both: correction
+larger than `RATE_TRIM_MAX_HZ` moves the clock, anything smaller moves
+`rate_trim_hz`. A servo that only ever trimmed in software here would have tried
+to absorb 40,000 ppm by dropping one frame in 29.
+
+### 9.3 The depth net went to software too
+
+The ±20 Hz buffer safety net now moves the trim rather than the clock. It fires
+when the ring is heading for empty, which is the worst possible moment to park
+the play task for 3.6 ms, and 454 ppm of drop rate is a gentler failure than a
+silence. It is also the one regime where the trim could plausibly be audible —
+20 frames a second — and nobody has listened to it. Recorded as a wart in
+architecture.md §16.

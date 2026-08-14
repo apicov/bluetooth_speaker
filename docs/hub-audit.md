@@ -1153,3 +1153,44 @@ and putting a transient into the live stream on top of the silence.
   and a buffer count was later raised in the defaults without reaching a board.
   The check that catches it is cheap — delete `sdkconfig`, rebuild, read the
   generated header — and is worth running whenever a default changes.
+
+---
+
+## 14. The rate servo's actuator (2026-08-14)
+
+The retune was the last self-inflicted interruption in this unit's audio path.
+Everything else it interrupts, it interrupts on purpose: `tx-fail 0`, no
+underruns, `dma-starve 0`. A clock retune took the I2S channel down for 1.7–6.2
+ms, mean ~3.6 ms, once every 20–45 s — to apply ±4 Hz against ~14 ppm of real
+drift.
+
+The fine correction is now made in software, by dropping or duplicating one PCM
+frame at a time (`rate_trim_hz`, one frame in ~71,000 at real drift). The clock
+keeps the coarse job, which software cannot do. See clock-sync.md §8 for the
+split and the reasoning.
+
+### 14.1 What was deliberately left alone
+
+The servo's input, gain, deadband and cooldown are untouched, and
+`PHASE_DEADBAND_US` stays at 7000. Widening it is the obvious way to cut retunes
+and the wrong one — two units at opposite edges of a wider band are that much
+further apart, and cross-unit audio currently measures 0.5–2.5 ms, the best this
+project has recorded. The only edit to the loop is that the deadband now compares
+the requested trim against the trim already applied, where it used to compare
+`desired` against `tx_rate`. Same meaning, different actuator.
+
+`TIMELINE_SLEW_US` is untouched and still correct: the 2.27 ms/s ceiling it is
+sized against is `RATE_TRIM_MAX_HZ / 44100`, which did not move, and neither did
+the packet rate. This was checked explicitly because §13.5 names it as a trap and
+§13.2 is the record of it being sprung.
+
+### 14.2 Process, since §13.2 is the record of getting this wrong
+
+Two flashes, one variable each. The satellite's `samples_played += AUDIO_FRAMES`
+had to become consumed-frames before the trim could work, and that is also a
+standalone fix to a bias `sat.h` had counted-but-not-fixed for weeks — so it went
+in on its own, with the expectation that it changes nothing visible.
+
+The `TRIM:` counters went in **before** either flash, not after. §13.2 records a
+doubled packet rate passing through a build, two test suites and a review because
+the one counter that would have shown it was added afterwards.

@@ -17,10 +17,13 @@
  *               n_ring_full, n_anchor_* counters.
  *   play_task   writes what playback has reached: the phase queue tail,
  *               phase_err_us, phase_valid, phase_stepped, phase_hist, the
- *               splice_report_* set, n_underruns, n_splices, hw_play, and the
- *               refill pair. It owns stream_offset once a stream is running.
- *   drift_task  writes the servo's own state, the retune_* set and the windowed
- *               heap figures, and READS everything else in order to report it.
+ *               splice_report_* set, n_underruns, n_splices, n_short_*,
+ *               n_trim_drops / n_trim_dups, hw_play, and the refill pair. It
+ *               owns stream_offset once a stream is running, and READS
+ *               rate_trim_hz.
+ *   drift_task  writes the servo's own state, rate_trim_hz, the retune_* set
+ *               and the windowed heap figures, and READS everything else in
+ *               order to report it.
  *   wifi_event  writes n_wifi_drops, wifi_down_at, rejoined_at.
  *
  * `volatile` here means "another task writes this", not "this is atomic". A
@@ -680,31 +683,75 @@ extern int32_t s_refill_frames;
 /* ----------------------------------------------------------------- drift */
 
 /*
- * Widest trim the servo may ever ask for. Real drift is ~14 ppm and the buffer
+ * Widest trim the servo may ever ask for, and since 2026-08-14 also the
+ * boundary between its two actuators. Real drift is ~14 ppm and the buffer
  * safety net asks for 20 Hz, so 100 Hz is already absurd -- anything beyond it
  * is a broken measurement, not a correction.
+ *
+ * Within it the correction is made in SOFTWARE, by dropping or duplicating one
+ * frame at a time -- see rate_trim_hz. Beyond it, only the clock can help, and
+ * on this unit that is not a hypothetical: i2s_start() is called with a
+ * hardcoded 44100 before any stream exists, so a hub streaming a source
+ * measured at ~42600 is matched by the servo walking tx_rate there in one step
+ * through retune_output(). That is the coarse case, it happens once per stream,
+ * and software could not absorb it -- 40000 ppm drains the ring in seconds.
  */
 #define RATE_TRIM_MAX_HZ 100
 
 /*
- * What a retune costs, which nobody has measured.
+ * The FINE rate correction, in Hz, written by the servo and read by playback.
  *
- * Two effects pull opposite ways and neither is visible to the servo. The
- * channel is DOWN across disable/reconfig/enable, and real time passes with no
- * audio playing, so playback returns that far behind the timeline. Against
- * that, the disable discards the DMA buffer -- audio already counted in
- * samples_played and already fed to the visualiser -- which skips content and
- * pushes the other way.
+ * This is what the servo used to hand to retune_output(). It now names a rate
+ * the DAC is NOT running at: the clock stays put and playback consumes the ring
+ * at an effective (tx_rate + rate_trim_hz) instead, by dropping one frame when
+ * it needs to get through the stream faster and duplicating one when it needs
+ * to get through it slower. Positive means playing late, so consume faster.
  *
- * Software can see the first and, by construction, never the second: those
- * frames were counted as played, so every reading derived from samples_played
- * agrees that they were. Only the marker GPIO, which fires when a sample
- * physically reaches the output, can close that gap.
+ * Why it is worth the trouble: a clock retune takes the I2S channel down for
+ * 1.7-6.2 ms, measured on the bench below, once every 20-45 s -- to apply +-4 Hz
+ * against ~14 ppm of real drift. One frame in ~71000 is inaudible, and unlike a
+ * retune it is continuous rather than stepped.
  *
- * These record the first effect directly and the NET at the writer, which is
- * what the servo has to correct. Four retunes scraped from a session put the
- * net somewhere between +5 and +22 ms; that is a range, not a number, because
- * phase wanders by several ms on its own between the 5 s log ticks.
+ * Identical to the hub's, deliberately and to the arithmetic: unequal
+ * correction between the two units is a cross-unit sync error by construction,
+ * which is the same reason PHASE_DEADBAND_US is shared rather than per-unit.
+ *
+ * Persists across a playback restart, exactly as tx_rate does. Zeroed only when
+ * a coarse retune moves the clock, because the clock then carries what this was
+ * carrying.
+ */
+extern volatile int32_t rate_trim_hz;
+
+/*
+ * Frames the fine rate trim has dropped from, and duplicated into, the stream.
+ *
+ * The instrument for rate_trim_hz, in before the trim was ever flashed: a
+ * correction you cannot see in a log is a correction you cannot attribute. At
+ * ~14 ppm expect one frame every ~1.6 s in ONE direction. Flat means the trim
+ * is not running; both climbing together means the servo is hunting across
+ * zero; above ~20/s means the depth net is engaged, which is the only regime
+ * where this should be audible at all.
+ */
+extern volatile uint32_t n_trim_drops;
+extern volatile uint32_t n_trim_dups;
+
+/*
+ * What a retune costs. A COARSE-ONLY path since 2026-08-14 -- the servo reaches
+ * it only when the correction exceeds RATE_TRIM_MAX_HZ, i.e. essentially only
+ * when first matching the stream's rate.
+ *
+ * The channel is DOWN across disable/reconfig/enable, and real time passes with
+ * no audio playing, so playback returns that far behind the timeline. This was
+ * once thought to be offset by the disable DISCARDING the DMA buffer -- audio
+ * already counted in samples_played -- which would skip content and push the
+ * other way. It does not: the REFILL note below records 25 of 26 post-retune
+ * measurements reading `0 frames`, so the disable DRAINS the descriptors and
+ * there is nothing to refill. The step is simply the outage.
+ *
+ * These record it directly and the NET at the writer, which is what the servo
+ * has to correct. The bench put it at 1.8-5.8 ms down against a 1.1-6.9 ms
+ * step, mean 3.3 against 3.1 -- the step IS the outage, to within the several
+ * ms phase wanders on its own between 5 s log ticks.
  */
 extern volatile int32_t retune_phase_before;
 extern volatile bool    retune_watch;  /* playback reports the next reading */
@@ -757,8 +804,13 @@ extern volatile uint8_t retune_tail_left;
  * window. The short outages, where the task had less time to spin, cost +4 ms.
  *
  * The hub has had this since "a measured 54 ms correction cost 177 ms of
- * buffer". It was never ported here, and every satellite retune has been paying
- * for it since.
+ * buffer". It was never ported here, and every satellite retune paid for it
+ * until it was.
+ *
+ * Still required, and still cheap to keep: retunes are COARSE-ONLY since
+ * 2026-08-14, so this now guards a path taken about once per stream instead of
+ * every 20-45 s. The fine correction that replaced it never takes the channel
+ * down and so never needs a park -- see rate_trim_hz.
  */
 extern volatile bool retuning;
 /*

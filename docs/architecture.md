@@ -1217,7 +1217,21 @@ inside the firmware at all, because every reading derived from `samples_played`
 agrees those frames were played. Only the marker GPIO can measure it, and nobody
 has. Since `auto_clear` (§5), whichever of those buffers had already played comes
 back as silence rather than a repeat — the same frames are still lost, so the
-figure is unchanged, but the artifact is quieter.
+figure is unchanged, but the artifact is quieter. Largely moot since the software
+rate trim (clock-sync.md §8): the servo's fine correction no longer touches the
+clock, so a retune is a once-per-stream coarse rate match rather than something
+that happens twice a minute. Still unmeasured, just rarely paid.
+
+**Nobody has listened to the rate trim under the depth net.** The fine rate
+correction drops or duplicates one frame at a time, which at ~14 ppm of real
+drift is one frame every ~1.6 s and inaudible by any reasonable account. The
+buffer safety net asks for ±20 Hz, which is 454 ppm — one frame every 50 ms, a
+20 Hz repetition rate, and the one regime where this could plausibly be heard as
+a tone rather than not heard at all. It fires only as a rescue, and what it
+replaced was a 3.6 ms silence in the same moment, so the trade is very likely
+right; it has not been checked by ear. `TRIM:` on the console reports the rate,
+so the condition is at least visible. If it does tick, the fix is a short
+crossfade rather than a zero-order hold, not a return to the clock.
 
 **The LED drift check bounds the error, it does not remove it.** `ALIGN_DRIFT_US`
 is 2 ms, so holes smaller than that accumulate until they add up to something

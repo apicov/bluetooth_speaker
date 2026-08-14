@@ -1,6 +1,13 @@
 /*
- * The output-clock servo: hold this speaker's position in the timeline by
- * trimming the rate the DAC runs at.
+ * The output-rate servo: hold this speaker's position in the timeline by
+ * trimming the rate audio is consumed at.
+ *
+ * "Consumed at", not "the DAC runs at", since 2026-08-14. The loop below is
+ * unchanged -- same input, same gain, same deadband, same cooldown -- but its
+ * output now normally goes to rate_trim_hz, which playback applies by dropping
+ * or duplicating one frame at a time, rather than to retune_output(), which
+ * takes the I2S channel down for several milliseconds to do it. The clock is
+ * still what a COARSE rate match uses; see RATE_TRIM_MAX_HZ for the boundary.
  *
  * Split out of main.c on 2026-08-12. The body is unchanged apart from one level
  * of indentation and the `continue` statements, which skipped to the next 5 s
@@ -146,11 +153,13 @@ void servo_tick(void)
      * while the rest of the stream is in flight: a run read `buffer 40 ms`
      * 100 ms after playback started, from a 107 ms prefill.
      *
-     * The net fired on exactly that, dropping the clock 44100 -> 44080 to
-     * rescue a ring that was not in trouble. The stream then spent 110 s and
-     * six retunes walking off the phase excursion it caused -- peak +48 ms,
-     * with the visualiser rendering 7% of its frames late while the sound
-     * ran behind the timeline the lights were drawn on.
+     * The net fired on exactly that, asking for -20 Hz to rescue a ring that
+     * was not in trouble. It moved the clock in those days; it moves the
+     * software trim now, but the hold is unchanged and so is the reason for
+     * it. The stream then spent 110 s and six retunes walking off the phase
+     * excursion it caused -- peak +48 ms, with the visualiser rendering 7% of
+     * its frames late while the sound ran behind the timeline the lights were
+     * drawn on.
      *
      * 20 s is four servo windows and matches the retune cooldown, by which
      * point the phase measurement is trustworthy and is the better input
@@ -187,11 +196,51 @@ void servo_tick(void)
     if (deadband < 1) {
         deadband = 1;
     }
+    /*
+     * The correction, as an offset from the rate the CLOCK is actually running
+     * at. This is the number that used to be handed to retune_output() as an
+     * absolute rate; splitting it out is what lets the two actuators be chosen
+     * between, because their boundary is a size and not a kind.
+     */
+    const int32_t trim_hz = (int32_t)desired - (int32_t)tx_rate;
+
     if (cooldown > 0) {
         cooldown--;
-    } else if (desired > tx_rate + (uint32_t)deadband ||
-               desired < tx_rate - (uint32_t)deadband) {
-        retune_output(desired);
-        cooldown = 4;        /* ~20 s, against a 40 s correction time */
+    } else {
+        /*
+         * Deadband against the trim ALREADY APPLIED, which is where tx_rate
+         * used to be read: the servo tolerates PHASE_DEADBAND_US of its own
+         * error before moving, and that meaning is unchanged. Only what moves
+         * has changed.
+         */
+        const int32_t step = trim_hz - rate_trim_hz;
+        if (step > deadband || step < -deadband) {
+            if (trim_hz > RATE_TRIM_MAX_HZ || trim_hz < -RATE_TRIM_MAX_HZ) {
+                /*
+                 * COARSE: too big for software to absorb without shredding the
+                 * audio, so the clock has to move. On this unit that is how a
+                 * stream is first matched at all -- i2s_start() ran with a
+                 * hardcoded 44100 before any stream existed, so a source
+                 * measured at ~42600 arrives here as a ~1500 Hz step.
+                 *
+                 * The trim is cleared because the clock now carries what it was
+                 * carrying; leaving it set would apply the correction twice.
+                 */
+                ESP_LOGI(TAG, "servo: smoothed %+ld us -> COARSE, output %" PRIu32 " Hz",
+                         (long)err_ema, desired);
+                rate_trim_hz = 0;
+                retune_output(desired);
+            } else {
+                /* FINE: playback drops or duplicates one frame at a time. No
+                 * channel-down, and continuous rather than stepped. */
+                ESP_LOGI(TAG, "servo: smoothed %+ld us -> trim %+ld Hz "
+                              "(1 frame per %ld ms)",
+                         (long)err_ema, (long)trim_hz,
+                         trim_hz ? (long)(tx_rate / (trim_hz < 0 ? -trim_hz : trim_hz))
+                                 : 0L);
+                rate_trim_hz = trim_hz;
+            }
+            cooldown = 4;        /* ~20 s, against a 40 s correction time */
+        }
     }
 }

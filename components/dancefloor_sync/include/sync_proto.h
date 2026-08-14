@@ -177,13 +177,13 @@ typedef struct __attribute__((packed)) {
 #define MARKER_PULSE_US   200
 
 /*
- * Smoothed phase error each unit tolerates before retuning its output clock.
+ * Smoothed phase error each unit tolerates before correcting its output rate.
  *
  * Shared, because it is not a per-unit preference: every unit deadbands around
  * its own reading of the same timeline, so the worst case between any two of
  * them is twice this, whatever the servos report individually.
  *
- * Bounded below by what a RETUNE costs, which is now measured rather than
+ * It used to be bounded below by what a RETUNE costs, measured rather than
  * guessed. On the bench, forcing same-rate retunes and reading the phase either
  * side: the channel is down 1.8 to 5.8 ms and the phase step is 1.1 to 6.9 ms,
  * mean 3.3 ms against a mean outage of 3.1 ms. The step IS the outage, to
@@ -192,12 +192,23 @@ typedef struct __attribute__((packed)) {
  * This was briefly raised to 20000 on the theory that frequent retunes were
  * what made the strips drift. They were not. A retune used to cost up to 50 ms
  * because the satellite's playback task ran flat out while the channel was down
- * -- see the `retuning` guard in satellite/main/main.c -- and once that was
+ * -- see the `retuning` guard in satellite/main/out.c -- and once that was
  * fixed the cost fell to the outage. 7000 is what the build that measured well
  * actually had.
  *
- * The floor is the clock: retuning happens in whole Hz, 22.7 ppm at 44.1 kHz,
- * so ~2.3 ms of phase is the smallest correction expressible at 44.1 kHz.
+ * NEITHER BOUND STILL BINDS, as of 2026-08-14. Corrections this size are made
+ * in software now, by dropping or duplicating one frame at a time (see
+ * rate_trim_hz on either unit), so a correction costs no outage at all and the
+ * whole-Hz floor -- 22.7 ppm at 44.1 kHz, ~2.3 ms of phase, the smallest step a
+ * clock retune could express -- is a property of an actuator that is no longer
+ * used here. Only a coarse rate MATCH still retunes the clock.
+ *
+ * 7000 is kept unchanged all the same, and deliberately: the point of that
+ * change was to remove an interruption without moving the sync behaviour, and
+ * every cross-unit figure this project has recorded was measured at this value.
+ * Tightening it is now affordable in a way it was not, and it is the obvious
+ * next experiment -- but it is a separate one, with its own flash and its own
+ * TRACK DIVERGENCE reading. See docs/clock-sync.md.
  */
 #define PHASE_DEADBAND_US 7000
 
