@@ -11,6 +11,14 @@ listens on WiFi. Any ESP32 variant would work for this role, but the project
 standardises on the classic ESP32 so every unit is interchangeable with the
 master, which does need Bluetooth Classic.
 
+**The two targets are no longer the same unit with different pins.** A classic
+satellite receives, decodes, plays and draws the hub's frames. A XIAO S3
+satellite does all of that *and* runs the pluggable analysers, including
+TensorFlow Lite Micro models — on the spectrum those same frames carry, so it
+still analyses no audio of its own. `DANCEFLOOR_ML` is what separates them and
+it is set in `sdkconfig.defaults.esp32s3` alone; see "Where a difference between
+the two goes" below for how that generalises.
+
 > [`../docs/satellite-audit.md`](../docs/satellite-audit.md) reads this firmware
 > for clarity, modularity and what a second target costs. Its findings were
 > acted on over 2026-08-12: the firmware is nine files rather than one, the
@@ -78,17 +86,70 @@ The S3 console is on USB-C for bring-up, which costs radio performance —
 `sdkconfig.defaults.esp32s3` carries a commented-out UART block to switch to once
 the unit is playing, and the reasoning behind it.
 
-To build both targets side by side without `set-target` rewriting `sdkconfig`
-each time — the form [`.gitignore`](../.gitignore) already documents:
+### Two images, side by side
+
+The two builds coexist permanently in one checkout — no `set-target`, no
+switching, nothing to rewrite between them:
+
+| | classic | S3 |
+|---|---|---|
+| tracked config | `sdkconfig.defaults` | `sdkconfig.defaults` **+** `sdkconfig.defaults.esp32s3` |
+| generated config | `sdkconfig` | `sdkconfig.s3` |
+| build directory | `build/` | `build.s3/` |
+
+[`tools/sat.py`](../tools/sat.py) is the short way, and prints the full command
+it runs so nothing is hidden:
 
 ```sh
-idf.py -B build.s3 -DIDF_TARGET=esp32s3 -DSDKCONFIG=sdkconfig.s3 build
-idf.py -B build.s3 -DSDKCONFIG=sdkconfig.s3 -p /dev/ttyACM0 flash monitor
+tools/sat.py build   s3
+tools/sat.py flash   classic
+tools/sat.py monitor s3
 ```
+
+The long way, which is what it assembles:
+
+```sh
+idf.py build                                                    # classic
+idf.py -B build.s3 -DIDF_TARGET=esp32s3 -DSDKCONFIG=sdkconfig.s3 build
+```
+
+**`-DSDKCONFIG` is needed on every S3 invocation, not just the first.** Omit it
+with `-B build.s3` and that build directory is silently reconfigured from the
+classic `sdkconfig` — wrong pins, and since the ML work, the wrong feature set
+too, reported by nothing louder than behaviour. That is the whole reason
+`tools/sat.py` exists.
 
 Use a full `flash`, never `app-flash`: the flash is stamped DIO and upgraded to
 QIO by the bootloader, so a stale bootloader leaves the app running DIO.
-`/dev/ttyACM0` rather than `ttyUSB*` because the XIAO has no USB-UART bridge.
+`/dev/ttyACM0` rather than `ttyUSB*` because the XIAO has no USB-UART bridge —
+`sat.py` guesses accordingly and takes `--port` to override.
+
+The boot line says which image is running: `BUILD <date> <time> <target>
+elf:<hash>`.
+
+### Where a difference between the two goes
+
+Three tracked files, one per audience. IDF appends `sdkconfig.defaults.<target>`
+after `sdkconfig.defaults` for **any** target, so this works in both directions:
+
+| file | applies to |
+|---|---|
+| `sdkconfig.defaults` | both |
+| `sdkconfig.defaults.esp32` | classic only — *does not exist yet; create it when something needs it* |
+| `sdkconfig.defaults.esp32s3` | S3 only |
+
+Code that belongs to one of them is a whole file wrapped in `#if
+CONFIG_DANCEFLOOR_<THING>`, with the symbol set from that target's file —
+`analyser_tflm.cpp` is the worked example. **The code never tests the target**;
+it tests the capability, and the config file decides. That keeps the rule
+`visualiser.cpp` states — "adding a mode, not re-deriving which of ten
+conditionals meant which thing" — true both ways, and makes a third board a
+fourth config file rather than a rewrite of every `#if`.
+
+When a setting in `sdkconfig.defaults` stops being common to both, move it down
+into the two target files rather than leaving it in the base with an override on
+top. A base value that is always overridden reads as a shared default and is not
+one.
 
 Changing target rewrites `sdkconfig` from the defaults, so re-check anything you
 had set by hand in `menuconfig`.

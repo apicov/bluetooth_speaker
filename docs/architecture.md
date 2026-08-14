@@ -838,6 +838,16 @@ that shapes the detector's tuning: anything a remote unit might one day be asked
 to compute has to be derivable from the four `band` floats that do travel, which
 [`tuning-corpus.md`](tuning-corpus.md) §9 makes executable rather than a promise.
 
+**`spec[]` is what the pluggable analysers read**, and that is what lets a unit
+on `REMOTE` run a model. It is 64 log-spaced bins, quantised to `uint8` on a
+fixed compression curve (`raw / (1 + raw)`, not an AGC against a running
+maximum), so absolute level survives it and a feature wanting loudness may take
+it from these bins. The identical bytes are produced locally and unpacked off the
+radio — `visualiser.cpp` `static_assert`s that the two widths agree — so an
+analyser cannot tell which it got, and `DANCEFLOOR_ML` is therefore independent
+of this setting in both directions. The S3 satellite is `REMOTE` **and** runs
+models; the hub is `LOCAL` and runs none.
+
 #### Where the code lives
 
 `components/dancefloor_leds/` is shared by the hub and every satellite: the same
@@ -950,7 +960,7 @@ paid for.
 | `DANCEFLOOR_AUDIO_MCAST` | `y` | Audio to `239.0.0.1` |
 | `DANCEFLOOR_MCAST_FRAMES` | `y` | Analysis frames to the same group. Needs the 32 buffers; at 26 it costs ~5% of the audio |
 | `DANCEFLOOR_AUDIO_FEC_DEPTH` | **0** | Piggyback redundancy off — it cannot fit the MTU whole, and making it fit doubles the packet rate. See §4 |
-| `DANCEFLOOR_ML_SOURCE` | **`REMOTE`** | The hub runs no pluggable analysers. Frees ~25 kB of internal SRAM, which is what the TX buffers are spent from |
+| `DANCEFLOOR_ML` | **`n`** | The hub runs no pluggable analysers. Freed ~25 kB of internal SRAM, which is what the TX buffers are spent from. Replaced the `DANCEFLOOR_ML_SOURCE` choice when analyser results stopped being distributed |
 | `DANCEFLOOR_WIFI_LOGS` | **`n`** | Log shipping compiles out. It is bursty unicast from the same buffer pool, and burstiest exactly when something is wrong |
 | `CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0` | `y`, **hub only** | See below |
 | `CONFIG_DANCEFLOOR_LED_HOP_512` | `y` | The component default too, but pinned in the tracked config because a hop mismatch across a floor is the expensive bug |
@@ -985,7 +995,8 @@ paid for.
 | `MAX_SPLICE_MS` | 150 | Ceiling on a track-boundary correction; anything larger is a bug, not drift |
 | ~~`DANCEFLOOR_USE_INTERNAL_DAC`~~ | — | Was a build option for testing with no DAC wired: 8-bit, audibly poor. Removed 2026-08-12; see §5 |
 | `DANCEFLOOR_LED_SOURCE` | **`REMOTE`** | Draw the frames the hub sends rather than analyse locally. Was `LOCAL`; a locally-analysing satellite did not fit its RAM — 177 failed allocations and 396 bytes of free heap. See §12 |
-| `DANCEFLOOR_ML_SOURCE` | `REMOTE` | No analyser lane here either. Both units are `REMOTE` now, so **nothing in the tree compiles the lane** — `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` is what keeps it from rotting until a satellite runs it |
+| `DANCEFLOOR_ML` | **`y` on the S3 only** | The S3 satellite runs the analysers; the classic one does not. Set in `sdkconfig.defaults.esp32s3`, which no other build reads. Independent of `LED_SOURCE`: analysers read the spectrum every frame carries, so this unit runs models on audio it never had |
+| `DANCEFLOOR_ML_TFLM` | **`y` on the S3 only** | The TFLM interpreter and arena. `depends on SPIRAM` — `ml_arena` falls back to internal SRAM rather than failing, and that fallback surfaces an hour later as an audio dropout |
 | `DANCEFLOOR_WIFI_LOGS` | **`n`** | Must match the hub's; satellites ship to the hub and the hub relays |
 
 ### 14. Pins and wiring

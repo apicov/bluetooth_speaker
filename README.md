@@ -36,10 +36,11 @@ of the 1 Mbps basic rate 802.11b forces; see
 | `hub_s3/` | Chip B, on an ESP32-S3. SoftAP, the presentation timeline every unit obeys, its own speaker and strip. The only hub; the classic-ESP32 `hub/` it superseded was retired on 2026-08-12. |
 | `satellite/` | Joins the hub's SoftAP, plays the stream, drives a strip. Any number of these. |
 | `components/dancefloor_sync/` | Wire format and the clock estimator. No ESP-IDF dependencies, host-testable. |
-| `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver. Shared by hub and satellites. |
+| `components/dancefloor_leds/` | FFT, onset detection, patterns, strip driver, and the pluggable analysers. Shared by hub and satellites. |
 | `components/sbc_decoder/` | Vendored SBC decoder. |
 | `tools/pattern_lab/` | The LED pipeline on a laptop, compiled from the firmware sources. |
 | `tools/tuning/` | The detector's tuning harness — sweeps, the negative control, the corpus manifest. |
+| `tools/sat.py` | Builds, flashes and monitors either satellite; one source tree, two images. |
 
 The master is two chips because Bluetooth and WiFi on one ESP32 fight over the
 radio, the memory and the CPU. See [`docs/two-chip-master.md`](docs/two-chip-master.md).
