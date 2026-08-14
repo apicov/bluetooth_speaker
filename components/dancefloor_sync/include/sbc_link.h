@@ -57,6 +57,7 @@
 typedef enum {
     LINK_KIND_SBC  = 0,   /* one or more SBC frames */
     LINK_KIND_META = 1,   /* track metadata, see link_meta_t */
+    LINK_KIND_VOL  = 2,   /* AVRCP absolute volume, see link_vol_t */
 } link_kind_t;
 
 /* ------------------------------------------------------------------------- */
@@ -153,3 +154,27 @@ typedef struct __attribute__((packed)) {
     char     artist[META_TEXT_LEN];
     char     album[META_TEXT_LEN];
 } link_meta_t;
+
+/*
+ * Absolute volume from AVRCP, 0-127 by specification, 127 being unity.
+ *
+ * The bridge is the only unit the phone talks to, so it is the only one that
+ * can hear this, and it forwards rather than acts: the speakers apply it, at
+ * the output, in audio_apply_volume(). A whole SPI frame for one byte, which is
+ * fine -- a volume change is a human moving a slider, not an audio-rate event.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t volume;
+} link_vol_t;
+
+/*
+ * Full scale, and the default everywhere. AVRCP fixes the range at 0-127, so
+ * this is the specification's number rather than a choice.
+ *
+ * Here rather than in audio_out.h because all three projects need it and only
+ * the speakers include that: the bridge reads sbc_link.h, and sync_proto.h --
+ * which audio_out.h includes -- reads it too, so one definition reaches
+ * everything. A unit that has never been told a volume uses this, which is why
+ * a missed message plays loud rather than silent.
+ */
+#define AUDIO_VOL_MAX 127

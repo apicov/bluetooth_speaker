@@ -889,6 +889,21 @@ extern volatile int32_t s_hub_splice_alt_us;
  */
 extern volatile int32_t rate_trim_hz;
 
+/*
+ * Playback volume, 0-127, AUDIO_VOL_MAX being unity and the default.
+ *
+ * Written by the SBC input task when the phone moves the slider, read by
+ * playback. Applied at the DAC write only -- see audio_apply_volume() -- so what
+ * is transmitted to the satellites stays FULL SCALE and each unit attenuates its
+ * own output. Attenuating before the send would spend the air's dynamic range on
+ * a level decision and leave the satellites unable to differ, which is the same
+ * mistake the phone was making before the bridge advertised an AVRCP target.
+ *
+ * A torn read is not possible on a byte, and a stale one costs one chunk at the
+ * previous level -- 5.8 ms, at a step a human just asked for.
+ */
+extern volatile uint8_t audio_volume;
+
 /* What a retune costs -- see the note on the satellite's copy. The channel down
  * is measurable here; the discarded DMA buffer is not measurable anywhere in
  * software, because those frames were counted as played.

@@ -152,6 +152,29 @@ void sbc_link_send_meta(const link_meta_t *meta)
     }
 }
 
+void sbc_link_send_vol(uint8_t volume)
+{
+    if (!s_ring) {
+        return;
+    }
+    struct {
+        spi_link_hdr_t hdr;
+        link_vol_t     vol;
+    } pkt;
+
+    pkt.vol.volume = volume;
+    pkt.hdr.kind = LINK_KIND_VOL;
+    pkt.hdr.rsv = 0;
+    pkt.hdr.rsv2 = 0;
+    pkt.hdr.len = sizeof(link_vol_t);
+    pkt.hdr.seq = s_seq++;
+    pkt.hdr.crc = sbc_link_crc16(&pkt.hdr, &pkt.vol, sizeof(link_vol_t));
+
+    if (xRingbufferSend(s_ring, &pkt, sizeof(pkt), 0) != pdTRUE) {
+        s_dropped++;
+    }
+}
+
 static void IRAM_ATTR handshake_isr(void *arg)
 {
     BaseType_t woken = pdFALSE;

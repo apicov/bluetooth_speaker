@@ -212,8 +212,9 @@ void telemetry_tick(void)
          * zero. See n_trim_drops.
          */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
-                      " frames | retunes %" PRIu32 " coarse",
-                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes);
+                      " frames | retunes %" PRIu32 " coarse | volume %u/%d",
+                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes,
+                 audio_volume, AUDIO_VOL_MAX);
 
         /* Its own line rather than four more fields above -- see the hub's
          * copy for why, and for what the two pools mean. Here they should

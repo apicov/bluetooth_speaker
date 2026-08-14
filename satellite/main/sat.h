@@ -723,6 +723,18 @@ extern int32_t s_refill_frames;
 extern volatile int32_t rate_trim_hz;
 
 /*
+ * Playback volume, 0-127, AUDIO_VOL_MAX being unity and the default it holds
+ * until the hub says otherwise -- so a satellite that never hears a MSG_VOL
+ * plays loud rather than silent.
+ *
+ * Written by rx_task, read by playback, applied at the output in
+ * audio_apply_volume(). The hub sends full-scale audio and this level
+ * separately, and both units run the same integer taper on it, so two speakers
+ * told the same number produce the same level.
+ */
+extern volatile uint8_t audio_volume;
+
+/*
  * Frames the fine rate trim has dropped from, and duplicated into, the stream.
  *
  * The instrument for rate_trim_hz, in before the trim was ever flashed: a

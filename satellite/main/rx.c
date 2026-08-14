@@ -822,6 +822,20 @@ void rx_task(void *arg)
             /* The window carries no timestamps of its own, and the whole
              * question about a rejoin is how old the newest sample in it is. */
             est_newest_at = t4;
+        } else if (buf[0] == MSG_VOL && n >= (int)sizeof(vol_msg_t)) {
+            const vol_msg_t *v = (const vol_msg_t *)buf;
+            /* Clamped rather than trusted: a byte past full scale would build a
+             * gain that amplifies instead of attenuating. */
+            const uint8_t vol = v->volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX
+                                                          : v->volume;
+            /* Repeated once per telemetry window, so say something only when it
+             * moved -- this is the audio path's log discipline, and a line every
+             * 5 s saying nothing changed is the mistake the RX counters exist to
+             * undo. */
+            if (vol != audio_volume) {
+                ESP_LOGW(TAG, "VOLUME %u/%d", vol, AUDIO_VOL_MAX);
+            }
+            audio_volume = vol;
         } else if (buf[0] == MSG_META && n >= (int)sizeof(meta_msg_t)) {
             const link_meta_t *m = (const link_meta_t *)((const meta_msg_t *)buf)->payload;
             ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",

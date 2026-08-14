@@ -57,6 +57,14 @@ void streamer_request_restart(void);
  * simply goes out alongside the audio unicast. */
 void streamer_send_meta(const uint8_t *meta, uint16_t len);
 
+/* A new volume from the phone, via the bridge: clamped, kept, and sent on to
+ * every listener. This is what the SBC input task calls. */
+void streamer_set_volume(uint8_t volume);
+
+/* Playback volume to every listener, without changing it. The telemetry window
+ * repeats the current value with this; see the definition for why it repeats. */
+void streamer_send_vol(uint8_t volume);
+
 /* Call before feeding a packet's audio: records where it starts, so it can be
  * paired with the play_at that streamer_send_sbc() assigns to it. */
 void streamer_begin_packet(void);

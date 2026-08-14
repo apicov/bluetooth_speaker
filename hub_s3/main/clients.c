@@ -255,6 +255,50 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
     }
 }
 
+/*
+ * Playback volume to every listener, unicast like the metadata above.
+ *
+ * Called both when the phone moves it and once per telemetry window. The repeat
+ * is what makes a satellite that joined late, or missed the change, converge on
+ * the right level instead of playing at a stale one -- two bytes at 0.2/s
+ * against a join handshake that could be got wrong.
+ */
+/*
+ * Take a new volume from the phone: clamp it, keep it, and tell everyone.
+ *
+ * Clamped rather than trusted -- it arrives from another chip, and a gain built
+ * from a byte past full scale would amplify instead of attenuate. Sent
+ * immediately so the step reaches every speaker within one packet rather than
+ * waiting up to a window for the repeat.
+ */
+void streamer_set_volume(uint8_t volume)
+{
+    const uint8_t v = volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX : volume;
+    if (v != audio_volume) {
+        ESP_LOGW(TAG, "VOLUME %u/%d", v, AUDIO_VOL_MAX);
+    }
+    audio_volume = v;
+    streamer_send_vol(v);
+}
+
+void streamer_send_vol(uint8_t volume)
+{
+    if (sock < 0) {
+        return;
+    }
+    vol_msg_t msg = { .type = MSG_VOL, .volume = volume };
+
+    client_t snapshot[MAX_CLIENTS];
+    clients_snapshot(snapshot);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (snapshot[i].last_seen) {
+            sendto(sock, &msg, sizeof(msg), 0,
+                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr));
+        }
+    }
+}
+
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 /*
  * Send one analysis frame to every listener.

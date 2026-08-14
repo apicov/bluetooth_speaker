@@ -15,6 +15,7 @@ volatile uint32_t sample_rate = 44100;
 uint32_t tx_rate = 44100;
 uint32_t rate_ema;
 volatile int32_t rate_trim_hz;
+volatile uint8_t audio_volume = AUDIO_VOL_MAX;
 #if CONFIG_DANCEFLOOR_ENABLE_MARKER
 volatile int64_t s_marker_at;
 #endif

@@ -135,9 +135,75 @@ void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *rc)
     }
 }
 
+/*
+ * The TARGET half, which is what makes the phone's volume slider a control
+ * command instead of an attenuation applied to the audio.
+ *
+ * Without this the handset has nowhere to send volume, so it scales the PCM
+ * before the SBC encoder and every step down is resolution destroyed before the
+ * audio reaches the air. With it, the phone transmits at full scale and tells us
+ * how loud to play; the speakers honour it at their own output, in
+ * audio_apply_volume().
+ *
+ * This unit has no DAC of its own -- it is a bridge -- so it does not act on the
+ * volume at all. It forwards it and the speakers apply it.
+ */
+static uint8_t s_volume = AUDIO_VOL_MAX;   /* unity until the phone says otherwise */
+
+void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *rc)
+{
+    switch (event) {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG, "AVRCP target %s",
+                 rc->conn_stat.connected ? "connected" : "disconnected");
+        break;
+
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+        s_volume = rc->set_abs_vol.volume > AUDIO_VOL_MAX
+                 ? AUDIO_VOL_MAX : rc->set_abs_vol.volume;
+        ESP_LOGI(TAG, "volume %u/%d", s_volume, AUDIO_VOL_MAX);
+        sbc_link_send_vol(s_volume);
+        break;
+
+    case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+        /*
+         * Answered INTERIM and never followed by CHANGED, deliberately.
+         *
+         * The notification exists so a sink with its own volume control -- a
+         * knob, a button -- can tell the phone the user turned it. Nothing here
+         * has one: volume only ever arrives FROM the phone, so there is never a
+         * change to report back and a CHANGED would only ever be an echo of
+         * what the controller just sent. An interim response with the current
+         * value is the whole of this target's obligation.
+         */
+        if (rc->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+            esp_avrc_rn_param_t rn = { .volume = s_volume };
+            esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE,
+                                    ESP_AVRC_RN_RSP_INTERIM, &rn);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
 void avrcp_meta_start(void)
 {
     ESP_ERROR_CHECK(esp_avrc_ct_init());
     ESP_ERROR_CHECK(esp_avrc_ct_register_callback(avrcp_meta_ct_cb));
-    ESP_LOGI(TAG, "AVRCP controller up");
+
+    ESP_ERROR_CHECK(esp_avrc_tg_init());
+    ESP_ERROR_CHECK(esp_avrc_tg_register_callback(avrcp_meta_tg_cb));
+
+    /* Declare which notifications this target supports. Volume change is the
+     * one that matters; without it in the capability set the phone never sends
+     * SET_ABSOLUTE_VOLUME and keeps scaling the audio itself. */
+    esp_avrc_rn_evt_cap_mask_t evt_set = { 0 };
+    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set,
+                                       ESP_AVRC_RN_VOLUME_CHANGE);
+    ESP_ERROR_CHECK(esp_avrc_tg_set_rn_evt_cap(&evt_set));
+
+    ESP_LOGI(TAG, "AVRCP controller and target up, volume %u/%d",
+             s_volume, AUDIO_VOL_MAX);
 }

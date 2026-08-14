@@ -10,6 +10,7 @@
  * which makes the estimator's error exactly (up - down) / 2.
  */
 #include "sync_proto.h"
+#include "audio_out.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -490,6 +491,74 @@ int main(void)
               LOG_MSG_BYTES(0) == hdr &&
               LOG_MSG_BYTES(LOG_MSG_MAX) == sizeof(log_msg_t) &&
               LOG_MSG_BYTES(LOG_MSG_MAX) <= 1500, d);
+    }
+
+    /*
+     * 23. The volume taper.
+     *
+     * It runs on both units against the same number and must produce the same
+     * samples: the hub is an LX7 and the satellite an LX6, and two speakers
+     * disagreeing about level is the same class of fault as them disagreeing
+     * about rate. Integer throughout is what guarantees it, and these pin the
+     * properties that make the integer version usable.
+     */
+    {
+        check("full volume is exactly unity",
+              audio_volume_q15(AUDIO_VOL_MAX) == 32768, "no rounding loss at the top");
+        check("zero volume is silence", audio_volume_q15(0) == 0, NULL);
+
+        bool monotonic = true;
+        for (int v = 1; v <= AUDIO_VOL_MAX; v++) {
+            if (audio_volume_q15(v) < audio_volume_q15(v - 1)) {
+                monotonic = false;
+            }
+        }
+        check("the taper never goes backwards", monotonic,
+              "a slider that drops in level as it is raised");
+
+        /* Full scale must be a no-op on the samples, not merely close to one:
+         * the default build never attenuates and must be bit-identical to one
+         * compiled before this existed. */
+        int16_t a[8], b[8];
+        for (int i = 0; i < 8; i++) {
+            a[i] = b[i] = (int16_t)(i * 4000 - 16000);
+        }
+        audio_apply_volume(a, 4, AUDIO_VOL_MAX);
+        check("full volume does not touch the samples",
+              memcmp(a, b, sizeof a) == 0, NULL);
+
+        /* Silence in, silence out -- the property that lets the splice's const
+         * quiet buffer skip this entirely. */
+        int16_t q[8] = { 0 };
+        audio_apply_volume(q, 4, 40);
+        bool quiet_stays = true;
+        for (int i = 0; i < 8; i++) {
+            if (q[i] != 0) {
+                quiet_stays = false;
+            }
+        }
+        check("silence maps to silence at any volume", quiet_stays, NULL);
+
+        /* Attenuation actually attenuates, and never inverts or overflows. */
+        int16_t s[8];
+        for (int i = 0; i < 8; i++) {
+            s[i] = (int16_t)(i * 4000 - 16000);
+        }
+        audio_apply_volume(s, 4, AUDIO_VOL_MAX / 2);
+        bool shrunk = true;
+        for (int i = 0; i < 8; i++) {
+            const int16_t o = (int16_t)(i * 4000 - 16000);
+            if (abs(s[i]) > abs(o) || (o > 0 && s[i] < 0) || (o < 0 && s[i] > 0)) {
+                shrunk = false;
+            }
+        }
+        char d[96];
+        snprintf(d, sizeof d, "half slider = q15 %d of 32768",
+                 (int)audio_volume_q15(AUDIO_VOL_MAX / 2));
+        check("half volume attenuates without inverting", shrunk, d);
+
+        check("vol_msg_t is two bytes on the wire", sizeof(vol_msg_t) == 2,
+              "type + level, and nothing a padding byte could hide in");
     }
 
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");

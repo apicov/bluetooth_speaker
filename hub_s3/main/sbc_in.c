@@ -178,7 +178,8 @@ static void rx_task(void *arg)
              * CRC is checking content rather than deciding where content ends.
              */
             if (hdr.len == 0 || hdr.len > SBC_LINK_MAX_PAYLOAD ||
-                (hdr.kind != LINK_KIND_SBC && hdr.kind != LINK_KIND_META)) {
+                (hdr.kind != LINK_KIND_SBC && hdr.kind != LINK_KIND_META &&
+                 hdr.kind != LINK_KIND_VOL)) {
                 s_bad_hdr++;
                 goto rearm;
             }
@@ -211,6 +212,17 @@ static void rx_task(void *arg)
                     }
                     last_track_id = m->track_id;
                     have_track = true;
+                }
+                goto rearm;
+            }
+
+            if (hdr.kind == LINK_KIND_VOL) {
+                if (hdr.len == sizeof(link_vol_t)) {
+                    const link_vol_t *v = (const link_vol_t *)payload;
+                    /* Through the streamer's interface, like the metadata and
+                     * the restart request above: this module reads the link and
+                     * hands over, and does not touch playback state itself. */
+                    streamer_set_volume(v->volume);
                 }
                 goto rearm;
             }

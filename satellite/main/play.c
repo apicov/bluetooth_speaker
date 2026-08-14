@@ -526,6 +526,13 @@ void play_task(void *arg)
              * written to -- and needs nothing doing to it, since every mode
              * maps silence to silence. */
             audio_apply_channel_mode((int16_t *)chunk, AUDIO_FRAMES);
+            /* Beside the channel mode and for the same reasons: in place, on
+             * the last buffer before the output, frame count untouched. The hub
+             * sends full scale and this level separately, and both units run the
+             * same integer taper, so the two speakers match. Not inside
+             * write_audio() because a splice calls that with the const `quiet`
+             * buffer -- and silence needs no attenuating. */
+            audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, audio_volume);
 
             write_audio(chunk, sizeof(chunk));
             /* Immediately: it is the instant the next pass dates its phase
