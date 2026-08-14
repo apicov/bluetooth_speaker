@@ -178,17 +178,20 @@ Every unit drives its own DAC — the hub is a full speaker, not a base station 
 and in every case **the ESP32 is the I2S master**, generating the clocks the DAC
 follows.
 
-| PCM5102A | classic hub | classic satellite | S3 hub (`hub_s3/`) |
-|---|---|---|---|
-| BCK | GPIO 26 | GPIO 26 | **GPIO 7**, pad `D8` |
-| LRCK | GPIO 27 | GPIO 27 | **GPIO 8**, pad `D9` |
-| DIN | GPIO 25 | GPIO 25 | **GPIO 9**, pad `D10` |
-| VIN | 3V3 | 3V3 | 3V3 |
-| GND | GND | GND | GND |
-| SCK | GND | GND | GND |
+| PCM5102A | classic hub | classic satellite | S3 hub (`hub_s3/`) | S3 satellite |
+|---|---|---|---|---|
+| BCK | GPIO 26 | GPIO 26 | **GPIO 7**, pad `D8` | **GPIO 7**, pad `D8` |
+| LRCK | GPIO 27 | GPIO 27 | **GPIO 8**, pad `D9` | **GPIO 8**, pad `D9` |
+| DIN | GPIO 25 | GPIO 25 | **GPIO 9**, pad `D10` | **GPIO 9**, pad `D10` |
+| VIN | 3V3 | 3V3 | 3V3 | 3V3 |
+| GND | GND | GND | GND | GND |
+| SCK | GND | GND | GND | GND |
 
-There is no S3 satellite build. If you make one, the pins above are what it
-would take — `hub_s3/` and `satellite/` read the same three Kconfig symbols.
+The last two columns are the same three pins because `hub_s3/` and `satellite/`
+read the same three Kconfig symbols, and the satellite's S3 defaults pin them to
+the hub's values on purpose — a hub and a satellite on a XIAO are wired
+identically. An S3 satellite is `idf.py set-target esp32s3` in `satellite/`, not
+a separate app; see [`satellite/README.md`](satellite/README.md).
 
 Four things that are not obvious from the table:
 
@@ -229,9 +232,9 @@ Every unit drives its own strip — the hub is a full speaker, not a base statio
 — so this is identical on a hub, an S3 hub and a satellite except for the data
 pin.
 
-| | classic hub | S3 hub | satellite |
-|---|---|---|---|
-| WS2812 data | **GPIO 18** | **GPIO 1**, pad `D0` | GPIO 18 |
+| | classic hub | S3 hub | classic satellite | S3 satellite |
+|---|---|---|---|---|
+| WS2812 data | **GPIO 18** | **GPIO 1**, pad `D0` | GPIO 18 | **GPIO 1**, pad `D0` |
 
 ```
    ESP32 / XIAO            74AHCT125            WS2812 strip

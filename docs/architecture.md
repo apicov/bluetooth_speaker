@@ -1020,18 +1020,29 @@ without a console.
 
 **On the hub and each satellite:**
 
-| Function | GPIO | Note |
-|---|---|---|
-| I2S BCK → DAC | 26 | |
-| I2S WS/LRCK → DAC | 27 | |
-| I2S DATA → DAC | 25 | |
-| WS2812 data | 18 | Via 74AHCT125 level shifter, 330 Ω series resistor |
-| Sync marker (output) | 4 | Pulses when marked audio plays |
-| Sync monitor (input, hub) | 21 | Wire a satellite's marker pin here + common ground |
+| Function | classic ESP32 | XIAO ESP32-S3 | Note |
+|---|---|---|---|
+| I2S BCK → DAC | 26 | 7 (`D8`) | |
+| I2S WS/LRCK → DAC | 27 | 8 (`D9`) | |
+| I2S DATA → DAC | 25 | 9 (`D10`) | |
+| WS2812 data | 18 | 1 (`D0`) | Via 74AHCT125 level shifter, 330 Ω series resistor |
+| Sync marker (output) | 4 | 4 (`D3`) | Pulses when marked audio plays |
+| Sync monitor (input, hub) | 21 | 5 (`D4`) | Wire a satellite's marker pin here + common ground |
+| LED marker (output) | 2 | 2 (`D1`) | External LED on the XIAO; GPIO 21 is documented as onboard and does not light |
+
+Both columns apply to a hub and to a satellite alike — the hub is an S3 and a
+satellite may be either, and the S3 values are shared deliberately so that a hub
+and a satellite on a XIAO are wired identically. GPIO 25/26/27 do not exist as
+usable pins on an S3 at all: 26–32 are the SPI flash, and octal PSRAM takes
+33–37.
 
 All configurable under `idf.py menuconfig` → *Dancefloor*, because board
 silkscreens disagree — `G4` is GPIO 4 on one board, `D4` is emphatically not on
 another.
+
+> On the S3 hub the sync monitor and the SBC link's CS both want GPIO 5, so those
+> two instruments cannot both be wired on that board — see the note above the
+> bridge table.
 
 > **Avoid GPIO 16/17.** On WROVER modules they are wired to the PSRAM die even
 > when PSRAM is disabled in software. **Avoid GPIO 5** — it is a strapping pin,

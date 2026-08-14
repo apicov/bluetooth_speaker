@@ -58,13 +58,37 @@ idf.py -p /dev/ttyUSB2 flash monitor
 ```
 
 **One source, two targets.** `set-target` is the whole difference between a
-classic-ESP32 satellite and a Seeed XIAO ESP32-S3 one. Pins, PSRAM, flash size
-and the console route come from `sdkconfig.defaults.esp32s3`, which IDF reads
-after `sdkconfig.defaults` when the target is the S3; the pin *defaults* are
-also keyed on `IDF_TARGET_ESP32S3` in `main/Kconfig.projbuild`, so a bare
-`set-target` build is already correct. There is deliberately no `satellite_s3/`
-directory — see [`../docs/satellite-audit.md`](../docs/satellite-audit.md) §F1
-for what the equivalent fork cost on the hub.
+classic-ESP32 satellite and a Seeed XIAO ESP32-S3 one. Pins, PSRAM, flash size,
+the WiFi buffer placement and the console route come from
+`sdkconfig.defaults.esp32s3`, which IDF reads after `sdkconfig.defaults` when the
+target is the S3; the pin *defaults* are also keyed on `IDF_TARGET_ESP32S3` in
+`main/Kconfig.projbuild`, so a bare `set-target` build is already correct. There
+is deliberately no `satellite_s3/` directory — see
+[`../docs/satellite-audit.md`](../docs/satellite-audit.md) §F1 for what the
+equivalent fork cost on the hub.
+
+**Which XIAO.** The S3 defaults are written for the **XIAO ESP32-S3 Plus**, which
+is what `hub_s3/` runs on, so a hub and a satellite are the same board wired the
+same way — I2S on pads `D8`/`D9`/`D10`, the strip on `D0`, the LED marker on `D1`.
+The pad numbering is identical on the plain XIAO and the Sense, so those work too;
+the only line that is Plus-specific is `CONFIG_ESPTOOLPY_FLASHSIZE_16MB`, which
+should go back to `8MB` on the other two. The file says so at that line.
+
+The S3 console is on USB-C for bring-up, which costs radio performance —
+`sdkconfig.defaults.esp32s3` carries a commented-out UART block to switch to once
+the unit is playing, and the reasoning behind it.
+
+To build both targets side by side without `set-target` rewriting `sdkconfig`
+each time — the form [`.gitignore`](../.gitignore) already documents:
+
+```sh
+idf.py -B build.s3 -DIDF_TARGET=esp32s3 -DSDKCONFIG=sdkconfig.s3 build
+idf.py -B build.s3 -DSDKCONFIG=sdkconfig.s3 -p /dev/ttyACM0 flash monitor
+```
+
+Use a full `flash`, never `app-flash`: the flash is stamped DIO and upgraded to
+QIO by the bootloader, so a stale bootloader leaves the app running DIO.
+`/dev/ttyACM0` rather than `ttyUSB*` because the XIAO has no USB-UART bridge.
 
 Changing target rewrites `sdkconfig` from the defaults, so re-check anything you
 had set by hand in `menuconfig`.
@@ -85,29 +109,32 @@ Pins, LED count, brightness, pattern and the bench instruments are under
 
 ## Wiring
 
-Same as the hub's own DAC, on the same pins.
+Same as the hub's own DAC, on the same pins — and on the S3 that is literally the
+same pins as `hub_s3/`, so the two boards are wired identically.
 
-| ESP32 | PCM5102A |
-|---|---|
-| GPIO 26 | BCK |
-| GPIO 27 | LRCK |
-| GPIO 25 | DIN |
-| GND | GND, SCK |
-| 3V3 | VIN |
+| PCM5102A | classic ESP32 | XIAO ESP32-S3 |
+|---|---|---|
+| BCK | GPIO 26 | GPIO 7, pad `D8` |
+| LRCK | GPIO 27 | GPIO 8, pad `D9` |
+| DIN | GPIO 25 | GPIO 9, pad `D10` |
+| GND | GND, SCK | GND, SCK |
+| VIN | 3V3 | 3V3 |
 
 XSMT must be high or the DAC stays muted.
 
 ### LEDs
 
-GPIO 18 -> 74AHCT125 level shifter -> WS2812 DIN. 330 Ω series on data, 1000 µF
-across the strip supply, separate 5 V supply, common ground.
+Data pin -> 74AHCT125 level shifter -> WS2812 DIN. 330 Ω series on data, 1000 µF
+across the strip supply, separate 5 V supply, common ground. The data pin is
+**GPIO 18** on a classic ESP32 and **GPIO 1** (pad `D0`) on the XIAO, which does
+not bring 18 out.
 
 ### Bench instruments, optional, off by default
 
-| | |
-|---|---|
-| GPIO 4 | Audio marker. Wire to the hub's GPIO 21, plus a common ground, and the hub reports how far this unit's audio is from its own. |
-| GPIO 2 | LED marker. One flash per second, in step on every unit. Onboard LED on many boards, but not all. |
+| classic | XIAO S3 | |
+|---|---|---|
+| GPIO 4 | GPIO 4, pad `D3` | Audio marker. Wire to the hub's monitor pin, plus a common ground, and the hub reports how far this unit's audio is from its own. |
+| GPIO 2 | GPIO 2, pad `D1` | LED marker. One flash per second, in step on every unit. Onboard LED on many classic boards; on the XIAO wire an external one to `D1` — the documented onboard LED at GPIO 21 does not light. |
 
 Nothing corrects on either. Every servo and every splice closes through
 `play_at` and the phase queue, so enabling or disabling them changes no
