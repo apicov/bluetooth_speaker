@@ -630,11 +630,25 @@ extern volatile uint32_t n_short_frames;
  * a build, two test suites and a review because the one counter that would have
  * shown it was added afterwards.
  *
- * What they should read: at ~14 ppm of real drift, one frame every ~1.6 s, so
- * ~37 per minute, climbing steadily and in ONE direction. Flat means the trim
- * is not running. Both climbing together means the servo is hunting across
- * zero. A rate above ~20/s means the depth net is engaged, which is the only
- * regime where this is expected to be audible at all.
+ * The rate is |rate_trim_hz| frames per second, by construction: a trim of N Hz
+ * against a rate of `rate` needs rate * N/rate = N extra frames each second.
+ * Measured on the first run that played: 720 frames in the 60 s window where
+ * the trim was -14 then -10 Hz, and 300 in the window where it was -10 then
+ * -6. That is the arithmetic, and it is what these are here to keep honest.
+ *
+ * What that means in practice, which is NOT one number:
+ *
+ *   converging   ~14/s for the first minute or two. Startup phase is ~-32 ms
+ *                (the DMA refill, see s_refill_active) and the loop spreads it
+ *                over ~100 s, so it asks for ~320 ppm -- twenty times the
+ *                crystals' own difference. Heard on the bench as nothing.
+ *   steady       ~1/s. Real drift is ~14 ppm, which is 0.6 Hz, and the trim is
+ *                whole Hz, so it sits at 0 or 1 and the deadband holds it
+ *                there.
+ *   depth net    20/s, the +-20 Hz rescue. The loudest this gets.
+ *
+ * Flat when rate_trim_hz is non-zero means the trim is not running. Both
+ * climbing together means the servo is hunting across zero.
  */
 extern volatile uint32_t n_trim_drops;
 extern volatile uint32_t n_trim_dups;

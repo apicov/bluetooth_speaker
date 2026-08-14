@@ -249,12 +249,20 @@ void servo_tick(void)
             } else {
                 /* FINE: playback drops or duplicates one frame at a time. No
                  * channel-down, and continuous rather than stepped. */
+                /*
+                 * Frames per second, which IS |trim_hz|: a trim of N Hz against
+                 * a rate of `rate` needs rate * N/rate = N extra frames every
+                 * second. Printed anyway, because it is the figure the
+                 * n_trim_drops / n_trim_dups deltas have to match, and reading
+                 * that off a Hz value is one inference more than a log should
+                 * ask for. It was briefly printed as `tx_rate / |trim_hz|`
+                 * labelled milliseconds, which is frames-between-corrections
+                 * with the wrong unit on it -- 3150 ms where the truth was 71.
+                 */
                 ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
-                              "-> trim %+ld Hz (1 frame per %ld ms)",
+                              "-> trim %+ld Hz (%ld frames/s)",
                          (long)s_err_ema, (long)s_phase_err_us, (long)depth_ms,
-                         (long)trim_hz,
-                         trim_hz ? (long)(tx_rate / (trim_hz < 0 ? -trim_hz : trim_hz))
-                                 : 0L);
+                         (long)trim_hz, (long)(trim_hz < 0 ? -trim_hz : trim_hz));
                 rate_trim_hz = trim_hz;
             }
             cooldown = 4;          /* ~20 s against a 100 s correction */

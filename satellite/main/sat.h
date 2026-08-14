@@ -726,11 +726,17 @@ extern volatile int32_t rate_trim_hz;
  * Frames the fine rate trim has dropped from, and duplicated into, the stream.
  *
  * The instrument for rate_trim_hz, in before the trim was ever flashed: a
- * correction you cannot see in a log is a correction you cannot attribute. At
- * ~14 ppm expect one frame every ~1.6 s in ONE direction. Flat means the trim
- * is not running; both climbing together means the servo is hunting across
- * zero; above ~20/s means the depth net is engaged, which is the only regime
- * where this should be audible at all.
+ * correction you cannot see in a log is a correction you cannot attribute.
+ *
+ * The rate is |rate_trim_hz| frames per second, by construction. Measured on
+ * the first run that played: 501 frames in the 60 s window where the trim was
+ * -14 then -10 Hz, and 220 where it was -6 then -2. Converging from the ~-32 ms
+ * startup phase runs at ~14/s for a minute or two; steady state is ~1/s,
+ * because real drift is 0.6 Hz and the trim is whole Hz; the depth net is 20/s.
+ * See the hub's copy for the full table.
+ *
+ * Flat when rate_trim_hz is non-zero means the trim is not running; both
+ * climbing together means the servo is hunting across zero.
  */
 extern volatile uint32_t n_trim_drops;
 extern volatile uint32_t n_trim_dups;

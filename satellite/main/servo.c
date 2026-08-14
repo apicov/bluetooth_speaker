@@ -233,11 +233,12 @@ void servo_tick(void)
             } else {
                 /* FINE: playback drops or duplicates one frame at a time. No
                  * channel-down, and continuous rather than stepped. */
+                /* Frames per second, which IS |trim_hz| -- see the hub's copy,
+                 * including what this printed before it was right. */
                 ESP_LOGI(TAG, "servo: smoothed %+ld us -> trim %+ld Hz "
-                              "(1 frame per %ld ms)",
+                              "(%ld frames/s)",
                          (long)err_ema, (long)trim_hz,
-                         trim_hz ? (long)(tx_rate / (trim_hz < 0 ? -trim_hz : trim_hz))
-                                 : 0L);
+                         (long)(trim_hz < 0 ? -trim_hz : trim_hz));
                 rate_trim_hz = trim_hz;
             }
             cooldown = 4;        /* ~20 s, against a 40 s correction time */

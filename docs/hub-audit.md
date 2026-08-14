@@ -1194,3 +1194,41 @@ in on its own, with the expectation that it changes nothing visible.
 The `TRIM:` counters went in **before** either flash, not after. §13.2 records a
 doubled packet rate passing through a build, two test suites and a review because
 the one counter that would have shown it was added afterwards.
+
+### 14.3 First run on hardware (2026-08-14)
+
+Both units, one track, ~4 minutes. `retunes 0 (0 refused)` on both — the coarse
+path was never reached, which is what it should do at a matched 44100.
+
+| | hub | satellite |
+|---|---|---|
+| phase at playback start | -32555 us | -32435 us |
+| phase after ~165 s | -784 us | -1728 us |
+| retunes | 0 | 0 |
+| underruns / dma-starve / short-reads | 0 | 0 |
+| splices | 0 | 0 |
+
+Both walked -32 ms to under -2 ms with no clock retune and no channel-down. The
+two tracked each other to within roughly 0.5–1 ms throughout the convergence,
+compared at equal times since their own playback start (they started 35 s apart).
+
+The counters matched the arithmetic exactly. The drop/dup rate is `|trim_hz|`
+frames per second, and the hub logged 720 frames across the 60 s window where
+the trim was -14 then -10 Hz, and 300 where it was -10 then -6.
+
+Every correction was a DUPLICATE; neither unit dropped a frame. Startup phase is
+negative on both — the ~30 ms DMA refill — so the servo spent the whole run
+asking them to slow down. The drop path is therefore **still untested on
+hardware**, which the first run to start late will exercise.
+
+Two things this corrected:
+
+- **The servo line printed the wrong unit.** `1 frame per %ld ms` was fed
+  `tx_rate / |trim_hz|`, which is frames between corrections, not milliseconds:
+  it read "3150 ms" where the truth was 71. Now `%ld frames/s`, which is
+  `|trim_hz|` and is directly comparable with the `TRIM:` deltas.
+- **"One frame every 1.6 s" describes steady state only.** Converging from the
+  startup phase asks for ~320 ppm, so it runs at ~14 frames/s for the first
+  minute or two — twenty times the crystals' own difference, and within striking
+  distance of the depth net's 20/s. Nothing was audible at that rate on music,
+  which is the closest thing to evidence the net has.

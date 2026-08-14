@@ -1223,15 +1223,20 @@ clock, so a retune is a once-per-stream coarse rate match rather than something
 that happens twice a minute. Still unmeasured, just rarely paid.
 
 **Nobody has listened to the rate trim under the depth net.** The fine rate
-correction drops or duplicates one frame at a time, which at ~14 ppm of real
-drift is one frame every ~1.6 s and inaudible by any reasonable account. The
-buffer safety net asks for ±20 Hz, which is 454 ppm — one frame every 50 ms, a
-20 Hz repetition rate, and the one regime where this could plausibly be heard as
-a tone rather than not heard at all. It fires only as a rescue, and what it
-replaced was a 3.6 ms silence in the same moment, so the trade is very likely
-right; it has not been checked by ear. `TRIM:` on the console reports the rate,
-so the condition is at least visible. If it does tick, the fix is a short
-crossfade rather than a zero-order hold, not a return to the clock.
+correction drops or duplicates one frame at a time at `|rate_trim_hz|` frames per
+second. Steady state is ~1/s and inaudible by any reasonable account.
+
+Partly answered on the first run that played: **converging from the ~-32 ms
+startup phase runs at ~14 frames/s for the first minute or two** — the loop
+spreads that error over ~100 s, so it asks for ~320 ppm, twenty times the
+crystals' own difference — and both units did that on music with nothing
+audible. That is close enough to the depth net's 20/s to make it likely fine
+there too, but it is not the same test: the net fires mid-stream on a ring in
+trouble rather than during a fade-in from silence.
+
+If it ever does tick, the fix is a short crossfade rather than a zero-order
+hold, not a return to the clock. `TRIM:` reports the rate, so the condition is
+visible whenever it happens.
 
 **The LED drift check bounds the error, it does not remove it.** `ALIGN_DRIFT_US`
 is 2 ms, so holes smaller than that accumulate until they add up to something
