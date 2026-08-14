@@ -234,6 +234,21 @@ class Session:
                     pass
 
 
+def garbled(line):
+    """True when a line is mostly replacement chars -- wrong baud, most likely.
+
+    Reading a board below its console baud turns the stream into accent soup,
+    and the soup rarely contains a newline, so it surfaces as one huge line
+    rather than an error. This is what that looks like, so it can be said out
+    loud instead of quietly capturing nothing for an hour.
+    """
+    if not line.strip():
+        return False
+    bad = sum(1 for c in line if c == "�" or
+              (ord(c) < 32 and c not in "\t"))
+    return bad > len(line) * 0.1
+
+
 def reader(session, unit, port, baud):
     """One serial port, reopened for as long as the soak runs.
 
@@ -246,14 +261,28 @@ def reader(session, unit, port, baud):
             with serial.Serial(port, baud, timeout=1) as ser:
                 session.record(unit, f"--- capture: opened {port} @ {baud} ---")
                 buf = b""
+                garbled_seen = False
                 while not session.stop.is_set():
                     chunk = ser.read(4096) or b""
                     if chunk:
                         buf += chunk
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
-                            session.record(
-                                unit, line.decode("utf-8", errors="replace"))
+                            text = line.decode("utf-8", errors="replace")
+                            if not garbled_seen and garbled(text):
+                                garbled_seen = True
+                                session.record(
+                                    unit,
+                                    f"--- capture: GARBLED TEXT from {port} -- "
+                                    f"wrong baud? reading @ {baud}; a board's "
+                                    f"console needs its own rate ---")
+                            session.record(unit, text)
+                        # Garbled streams may never emit a newline; cap the
+                        # buffer rather than grow it for four hours.
+                        if len(buf) > 65536:
+                            session.record(unit, buf.decode("utf-8",
+                                                             errors="replace"))
+                            buf = b""
         except serial.SerialException as e:
             if session.stop.is_set():
                 return
