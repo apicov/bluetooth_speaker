@@ -58,35 +58,6 @@ typedef struct __attribute__((packed)) {
 } vis_frame_t;
 
 /*
- * One pluggable analyser's result, in the form that can leave the unit that
- * computed it.
- *
- * df::Result, packed. It travels on its own message at its own cadence rather
- * than inside vis_frame_t -- see ml_msg_t in sync_proto.h for why -- and it is
- * declared here for the same reason vis_frame_t is: this component does not
- * depend on the audio protocol, and the unit that transports a result is the
- * one that knows how.
- *
- * `unit` says which speaker computed it, so a floor where two units are running
- * different builds is a fact in a log rather than a puzzle. `model_id` is the
- * sharper half of that: a result computed by a different model than this unit
- * would have used is the one difference that makes two strips disagree while
- * every other diagnostic looks healthy.
- */
-#define VIS_RESULT_SCORES 8
-
-typedef struct __attribute__((packed)) {
-    int64_t show_at_us;     /* master-clock instant this result is DISPLAYED */
-    int64_t index;          /* window number on the analyser's own grid */
-    uint8_t analyser;       /* which slot, so the far end files it correctly */
-    uint8_t model_id;
-    uint8_t n;              /* how many of the arrays below are valid */
-    uint8_t unit;           /* which speaker computed it; 0 is the hub */
-    uint8_t label[VIS_RESULT_SCORES];
-    uint8_t score[VIS_RESULT_SCORES];
-} ml_result_t;
-
-/*
  * Called with every frame this unit computes, if set.
  *
  * For a unit that sends its frames to others. Runs on the analysis task, so it
@@ -94,32 +65,6 @@ typedef struct __attribute__((packed)) {
  * Registering nothing, which is the default, simply publishes nothing.
  */
 void visualiser_set_publish(void (*publish)(const vis_frame_t *f));
-
-/*
- * The same, for analyser results.
- *
- * Runs on whichever lane produced the result -- the analysis task for a fast
- * analyser, the slow lane's own task for a slow one -- so it must not block
- * from either.
- */
-void visualiser_set_ml_publish(void (*publish)(const ml_result_t *r));
-
-/*
- * Hand this unit a result computed somewhere else.
- *
- * Goes into the same latch a local analyser fills and is shown at the instant
- * it names, so the two sources are interchangeable by construction -- the same
- * property visualiser_submit_frame() gives frames. Safe from any task.
- *
- * Ignored unless this unit is built to take results from elsewhere; see
- * CONFIG_DANCEFLOOR_ML_SOURCE. A unit running its own analysers and also
- * accepting somebody else's would show two answers to the same question.
- */
-void visualiser_submit_ml(const ml_result_t *r);
-
-/* Whether this unit runs its own analysers or is given their results.
- * Reportable, so a mixed floor is a fact in the log rather than a puzzle. */
-const char *visualiser_ml_source_name(void);
 
 /*
  * Hand this unit a frame computed somewhere else.

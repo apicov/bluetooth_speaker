@@ -63,20 +63,29 @@ constexpr const char *TAG = "vis";
 #endif
 
 /*
- * The same question for the pluggable analysers, and deliberately a SEPARATE
- * answer.
+ * Whether the pluggable analysers run here.
  *
- * A unit may compute its own FFT frames and still be given a model's results:
- * the FFT is cheap and deterministic, a model may be neither, and a satellite
- * that cannot hold an arena can still light up in step with one that can. The
- * reverse -- being given frames but running analysers locally -- cannot work,
- * because a unit taking frames analyses no audio and there is nothing to run
- * them on. Kconfig enforces that; this is only the derivation.
+ * This used to be a separate question with its own setting: a unit could compute
+ * its own FFT frames and still be GIVEN a model's results, so that a satellite
+ * unable to hold an arena could light up in step with one that could. Nothing is
+ * given any more -- results are computed wherever they are wanted -- so
+ * DANCEFLOOR_ML_SOURCE became DANCEFLOOR_ML, which asks only whether this unit
+ * runs them.
+ *
+ * IT IS NOT ENOUGH TO ASK LED_SOURCE. Deriving this from "does this unit analyse
+ * audio" is wrong in a way that compiles and links: the hub analyses audio and
+ * must NOT run the lane -- it gave up ~25 kB of internal SRAM to stop, and that
+ * is the pool its WiFi TX buffers come from. Written down because that is
+ * exactly the regression this line was briefly rewritten into.
+ *
+ * The second half is still needed while the analysers read PCM: a unit taking
+ * remote frames has no audio to give them. That drops out when they move to the
+ * spectrum, which every unit has either way.
  */
-#if CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE || CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
-#define DF_RUNS_ANALYSERS 0
-#else
+#if CONFIG_DANCEFLOOR_ML && !CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
 #define DF_RUNS_ANALYSERS 1
+#else
+#define DF_RUNS_ANALYSERS 0
 #endif
 
 using df::FFT_N;
@@ -497,54 +506,6 @@ std::atomic<int64_t (*)(int64_t)> s_to_local{nullptr};
 
 /* Set on a unit that sends its frames onward. Null publishes nothing. */
 std::atomic<void (*)(const vis_frame_t *)> s_publish{nullptr};
-/* The same, for analyser results. Written from two lanes, so atomic. */
-std::atomic<void (*)(const ml_result_t *)> s_ml_publish{nullptr};
-
-static_assert(VIS_RESULT_SCORES == df::RESULT_SCORES,
-              "the wire result and df::Result disagree about how many scores");
-
-/* df::Result -> the form that can leave this unit, and back. Plain copies:
- * unlike a frame there is nothing here that cannot travel. */
-void to_wire(const df::Result &r, ml_result_t *w)
-{
-    w->show_at_us = r.show_at_us;
-    w->index      = r.index;
-    w->analyser   = r.analyser;
-    w->model_id   = r.model_id;
-    w->n          = r.n;
-    w->unit       = 0;                  /* the hub is the only publisher today */
-    std::memcpy(w->label, r.label, sizeof(w->label));
-    std::memcpy(w->score, r.score, sizeof(w->score));
-}
-
-[[maybe_unused]] void from_wire(const ml_result_t *w, df::Result &r)
-{
-    r = df::result_none();
-    r.show_at_us = w->show_at_us;
-    r.index      = w->index;
-    r.analyser   = w->analyser;
-    r.model_id   = w->model_id;
-    r.n          = w->n > df::RESULT_SCORES ? df::RESULT_SCORES : w->n;
-    std::memcpy(r.label, w->label, sizeof(r.label));
-    std::memcpy(r.score, w->score, sizeof(r.score));
-}
-
-/*
- * Send a result onward, if anything is listening.
- *
- * Called from whichever lane produced it. Both lanes hand results to the local
- * latch first and come here afterwards, so this unit's own strip never waits on
- * a radio and a send that fails costs a neighbour a result rather than costing
- * this unit one too -- the same ordering publish_frame() has.
- */
-void publish_result(const df::Result &r)
-{
-    if (const auto publish = s_ml_publish.load(std::memory_order_relaxed)) {
-        ml_result_t w;
-        to_wire(r, &w);
-        publish(&w);
-    }
-}
 
 /* BEAT_BANDS is a macro from beat_detect.h, not a df:: member. */
 static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
@@ -734,9 +695,6 @@ void run_fast_lane(const int16_t *mono, int64_t index, int64_t due_us,
     for (int i = 0; i < df::ML_SLOTS; i++) {
         if (df::result_valid(out[i])) {
             bump(s_ml_results);
-            /* After the frame it travels in has been filled, so a radio that is
-             * busy costs a neighbour a result and not this unit's own strip. */
-            publish_result(out[i]);
         }
     }
 }
@@ -1382,68 +1340,6 @@ void visualiser_set_publish(void (*publish)(const vis_frame_t *))
     s_publish.store(publish, std::memory_order_relaxed);
 }
 
-void visualiser_set_ml_publish(void (*publish)(const ml_result_t *r))
-{
-    s_ml_publish.store(publish, std::memory_order_relaxed);
-}
-
-const char *visualiser_ml_source_name(void)
-{
-#if DF_RUNS_ANALYSERS
-    return "local";
-#else
-    return "remote";
-#endif
-}
-
-void visualiser_submit_ml(const ml_result_t *r)
-{
-#if DF_RUNS_ANALYSERS
-    /* This unit computes its own. Accepting somebody else's as well would put
-     * two answers to the same question in one slot, alternating by whichever
-     * arrived last -- the same reason visualiser_submit_frame() is a no-op on a
-     * unit doing its own analysis. */
-    (void)r;
-#else
-    if (!r || r->analyser >= df::ML_SLOTS) {
-        return;
-    }
-
-    /*
-     * Is this the model this unit expects in that slot?
-     *
-     * A result from a different model is the one difference that makes two
-     * strips disagree while every counter looks healthy, so it is said out loud
-     * -- once, because it is a property of the pair of builds and will not stop
-     * happening, and a complaint per result would bury everything else.
-     *
-     * Reported, not refused. A floor deliberately running a bigger model on the
-     * hub than a satellite could hold is a case this is meant to serve; what it
-     * must not be is a surprise.
-     */
-    if (df::Analyser *a = df::analyser_at(r->analyser)) {
-        if (a->spec().model_id != r->model_id) {
-            static bool told[df::ML_SLOTS];
-            if (!told[r->analyser]) {
-                told[r->analyser] = true;
-                ESP_LOGW(TAG, "slot %u carries model %u, this build expects %u "
-                              "(\"%s\") -- the strips will follow the sender",
-                         r->analyser, r->model_id, a->spec().model_id, a->spec().name);
-            }
-        }
-    }
-
-    df::Result local;
-    from_wire(r, local);
-    /* A failed publish is already counted as a latch overrun, which is where
-     * a reader would look for it -- it means the render stage is not draining,
-     * and that is the same fault whichever side filled the slot. */
-    if (s_latch.publish(r->analyser, local)) {
-        bump(s_ml_results);
-    }
-#endif
-}
-
 void visualiser_submit_frame(const vis_frame_t *f)
 {
 #if DF_TAKES_REMOTE_FRAMES
@@ -1771,7 +1667,7 @@ void visualiser_start(void)
 #if DF_ANALYSES_AUDIO && DF_RUNS_ANALYSERS
         /* Starts nothing if no analyser is slow, so a build without one pays no
          * task, no stack and no 4 kB filter table. */
-        df::ml_lane_start(&s_latch, rate, publish_result);
+        df::ml_lane_start(&s_latch, rate);
 #endif
     }
 

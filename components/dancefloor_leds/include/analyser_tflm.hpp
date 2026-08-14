@@ -43,10 +43,12 @@
  * the way that takes an evening to find: two strips that agree on the bench and
  * drift apart over a set. Use full-integer quantisation.
  *
- * A float model is still fine on a floor where exactly one unit runs it and
- * everyone else is DANCEFLOOR_ML_SOURCE_REMOTE -- there is only one copy of the
- * decision then, which is the same argument that lets the hub run any algorithm
- * at all. Say so in a comment if you rely on it.
+ * A float model is still fine on a floor where exactly one unit runs it at all
+ * -- there is only one copy of the decision then, so there is nothing for it to
+ * disagree with. That was previously arranged by building the other units
+ * DANCEFLOOR_ML_SOURCE_REMOTE; with that setting gone it means, literally, that
+ * only one unit has DANCEFLOOR_ML_TFLM. Say so in a comment if you rely on it,
+ * because nothing enforces it.
  */
 #pragma once
 

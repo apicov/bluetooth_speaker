@@ -30,8 +30,8 @@
  * both do.
  *
  * So: quantised integer models are a CORRECTNESS requirement here, not a size
- * optimisation. See docs/architecture.md and the note in Kconfig under
- * DANCEFLOOR_ML_SOURCE for what a mixed floor is and is not promised.
+ * optimisation. See docs/architecture.md, and the note in Kconfig under
+ * DANCEFLOOR_ML_TFLM for what a mixed floor is and is not promised.
  */
 #pragma once
 
@@ -68,9 +68,10 @@ constexpr uint8_t RESULT_NONE = 0xFF;
  * One analyser's answer about one window of audio.
  *
  * Deliberately small and deliberately plain data. It is copied into every
- * df::Frame that carries it, it goes on the wire as ml_result_t, and it is
- * latched across tasks -- three places where a pointer would need a lifetime
- * rule, which Frame::mag already demonstrates the cost of.
+ * df::Frame that carries it and latched across tasks -- two places where a
+ * pointer would need a lifetime rule, which Frame::mag already demonstrates the
+ * cost of. It used to travel between units as ml_result_t as well; results are
+ * now computed wherever they are wanted, so nothing serialises one.
  */
 struct Result {
     /* Window number on this analyser's own grid, from an origin all units

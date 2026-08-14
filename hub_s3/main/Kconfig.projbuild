@@ -111,28 +111,6 @@ menu "Dancefloor hub"
             hub's own local strip is unaffected either way: this gates the
             broadcast, not the analysis.
 
-    config DANCEFLOOR_PUBLISH_ML
-        bool "Send analyser results to satellites (ML_SOURCE_REMOTE)"
-        default y
-        depends on DANCEFLOOR_ENABLE_VISUALISER
-        help
-            Whether the hub unicasts its pluggable analysers' results (MSG_ML)
-            to every registered satellite. Leave on when any satellite is built
-            ML_SOURCE_REMOTE; turn off when every satellite runs its own.
-
-            Cost depends entirely on which analysers are enabled, and the two
-            lanes are not comparable. A SLOW analyser reporting once a second is
-            36 bytes a second and beneath notice. A FAST one publishes at the
-            analysis rate -- 86 a second at hop 512 -- which is about what the
-            MSG_FRAME stream itself costs, so turning one on roughly doubles the
-            per-listener downlink this hub already pays.
-
-            Separate from DANCEFLOOR_PUBLISH_FRAMES because the two answer
-            different questions and a floor may well want one without the other:
-            satellites computing their own FFT frames while being given a model
-            only the hub can hold is exactly the arrangement ML_SOURCE_REMOTE
-            exists for.
-
     # The SSID, the password, DANCEFLOOR_AP_OPEN and DANCEFLOOR_DISABLE_PMF live
     # in components/dancefloor_sync/Kconfig, under "Dancefloor radio pairing".
     # They describe one link seen from both ends and were previously declared

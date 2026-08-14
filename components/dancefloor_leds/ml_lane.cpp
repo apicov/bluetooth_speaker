@@ -24,7 +24,6 @@ constexpr const char *TAG = "mlan";
 Analyser   *s_slow = nullptr;
 int         s_slot = -1;
 ResultLatch *s_latch = nullptr;
-void (*s_on_result)(const Result &) = nullptr;
 
 StreamBufferHandle_t s_stream = nullptr;
 
@@ -92,7 +91,6 @@ void feed(SlowWindow &grid, const AnalyserSpec &sp, const int16_t *in, int n)
             s_latch->publish(s_slot, r);
             bump(s_results);
             /* After the latch, so the local strip is served before the radio. */
-            if (s_on_result) s_on_result(r);
 
             /*
              * Say what changed, and only what changed.
@@ -203,8 +201,7 @@ int ml_lane_slot()
     return -1;
 }
 
-void ml_lane_start(ResultLatch *latch, int stream_rate_hz,
-                   void (*on_result)(const Result &r))
+void ml_lane_start(ResultLatch *latch, int stream_rate_hz)
 {
     s_slot = ml_lane_slot();
     if (s_slot < 0) {
@@ -212,7 +209,6 @@ void ml_lane_start(ResultLatch *latch, int stream_rate_hz,
     }
     s_slow      = analyser_at(s_slot);
     s_latch     = latch;
-    s_on_result = on_result;
 
     const AnalyserSpec &sp = s_slow->spec();
 

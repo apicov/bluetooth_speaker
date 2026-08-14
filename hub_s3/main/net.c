@@ -305,8 +305,8 @@ void tx_fail_note(int err)
     /*
      * ENOMEM is the WiFi pool out of TX buffers, and it is the one failure a
      * non-audio lane can do something about: back off for TX_BACKOFF_US so
-     * publish_frame/publish_ml yield and the buffers audio is being refused are
-     * left for audio. fan_out() does not check this, so audio keeps sending and,
+     * publish_frame yields and the buffers audio is being refused are left for
+     * audio. fan_out() does not check this, so audio keeps sending and,
      * if it still hits ENOMEM, re-arms the deadline from here. The errno tally
      * above stays the whole of the diagnosis; this is the reaction to it.
      */

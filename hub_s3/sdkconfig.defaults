@@ -745,36 +745,33 @@ CONFIG_DANCEFLOOR_WIFI_LOGS=n
 # together.
 CONFIG_LWIP_DHCPS_MAX_STATION_NUM=15
 
-# The hub runs NO pluggable analysers, and gives up its own to buy transmit
-# capacity. Pinned here because it was not pinned anywhere: the Kconfig default
-# is DANCEFLOOR_ML_SOURCE_LOCAL, sdkconfig is gitignored, and so a clone of this
-# repo built a hub that started the slow lane while every measurement written
-# above was taken on one that did not.
+# THE HUB RUNS NO PLUGGABLE ANALYSERS. The setting that says so is now
+# DANCEFLOOR_ML, which replaced the DANCEFLOOR_ML_SOURCE choice when results
+# stopped being distributed; DANCEFLOOR_PUBLISH_ML went at the same time.
 #
-# What it costs the hub: nothing it was using. The lane's two analysers are
-# ZcrRms and Mood; the periodic log read `slow 0/0 us` and `results N+0` for the
-# whole of every run captured -- the slow lane produced nothing at all -- and
-# `ml-throt` showed ~77 of the fast one's results a second being computed and
-# thrown away against a 100 ms publish period.
+# Pinned here rather than left to the Kconfig default of n, for the reason the
+# old ML_SOURCE line was pinned: sdkconfig is gitignored, this hub's measurements
+# were all taken with the lane off, and a clone that quietly turned it on would
+# invalidate them. The default agrees today -- that is not a reason to rely on it.
 #
-# What it buys: ~25 kB of INTERNAL SRAM, which is the pool the WiFi static TX
-# buffers come from and the binding constraint on this board. The lane's stream
-# buffer alone is 12.8 kB (16 kHz x 400 ms x 2 B), plus a 4 kB mlan stack and
-# its TCB, plus ~6.3 kB of resampler table and decimation buffer that
-# DF_RUNS_ANALYSERS drops with it. None of it can live in PSRAM:
-# SPIRAM_USE_CAPS_ALLOC means plain malloc and every task stack are internal.
+# What it cost the hub when the choice existed: nothing it was using. The lane's
+# two analysers are ZcrRms and Mood; the periodic log read `slow 0/0 us` and
+# `results N+0` for the whole of every run captured -- the slow lane produced
+# nothing at all -- and `ml-throt` showed ~77 of the fast one's results a second
+# being computed and thrown away against a 100 ms publish period.
 #
-# The analysers stay in the shared component and stay buildable -- the intent is
-# to run them on a SATELLITE, which has the audio and none of this hub's
-# transmit load. Nothing in the tree compiles that path now, so
-# `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` is what keeps it
-# from rotting.
-CONFIG_DANCEFLOOR_ML_SOURCE_LOCAL=n
-CONFIG_DANCEFLOOR_ML_SOURCE_REMOTE=y
-
-# Nothing to publish once no analyser runs here, so this would send an empty
-# result stream to every satellite. ~10 datagrams/s per satellite, unicast.
-CONFIG_DANCEFLOOR_PUBLISH_ML=n
+# What it bought: ~25 kB of INTERNAL SRAM, the pool the WiFi static TX buffers
+# come from and the binding constraint on this board. The lane's stream buffer
+# alone was 12.8 kB (16 kHz x 400 ms x 2 B), plus a 4 kB mlan stack and its TCB,
+# plus ~6.3 kB of resampler table and decimation buffer. None of it could live in
+# PSRAM: SPIRAM_USE_CAPS_ALLOC means plain malloc and every task stack are
+# internal.
+#
+# The lane is on its way out entirely: once the analysers read the quantised
+# spectrum every unit already receives in MSG_FRAME, they need no audio, no
+# resampler and no task, which is what makes running them on a satellite
+# practical. Until then this line is what keeps them off here.
+CONFIG_DANCEFLOOR_ML=n
 
 # MEASURED, AND IT WORKS AT 32 BUFFERS. Overrides the Kconfig default of n,
 # which stays n because it is the right answer for a hub with the 26 static TX

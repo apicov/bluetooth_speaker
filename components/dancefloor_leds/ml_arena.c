@@ -56,8 +56,8 @@ bool ml_arena_take(ml_arena_t *a, size_t bytes, const char *name)
      * dropout nobody connects to the model.
      *
      * So the free figures are printed beside the request. If the margin looks
-     * thin here it IS thin, and the answer is a smaller model or
-     * DANCEFLOOR_ML_SOURCE_REMOTE on this unit.
+     * thin here it IS thin, and the answer is a smaller model -- there is no
+     * longer an option to take somebody else's results instead.
      */
     a->base = heap_caps_aligned_alloc(ARENA_ALIGN, bytes,
                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
