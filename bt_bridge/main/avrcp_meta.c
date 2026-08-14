@@ -149,18 +149,6 @@ void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *rc)
  * volume at all. It forwards it and the speakers apply it.
  */
 static uint8_t s_volume = AUDIO_VOL_MAX;   /* unity until the phone says otherwise */
-static bool    s_vol_ntf_pending;
-static uint8_t s_vol_ntf_tl;
-
-static void notify_volume(void)
-{
-    if (!s_vol_ntf_pending) {
-        return;
-    }
-    esp_avrc_rn_param_t rn = { .volume = s_volume };
-    esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn);
-    s_vol_ntf_pending = false;
-}
 
 void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *rc)
 {
@@ -168,9 +156,6 @@ void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *rc)
     case ESP_AVRC_TG_CONNECTION_STATE_EVT:
         ESP_LOGI(TAG, "AVRCP target %s",
                  rc->conn_stat.connected ? "connected" : "disconnected");
-        if (!rc->conn_stat.connected) {
-            s_vol_ntf_pending = false;
-        }
         break;
 
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
@@ -178,21 +163,21 @@ void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *rc)
                  ? AUDIO_VOL_MAX : rc->set_abs_vol.volume;
         ESP_LOGI(TAG, "volume %u/%d", s_volume, AUDIO_VOL_MAX);
         sbc_link_send_vol(s_volume);
-        /* The phone asked to be told when volume changes, and a change it made
-         * itself still counts -- some stacks will not send another SET until the
-         * outstanding notification has been answered. */
-        notify_volume();
         break;
 
     case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+        /*
+         * Answered INTERIM and never followed by CHANGED, deliberately.
+         *
+         * The notification exists so a sink with its own volume control -- a
+         * knob, a button -- can tell the phone the user turned it. Nothing here
+         * has one: volume only ever arrives FROM the phone, so there is never a
+         * change to report back and a CHANGED would only ever be an echo of
+         * what the controller just sent. An interim response with the current
+         * value is the whole of this target's obligation.
+         */
         if (rc->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
-            s_vol_ntf_pending = true;
-            s_vol_ntf_tl = 0;
-            (void)s_vol_ntf_tl;
             esp_avrc_rn_param_t rn = { .volume = s_volume };
-            /* INTERIM now, CHANGED later. Answering with CHANGED straight away
-             * is read as "it already moved" and some handsets then stop
-             * registering at all. */
             esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE,
                                     ESP_AVRC_RN_RSP_INTERIM, &rn);
         }

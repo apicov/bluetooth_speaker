@@ -81,6 +81,15 @@ synchronisation, not just for display: a track change is the one moment a
 splice is inaudible, so it is when every unit nulls its accumulated phase error.
 See §10.
 
+AVRCP has two halves and the bridge speaks both. As a **controller** it asks the
+phone for metadata. As a **target** it accepts *absolute volume* — and that half
+exists for a reason worth stating plainly: without it the phone has nowhere to
+send a volume command, so it scales the PCM itself before the SBC encoder, and
+every step down the slider is resolution thrown away before the audio ever
+reaches the air. With a target advertised the phone transmits at full scale and
+sends the level as a number; each speaker attenuates its own output. The bridge
+has no DAC, so it forwards and never acts. See §7.
+
 ### 3. Codecs, and what "lossy" costs here
 
 Raw CD-quality audio is 44,100 samples per second × 2 channels × 16 bits =
@@ -308,6 +317,27 @@ twice.
 
 **The master is also a speaker.** The hub chip drives its own DAC and its own LED
 strip, exactly like a satellite. It is not a base station.
+
+**Volume travels beside the audio, not inside it.** The phone sends a level over
+AVRCP; the bridge forwards it on the SPI link as `LINK_KIND_VOL`, the hub keeps
+it and relays `MSG_VOL` to every listener, and each unit applies it to its own
+DMA buffer immediately before the write. The audio on both hops stays full
+scale, so nothing spends dynamic range carrying a level decision, and one number
+reaches every speaker rather than every speaker guessing.
+
+That last step lives in `audio_apply_volume()`, beside `audio_apply_channel_mode()`
+and for the same reason: both rewrite samples inside frames that already exist,
+so the frame count is untouched and nothing downstream — `samples_played`, the
+phase queue, the splice arithmetic, the rate servo — can see either of them.
+Applying volume any earlier would put a level into the ring, where a splice would
+later replay stale audio at the wrong gain.
+
+The taper is a square law in integer arithmetic. Integer because the hub is an
+LX7 and the satellite an LX6: a float could round differently on the two and put
+the same stream out at two levels, which is the same class of fault as the two
+disagreeing about rate. `AUDIO_VOL_MAX` (127, AVRCP's own range) is unity and is
+the default everywhere, so a unit that has never been told a volume plays loud
+rather than silent.
 
 Three firmware images live in this repository, plus two host tools and a Python
 client that lives elsewhere:
@@ -1342,7 +1372,7 @@ budget.
 | `components/dancefloor_sync/` | Wire formats and the clock estimator. **No ESP-IDF dependencies** — it is the part most likely to be subtly wrong, and hardware bring-up is a bad place to find out |
 | `components/sbc_decoder/` | Vendored OI SBC decoder from Bluedroid |
 | `bt_bridge/main/sbc_spi.c` | Frames SBC onto the SPI link as master, `seq` assigned at enqueue |
-| `bt_bridge/main/avrcp_meta.c` | Track metadata and change notifications |
+| `bt_bridge/main/avrcp_meta.c` | AVRCP controller (track metadata) and target (absolute volume) |
 | `bt_bridge/main/status_led.c` | The two front-panel LEDs — connected solid, streaming blinking |
 | `hub_s3/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
 | `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed |

@@ -1270,3 +1270,55 @@ three orders of magnitude smaller. A 74 s stall is the phone or the A2DP link,
 not delivery jitter. What makes it audible for longer than the stall itself is
 that a satellite parks on underrun and waits for an anchor; recovery is bounded
 by when the hub next restarts its timeline, not by when audio comes back.
+
+---
+
+## 15. Volume (2026-08-14)
+
+Found while chasing dropouts, and worth recording separately because it was
+never a bug report -- nobody had noticed it was possible.
+
+`bt_bridge` initialised the AVRCP **controller** only, for track metadata. A
+controller reads; it does not accept commands. So the bridge never advertised
+AVRCP **target**, never advertised absolute-volume support, and the phone -- with
+nowhere to send a level -- did the only thing left to it and scaled the PCM
+itself before the SBC encoder.
+
+Every step down the volume slider was therefore resolution destroyed upstream of
+the air, upstream of the bridge, upstream of everything this project measures. No
+unit in the tree had any idea a volume existed.
+
+The bridge advertises a target now. `LINK_KIND_VOL` on the SPI link mirrors
+`LINK_KIND_META` exactly; the hub keeps the value and relays `MSG_VOL` unicast to
+each satellite, like meta and unlike audio so it is never held behind a DTIM
+burst. Both hops carry FULL-SCALE audio and the level separately.
+
+Applied in `audio_apply_volume()`, beside `audio_apply_channel_mode()`, on the
+last buffer before the write. That position is what makes it invisible: frame
+count untouched, so `samples_played`, the phase queue, the splice arithmetic and
+the rate servo cannot see it. Earlier would be wrong in two different ways --
+into the ring, and a splice replays old audio at a stale gain; into the transmit
+path, and the satellites can no longer differ from the hub.
+
+Square law, integers only. Integer because the hub is an LX7 and the satellite an
+LX6 and a float could round differently on the two, which is the same reasoning
+the fixed-point resampler in `dancefloor_leds` carries. `AUDIO_VOL_MAX` is 127,
+AVRCP's own range, is unity, and is the default everywhere -- a unit that never
+hears a `MSG_VOL` plays loud rather than silent.
+
+Repeated once per telemetry window as well as sent on change, so a satellite that
+joined late or missed the packet converges instead of sitting at a stale level.
+Two bytes per client at 0.2/s, against a join handshake that could be got wrong.
+It is not an audio packet, so `TIMELINE_SLEW_US` is untouched -- checked, because
+13.5 names that as a trap.
+
+Six host tests pin the taper: unity is exactly 32768 with no rounding loss, zero
+is silence, it never goes backwards, full volume does not touch the samples at
+all, silence maps to silence, and attenuation never inverts or overflows.
+
+**What this does NOT yet answer.** The suspicion that started it -- that a
+near-silent stream was being suspended by the phone, which `sbc_in` saw as
+`pkts 0` for 74 seconds -- is still a suspicion. Running the phone at full scale
+removes that input whether or not the theory is right, but the theory itself is
+unproven and the measurement that would settle it is simply watching `sbc_in:
+pkts` while turning the slider down on a build without this change.
