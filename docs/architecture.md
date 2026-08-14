@@ -1381,6 +1381,8 @@ budget.
 | `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |
 | `tools/pattern_lab/` | The LED pipeline over a WAV on a laptop, compiled from the component |
 | `tools/tuning/` | `sweep.py` and `converge.cpp` — the harness behind `tuning-corpus.md` |
+| `tools/soak/capture.py` | Reads every unit's console over serial, prints it, writes `metrics.csv` / `events.csv` / `raw.log` |
+| `tools/soak/analyse.py` | Reads a capture session and reports faults, divergence, trim, phase, buffer, heap and source stalls |
 
 ---
 
