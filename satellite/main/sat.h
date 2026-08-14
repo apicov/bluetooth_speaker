@@ -517,18 +517,21 @@ extern volatile uint32_t n_phase_drop;
  * Ring reads that came back short of a full chunk, and the frames of silence
  * padded in to cover them.
  *
- * Suspected, not established, which is why this is a counter and not a fix. The
- * pad is played but was never in the ring, while samples_played advances by a
- * whole chunk regardless -- so if it happens, every later phase point is
- * displaced by the pad and the servo's only input carries a permanent bias.
+ * FIXED 2026-08-14; these stay as the instrument that says whether it mattered.
+ *
+ * The pad is played but was never in the ring, and samples_played used to
+ * advance by a whole chunk regardless -- so every later phase point was
+ * displaced by the pad and the servo's only input carried a permanent bias.
  * That is the exact shape of the "silence inserted for a lost packet was not
  * counted in samples_in" bug, which put this unit ~20 ms out per loss and
- * stayed hidden because the marker was derived from the same count.
+ * stayed hidden because the marker was derived from the same count. The hub
+ * had counted the ring's return value since it was written; this unit did not,
+ * and playback advances by what came out of the ring here now too.
  *
  * The ring's trigger level is one chunk, so a short read means the 500 ms
- * timeout expired on a partly-filled ring -- a near-underrun. If these stay
- * zero over a long session the concern is latent and the fix can ride along
- * with anything; if they do not, n_short_frames IS the bias, in frames.
+ * timeout expired on a partly-filled ring -- a near-underrun. n_short_frames
+ * is what the bias WOULD have been, in frames; it has read 0 on every run so
+ * far, which is why the fix is expected to change nothing visible.
  */
 extern volatile uint32_t n_short_reads;
 extern volatile uint32_t n_short_frames;

@@ -141,6 +141,13 @@ void play_task(void *arg)
                 stream_start_local = 0;
                 break;
             }
+            /*
+             * A short read is padded to a full chunk so the DAC gets one, but
+             * samples_played must NOT count the pad. See where it is advanced
+             * below for why; the hub has counted it this way since it was
+             * written and this unit did not until 2026-08-14.
+             */
+            const int32_t consumed = (int32_t)(got / (AUDIO_CHANNELS * sizeof(int16_t)));
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
                 n_short_reads++;
@@ -379,7 +386,26 @@ void play_task(void *arg)
 #endif
                 marker_sample = -1;
             }
-            samples_played += AUDIO_FRAMES;
+            /*
+             * By what came OUT OF THE RING, not by the chunk size.
+             *
+             * samples_played is a position in the ring stream: it is compared
+             * against phase_q[].pos, marker_sample and restart_pos, all of
+             * which come from samples_in, which counts only frames actually
+             * written to the ring. A short read's pad was never in the ring, so
+             * advancing by a whole chunk regardless displaced samples_played
+             * permanently against every position it is compared with -- the
+             * same shape as the "silence inserted for a lost packet was not
+             * counted in samples_in" bug that once put this unit ~20 ms out per
+             * loss and stayed hidden because the marker came from the same
+             * count.
+             *
+             * The pad does take DAC time, so the timing reference shifts by
+             * that much for one pass. That is a one-off of at most a chunk
+             * (5.8 ms) at the moment of the short read, against a displacement
+             * that was permanent and cumulative.
+             */
+            samples_played += consumed;
 
             /* Last thing before the output, and deliberately after every count
              * above: it rewrites slots within frames that already exist, so
