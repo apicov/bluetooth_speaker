@@ -201,6 +201,20 @@ void telemetry_tick(void)
                  n_frames_rx, n_frames_bad,
                  visualiser_ml_source_name(), n_ml_rx, n_ml_bad);
 
+        /*
+         * Its own line for the same reason MEM has one -- see the hub's copy.
+         *
+         * This is what says the fine rate trim is running at all. `trim` is
+         * what the servo asked for; the two totals are what playback actually
+         * did about it, which is the only pair that can disagree. Expect one
+         * frame per ~1.6 s in one direction at ~14 ppm of real drift; flat
+         * means the trim is off, and both climbing means it is hunting across
+         * zero. See n_trim_drops.
+         */
+        ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
+                      " frames | retunes %" PRIu32 " coarse",
+                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes);
+
         /* Its own line rather than four more fields above -- see the hub's
          * copy for why, and for what the two pools mean. Here they should
          * read the same: no PSRAM on this board. */

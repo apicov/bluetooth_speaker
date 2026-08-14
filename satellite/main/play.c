@@ -34,6 +34,55 @@
 
 #include "sat.h"
 
+/*
+ * Frames the fine rate trim owes, in 1/TRIM_ONE_FRAME of a frame.
+ *
+ * rate_trim_hz names a rate the DAC is not running at, so playback has to
+ * consume the ring at that rate instead: over one chunk of output that is
+ * AUDIO_FRAMES * rate_trim_hz / tx_rate extra frames of input, which is a
+ * fraction far below one. Accumulate it and spend a whole frame when a whole
+ * frame has been earned.
+ *
+ * At 1 Hz and 44.1 kHz the step is 380, so a frame comes due every 172 chunks
+ * -- one second, which is 22.7 ppm, exactly the granularity a whole-Hz clock
+ * retune had. At the RATE_TRIM_MAX_HZ clamp the step is 38036, still under
+ * TRIM_ONE_FRAME, so ONE frame per chunk is always enough headroom and no pass
+ * ever needs two.
+ *
+ * Identical to the hub's copy, to the arithmetic. Unequal correction between
+ * the two units is a cross-unit sync error by construction.
+ */
+#define TRIM_ONE_FRAME 65536
+static int32_t s_trim_owed;
+
+/* +1 to drop a frame this pass, -1 to duplicate one, 0 for neither. */
+static int trim_due(void)
+{
+    const int32_t hz = rate_trim_hz;
+    if (hz == 0) {
+        /* Not just an optimisation: it stops a stale fraction sitting in the
+         * accumulator for as long as the trim is off. */
+        s_trim_owed = 0;
+        return 0;
+    }
+    s_trim_owed += (int32_t)((int64_t)AUDIO_FRAMES * hz * TRIM_ONE_FRAME
+                             / (int64_t)tx_rate);
+    /* Bounded before it is spent, so that a spell where the drop could not be
+     * taken -- the ring was momentarily empty -- cannot wind up an arbitrary
+     * debt and then pay it off in a burst of consecutive drops. */
+    if (s_trim_owed >  2 * TRIM_ONE_FRAME) s_trim_owed =  2 * TRIM_ONE_FRAME;
+    if (s_trim_owed < -2 * TRIM_ONE_FRAME) s_trim_owed = -2 * TRIM_ONE_FRAME;
+    if (s_trim_owed >= TRIM_ONE_FRAME) {
+        s_trim_owed -= TRIM_ONE_FRAME;
+        return 1;
+    }
+    if (s_trim_owed <= -TRIM_ONE_FRAME) {
+        s_trim_owed += TRIM_ONE_FRAME;
+        return -1;
+    }
+    return 0;
+}
+
 void play_task(void *arg)
 {
     (void)arg;
@@ -71,6 +120,11 @@ void play_task(void *arg)
          * and zeroing it shifts every marker by the buffer depth.
          */
         int32_t samples_played = 0;
+        /* The fraction of a frame owed described the stream this anchor
+         * replaces. rate_trim_hz itself is NOT reset: it is this unit's
+         * standing rate offset against the source, exactly as tx_rate is, and
+         * it survives a restart for the same reason. */
+        s_trim_owed = 0;
         /* Every reading in it was measured against the stream this anchor
          * replaces, so none of them describes where this unit now is. */
         sync_phase_reset(&phase_hist);
@@ -133,19 +187,77 @@ void play_task(void *arg)
                 phase_stepped = true;
                 break;
             }
+            /*
+             * The trim varies how much is read FROM THE RING; it never varies
+             * what is written to the DAC. write_audio() below still hands over
+             * exactly sizeof(chunk), which is exactly one DMA descriptor -- see
+             * the dma_frame_num note in i2s_start(), which both units must
+             * carry because it also sets the output pipeline latency the servo
+             * absorbs at startup.
+             */
+            const int trim = trim_due();
+            const size_t frame_bytes = AUDIO_CHANNELS * sizeof(int16_t);
+            const size_t want = (trim < 0) ? sizeof(chunk) - frame_bytes
+                                           : sizeof(chunk);
+
             hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
-            size_t got = xStreamBufferReceive(ring, chunk, sizeof(chunk), pdMS_TO_TICKS(500));
+            size_t got = xStreamBufferReceive(ring, chunk, want, pdMS_TO_TICKS(500));
             if (got == 0) {
                 n_underruns++;
                 ESP_LOGW(TAG, "underrun, waiting for a new stream");
                 stream_start_local = 0;
                 break;
             }
+            /*
+             * A short read is padded to a full chunk so the DAC gets one, but
+             * samples_played must NOT count the pad. See where it is advanced
+             * below for why; the hub has counted it this way since it was
+             * written and this unit did not until 2026-08-14.
+             *
+             * Measured against `want`, not sizeof(chunk): on a duplicating pass
+             * a read of one frame less than the chunk is what was ASKED for and
+             * is not short. The pad still fills to sizeof(chunk), because that
+             * is what the DAC is given.
+             */
+            int32_t consumed = (int32_t)(got / frame_bytes);
+            if (got < want) {
+                n_short_reads++;
+                n_short_frames += (uint32_t)((want - got) / frame_bytes);
+            }
             if (got < sizeof(chunk)) {
                 memset(chunk + got, 0, sizeof(chunk) - got);
-                n_short_reads++;
-                n_short_frames += (uint32_t)((sizeof(chunk) - got)
-                                             / (AUDIO_CHANNELS * sizeof(int16_t)));
+            }
+
+            if (trim > 0) {
+                /*
+                 * Drop one frame: take it out of the ring and throw it away. A
+                 * second receive rather than one oversized read, so that
+                 * `chunk` stays exactly AUDIO_CHUNK_BYTES and every
+                 * sizeof(chunk) here stays correct.
+                 *
+                 * Non-blocking, and credited only if it actually returned a
+                 * frame: if the ring is momentarily empty the trim waits for
+                 * the next pass rather than stalling the DAC for a correction
+                 * worth 23 us.
+                 *
+                 * At the chunk boundary rather than mid-chunk, which is the
+                 * same thing: the ring is a byte stream and the boundary is an
+                 * artefact of how much is read at a time.
+                 */
+                static uint8_t dropped[AUDIO_CHANNELS * sizeof(int16_t)];
+                if (xStreamBufferReceive(ring, dropped, sizeof(dropped), 0)
+                    == sizeof(dropped)) {
+                    consumed++;
+                    n_trim_drops++;
+                } else {
+                    s_trim_owed += TRIM_ONE_FRAME;  /* still owed; retry next pass */
+                }
+            } else if (trim < 0) {
+                /* Duplicate one frame into the slot the shorter read left.
+                 * Zero-order hold on a single sample, at 0.6 Hz in normal
+                 * service. */
+                memcpy(chunk + want, chunk + want - frame_bytes, frame_bytes);
+                n_trim_dups++;
             }
             /* Before measuring anything against the master clock, make sure the
              * conversion still describes it. */
@@ -164,13 +276,17 @@ void play_task(void *arg)
                  * chunk grid, which is uncorrelated noise straight into the
                  * servo's only input. The overshoot is known, and writes are
                  * paced by the DAC, so the correction is exact rather than a
-                 * filter. See the hub's copy for what this cost there.
+                 * filter. See the hub's copy for what this cost there, and for
+                 * the sub-microsecond error the fine rate trim adds by leaving
+                 * an input-frame count converted at the output rate.
                  */
                 int32_t overshoot = samples_played - phase_q[phase_tail].pos;
                 /* Capped at one chunk: a splice steps samples_played by up to
                  * MAX_SPLICE_MS at once and those frames were skipped rather
                  * than played, so anything the jump carried us past cannot be
-                 * dated this way. Same guard as the hub. */
+                 * dated this way. A dropping pass steps it by AUDIO_FRAMES + 1
+                 * and is clipped by one frame, worth 23 us. Same guard as the
+                 * hub. */
                 if (overshoot > (int32_t)AUDIO_FRAMES) {
                     overshoot = (int32_t)AUDIO_FRAMES;
                 }
@@ -379,7 +495,26 @@ void play_task(void *arg)
 #endif
                 marker_sample = -1;
             }
-            samples_played += AUDIO_FRAMES;
+            /*
+             * By what came OUT OF THE RING, not by the chunk size.
+             *
+             * samples_played is a position in the ring stream: it is compared
+             * against phase_q[].pos, marker_sample and restart_pos, all of
+             * which come from samples_in, which counts only frames actually
+             * written to the ring. A short read's pad was never in the ring, so
+             * advancing by a whole chunk regardless displaced samples_played
+             * permanently against every position it is compared with -- the
+             * same shape as the "silence inserted for a lost packet was not
+             * counted in samples_in" bug that once put this unit ~20 ms out per
+             * loss and stayed hidden because the marker came from the same
+             * count.
+             *
+             * The pad does take DAC time, so the timing reference shifts by
+             * that much for one pass. That is a one-off of at most a chunk
+             * (5.8 ms) at the moment of the short read, against a displacement
+             * that was permanent and cumulative.
+             */
+            samples_played += consumed;
 
             /* Last thing before the output, and deliberately after every count
              * above: it rewrites slots within frames that already exist, so

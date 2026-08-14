@@ -1153,3 +1153,120 @@ and putting a transient into the live stream on top of the silence.
   and a buffer count was later raised in the defaults without reaching a board.
   The check that catches it is cheap — delete `sdkconfig`, rebuild, read the
   generated header — and is worth running whenever a default changes.
+
+---
+
+## 14. The rate servo's actuator (2026-08-14)
+
+The retune was the last self-inflicted interruption in this unit's audio path.
+Everything else it interrupts, it interrupts on purpose: `tx-fail 0`, no
+underruns, `dma-starve 0`. A clock retune took the I2S channel down for 1.7–6.2
+ms, mean ~3.6 ms, once every 20–45 s — to apply ±4 Hz against ~14 ppm of real
+drift.
+
+The fine correction is now made in software, by dropping or duplicating one PCM
+frame at a time (`rate_trim_hz`, one frame in ~71,000 at real drift). The clock
+keeps the coarse job, which software cannot do. See clock-sync.md §8 for the
+split and the reasoning.
+
+### 14.1 What was deliberately left alone
+
+The servo's input, gain, deadband and cooldown are untouched, and
+`PHASE_DEADBAND_US` stays at 7000. Widening it is the obvious way to cut retunes
+and the wrong one — two units at opposite edges of a wider band are that much
+further apart, and cross-unit audio currently measures 0.5–2.5 ms, the best this
+project has recorded. The only edit to the loop is that the deadband now compares
+the requested trim against the trim already applied, where it used to compare
+`desired` against `tx_rate`. Same meaning, different actuator.
+
+`TIMELINE_SLEW_US` is untouched and still correct: the 2.27 ms/s ceiling it is
+sized against is `RATE_TRIM_MAX_HZ / 44100`, which did not move, and neither did
+the packet rate. This was checked explicitly because §13.5 names it as a trap and
+§13.2 is the record of it being sprung.
+
+### 14.2 Process, since §13.2 is the record of getting this wrong
+
+Two flashes, one variable each. The satellite's `samples_played += AUDIO_FRAMES`
+had to become consumed-frames before the trim could work, and that is also a
+standalone fix to a bias `sat.h` had counted-but-not-fixed for weeks — so it went
+in on its own, with the expectation that it changes nothing visible.
+
+The `TRIM:` counters went in **before** either flash, not after. §13.2 records a
+doubled packet rate passing through a build, two test suites and a review because
+the one counter that would have shown it was added afterwards.
+
+### 14.3 First run on hardware (2026-08-14)
+
+Both units, one track, ~4 minutes. `retunes 0 (0 refused)` on both — the coarse
+path was never reached, which is what it should do at a matched 44100.
+
+| | hub | satellite |
+|---|---|---|
+| phase at playback start | -32555 us | -32435 us |
+| phase after ~165 s | -784 us | -1728 us |
+| retunes | 0 | 0 |
+| underruns / dma-starve / short-reads | 0 | 0 |
+| splices | 0 | 0 |
+
+Both walked -32 ms to under -2 ms with no clock retune and no channel-down. The
+two tracked each other to within roughly 0.5–1 ms throughout the convergence,
+compared at equal times since their own playback start (they started 35 s apart).
+
+The counters matched the arithmetic exactly. The drop/dup rate is `|trim_hz|`
+frames per second, and the hub logged 720 frames across the 60 s window where
+the trim was -14 then -10 Hz, and 300 where it was -10 then -6.
+
+Every correction was a DUPLICATE; neither unit dropped a frame. Startup phase is
+negative on both — the ~30 ms DMA refill — so the servo spent the whole run
+asking them to slow down. The drop path is therefore **still untested on
+hardware**, which the first run to start late will exercise.
+
+Two things this corrected:
+
+- **The servo line printed the wrong unit.** `1 frame per %ld ms` was fed
+  `tx_rate / |trim_hz|`, which is frames between corrections, not milliseconds:
+  it read "3150 ms" where the truth was 71. Now `%ld frames/s`, which is
+  `|trim_hz|` and is directly comparable with the `TRIM:` deltas.
+- **"One frame every 1.6 s" describes steady state only.** Converging from the
+  startup phase asks for ~320 ppm, so it runs at ~14 frames/s for the first
+  minute or two — twenty times the crystals' own difference, and within striking
+  distance of the depth net's 20/s. Nothing was audible at that rate on music,
+  which is the closest thing to evidence the net has.
+
+### 14.4 The drop path, and a source stall that looked like a regression
+
+A ~15 minute run answered the open item in 14.3. **The drop path works and is now
+exercised**: with the trim at +2 Hz the hub logged 598 -> 718 -> 838 dropped
+frames across consecutive 60 s HEALTH windows, 120 each, which is 2/s and is
+exactly `|trim_hz|`. Both directions now match the arithmetic on hardware.
+
+`retunes 0 (0 refused)` across 900 s. Phase settled and held between +824 and
+-2684 us. `tx-fail 0 (0 audio)` throughout.
+
+The run also contained audible silences, and they were not this. The source
+stopped:
+
+```
+I (751921) sbc_in: pkts 251 | eff 44120 Hz | max gap 42297 us
+W (761413) stream: local underrun, restarting timeline
+I (771948) sbc_in: pkts 0 | eff 0 Hz         <- and for three more windows
+I (836961) sbc_in: pkts 109 | eff 19175 Hz | max gap 74084470 us
+```
+
+**74 seconds with no SBC packet**, then a second stall of 19.8 s. `sbc_in` is the
+input from the bridge, upstream of the radio and of everything the rate trim
+touches. The hub's ring drained, it underran, it restarted the timeline, and the
+satellite -- with nothing arriving -- drained and parked. That is the whole chain.
+
+Worth knowing for next time, because both units' counters look alarming and mean
+one thing: **`dma-starve` reads ~81 per underrun on either unit**, and that is
+arithmetic rather than a fault. The play task blocks on its 500 ms ring timeout
+and the channel starves once per descriptor meanwhile: 500 / 5.8 = 86. Two
+underruns read 162. One `short-read` accompanies each, being the partial chunk
+before the ring went dry.
+
+This is distinct from the ~118 ms delivery pause in architecture.md 16, which is
+three orders of magnitude smaller. A 74 s stall is the phone or the A2DP link,
+not delivery jitter. What makes it audible for longer than the stall itself is
+that a satellite parks on underrun and waits for an anchor; recovery is bounded
+by when the hub next restarts its timeline, not by when audio comes back.

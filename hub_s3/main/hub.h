@@ -22,11 +22,13 @@
  *   local_play_task    writes what playback has reached: the phase queue TAIL,
  *                      s_phase_err_us, s_phase_valid, s_phase_stepped,
  *                      s_phase_hist, the s_hub_splice_* set, the refill trio,
- *                      s_marker_at, n_underruns, n_splices, n_short_*, hw_play.
- *                      and s_playing. It no longer writes local_start.
- *   ring_monitor_task  writes the servo's own state, the retune_* set and the
- *                      windowed heap figures, and READS everything else in order
- *                      to report it. retune_dac() runs on this task.
+ *                      s_marker_at, n_underruns, n_splices, n_short_*,
+ *                      n_trim_drops / n_trim_dups, hw_play and s_playing. It
+ *                      no longer writes local_start. It READS rate_trim_hz.
+ *   ring_monitor_task  writes the servo's own state, rate_trim_hz, the retune_*
+ *                      set and the windowed heap figures, and READS everything
+ *                      else in order to report it. retune_dac() runs on this
+ *                      task.
  *   probe_task         writes only the client list (via client_seen).
  *   the WiFi event task writes n_sta_left and the client list.
  *   monitor_task       writes s_sync_err_us / s_sync_at (marker builds only).
@@ -620,6 +622,38 @@ extern volatile uint32_t n_short_reads;
 extern volatile uint32_t n_short_frames;
 
 /*
+ * Frames the fine rate trim has dropped from, and duplicated into, the stream.
+ *
+ * The instrument for rate_trim_hz, and the reason it went in before the trim
+ * was ever flashed: a correction you cannot see in a log is a correction you
+ * cannot attribute. On this branch a doubled packet rate went unnoticed through
+ * a build, two test suites and a review because the one counter that would have
+ * shown it was added afterwards.
+ *
+ * The rate is |rate_trim_hz| frames per second, by construction: a trim of N Hz
+ * against a rate of `rate` needs rate * N/rate = N extra frames each second.
+ * Measured on the first run that played: 720 frames in the 60 s window where
+ * the trim was -14 then -10 Hz, and 300 in the window where it was -10 then
+ * -6. That is the arithmetic, and it is what these are here to keep honest.
+ *
+ * What that means in practice, which is NOT one number:
+ *
+ *   converging   ~14/s for the first minute or two. Startup phase is ~-32 ms
+ *                (the DMA refill, see s_refill_active) and the loop spreads it
+ *                over ~100 s, so it asks for ~320 ppm -- twenty times the
+ *                crystals' own difference. Heard on the bench as nothing.
+ *   steady       ~1/s. Real drift is ~14 ppm, which is 0.6 Hz, and the trim is
+ *                whole Hz, so it sits at 0 or 1 and the deadband holds it
+ *                there.
+ *   depth net    20/s, the +-20 Hz rescue. The loudest this gets.
+ *
+ * Flat when rate_trim_hz is non-zero means the trim is not running. Both
+ * climbing together means the servo is hunting across zero.
+ */
+extern volatile uint32_t n_trim_drops;
+extern volatile uint32_t n_trim_dups;
+
+/*
  * How much audio goes into the DMA before a write first blocks.
  *
  * The satellite has had this since a retune was found to be costing tens of
@@ -806,10 +840,20 @@ extern volatile int64_t s_hub_splice_at;   /* 0 = no boundary yet */
 extern volatile int32_t s_hub_splice_alt_us;
 
 /*
- * Widest DRIFT correction the servo may ask for, in Hz. Deliberately not
- * applied inside retune_dac(): the initial match to the measured input rate is
- * a different thing and is legitimately several percent (44100 nominal against
- * ~42600 measured), so a bound tight enough to be useful here would refuse it.
+ * Widest DRIFT correction the servo may ask for, in Hz, and since 2026-08-14
+ * also the boundary between the servo's two actuators.
+ *
+ * Within it the correction is made in SOFTWARE, by dropping or duplicating one
+ * frame at a time -- see rate_trim_hz. Beyond it, only the clock can help: a
+ * source measured at ~42600 against a 44100 output is 40000 ppm and drains a
+ * 250 ms buffer in five seconds, which no drop rate short of shredding the
+ * audio would absorb. That is the case retune_dac() exists for, and it is why
+ * this bound is still deliberately NOT applied inside it.
+ *
+ * Real drift is ~14 ppm, so a fine correction is ~0.6 Hz and this is 160x it.
+ * The buffer safety net asks for 20 Hz. Anything past 100 is a broken
+ * measurement rather than a correction, and routing it to the clock is what
+ * puts it in front of RATE_SANE_MIN/MAX to be refused.
  */
 #define RATE_TRIM_MAX_HZ 100
 
@@ -818,9 +862,40 @@ extern volatile int32_t s_hub_splice_alt_us;
 #define RATE_SANE_MIN 8000
 #define RATE_SANE_MAX 192000
 
+/*
+ * The FINE rate correction, in Hz, written by the servo and read by playback.
+ *
+ * This is what the servo used to hand to retune_dac(). It now names a rate the
+ * DAC is NOT running at: the clock stays put and playback consumes the ring at
+ * an effective (tx_rate + rate_trim_hz) instead, by dropping one frame when it
+ * needs to get through the stream faster and duplicating one when it needs to
+ * get through it slower. Positive means playing late, so consume faster.
+ *
+ * Why it is worth the trouble: a clock retune takes the I2S channel down for
+ * 1.7-6.2 ms, measured, mean ~3.6 ms, once every 20-45 s per unit -- to apply
+ * +-4 Hz against ~14 ppm of real drift. It was the last self-inflicted
+ * interruption in the audio path. One frame in ~71000 is inaudible and, more to
+ * the point, continuous where the clock was stepped.
+ *
+ * In whole Hz because that is what the servo already computes and what the
+ * deadband already quantises to, NOT because anything here needs it: the
+ * whole-Hz floor under PHASE_DEADBAND_US was a property of the CLOCK, and the
+ * software path has no such floor. That is what makes tightening the deadband a
+ * later one-line experiment -- see docs/clock-sync.md.
+ *
+ * Persists across a playback restart, exactly as tx_rate does. Zeroed only when
+ * a coarse retune moves the clock, because the clock then carries what this was
+ * carrying.
+ */
+extern volatile int32_t rate_trim_hz;
+
 /* What a retune costs -- see the note on the satellite's copy. The channel down
  * is measurable here; the discarded DMA buffer is not measurable anywhere in
- * software, because those frames were counted as played. */
+ * software, because those frames were counted as played.
+ *
+ * Since 2026-08-14 this is a COARSE-ONLY path: the servo reaches it when the
+ * correction exceeds RATE_TRIM_MAX_HZ, which in steady state it never does. The
+ * measurements below stand; what changed is how often they are paid. */
 extern volatile int32_t s_retune_phase_before;
 extern volatile bool    s_retune_watch;
 extern volatile int64_t s_retune_outage_us;

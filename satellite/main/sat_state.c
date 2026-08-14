@@ -28,6 +28,7 @@ volatile int64_t stream_start_local;
 volatile int64_t anchor_at;
 volatile uint32_t stream_rate = 44100;
 uint32_t tx_rate = 44100;  /* what the output clock is actually set to */
+volatile int32_t rate_trim_hz;  /* the fine correction playback applies instead */
 int64_t stream_offset;
 int64_t offset_slew_last;  /* when the slew last moved it */
 volatile int32_t marker_sample = -1;  /* ring position of a tagged packet */
@@ -73,6 +74,8 @@ volatile uint32_t n_anchor_soon;  /* anchors refused, one just happened */
 volatile uint32_t n_phase_drop;
 volatile uint32_t n_short_reads;
 volatile uint32_t n_short_frames;
+volatile uint32_t n_trim_drops;
+volatile uint32_t n_trim_dups;
 volatile uint32_t n_tsf_wide;
 volatile int64_t wifi_down_at;
 volatile int64_t rejoined_at;  /* 0 = the next anchor is not the first */

@@ -1217,7 +1217,26 @@ inside the firmware at all, because every reading derived from `samples_played`
 agrees those frames were played. Only the marker GPIO can measure it, and nobody
 has. Since `auto_clear` (§5), whichever of those buffers had already played comes
 back as silence rather than a repeat — the same frames are still lost, so the
-figure is unchanged, but the artifact is quieter.
+figure is unchanged, but the artifact is quieter. Largely moot since the software
+rate trim (clock-sync.md §8): the servo's fine correction no longer touches the
+clock, so a retune is a once-per-stream coarse rate match rather than something
+that happens twice a minute. Still unmeasured, just rarely paid.
+
+**Nobody has listened to the rate trim under the depth net.** The fine rate
+correction drops or duplicates one frame at a time at `|rate_trim_hz|` frames per
+second. Steady state is ~1/s and inaudible by any reasonable account.
+
+Partly answered on the first run that played: **converging from the ~-32 ms
+startup phase runs at ~14 frames/s for the first minute or two** — the loop
+spreads that error over ~100 s, so it asks for ~320 ppm, twenty times the
+crystals' own difference — and both units did that on music with nothing
+audible. That is close enough to the depth net's 20/s to make it likely fine
+there too, but it is not the same test: the net fires mid-stream on a ring in
+trouble rather than during a fade-in from silence.
+
+If it ever does tick, the fix is a short crossfade rather than a zero-order
+hold, not a return to the clock. `TRIM:` reports the rate, so the condition is
+visible whenever it happens.
 
 **The LED drift check bounds the error, it does not remove it.** `ALIGN_DRIFT_US`
 is 2 ms, so holes smaller than that accumulate until they add up to something

@@ -8,13 +8,20 @@
 #include "hub.h"
 
 /*
- * Servo the DAC clock on the buffer level, not on the measured rate.
+ * Servo the output rate on the buffer level, not on the measured rate.
  *
  * Chasing the measured rate cannot work: it carries ~0.3% noise, and whatever
  * error is left integrates straight into this buffer until it overflows or
  * empties. The level itself IS that integral, so nulling it removes the
  * accumulated error rather than the instantaneous one. Correction is spread over
  * ~40 s, well below the ~1% pitch shift a listener would notice.
+ *
+ * "The output rate", not "the DAC clock", since 2026-08-14. The loop is
+ * unchanged -- same input, same gain, same deadband, same cooldown -- but its
+ * output now normally goes to rate_trim_hz, which playback applies by dropping
+ * or duplicating one frame at a time, rather than to retune_dac(), which takes
+ * the I2S channel down for several milliseconds to do it. The clock is still
+ * what a COARSE rate match uses; see RATE_TRIM_MAX_HZ for the boundary.
  */
 
 /*
@@ -201,17 +208,63 @@ void servo_tick(void)
      * value is still printed on the servo line beside the smoothed one, so the
      * two remain comparable at every retune.
      */
+    /*
+     * The correction, as an offset from the rate the CLOCK is actually running
+     * at. This is the number that used to be handed to retune_dac() as an
+     * absolute rate; splitting it out is what lets the two actuators be chosen
+     * between, because their boundary is a size and not a kind.
+     */
+    const int32_t trim_hz = (int32_t)desired - (int32_t)tx_rate;
+
     static int cooldown;
     if (cooldown > 0) {
         cooldown--;
     } else {
-        const bool ema_would = desired > tx_rate + (uint32_t)deadband ||
-                               desired < tx_rate - (uint32_t)deadband;
-        if (ema_would) {
-            ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
-                          "-> DAC %" PRIu32 " Hz",
-                     (long)s_err_ema, (long)s_phase_err_us, (long)depth_ms, desired);
-            retune_dac(desired);
+        /*
+         * Deadband against the trim ALREADY APPLIED, which is where tx_rate
+         * used to be read: the servo tolerates PHASE_DEADBAND_US of its own
+         * error before moving, and that meaning is unchanged. Only what moves
+         * has changed.
+         */
+        const int32_t step = trim_hz - rate_trim_hz;
+        if (step > deadband || step < -deadband) {
+            if (trim_hz > RATE_TRIM_MAX_HZ || trim_hz < -RATE_TRIM_MAX_HZ) {
+                /*
+                 * COARSE: too big for software to absorb without shredding the
+                 * audio, so the clock has to move. The case this exists for is
+                 * a source measured at ~42600 against a 44100 output -- 40000
+                 * ppm, which drains a 250 ms buffer in five seconds. Costs the
+                 * channel-down that the fine path was written to stop paying,
+                 * and in steady state never happens.
+                 *
+                 * The trim is cleared because the clock now carries what it was
+                 * carrying; leaving it set would apply the correction twice.
+                 */
+                ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
+                              "-> COARSE, DAC %" PRIu32 " Hz",
+                         (long)s_err_ema, (long)s_phase_err_us, (long)depth_ms,
+                         desired);
+                rate_trim_hz = 0;
+                retune_dac(desired);
+            } else {
+                /* FINE: playback drops or duplicates one frame at a time. No
+                 * channel-down, and continuous rather than stepped. */
+                /*
+                 * Frames per second, which IS |trim_hz|: a trim of N Hz against
+                 * a rate of `rate` needs rate * N/rate = N extra frames every
+                 * second. Printed anyway, because it is the figure the
+                 * n_trim_drops / n_trim_dups deltas have to match, and reading
+                 * that off a Hz value is one inference more than a log should
+                 * ask for. It was briefly printed as `tx_rate / |trim_hz|`
+                 * labelled milliseconds, which is frames-between-corrections
+                 * with the wrong unit on it -- 3150 ms where the truth was 71.
+                 */
+                ESP_LOGI(TAG, "servo: smoothed %+ld us (raw %+ld), buffer %+ld ms "
+                              "-> trim %+ld Hz (%ld frames/s)",
+                         (long)s_err_ema, (long)s_phase_err_us, (long)depth_ms,
+                         (long)trim_hz, (long)(trim_hz < 0 ? -trim_hz : trim_hz));
+                rate_trim_hz = trim_hz;
+            }
             cooldown = 4;          /* ~20 s against a 100 s correction */
         }
     }
