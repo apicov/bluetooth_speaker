@@ -261,7 +261,7 @@ menu "Dancefloor LEDs"
     config DANCEFLOOR_ML_TFLM
         bool "Build the TensorFlow Lite Micro analyser base"
         default n
-        depends on DANCEFLOOR_ML
+        depends on DANCEFLOOR_ML && SPIRAM
         help
             Compiles analyser_tflm.cpp, which removes the boilerplate every
             TFLM-backed analyser would otherwise repeat: the arena, the schema
@@ -273,6 +273,24 @@ menu "Dancefloor LEDs"
             uncommenting the dependency in
             components/dancefloor_leds/idf_component.yml -- the exact lines are
             there.
+
+            DEPENDS ON SPIRAM, WHICH IS A STATEMENT ABOUT THE ARENA rather than
+            about a part number. ml_arena.c prefers PSRAM and falls back to
+            internal SRAM, and the fallback is the dangerous path: a 64 kB arena
+            does not fail at the allocation on a board without PSRAM, it fails an
+            hour later as an audio dropout nobody connects to the model. A
+            classic-ESP32 satellite is already holding an 80 kB ring in the same
+            pool.
+
+            So the guard is here rather than on the target. That keeps the rule
+            the rest of this component follows -- gate on what a unit can do, not
+            on what chip it is -- and it means a future part with PSRAM is
+            allowed without editing this line. The practical effect today is that
+            models run on the XIAO S3 satellite and nowhere else.
+
+            Note it does NOT gate DANCEFLOOR_ML. The shipped analysers need no
+            arena at all, so a board without PSRAM can still run those; it just
+            cannot host a model.
 
             Read the note at the top of analyser_tflm.hpp before converting a
             model. The short version: quantise it to int8. On a floor where more

@@ -182,3 +182,33 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 # CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # CONFIG_ESP_PHY_ENABLE_USB=n
+
+# THIS IS THE TINYML BOARD, and these two lines are the whole of what makes it
+# one. Everything else in this file is about the XIAO S3 Plus as a satellite.
+#
+# DANCEFLOOR_ML runs the pluggable analysers here. It does NOT require this unit
+# to analyse audio: LED_SOURCE stays REMOTE above, so this satellite still draws
+# the frames the hub sends it, and the analysers read the quantised spectrum
+# those frames already carry. That is the point of the whole arrangement -- the
+# model gets the hub's FFT for free and this board never runs one of its own.
+#
+# Computing the FFT locally is still available and independent of this: set
+# LED_SOURCE_LOCAL and the analysers see a locally-computed spectrum instead,
+# with no change to any analyser. It costs ~33 kB of internal SRAM here, which is
+# what commit 82f4e8d spent on a classic ESP32 before running out; measure the
+# MEM line before assuming an S3 has it spare.
+CONFIG_DANCEFLOOR_ML=y
+
+# The TFLM base -- the arena, the schema check and the interpreter. Nothing in
+# the tree has a model yet, so today this compiles the scaffolding and runs the
+# two analysers that need no weights.
+#
+# It depends on SPIRAM, which this board has and a classic satellite does not:
+# ml_arena falls back to internal SRAM rather than failing, and that fallback
+# surfaces an hour later as an audio dropout. See the Kconfig help.
+#
+# Fetches esp-tflite-micro on the next build. The dependency is guarded by
+# `rules: - if: $CONFIG{DANCEFLOOR_ML_TFLM}` in
+# components/dancefloor_leds/idf_component.yml, so the hub and the bridge do not
+# pull it in. Expect a long first build and a much larger image.
+CONFIG_DANCEFLOOR_ML_TFLM=y
