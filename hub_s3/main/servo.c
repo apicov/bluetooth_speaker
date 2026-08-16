@@ -169,10 +169,31 @@ void servo_tick(void)
      * Anything larger is a bad phase reading, not a rate error. */
     if (adj >  RATE_TRIM_MAX_HZ) adj =  RATE_TRIM_MAX_HZ;
     if (adj < -RATE_TRIM_MAX_HZ) adj = -RATE_TRIM_MAX_HZ;
+    /*
+     * A FLOOR, NOT A REPLACEMENT, since 2026-08-15. It used to assign adj
+     * outright, so it could only ever WEAKEN a phase correction that already
+     * agreed with it -- and a ring past target IS playing late, so the two
+     * normally do agree. The satellite's copy carries the measurement that
+     * argued for this; this unit's own ring is fed over a stream buffer rather
+     * than the radio, so it never showed the fault. Landed on both units in one
+     * commit all the same: the two servos are the same loop, and a correction
+     * rate that differs between them is a cross-unit sync error by
+     * construction.
+     *
+     * Depth still wins when the two disagree, which is the case it was written
+     * for. No steady-state effect -- depth only leaves +-120 ms during the
+     * events this is about.
+     */
+    const int32_t adj_phase = adj;       /* what phase alone asked for */
     if (depth_ms < -120) {
-        adj = -20;
+        if (adj > -20) adj = -20;
     } else if (depth_ms > 120) {
-        adj = 20;
+        if (adj < 20) adj = 20;
+    }
+    /* Same instrument as the satellite's, for the same reason. */
+    if (adj != adj_phase) {
+        ESP_LOGW(TAG, "depth net: buffer %+ld ms, phase asked %+ld Hz -> %+ld Hz",
+                 (long)depth_ms, (long)adj_phase, (long)adj);
     }
     uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
 
