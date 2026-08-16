@@ -55,6 +55,25 @@
 #define TRIM_ONE_FRAME 65536
 static int32_t s_trim_owed;
 
+/*
+ * The previous accepted phase reading, for the step detector in the crossing
+ * loop. Play task only, and reset at every start -- the first reading of a new
+ * stream is not a step from the last reading of the old one, and calling it one
+ * would put a PHASE STEP line under every re-anchor.
+ */
+static int32_t s_phase_prev;
+static bool    s_phase_prev_valid;
+
+/*
+ * How far two consecutive readings must differ to be worth a line.
+ *
+ * Drift is ~0.8 ms per minute and the deadband is 7 ms, so 20 ms is clear of
+ * everything the system does on purpose and well under the 40-270 ms steps the
+ * soak recorded. A splice trips it too, which is correct: a splice IS a step,
+ * and it already announces itself on the line above.
+ */
+#define PHASE_STEP_LOG_US 20000
+
 /* +1 to drop a frame this pass, -1 to duplicate one, 0 for neither. */
 static int trim_due(void)
 {
@@ -128,6 +147,9 @@ void play_task(void *arg)
         /* Every reading in it was measured against the stream this anchor
          * replaces, so none of them describes where this unit now is. */
         sync_phase_reset(&phase_hist);
+        /* Same reason, and it stops the first reading of this stream being
+         * reported as a step from the last reading of the previous one. */
+        s_phase_prev_valid = false;
         /*
          * Measure the DMA prefill at every playback START, not only after a
          * retune. The channel has been draining while this task was parked, so
@@ -347,6 +369,60 @@ void play_task(void *arg)
                                       "the retune (net %+lld from before it)",
                                  err, since_retune, err - retune_phase_before);
                     }
+                    /*
+                     * A STEP, RECORDED here and narrated by drift_task.
+                     *
+                     * The soak that found the delivery-burst fault
+                     * (tools/soak/logs-soak-20260815-224002) had to be
+                     * reconstructed from 20 s status samples, which is how a
+                     * +12 ms reading and a +268 ms one came to sit in adjacent
+                     * lines with nothing between them. A step is a
+                     * packet-cadence event -- ~50/s -- and nothing recorded it
+                     * at that resolution.
+                     *
+                     * IT MUST NOT LOG FROM HERE, and the first version of this
+                     * did. See the note on resync_request above, which says the
+                     * same thing about the same task: this is the audio path.
+                     * This console is 115200 baud, so a ~140-character line is
+                     * ~12 ms of blocking UART against a 5.8 ms chunk and 34.8 ms
+                     * of DMA -- and the steps arrive in bursts, three inside one
+                     * millisecond in the 0116 soak, which is more than the whole
+                     * DMA depth. It starved the DAC, and starvation causes short
+                     * reads, which cause steps, which logged again. It was
+                     * audible.
+                     *
+                     * So: store, and let the 5 s window print it, exactly as
+                     * splice_report_* is written here and sent by the probe
+                     * task. Only the largest step per window survives, which is
+                     * the one worth seeing.
+                     *
+                     * Ring depth and the short-read count ride along because
+                     * they are the two things that move a unit permanently
+                     * later and neither is visible in a phase number: depth is
+                     * lateness by definition, and a padded frame takes DAC time
+                     * that samples_played does not count.
+                     *
+                     * In this arm only, so a reading the retune watch withheld
+                     * does not become the baseline the next one is a step from.
+                     */
+                    if (s_phase_prev_valid) {
+                        const int32_t step = (int32_t)err - s_phase_prev;
+                        const int32_t mag = step < 0 ? -step : step;
+                        if (mag > PHASE_STEP_LOG_US && mag > step_report_mag) {
+                            step_report_mag  = mag;
+                            step_report_from = s_phase_prev;
+                            step_report_to   = (int32_t)err;
+                            step_report_ring = (int32_t)((RING_BYTES -
+                                xStreamBufferSpacesAvailable(ring)) * 1000
+                                / (stream_rate * AUDIO_CHANNELS * 2));
+                            step_report_pad  = n_short_frames;
+                            step_report_trim = rate_trim_hz;
+                            step_report_pending = true;
+                        }
+                    }
+                    s_phase_prev = (int32_t)err;
+                    s_phase_prev_valid = true;
+
                     phase_err_us = (int32_t)err;
                     phase_valid = true;
                     sync_phase_push(&phase_hist, (int32_t)err);

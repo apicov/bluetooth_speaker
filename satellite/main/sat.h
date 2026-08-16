@@ -289,6 +289,22 @@ extern volatile bool phase_stepped;
  * playback, sent by the probe task, because a sendto() in the audio path is
  * exactly the kind of thing that costs a buffer.
  */
+/*
+ * The largest phase step seen this window, for drift_task to narrate.
+ *
+ * Written by playback, printed by the 5 s window, for exactly the reason
+ * splice_report_* is: the play task is the audio path and must not log. At
+ * 115200 a status line is ~12 ms of blocking UART against 34.8 ms of DMA, and
+ * steps arrive in bursts -- the first version of this instrument logged inline
+ * and was audible. Largest-per-window, because a burst of ten says the same
+ * thing as its biggest member.
+ */
+extern volatile int32_t step_report_mag;   /* 0 = nothing to report */
+extern volatile int32_t step_report_from, step_report_to;
+extern volatile int32_t step_report_ring, step_report_trim;
+extern volatile uint32_t step_report_pad;
+extern volatile bool    step_report_pending;
+
 extern volatile int32_t splice_report_us;
 extern volatile int32_t splice_report_phase;
 /* SHADOW: the correction the median would have produced instead. Acted on by

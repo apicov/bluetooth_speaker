@@ -94,6 +94,24 @@ void telemetry_tick(void)
     }
 
     /*
+     * The largest phase step playback saw this window.
+     *
+     * Recorded there, printed here, for the reason the RX counters below are:
+     * the play task is the audio path. Cleared as it is taken, so a quiet
+     * window says nothing at all.
+     */
+    if (step_report_pending) {
+        step_report_pending = false;
+        ESP_LOGW(TAG, "PHASE STEP: %+ld -> %+ld us (%+ld) | buffer %ld ms | "
+                      "pad %" PRIu32 " frames | trim %+ld Hz",
+                 (long)step_report_from, (long)step_report_to,
+                 (long)(step_report_to - step_report_from),
+                 (long)step_report_ring, step_report_pad,
+                 (long)step_report_trim);
+        step_report_mag = 0;
+    }
+
+    /*
      * The receive path's window, said here because it cannot afford to say
      * it itself -- see the counters' declaration.
      *
@@ -102,10 +120,24 @@ void telemetry_tick(void)
      * failure this replaces produced output in proportion to the damage,
      * from the task that had to stop the damage.
      */
+    /*
+     * short_frames rides on this line as well as the 60 s HEALTH totals.
+     *
+     * It belongs beside gaps because it is the other half of the same event and
+     * the only one that moves this unit PERMANENTLY: a short read pads the DAC
+     * to a full chunk, the pad takes DAC time, and samples_played does not count
+     * it -- so every padded frame is a frame of the timeline this unit will
+     * never get back. The soak that found the delivery-burst fault accumulated
+     * 25299 of them, 574 ms, and it was only visible by differencing two HEALTH
+     * lines a minute apart. As a per-window delta beside the gaps that caused
+     * it, it reads directly.
+     */
     static uint32_t gaps_told, gap_frames_told, gap_short_told,
                     gap_short_frames_told, ring_full_told,
                     anchor_late_told, anchor_soon_told, gap_resyncs_told,
-                    upgrades_told, fec_told, fec_short_told, fec_err_told;
+                    upgrades_told, fec_told, fec_short_told, fec_err_told,
+                    short_frames_told;
+    const uint32_t short_frames_now = n_short_frames;
     const uint32_t gaps_now = n_gaps, gap_frames_now = n_gap_frames,
                    gap_short_now = n_gap_short,
                    gap_short_frames_now = n_gap_short_frames,
@@ -121,9 +153,10 @@ void telemetry_tick(void)
         anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told ||
         gap_resyncs_now != gap_resyncs_told || upgrades_now != upgrades_told ||
         fec_now != fec_told || fec_short_now != fec_short_told ||
-        fec_err_now != fec_err_told) {
+        fec_err_now != fec_err_told || short_frames_now != short_frames_told) {
         ESP_LOGW(TAG, "RX 5s: gaps %" PRIu32 " (%" PRIu32 " ms silence, %"
                       PRIu32 " short by %" PRIu32 " ms) | ring-full %" PRIu32
+                      " | pad %" PRIu32 " ms"
                       " | too big to fill %" PRIu32 " | upgrades %" PRIu32
                       " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon"
                       " | fec %" PRIu32 " (%" PRIu32 " ms short, %" PRIu32 " err)",
@@ -132,6 +165,7 @@ void telemetry_tick(void)
                  gap_short_now - gap_short_told,
                  (gap_short_frames_now - gap_short_frames_told) * 1000 / stream_rate,
                  ring_full_now - ring_full_told,
+                 (short_frames_now - short_frames_told) * 1000 / stream_rate,
                  gap_resyncs_now - gap_resyncs_told,
                  upgrades_now - upgrades_told,
                  anchor_late_now - anchor_late_told,
@@ -152,6 +186,7 @@ void telemetry_tick(void)
     fec_told = fec_now;
     fec_short_told = fec_short_now;
     fec_err_told = fec_err_now;
+    short_frames_told = short_frames_now;
 
     /* Soak line, every 60 s, ahead of the streaming check below: if audio
      * has stopped, that is when the heap and the counters matter most.
