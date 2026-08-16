@@ -297,11 +297,29 @@ typedef struct __attribute__((packed)) {
  * likely to meet, and a silently reinterpreted frame would be worse than a
  * refused one.
  *
- * Unicast to each listener like the audio, NOT multicast. Group-addressed
- * frames are never acknowledged and so never retried -- measured at ~20% loss
- * at every PHY rate tried -- and 20% of frames missing is a visibly broken
- * strip. ~5 kB/s per listener at 43 Hz, against the 30-40 the audio already
- * costs, so paying for retries here is cheap.
+ * MULTICAST, to the same group as the audio. This paragraph used to say the
+ * opposite in capitals -- "NOT multicast", on the grounds that group-addressed
+ * frames are never acknowledged and so never retried, measured at ~20% loss at
+ * every PHY rate tried. That measurement was taken at the 1 Mbps basic rate
+ * 802.11b forces; with 11b dropped the group goes at 6 Mbps OFDM and loss is
+ * 0.2-0.3%, which a strip cannot see. See DANCEFLOOR_MCAST_FRAMES for the
+ * measurements in the order they were taken, and for the transmit-buffer count
+ * that has to come with it.
+ *
+ * The reason it stays multicast is not loss, it is SCALING: one transmission
+ * feeds every listener, so the hub's packet rate is flat in speaker count --
+ * ~146/s whatever N is, against 50 + 96xN. At fifteen satellites that is the
+ * difference between ~316 and ~1490 packets a second, and it is the only thing
+ * that makes the analysis lane free of speaker count entirely.
+ *
+ * ~5 kB/s per listener at 43 Hz, against the 30-40 the audio already costs.
+ *
+ * The cost is real and is paid elsewhere: a group-addressed frame is held by
+ * the SoftAP until the DTIM beacon releases it, occupying one static TX buffer
+ * the whole time, and at 86 frames a second that is most of the pool. That is
+ * what beacon_interval in the hub's wifi_start_ap() is set explicitly against,
+ * and it is why raising ESP_WIFI_STATIC_TX_BUFFER_NUM past 36 makes things
+ * WORSE rather than better -- a deeper queue does not drain faster.
  */
 #define FRAME_PAYLOAD_MAX 160
 
