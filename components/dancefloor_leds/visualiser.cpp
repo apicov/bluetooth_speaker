@@ -18,6 +18,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
+/* xStreamBufferCreateWithCaps() -- the only way to put a stream buffer anywhere
+ * but the internal heap. See where pcm_stream is created. */
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
@@ -1540,8 +1544,89 @@ void visualiser_start(void)
      * is pure overhead now that partial reads accumulate, and once the first
      * window is held a frame needs only a hop of fresh audio to produce the
      * next one. */
+    /*
+     * SAY WHAT THIS COSTS AND WHAT WAS THERE, because nothing else can.
+     *
+     * STREAM_BYTES is ONE contiguous ~32 kB block, and esp_wifi_init() has
+     * already taken its static TX buffers out of internal DRAM by the time this
+     * runs. That makes this allocation the ceiling on
+     * ESP_WIFI_STATIC_TX_BUFFER_NUM, and the ceiling was invisible: the HEALTH
+     * line's `internal ... (min N, largest M)` cannot show it, because `min` is
+     * a total where this needs contiguity, and `largest` is sampled long after
+     * this block is already held, so it describes the leftovers rather than what
+     * this had to choose from. Raising the buffer count 32 -> 40 on that
+     * arithmetic put the hub in a reboot loop on the assert below.
+     *
+     * The margin printed here is the number to size that decision on: it is how
+     * much contiguous internal memory was free at the one moment that matters,
+     * and buffers are ~1.6 kB each out of it.
+     */
+    const size_t largest_before =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const char *where = "internal";
+#if CONFIG_SPIRAM
+    /*
+     * PSRAM, ASKED FOR BY NAME.
+     *
+     * This is the whole 32 kB, and it is the largest single internal allocation
+     * on the hub -- so on a board with SPIRAM_USE_CAPS_ALLOC (where plain
+     * malloc() never returns PSRAM and everything therefore stays internal by
+     * default) it is the one worth moving. It frees the pool the WiFi static TX
+     * buffers come from, which hub_s3/sdkconfig.defaults calls the binding
+     * constraint on that board, and it removes the 32 kB CONTIGUOUS requirement
+     * that made a raised buffer count boot-loop.
+     *
+     * Safe to move, unlike the ring or the DMA buffers: nothing DMAs this. It is
+     * written by whatever feeds audio and read by the analysis task, both by
+     * memcpy from task context, so there is no cache-coherency question and no
+     * ISR touches it. Bandwidth is not close either -- 44.1 kHz stereo 16-bit is
+     * 176 kB/s against octal PSRAM at 80 MHz.
+     *
+     * What it CAN cost is cache pressure, which is not free even when nothing
+     * else moves. `cost: analysis mean/max` on the vis line is the instrument;
+     * the baseline before this moved was 1358/4287 us. If that climbs
+     * materially, put the caps back to MALLOC_CAP_INTERNAL -- it is one word.
+     */
+    pcm_stream = xStreamBufferCreateWithCaps(STREAM_BYTES, HOP_BYTES,
+                                             MALLOC_CAP_SPIRAM);
+    if (pcm_stream) {
+        where = "PSRAM";
+    } else {
+        /* Fall back rather than go dark. A board whose PSRAM is absent or
+         * smaller than expected still analyses; it just spends the internal
+         * memory it was spending before -- which is why the warning names the
+         * buffer count, since that is what was raised on the strength of this
+         * allocation moving. */
+        ESP_LOGW(TAG, "analysis stream: PSRAM refused %d bytes, falling back to "
+                      "internal -- ESP_WIFI_STATIC_TX_BUFFER_NUM may now be too "
+                      "high for this board", STREAM_BYTES);
+        pcm_stream = xStreamBufferCreate(STREAM_BYTES, HOP_BYTES);
+    }
+#else
     pcm_stream = xStreamBufferCreate(STREAM_BYTES, HOP_BYTES);
-    assert(pcm_stream);
+#endif
+    /*
+     * NOT an assert, for the reason a satellite's task_start() is not one: a
+     * reboot loop on a dance floor is worse than a unit that comes up crippled
+     * and says so. A hub with no pcm_stream still streams audio to every
+     * satellite, still answers probes and still carries the timeline -- it draws
+     * nothing, which is the smaller half of what it does. visualiser_feed()
+     * has always returned early on a null stream, so nothing downstream needs
+     * changing to survive this.
+     */
+    if (pcm_stream) {
+        ESP_LOGI(TAG, "analysis stream: %d bytes in %s, largest internal block "
+                      "%u -> %u -- the internal figure is the headroom for "
+                      "ESP_WIFI_STATIC_TX_BUFFER_NUM, ~1.6 kB a buffer",
+                 STREAM_BYTES, where, (unsigned)largest_before,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    } else {
+        ESP_LOGE(TAG, "analysis stream: %d bytes REFUSED -- largest internal "
+                      "block was only %u. This unit will not draw. Lower "
+                      "ESP_WIFI_STATIC_TX_BUFFER_NUM, or move this allocation "
+                      "ahead of esp_wifi_init().",
+                 STREAM_BYTES, (unsigned)largest_before);
+    }
 #endif
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
@@ -1668,7 +1753,17 @@ void visualiser_start(void)
      * exactly like a strip that is being fed silence, and the `started:` line
      * below would claim everything was fine either way. */
 #if DF_ANALYSES_AUDIO
-    if (xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1) != pdPASS) {
+    /*
+     * Only if there is something for it to read. visualiser_task() blocks in
+     * xStreamBufferReceive(pcm_stream, ...) with no null check -- there was no
+     * need for one while the allocation above was an assert, and starting the
+     * task without the buffer would turn a clean "this unit will not draw" into
+     * a null dereference inside FreeRTOS, which is strictly worse than the
+     * reboot loop the assert was removed to stop.
+     */
+    if (!pcm_stream) {
+        ESP_LOGE(TAG, "TASK \"vis\" NOT STARTED -- no analysis stream to read");
+    } else if (xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1) != pdPASS) {
         ESP_LOGE(TAG, "TASK \"vis\" FAILED TO START -- no analysis, the strip "
                       "will not react to audio");
     }

@@ -167,14 +167,52 @@ void servo_tick(void)
      * actually empty ring is caught by the playback task's 500 ms receive
      * timeout, which is a different mechanism and still armed.
      */
+    /*
+     * A FLOOR, NOT A REPLACEMENT, since 2026-08-15.
+     *
+     * This used to assign adj outright, which meant it could only ever WEAKEN a
+     * phase correction that already agreed with it. Measured on the soak in
+     * tools/soak/logs-soak-20260815-224002, in this unit's own words:
+     *
+     *   buffer 449 ms | phase +268516 us
+     *   servo: smoothed +83432 us -> trim +20 Hz (20 frames/s)
+     *
+     * The phase term asked for 83432 * 44100 / 1e8 = 36 Hz and got 20, because
+     * the ring was 249 ms past target and this branch overwrote it. So at the
+     * exact moment the ring was deepest, the guard that exists to protect the
+     * ring cut the recovery to 0.45 ms/s -- and a ring that deep IS playing
+     * that late, so the two were asking for the same thing and the guard won
+     * anyway. Recovery then took minutes and a track boundary ended it first.
+     *
+     * Depth still WINS when the two disagree, which is the case this was
+     * written for: a ring heading for empty or full while phase reads fine.
+     * When they agree, the larger correction stands.
+     *
+     * No steady-state effect. Depth only leaves +-120 ms during exactly the
+     * events this is about; every log window that ever read `buffer 165-250 ms`
+     * never reached this branch and still does not.
+     */
     const int64_t since_anchor = anchor_at ? esp_timer_get_time() - anchor_at
                                            : INT64_MAX;
+    const int32_t depth_ms = err_frames * 1000 / (int32_t)stream_rate;
+    const int32_t adj_phase = adj;       /* what phase alone asked for */
     if (since_anchor < DEPTH_NET_HOLD_US) {
         /* say nothing; the buffer line above already prints the depth */
-    } else if (err_frames * 1000 / (int32_t)stream_rate < -120) {
-        adj = -20;                       /* nearly empty: slow down */
-    } else if (err_frames * 1000 / (int32_t)stream_rate > 120) {
-        adj = 20;                        /* nearly full: speed up */
+    } else if (depth_ms < -120) {
+        if (adj > -20) adj = -20;        /* nearly empty: slow down, at least */
+    } else if (depth_ms > 120) {
+        if (adj < 20) adj = 20;          /* nearly full: speed up, at least */
+    }
+    /*
+     * Say so when the net is in play, because this is the branch that changed
+     * and a log window has no other way to show it. Under the old code the two
+     * numbers were the whole story: `phase 36 -> net 20` was the cap, and is
+     * what this commit exists to stop. Rare by construction -- depth only
+     * leaves +-120 ms during a delivery burst.
+     */
+    if (adj != adj_phase) {
+        ESP_LOGW(TAG, "depth net: buffer %+ld ms, phase asked %+ld Hz -> %+ld Hz",
+                 (long)depth_ms, (long)adj_phase, (long)adj);
     }
     uint32_t desired = (uint32_t)((int32_t)stream_rate + adj);
     /*

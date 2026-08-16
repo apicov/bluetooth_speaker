@@ -41,6 +41,12 @@ volatile bool phase_valid;
 sync_phase_hist_t phase_hist;
 volatile int32_t restart_pos = -1;  /* ring position of a track boundary */
 volatile bool phase_stepped;
+volatile int32_t step_report_mag;
+volatile int32_t step_report_from, step_report_to;
+volatile int32_t step_report_ring, step_report_trim;
+volatile uint32_t step_report_pad;
+volatile bool    step_report_pending;
+
 volatile int32_t splice_report_us;
 volatile int32_t splice_report_phase;
 volatile int32_t splice_report_alt;

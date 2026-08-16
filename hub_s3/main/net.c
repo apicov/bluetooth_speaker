@@ -81,6 +81,32 @@ void wifi_start_ap(void)
     wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
     wc.ap.channel = CONFIG_DANCEFLOOR_WIFI_CHANNEL;
     wc.ap.dtim_period = 1;
+    /*
+     * 50 ms, half the IDF default, and the one lever that shortens the DTIM
+     * hold without changing what is multicast.
+     *
+     * A SoftAP cannot send group-addressed frames whenever it likes -- stations
+     * may be asleep -- so it buffers them and releases them after each DTIM
+     * beacon. dtim_period is already 1, so that is every beacon; the interval is
+     * what is left. Until now it was 0 in the initialiser, which IDF reads as
+     * 100 ms, so every audio chunk and every analysis frame occupied one static
+     * TX buffer for up to 100 ms waiting for a window.
+     *
+     * That hold is why the pool exhausts: 50 audio/s plus 86 analysis frames/s
+     * all queue for a 10/s release. Halving the interval halves the average
+     * occupancy, and it does so without moving a packet off the group -- which
+     * matters, because the group is what keeps the hub's transmit rate flat in
+     * speaker count (see frame_msg_t). Raising the buffer count instead was
+     * tried and made things worse: a deeper queue does not drain faster, it
+     * just delivers later, and audio past its play_at is worth less than audio
+     * that never came.
+     *
+     * Costs beacon airtime, 10/s to 20/s -- a few ms per second at 6 Mbps
+     * against the ~14% duty cycle the stream already runs at. Power save is not
+     * a consideration here: every satellite sets WIFI_PS_NONE, so nothing is
+     * asleep between beacons and nothing depends on the listen interval.
+     */
+    wc.ap.beacon_interval = 50;
     /* Matches ESP-IDF's own softAP example. Setting capable=true is a deviation
      * that some clients refuse, so leave it alone. */
     wc.ap.pmf_cfg.required = false;
