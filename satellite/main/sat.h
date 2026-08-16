@@ -263,7 +263,20 @@ extern volatile bool phase_stepped;
  * plausible burst of lateness reaches it, short enough that a genuine
  * lead/path mismatch does not leave a speaker silent for a whole track.
  */
-#define ANCHOR_MIN_LEAD_US     100000
+/*
+ * 125000 SINCE LEAD_US BECAME 250 ms. This is "half the hub's lead" and has been
+ * since it was written; the number moved because the lead did, not because the
+ * reasoning changed. Leaving it at 100 ms would have quietly loosened the guard
+ * from half a lead to two fifths.
+ *
+ * The tension the paragraph above describes is what raising the lead was partly
+ * for. 251 anchors were refused in three hours against a measured mean lead of
+ * 146 ms: RESYNC_US lets the hub's timeline sit 150 ms below target, so a
+ * perfectly healthy packet in a trough showed under this floor and was refused,
+ * exactly as predicted. Both ends of that moved -- the centre is 250 now -- so
+ * the distribution should clear this by more than it did, not less.
+ */
+#define ANCHOR_MIN_LEAD_US     125000
 #define ANCHOR_MIN_INTERVAL_US 1000000
 #define ANCHOR_GIVE_UP_US      5000000
 
@@ -273,7 +286,7 @@ extern volatile bool phase_stepped;
  *
  * 150 ms is about seven packets. Normal loss on a healthy link is one to three
  * -- 20 to 60 ms -- so this sits well clear of anything that should be filled,
- * while staying below the 200 ms RING_TARGET_MS that a fill this size would
+ * while staying below the RING_TARGET_MS (250) that a fill this size would
  * otherwise push the ring past.
  */
 #define GAP_RESYNC_MS 150
@@ -659,9 +672,20 @@ extern volatile uint32_t n_task_fail;
 extern char s_task_fail_names[64];
 
 
-/* Target buffer depth: the hub stamps audio ~200 ms ahead, so in steady state
- * that much should be sitting here waiting. */
-#define RING_TARGET_MS 200
+/*
+ * Target buffer depth: the hub stamps audio LEAD_US ahead, so in steady state
+ * that much should be sitting here waiting.
+ *
+ * IT IS THE HUB'S LEAD_US AND MUST TRACK IT. This unit cannot see that constant
+ * -- it is compiled into a different image -- so the two are held equal by
+ * convention, and a mismatch does not fail loudly: the servo's depth safety net
+ * would simply hold this unit at the wrong depth, which reads as a standing
+ * phase error nothing explains. 250 since the lead became 250.
+ *
+ * Well inside RING_BYTES, which is 80 kB / 464 ms: the target leaves 214 ms for
+ * a gap fill to land in, and GAP_RESYNC_MS above is 150.
+ */
+#define RING_TARGET_MS 250
 
 /*
  * How much unpaced audio a playback START puts in before the DAC begins pacing.

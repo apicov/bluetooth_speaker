@@ -110,21 +110,39 @@
  * How far ahead of playback each chunk is stamped. Must exceed worst-case
  * network delivery -- measured RTT peaked at 28 ms, so this is a ~7x margin.
  *
- * Reduced from 250 ms so that LEAD + RESYNC stays inside the satellite's ring:
- * with bursty input the actual lead swings around this value rather than
- * sitting on it. That ring is 80 kB / 464 ms now and the bound is 350, so there
- * is room here again -- but do not spend it on the lead without a reason the
- * lead itself can serve. It buys tolerance for LATE delivery, and the delivery
- * fault this system has actually suffered was the transmit path refusing sends
- * outright, which no lead recovers. The 30 ms went to RESYNC_US below, which
- * had a measured seven-times-a-minute misfire to its name.
+ * BACK TO 250 ms, and this time with a reason the lead itself serves. It was cut
+ * to 200 so LEAD + RESYNC stayed inside the satellite's ring, and the note here
+ * said the room had returned -- that ring is 80 kB / 464 ms -- "but do not spend
+ * it on the lead without a reason the lead itself can serve". There are two now:
  *
- * The same answers "the S3 hub has PSRAM, can the lead not be 500 ms": the ring
- * a lead must fit in belongs to the SATELLITE, which is a classic ESP32 with no
- * PSRAM and a largest free block of 106 kB against the ~107 kB a 500 ms lead
- * would need. Memory on this board buys the lead nothing.
+ *   - THE SATELLITE RUNS MODELS. The S3 satellite takes MSG_FRAME and runs the
+ *     analyser lane on the spectrum it carries, and every frame names the
+ *     instant it is drawn at. The lead is the whole budget between a frame
+ *     arriving and being due, so it is what an inference has to finish inside.
+ *     At 200 ms that budget is shared with delivery; at 250 it is not as tight.
+ *   - ANCHORS ARE BEING REFUSED. 251 in three hours. A satellite will not anchor
+ *     on a packet with less than ANCHOR_MIN_LEAD_US in front of it, RESYNC_US
+ *     lets this timeline wander 150 ms below target, and the measured mean lead
+ *     was 146 ms -- so a healthy packet in a trough shows under 100 ms and is
+ *     refused, exactly as the note on ANCHOR_MIN_LEAD_US predicts. Raising the
+ *     centre lifts the whole distribution off that floor.
+ *
+ * The bound is unchanged and still binds: LEAD + RESYNC = 400 against the
+ * satellite's 464 ms ring, 64 ms of margin. Three things move with this and
+ * must stay in step -- RING_TARGET_MS on the satellite, ANCHOR_MIN_LEAD_US
+ * beside it, and LOCAL_RING_BYTES below, which now has to hold 250 ms before a
+ * feed burst arrives.
+ *
+ * What it does NOT buy is tolerance for the transmit path refusing sends
+ * outright, which is the fault this system has actually suffered. No lead
+ * recovers a packet that was never transmitted.
+ *
+ * And the ceiling is still not this board's memory: the ring a lead must fit in
+ * belongs to the SATELLITE, a classic ESP32 with no PSRAM and a largest free
+ * block of 106 kB against the ~107 kB a 500 ms lead would need. The hub's PSRAM
+ * buys the lead nothing; it bought LOCAL_RING_BYTES below, which is different.
  */
-#define LEAD_US   200000
+#define LEAD_US   250000
 
 /*
  * How far the presentation timeline may wander from real time before the slew
@@ -228,8 +246,12 @@
  * healthy window, so 300 ms is clear of normal and far below the 1.76 s that
  * mattered.
  *
- * STEADY is how long it must go without one. 500 ms is more than twice LEAD_US,
- * so a source that manages it can fill the ring before playback reaches it.
+ * STEADY is how long it must go without one. 500 ms is exactly twice LEAD_US
+ * since that became 250 ms -- it was "more than twice" at 200 -- so a source
+ * that manages it can still fill the ring before playback reaches it, with the
+ * margin now equal to the lead rather than half again. If LEAD_US grows any
+ * further this is the next constant to move, and the test is whether a stream
+ * still starts with a full ring rather than filling one behind playback.
  *
  * GIVE_UP bounds the wait, for the same reason the satellite's anchor guard has
  * one: a source that stalls forever is not fixed by refusing to play it, and a
@@ -280,26 +302,37 @@
  * this ring look far better provisioned than it was: 64 kB reads as three times
  * the lead against 21 kB and is only 1.86x against the real one.
  *
- * 48 kB is 279 ms, DOWN FROM 64 kB / 371 ms, and the 16 kB it releases is spent
- * on WiFi static TX buffers -- see ESP_WIFI_STATIC_TX_BUFFER_NUM in
- * sdkconfig.defaults, which is the other half of this change. This ring was 48%
- * of the internal heap and the only place a WiFi-sized block existed: internal
- * ran 7,760 bytes free with a 3,584 largest block, so nothing could grow until
- * something here shrank.
+ * 80 kB is 464 ms. It was 48 kB / 279 ms, and before that 64 kB / 371 ms; the
+ * cut to 48 released 16 kB for WiFi static TX buffers, because this ring was 48%
+ * of the internal heap and the only place a WiFi-sized block existed.
  *
- * WHY 48 AND NOT LESS. Measured occupancy over a full run was 31,744-39,424
- * bytes (179-223 ms), so 48 kB leaves 9,728 bytes above the observed peak. The
- * constraint is not the steady state but the FEED BURST: sbc_in reports
- * `max gap` of 34.8-42.0 ms, so the decoder pauses and then delivers in a lump,
- * and the ring has to swallow the lump or drop it. 9,728 bytes is 55 ms, which
- * clears the worst gap measured (42 ms) and not by much. 44 kB would leave 26 ms
- * and lose to a gap this unit has already produced.
+ * FED-DROP FALSIFIED IT, which is what that counter is for, and the note here
+ * said what to do: "non-zero means the burst no longer fits and the ring was the
+ * wrong donor; put it back to 64 kB and take the TX buffers from somewhere
+ * else." Measured 2026-08-16, twice in three hours -- 46,080 B and 42,496 B --
+ * both immediately after the A2DP source stalled (11.8 s and 2.4 s, on sbc_in's
+ * `max gap`) and the decoder caught up in a lump.
  *
- * FALSIFIED BY fed-drop, which is why that counter exists. Non-zero here means
- * the burst no longer fits and the ring was the wrong donor; put it back to 64 kB
- * and take the TX buffers from somewhere else.
+ * PAST 64 kB, TO 80, because the burst it is sized against has grown and the
+ * lead it must hold has too. `max gap` now sits at 51-80 ms in 523 of 597
+ * windows and tops out at ~95 ms, against the 34.8-42.0 ms this was sized on;
+ * and LEAD_US is 250 ms, which is 44,100 bytes of the ring before any burst
+ * arrives. 80 kB leaves 37,820 bytes -- 214 ms -- above the lead, which clears
+ * the worst normal gap twice over and would have swallowed both of the
+ * catch-up lumps above.
+ *
+ * "SOMEWHERE ELSE" IS PSRAM, and that is what makes this affordable now rather
+ * than a trade against the transmit path. pcm_stream's 32 kB moved to SPIRAM
+ * (visualiser.cpp), measured as hub internal min 30592 -> 37704 with the buffer
+ * count unchanged, so this ring can grow 32 kB without the TX pool giving
+ * anything back. Nothing else in this tree may follow it there without the same
+ * argument: SPIRAM_USE_CAPS_ALLOC exists so that things stay internal unless
+ * they ask, and the DMA buffers and every task stack must never ask.
+ *
+ * Still falsified by fed-drop. Non-zero again means the source stalls longer
+ * than this holds, and the answer stops being memory.
  */
-#define LOCAL_RING_BYTES (48 * 1024)
+#define LOCAL_RING_BYTES (80 * 1024)
 
 extern const char *TAG;
 
