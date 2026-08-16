@@ -318,17 +318,117 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 # 32 is spent from, not the ring, which stays at 48 kB and keeps the feed-burst
 # margin hub.h argues for.
 #
-# 32 IS WHAT WAS MEASURED, and it is enough for the DTIM burst that
-# DANCEFLOOR_MCAST_FRAMES creates: with analysis frames on the group the hub
-# reads `tx-fail 0 (0 audio)` and the satellite `gaps 0` over 125 s, where 26
-# gave `tx-fail 14-27 audio` per 20 s window. 40 was written here briefly and
-# never reached a board -- an existing sdkconfig kept 32 and the run that passed
-# was at 32. Do not raise it on the strength of that; there is headroom
-# (`min 28948` free with the log shipper off) but no measurement above 32.
+# 32 WAS MEASURED, over 125 s, and it was enough for the DTIM burst that
+# DANCEFLOOR_MCAST_FRAMES creates: the hub read `tx-fail 0 (0 audio)` and the
+# satellite `gaps 0`, where 26 gave `tx-fail 14-27 audio` per 20 s window. 40 was
+# written here briefly and never reached a board, and the standing instruction
+# was not to raise it on the strength of that.
+#
+# STILL 32, AND 40 IS NOT AVAILABLE. Tried 2026-08-15 and it does not boot:
+#
+#   assert failed: void visualiser_start() visualiser.cpp:1544 (pcm_stream)
+#
+# in a reboot loop. The reason is CONTIGUITY, not total free memory, and this is
+# the trap worth carrying: pcm_stream is ONE allocation of STREAM_BYTES --
+# FFT_N * CHANNELS * 2 * 8 = 32 kB (visualiser.cpp:123) -- and esp_wifi_init()
+# takes these buffers out of internal DRAM BEFORE visualiser_start() asks for
+# it. Eight more buffers is 12.8 kB off the largest free block, and the block
+# stopped being 32 kB.
+#
+# THE NUMBER THAT MISLED, so nobody re-derives it: the HEALTH line's
+# `internal 32604 free (min 30592, largest 22528)` looks like 12.8 kB of room.
+# It is not. `min` is a TOTAL and this allocation needs a contiguous block; and
+# `largest 22528` is measured AFTER pcm_stream already holds its 32 kB, so it
+# describes what is left over, not what was available to it. Neither number can
+# see this ceiling. Only a boot can.
+#
+# So the pool is not the lever here. The next one costs no memory at all: the
+# DTIM hold, where 86 group-addressed analysis frames a second each occupy one
+# of these buffers until the beacon releases it. See DANCEFLOOR_MCAST_FRAMES.
+#
+# WHAT ARGUED FOR RAISING IT, kept because the fault is real and still open. A
+# 45-minute soak that 125 s could not have shown
+# (tools/soak/logs-soak-20260815-224002): tx-fail came back at 1-33 audio
+# datagrams per 5 s window in roughly 30 of ~50 windows, and the satellites met
+# each burst with a gap fill -- `gaps 14 (586 ms silence)` against
+# `tx-fail 47 (33 audio)` in the same window -- which left their rings at
+# `buffer 449 ms` and their phase at +268 ms. Both satellites stepped together
+# and the hub did not move, which is what says the loss is here and not on the
+# air or in a satellite.
+#
+# READ THE PREMISE THAT CHANGED. Everything above argues buffers over rate on the
+# grounds that the transmit path "was broken for the first minute of a stream, on
+# the step from idle to ~135 datagrams a second" -- a startup transient, which is
+# exactly what a deeper queue absorbs. That premise no longer holds: the failures
+# in this soak are spread evenly across all 45 minutes with no startup
+# concentration (4 audio at 22:41, 33 at 22:52, 31 at 23:07, 14 at 23:24). A
+# deeper queue absorbs a burst; it does not fix a burst that recurs. Even if the
+# memory had been there, 40 was only ever expected to REDUCE this rather than end
+# it. The bar is `tx-fail 0 (0 audio)` across a whole session.
+#
+# NOT the dynamic path either. ESP_WIFI_DYNAMIC_TX_BUFFER_NUM above is dead --
+# the live sdkconfig has ESP_WIFI_TX_BUFFER_TYPE=0 -- and restoring the option
+# means turning SPIRAM_TRY_ALLOCATE_WIFI_LWIP off, which pushes lwIP's buffers
+# back into internal SRAM. WiFi TX buffers must be DMA-capable and come from
+# internal heap either way, so that trade is likely net-negative here.
+#
+# 36 WAS MEASURED AND WORKED, and the instrument that measured it said how much
+# was left: `analysis stream: 32768 bytes, largest internal block was 36864
+# (31744 left)`. 36864 - 32769 is 4095 bytes, so 38 was the ceiling and 39 was
+# not -- which is also why 40 boot-looped.
+#
+# MEMORY IS NO LONGER THE CEILING, and it turned out not to be the limit either.
+# pcm_stream is allocated from PSRAM now (visualiser.cpp, MALLOC_CAP_SPIRAM),
+# which is the one sanctioned way to move anything off internal on this board --
+# SPIRAM_USE_CAPS_ALLOC means plain malloc never returns PSRAM, so a thing moves
+# only by asking. That returned the whole 32 kB (measured: `analysis stream:
+# 32768 bytes in PSRAM, largest internal block 31744 -> 31744`, and hub
+# `internal min 37704` against 30592 before), AND it retired the 32 kB
+# CONTIGUOUS requirement that made the earlier overshoot a reboot loop.
+#
+# 48 WAS THEN TRIED, AND IT IS WORSE THAN 36. This is the finding worth keeping,
+# because every step in this file's history moved the number UP -- 16, 26, 32 --
+# and nobody had looked for the top. Per hour, three soaks:
+#
+#   buffers          32        36        48
+#   hub windows w/ tx-fail  23%      4.2%     14.7%
+#   sat gaps/h              92        16        35
+#   anchors-refused/h      139        15       278
+#   dma-starve/h           714       113       900
+#   ring-full/h             15         0        21
+#   pad frames/h         31500      9400     24300
+#
+# 48 is worse than 32 on several of those. Memory was fine throughout
+# (alloc-fail 0, internal min 37704), so this is not a resource fault.
+#
+# WHY MORE IS WORSE: bufferbloat. These buffers do not increase the rate the
+# radio drains them -- group-addressed frames leave on the DTIM beacon and
+# nothing here changes that -- so a deeper pool only lets more packets QUEUE, and
+# they arrive late instead of not arriving. Audio has a hard deadline: every
+# chunk carries play_at, LEAD_US = 200 ms ahead, and a satellite that gets a
+# packet after its instant has already filled the gap with silence and moved on.
+# A late packet is worth less than a dropped one. `anchors-refused` is the
+# counter that says so directly -- it fires when an arriving packet's play_at has
+# passed -- and at 48 it is 278/h against 15/h at 36.
+#
+# So: 36, and the ceiling on this number is BEHAVIOURAL, not memory. Anything
+# that raises it again has to answer anchors-refused, not free bytes.
+#
+# The PSRAM move stays regardless. It costs nothing measurable -- vis
+# `cost: analysis 1328/4406 us` against a 1358/4287 baseline, and the hub's own
+# audio path reads dma-starve 0, short-reads 0, underruns 0 -- and the headroom
+# it buys is what makes the next experiment a free choice rather than a fight
+# with the allocator. It is simply not headroom that should be spent here.
+#
+# CAVEAT ON ATTRIBUTION: the 48 run also carried the PSRAM move, so strictly it
+# is 48+PSRAM against 36+internal. The evidence points at the count -- analysis
+# cost did not move, the hub's own playback is spotless, and cache jitter would
+# have hit that first -- but the clean comparison is 36+PSRAM, which is what this
+# build now is.
 #
 # Falsified by tx-fail itself, which is the counter CACHE_TX_BUFFER_NUM is pinned
 # to 0 further down to keep honest.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=36
 
 # The socket's receive queue, in datagrams. IDF defaults to 6 and the boot
 # banner prints it as `udp mbox: 6`.
