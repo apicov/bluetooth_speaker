@@ -774,16 +774,36 @@ extern int32_t s_refill_frames;
 extern volatile int32_t rate_trim_hz;
 
 /*
- * Playback volume, 0-127, AUDIO_VOL_MAX being unity and the default it holds
- * until the hub says otherwise -- so a satellite that never hears a MSG_VOL
- * plays loud rather than silent.
+ * Playback volume, 0-127, AUDIO_VOL_MAX being unity.
  *
- * Written by rx_task, read by playback, applied at the output in
- * audio_apply_volume(). The hub sends full-scale audio and this level
- * separately, and both units run the same integer taper on it, so two speakers
- * told the same number produce the same level.
+ * MEANINGLESS UNTIL audio_vol_known. This used to default to AUDIO_VOL_MAX, on
+ * the rule that a satellite which never hears a MSG_VOL should play loud rather
+ * than silent; audio_vol_effective() in audio_out.h is where that rule was
+ * reconsidered and what replaced it. A satellite cannot play audio it has not
+ * been sent, and whoever sends the audio sends the level, so there is nothing to
+ * be loud for.
+ *
+ * Written by rx_task, read by playback, applied at the output. The hub sends
+ * full-scale audio and this level separately, and both units run the same
+ * integer taper on it, so two speakers told the same number produce the same
+ * level.
+ *
+ * WRITE ORDER IS LOAD-BEARING: rx_task stores the level and only then sets
+ * audio_vol_known. Both are single-byte volatile stores, so a reader that
+ * observes the flag has necessarily observed the level that goes with it, and no
+ * lock is needed for a pair this shape.
  */
 extern volatile uint8_t audio_volume;
+
+/*
+ * Whether anything has ever said how loud, this boot.
+ *
+ * Sticky. A hub going away does not make the last level wrong -- it takes the
+ * audio with it -- so nothing clears this. The fallback for a hub that never
+ * speaks at all is a deadline in the play task, not a reset of this flag; see
+ * audio_vol_effective() for why that distinction matters.
+ */
+extern volatile bool audio_vol_known;
 
 /*
  * MSG_VOL messages taken, REPEATS INCLUDED.

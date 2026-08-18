@@ -300,7 +300,12 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
  */
 void streamer_send_vol(uint8_t volume)
 {
-    if (sock < 0) {
+    /* Never relay a level nobody gave us. The hub has its own fallback for a
+     * bridge that has gone quiet, and broadcasting it would take a floor sitting
+     * correctly at -50 dB up to full scale -- so the fallback stays a local
+     * playback decision and this stays silent until there is a real level to
+     * repeat. See audio_vol_effective(). */
+    if (sock < 0 || !audio_vol_known) {
         return;
     }
     vol_msg_t msg = { .type = MSG_VOL, .volume = volume };
@@ -344,10 +349,12 @@ void streamer_send_vol(uint8_t volume)
 void streamer_set_volume(uint8_t volume)
 {
     const uint8_t v = volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX : volume;
-    if (v != audio_volume) {
+    if (v != audio_volume || !audio_vol_known) {
         ESP_LOGW(TAG, "VOLUME %u/%d", v, AUDIO_VOL_MAX);
     }
+    /* Level first, flag second, for the reason sat.h gives. */
     audio_volume = v;
+    audio_vol_known = true;
     for (int i = 0; i < VOL_CHANGE_REPEATS; i++) {
         streamer_send_vol(v);
     }

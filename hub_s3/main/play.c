@@ -744,6 +744,32 @@ static void pulse_marker(void)
  * The write is the only DAC-paced event in the whole loop, which is why the
  * instant after it is what every phase reading is dated from.
  */
+/*
+ * The level to actually play this chunk with.
+ *
+ * Kept out of the ring and out of every count, exactly like the level itself:
+ * this decides what the DAC hears, and nothing upstream may be able to see it.
+ *
+ * The deadline is a local of this task because this task is its only reader --
+ * no shared 64-bit field, so nothing to tear. It is measured from boot rather
+ * than from playback start; audio_vol_effective() has the argument.
+ *
+ * Says so once, loudly, if it ever fires. A unit inventing its own loudness is
+ * not a thing to discover by ear.
+ */
+static uint8_t vol_now(void)
+{
+    static bool told;
+    const bool due = esp_timer_get_time() >= AUDIO_VOL_UNKNOWN_HOLD_US;
+    if (due && !audio_vol_known && !told) {
+        told = true;
+        ESP_LOGE(TAG, "NO VOLUME in %d s -- nothing has told this unit a level. "
+                      "Falling back to FULL SCALE.",
+                 (int)(AUDIO_VOL_UNKNOWN_HOLD_US / 1000000));
+    }
+    return audio_vol_effective(audio_volume, audio_vol_known, due);
+}
+
 static void write_chunk(void)
 {
     /* Last thing before the DMA buffer, and deliberately after every
@@ -754,7 +780,7 @@ static void write_chunk(void)
     /* Beside the channel mode and for the same reasons: in place, on the last
      * buffer before the output, frame count untouched. What went to the
      * satellites was full scale; each unit attenuates its own. */
-    audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, audio_volume);
+    audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, vol_now());
     size_t written = 0;
     const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
     if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,

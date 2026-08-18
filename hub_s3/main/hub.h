@@ -1049,19 +1049,36 @@ extern volatile int32_t s_hub_splice_alt_us;
 extern volatile int32_t rate_trim_hz;
 
 /*
- * Playback volume, 0-127, AUDIO_VOL_MAX being unity and the default.
+ * Playback volume, 0-127, AUDIO_VOL_MAX being unity.
+ *
+ * MEANINGLESS UNTIL audio_vol_known. It used to default to AUDIO_VOL_MAX; see
+ * audio_vol_effective() in audio_out.h for why an untold level is now silence
+ * with a bounded fallback instead. The hub reaches that state the same way a
+ * satellite does -- it reboots, and the phone is not going to send a command it
+ * has no reason to send -- which is what the bridge's heartbeat now covers.
  *
  * Written by the SBC input task when the phone moves the slider, read by
- * playback. Applied at the DAC write only -- see audio_apply_volume() -- so what
- * is transmitted to the satellites stays FULL SCALE and each unit attenuates its
- * own output. Attenuating before the send would spend the air's dynamic range on
- * a level decision and leave the satellites unable to differ, which is the same
- * mistake the phone was making before the bridge advertised an AVRCP target.
+ * playback. Applied at the DAC write only, so what is transmitted to the
+ * satellites stays FULL SCALE and each unit attenuates its own output.
+ * Attenuating before the send would spend the air's dynamic range on a level
+ * decision and leave the satellites unable to differ, which is the same mistake
+ * the phone was making before the bridge advertised an AVRCP target.
  *
  * A torn read is not possible on a byte, and a stale one costs one chunk at the
- * previous level -- 5.8 ms, at a step a human just asked for.
+ * previous level -- 5.8 ms, at a step a human just asked for. The flag is stored
+ * after the level for the same reason the satellite's is; see sat.h.
  */
 extern volatile uint8_t audio_volume;
+
+/*
+ * Whether the bridge has ever said how loud, this boot. Sticky; see the
+ * satellite's copy in sat.h for why nothing clears it.
+ *
+ * streamer_send_vol() is gated on this. A hub must not relay a level it invented
+ * -- if the local fallback fired and were broadcast, a hub whose bridge had died
+ * would blast satellites that were sitting correctly at -50 dB.
+ */
+extern volatile bool audio_vol_known;
 
 /*
  * MSG_VOL datagrams sent to listeners, REPEATS INCLUDED.

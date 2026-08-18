@@ -29,7 +29,8 @@ volatile int64_t anchor_at;
 volatile uint32_t stream_rate = 44100;
 uint32_t tx_rate = 44100;  /* what the output clock is actually set to */
 volatile int32_t rate_trim_hz;  /* the fine correction playback applies instead */
-volatile uint8_t audio_volume = AUDIO_VOL_MAX;  /* until the hub says otherwise */
+volatile uint8_t audio_volume;  /* meaningless until audio_vol_known */
+volatile bool audio_vol_known;  /* sticky: set by the first MSG_VOL, never cleared */
 volatile uint32_t n_vol_rx;  /* MSG_VOL taken, repeats included */
 int64_t stream_offset;
 int64_t offset_slew_last;  /* when the slew last moved it */

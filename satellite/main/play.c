@@ -171,6 +171,32 @@ static int chunk_shift(void)
     return (int)k + trim;
 }
 
+/*
+ * The level to actually play this chunk with.
+ *
+ * Kept out of the ring and out of every count, exactly like the level itself:
+ * this decides what the DAC hears, and nothing upstream may be able to see it.
+ *
+ * The deadline is a local of this task because this task is its only reader --
+ * no shared 64-bit field, so nothing to tear. It is measured from boot rather
+ * than from playback start; audio_vol_effective() has the argument.
+ *
+ * Says so once, loudly, if it ever fires. A unit inventing its own loudness is
+ * not a thing to discover by ear.
+ */
+static uint8_t vol_now(void)
+{
+    static bool told;
+    const bool due = esp_timer_get_time() >= AUDIO_VOL_UNKNOWN_HOLD_US;
+    if (due && !audio_vol_known && !told) {
+        told = true;
+        ESP_LOGE(TAG, "NO VOLUME in %d s -- nothing has told this unit a level. "
+                      "Falling back to FULL SCALE.",
+                 (int)(AUDIO_VOL_UNKNOWN_HOLD_US / 1000000));
+    }
+    return audio_vol_effective(audio_volume, audio_vol_known, due);
+}
+
 void play_task(void *arg)
 {
     (void)arg;
@@ -778,7 +804,7 @@ void play_task(void *arg)
              * same integer taper, so the two speakers match. Not inside
              * write_audio() because a splice calls that with the const `quiet`
              * buffer -- and silence needs no attenuating. */
-            audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, audio_volume);
+            audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, vol_now());
 
             write_audio(chunk, sizeof(chunk));
             /* Immediately: it is the instant the next pass dates its phase

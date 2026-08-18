@@ -21,6 +21,7 @@
  * upstream of the timeline.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -128,3 +129,67 @@ static inline void audio_apply_volume(int16_t *frames, size_t n_frames, uint8_t 
         frames[i] = (int16_t)(((int32_t)frames[i] * g) >> 15);
     }
 }
+
+/*
+ * What to play when nobody has said how loud: NOTHING, for a while.
+ *
+ * "Never been told a level" and "was told full scale" used to be the same state,
+ * because the default WAS full scale. sbc_link.h argued for that: a missed
+ * message should play loud rather than silent. The soak capture of 2026-08-18
+ * is what disproves it -- `sat1, uptime 5997, VOLUME 20/127`, a satellite that
+ * played about six seconds before it learnt the level. The room was set to
+ * 20/127. The unit played at 127. That is 32 dB too loud, into a floor of
+ * people, for six seconds.
+ *
+ * The two failures are not symmetrical and were being treated as if they were. A
+ * speaker that is briefly silent is a speaker somebody walks over to. A speaker
+ * that is briefly 32 dB too loud is not a fault you get to investigate calmly,
+ * and at the bottom of the taper -- where this floor is actually used -- the
+ * error is at its largest.
+ *
+ * So: silence until told, and the old rule kept only as a bounded fallback, for
+ * the case it was really protecting against -- a hub that is never going to say
+ * anything, because it is running a build from before any of this existed. That
+ * is a bench condition with somebody standing next to it, not a party.
+ *
+ * A satellite cannot play audio it has not been sent, and the unit that sends
+ * the audio is the unit that sends the level, so in the healthy case there is
+ * nothing to wait for: the level arrives on the join push, before the first
+ * packet it could apply to.
+ *
+ * THREE RULES, each of which is a way this goes wrong if forgotten:
+ *
+ * 1. The fallback is a LOCAL PLAYBACK DECISION and is never relayed. If the hub
+ *    folded it back into audio_volume and broadcast that, a hub whose bridge had
+ *    died would blast a floor whose satellites were sitting correctly at -50 dB.
+ *    It lives here, in a pure function, and the senders are gated on `known`.
+ * 2. `known` is STICKY. A hub going away does not make the last level wrong; it
+ *    takes the audio with it. Nothing ever clears it.
+ * 3. A muted unit STILL WRITES. Skipping the write to save the work would stall
+ *    the DAC, break the wrote_at phase reference and bring the unit back out of
+ *    position. Zeros cost the same as samples.
+ *
+ * Deliberately told-and-zero is honoured as zero. Somebody who muted the room
+ * from the phone is not somebody who has said nothing.
+ */
+static inline uint8_t audio_vol_effective(uint8_t vol, bool known, bool fallback_due)
+{
+    if (known) {
+        return vol;
+    }
+    return fallback_due ? AUDIO_VOL_MAX : 0;
+}
+
+/*
+ * How long a unit stays silent before deciding nobody is ever going to tell it.
+ *
+ * Measured FROM BOOT, not from playback start. The question is "has anything
+ * ever told us", and a live hub answers it within milliseconds of the DHCP lease
+ * -- long before audio can anchor. From playback start would instead impose a
+ * fresh silence at every re-anchor, which is a healthy event.
+ *
+ * Thirty seconds against a 1 s repeat from the hub and a 5 s heartbeat from the
+ * bridge: the healthy case wins that race by a factor of six, and what is left
+ * is long enough that it cannot be reached by a burst of loss.
+ */
+#define AUDIO_VOL_UNKNOWN_HOLD_US 30000000
