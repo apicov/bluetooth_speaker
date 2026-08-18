@@ -889,6 +889,22 @@ extern int32_t s_refill_frames;
  */
 #define CLIENT_TIMEOUT_US 2000000
 
+/*
+ * How the volume is repeated, and how often.
+ *
+ * VOL_REPEAT_US is the interval of the standing repeat, and under the
+ * silent-until-told rule it is also the worst-case silence a joining satellite
+ * sits through when client_joined()'s push is lost. One second of two bytes is
+ * nothing to send and a short thing to hear.
+ *
+ * VOL_CHANGE_REPEATS covers the moment the level is provably wrong everywhere
+ * else. Group frames are not retried, so a change is sent more than once rather
+ * than trusted once; three is enough that losing all of them needs the link to
+ * be failing at a rate the audio would already be reporting.
+ */
+#define VOL_REPEAT_US     1000000
+#define VOL_CHANGE_REPEATS 3
+
 typedef struct {
     struct sockaddr_in addr;
     int64_t last_seen;
@@ -1033,19 +1049,53 @@ extern volatile int32_t s_hub_splice_alt_us;
 extern volatile int32_t rate_trim_hz;
 
 /*
- * Playback volume, 0-127, AUDIO_VOL_MAX being unity and the default.
+ * Playback volume, 0-127, AUDIO_VOL_MAX being unity.
+ *
+ * MEANINGLESS UNTIL audio_vol_known. It used to default to AUDIO_VOL_MAX; see
+ * audio_vol_effective() in audio_out.h for why an untold level is now silence
+ * with a bounded fallback instead. The hub reaches that state the same way a
+ * satellite does -- it reboots, and the phone is not going to send a command it
+ * has no reason to send -- which is what the bridge's heartbeat now covers.
  *
  * Written by the SBC input task when the phone moves the slider, read by
- * playback. Applied at the DAC write only -- see audio_apply_volume() -- so what
- * is transmitted to the satellites stays FULL SCALE and each unit attenuates its
- * own output. Attenuating before the send would spend the air's dynamic range on
- * a level decision and leave the satellites unable to differ, which is the same
- * mistake the phone was making before the bridge advertised an AVRCP target.
+ * playback. Applied at the DAC write only, so what is transmitted to the
+ * satellites stays FULL SCALE and each unit attenuates its own output.
+ * Attenuating before the send would spend the air's dynamic range on a level
+ * decision and leave the satellites unable to differ, which is the same mistake
+ * the phone was making before the bridge advertised an AVRCP target.
  *
  * A torn read is not possible on a byte, and a stale one costs one chunk at the
- * previous level -- 5.8 ms, at a step a human just asked for.
+ * previous level -- 5.8 ms, at a step a human just asked for. The flag is stored
+ * after the level for the same reason the satellite's is; see sat.h.
  */
 extern volatile uint8_t audio_volume;
+
+/*
+ * Whether the bridge has ever said how loud, this boot. Sticky; see the
+ * satellite's copy in sat.h for why nothing clears it.
+ *
+ * streamer_send_vol() is gated on this. A hub must not relay a level it invented
+ * -- if the local fallback fired and were broadcast, a hub whose bridge had died
+ * would blast satellites that were sitting correctly at -50 dB.
+ */
+extern volatile bool audio_vol_known;
+
+/*
+ * MSG_VOL datagrams sent to listeners, REPEATS INCLUDED.
+ *
+ * Counted before any change test, which is what makes it useful: the fault it
+ * exists to expose is a unit playing audio at a level nobody told it, and that
+ * reads as a satellite whose own vol-rx sits still while this counter climbs. A
+ * counter that only moved on change could not tell that apart from a slider
+ * nobody touched.
+ *
+ * The other direction is counted in sbc_in.c, on that module's own line, with
+ * its siblings -- it does not read hub.h and is not going to start.
+ *
+ * On the TRIM line as `vol-tx`, which tools/soak/capture.py's KEYNUM pass turns
+ * into a metrics column with no parser change.
+ */
+extern volatile uint32_t n_vol_tx;
 
 /* What a retune costs -- see the note on the satellite's copy. The channel down
  * is measurable here; the discarded DMA buffer is not measurable anywhere in

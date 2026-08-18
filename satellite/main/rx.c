@@ -828,14 +828,22 @@ void rx_task(void *arg)
              * gain that amplifies instead of attenuating. */
             const uint8_t vol = v->volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX
                                                           : v->volume;
+            /* Before the change test below, so repeats count too -- see n_vol_rx
+             * in sat.h for why the repeats are the interesting half. */
+            n_vol_rx++;
             /* Repeated once per telemetry window, so say something only when it
              * moved -- this is the audio path's log discipline, and a line every
              * 5 s saying nothing changed is the mistake the RX counters exist to
              * undo. */
-            if (vol != audio_volume) {
+            if (vol != audio_volume || !audio_vol_known) {
                 ESP_LOGW(TAG, "VOLUME %u/%d", vol, AUDIO_VOL_MAX);
             }
+            /* Level first, flag second -- see sat.h. Playback may read the pair
+             * between these two stores; observing the flag then guarantees the
+             * level beside it, and observing neither is the state it was
+             * already in. */
             audio_volume = vol;
+            audio_vol_known = true;
         } else if (buf[0] == MSG_META && n >= (int)sizeof(meta_msg_t)) {
             const link_meta_t *m = (const link_meta_t *)((const meta_msg_t *)buf)->payload;
             ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",

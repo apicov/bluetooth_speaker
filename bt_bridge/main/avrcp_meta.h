@@ -19,3 +19,8 @@ void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *para
 /* The target half: absolute volume, forwarded to the speakers rather than
  * acted on here. Same signature rule as the controller callback above. */
 void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param);
+
+/* What the phone last said the level should be, 0-127. For the paths that
+ * re-state it without a command to act on; see the heartbeat in avrcp_meta.c
+ * for why anything re-states it at all. */
+uint8_t avrcp_meta_volume(void);

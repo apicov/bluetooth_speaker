@@ -80,6 +80,10 @@ void streamer_start(void)
 
     ESP_LOGI(TAG, "free heap after WiFi init: %" PRIu32 " bytes", esp_get_free_heap_size());
 
+    /* After socket_start(), which is what it sends on, and before the tasks, so
+     * a satellite that joins during startup is told a level by the first tick. */
+    vol_repeat_start();
+
     task_start(probe_task, "probe", 4096, 6, TASK_ANY_CORE);
     task_start(local_play_task, "play", 4096, 8, 1);
     task_start(ring_monitor_task, "ringmon", 3072, 3, TASK_ANY_CORE);

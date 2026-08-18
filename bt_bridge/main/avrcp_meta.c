@@ -150,12 +150,67 @@ void avrcp_meta_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *rc)
  */
 static uint8_t s_volume = AUDIO_VOL_MAX;   /* unity until the phone says otherwise */
 
+/*
+ * Re-state the level on a timer, forever.
+ *
+ * The bridge is the only unit that ever hears the phone, so it is the only unit
+ * that can repair a hub which has forgotten. And there were three ways to
+ * forget, all of them silent:
+ *
+ *   - the hub reboots and comes up at its own default, with nothing to correct
+ *     it until somebody touches the slider;
+ *   - sbc_link_send_vol() enqueues with a zero timeout, so a full ring drops the
+ *     change and counts it as s_dropped;
+ *   - the frame arrives with a bad CRC and sbc_in.c refuses it.
+ *
+ * A heartbeat covers all three without the bridge having to detect any of them,
+ * which is the point -- detecting a hub reboot from this side means a protocol,
+ * and the protocol would be worth more than the byte it protects.
+ *
+ * One padded SPI frame per five seconds is 3.3 ms of link time at 5 MHz, 0.07%.
+ * And with the speakers staying silent until they are told a level, five seconds
+ * is a silence budget rather than a loudness one: the failure it bounds is a
+ * quiet floor, not a blast.
+ */
+#define VOL_HEARTBEAT_US 5000000
+
+static void vol_heartbeat_cb(void *arg)
+{
+    (void)arg;
+    sbc_link_send_vol(s_volume);
+}
+
+static void vol_heartbeat_start(void)
+{
+    const esp_timer_create_args_t args = {
+        .callback = vol_heartbeat_cb,
+        .name = "volhb",
+    };
+    esp_timer_handle_t h;
+    ESP_ERROR_CHECK(esp_timer_create(&args, &h));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(h, VOL_HEARTBEAT_US));
+}
+
+/* What the phone last said, for the paths that re-state it without a new
+ * command to act on -- A2DP connect, in main.c. */
+uint8_t avrcp_meta_volume(void)
+{
+    return s_volume;
+}
+
 void avrcp_meta_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *rc)
 {
     switch (event) {
     case ESP_AVRC_TG_CONNECTION_STATE_EVT:
         ESP_LOGI(TAG, "AVRCP target %s",
                  rc->conn_stat.connected ? "connected" : "disconnected");
+        /* Best knowledge at that instant, sent without waiting to be asked. The
+         * phone usually overwrites it with SET_ABSOLUTE_VOLUME within a second,
+         * and when it does not -- a handset that only sends the level on a
+         * change -- this is the only thing that would have. */
+        if (rc->conn_stat.connected) {
+            sbc_link_send_vol(s_volume);
+        }
         break;
 
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
@@ -204,6 +259,8 @@ void avrcp_meta_start(void)
                                        ESP_AVRC_RN_VOLUME_CHANGE);
     ESP_ERROR_CHECK(esp_avrc_tg_set_rn_evt_cap(&evt_set));
 
-    ESP_LOGI(TAG, "AVRCP controller and target up, volume %u/%d",
-             s_volume, AUDIO_VOL_MAX);
+    vol_heartbeat_start();
+
+    ESP_LOGI(TAG, "AVRCP controller and target up, volume %u/%d, re-stated every %d s",
+             s_volume, AUDIO_VOL_MAX, (int)(VOL_HEARTBEAT_US / 1000000));
 }

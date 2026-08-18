@@ -171,6 +171,14 @@ void client_joined(const uint8_t mac[6], const esp_ip4_addr_t *ip)
     };
     addr.sin_addr.s_addr = ip->addr;
     client_seen(&addr);
+    /* The level, at the one moment a unit provably has none. The ARP entry was
+     * seeded three lines up, which is the condition that makes a first unicast
+     * land -- the whole subject of this function's comment -- so this is a second
+     * and natural user of it. Under multicast it goes to the group like every
+     * other copy; either way it closes the join window from "up to one repeat
+     * interval" to one packet time, and with a unit that stays silent until told,
+     * that window is silence rather than full scale. */
+    streamer_send_vol(audio_volume);
     ESP_LOGI(TAG, "satellite " IPSTR " has an address -- on the send list, ARP seeded",
              IP2STR(ip));
 }
@@ -256,38 +264,63 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
 }
 
 /*
- * Playback volume to every listener, unicast like the metadata above.
+ * Playback volume, hub -> listeners.
  *
- * Called both when the phone moves it and once per telemetry window. The repeat
- * is what makes a satellite that joined late, or missed the change, converge on
- * the right level instead of playing at a stale one -- two bytes at 0.2/s
- * against a join handshake that could be got wrong.
- */
-/*
- * Take a new volume from the phone: clamp it, keep it, and tell everyone.
+ * ADDRESSED TO THE SAME SET AS THE AUDIO, BY CONSTRUCTION. That is the whole
+ * point of the #if below, and it is what this got wrong for as long as the audio
+ * has been multicast: fan_out() addresses a GROUP and this addressed the CLIENT
+ * LIST, and those are different sets. The difference is exactly the set of units
+ * that play audio at a level nobody told them -- anything that clears a slot
+ * (CLIENT_TIMEOUT_US of no probe, a disassociation, the gap between
+ * re-associating and the first probe) leaves a unit still hearing the stream and
+ * no longer hearing the level. Under multicast, hearing the audio and hearing
+ * the level are now the same condition.
  *
- * Clamped rather than trusted -- it arrives from another chip, and a gain built
- * from a byte past full scale would amplify instead of attenuate. Sent
- * immediately so the step reaches every speaker within one packet rather than
- * waiting up to a window for the repeat.
+ * The satellite needs nothing for this. net.c joins the group on the same socket
+ * it binds INADDR_ANY:SYNC_PORT on, and rx_task demuxes by type from one
+ * recvfrom, so a group-addressed MSG_VOL lands in the branch that already
+ * existed.
+ *
+ * WHAT A GROUP FRAME COSTS, AND HOW IT IS PAID FOR. It is never acknowledged and
+ * never retried, where a unicast has a link-layer ACK. For two bytes that is
+ * cheap to buy back with repetition, and there are three repetitions:
+ * streamer_set_volume() sends the change three times, client_joined() pushes it
+ * at the one moment a unit provably has none, and vol_repeat_start() below
+ * repeats it every second. Against the measured 0.2-0.3% group loss, exposure to
+ * a stale level is P(loss) x 1 s, and only in the window after a change.
+ *
+ * The old comment here argued for unicast so the level "must not be held for a
+ * DTIM burst behind the audio it would delay". That was never true on this
+ * build: hub and satellite both set WIFI_PS_NONE, so nothing is buffered for a
+ * DTIM at all -- net.c says so where it sets dtim_period.
+ *
+ * The unicast arm is kept for CONFIG_DANCEFLOOR_AUDIO_MCAST=n, where there is no
+ * group, the satellite never joins one, and the client list IS the audio set.
+ * That build is unchanged.
  */
-void streamer_set_volume(uint8_t volume)
-{
-    const uint8_t v = volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX : volume;
-    if (v != audio_volume) {
-        ESP_LOGW(TAG, "VOLUME %u/%d", v, AUDIO_VOL_MAX);
-    }
-    audio_volume = v;
-    streamer_send_vol(v);
-}
-
 void streamer_send_vol(uint8_t volume)
 {
-    if (sock < 0) {
+    /* Never relay a level nobody gave us. The hub has its own fallback for a
+     * bridge that has gone quiet, and broadcasting it would take a floor sitting
+     * correctly at -50 dB up to full scale -- so the fallback stays a local
+     * playback decision and this stays silent until there is a real level to
+     * repeat. See audio_vol_effective(). */
+    if (sock < 0 || !audio_vol_known) {
         return;
     }
     vol_msg_t msg = { .type = MSG_VOL, .volume = volume };
 
+#if CONFIG_DANCEFLOOR_AUDIO_MCAST
+    /* flags=0, unlike the audio's MSG_DONTWAIT. This runs on the timer task or
+     * an event handler, never on the SBC receive task that also feeds the hub's
+     * own ring, so there is no local feed here for a blocking send to starve --
+     * and a two-byte frame that waits for a TX slot is the outcome we want over
+     * one that is dropped. */
+    if (sendto(sock, &msg, sizeof(msg), 0,
+               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) >= 0) {
+        n_vol_tx++;
+    }
+#else
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
@@ -295,8 +328,89 @@ void streamer_send_vol(uint8_t volume)
         if (snapshot[i].last_seen) {
             sendto(sock, &msg, sizeof(msg), 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr));
+            n_vol_tx++;
         }
     }
+#endif
+}
+
+/*
+ * Take a new volume from the phone: clamp it, keep it, and tell everyone.
+ *
+ * Clamped rather than trusted -- it arrives from another chip, and a gain built
+ * from a byte past full scale would amplify instead of attenuate.
+ *
+ * A CHANGE IS SENT THREE TIMES; A RE-STATEMENT IS NOT SENT AT ALL. A change is
+ * the one moment the level is provably wrong everywhere else, and under
+ * multicast there is no link-layer retry to lean on -- four bytes of extra air
+ * against a slider move a human is watching the result of, where a single lost
+ * frame would otherwise be audible until the next second's repeat, which at the
+ * bottom of the taper is a large step.
+ *
+ * But most calls here are NOT changes. The bridge re-states the level on a 5 s
+ * heartbeat so a rebooted hub recovers, and every one of those arrives through
+ * this function. Bursting on them made the hub send 1.6 levels a second instead
+ * of one -- 96 per minute in logs-soak-20260818-150804, which is 60 from the
+ * repeat plus twelve heartbeats' worth of threes. Harmless in airtime, and wrong
+ * in two ways that matter more: the burst stopped meaning "something changed",
+ * and n_vol_tx stopped being readable for the staleness it exists to expose.
+ *
+ * So a re-statement sends nothing. The heartbeat's job is to tell THIS unit; the
+ * satellites are served by the 1 Hz repeat either way, and the first level after
+ * a boot is a change by this test because audio_vol_known is still false.
+ */
+void streamer_set_volume(uint8_t volume)
+{
+    const uint8_t v = volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX : volume;
+    const bool changed = (v != audio_volume) || !audio_vol_known;
+    if (changed) {
+        ESP_LOGW(TAG, "VOLUME %u/%d", v, AUDIO_VOL_MAX);
+    }
+    /* Level first, flag second, for the reason sat.h gives. */
+    audio_volume = v;
+    audio_vol_known = true;
+    if (!changed) {
+        return;
+    }
+    for (int i = 0; i < VOL_CHANGE_REPEATS; i++) {
+        streamer_send_vol(v);
+    }
+}
+
+/*
+ * Repeat the level once a second, for the whole life of the hub.
+ *
+ * This replaces the repeat that used to sit in telemetry_tick(), and the
+ * interval matters more than it did: with a unit that stays silent until it is
+ * told a level, this interval IS the silence a joining satellite sits through if
+ * client_joined()'s push is lost. Five seconds of silence was a fine price when
+ * the alternative was five seconds at full scale; one second is a better one.
+ *
+ * Its own esp_timer rather than a counter in fan_out(). Driving it from the
+ * audio would tie the repeat to the stream neatly, but it would put a sendto in
+ * the hub's tightest task -- decode, two stream buffers and a send in one block,
+ * priority 9, the thing dma_starve exists to catch -- for no gain a timer does
+ * not already give. A timer also keeps repeating while the stream is stopped,
+ * which is when a satellite is most likely to join unnoticed.
+ *
+ * Safe in a timer callback: sendto() on a UDP socket does not block, which is
+ * the same argument publish_frame() makes for running on the analysis task.
+ */
+static void vol_repeat_cb(void *arg)
+{
+    (void)arg;
+    streamer_send_vol(audio_volume);
+}
+
+void vol_repeat_start(void)
+{
+    const esp_timer_create_args_t args = {
+        .callback = vol_repeat_cb,
+        .name = "volrpt",
+    };
+    esp_timer_handle_t h;
+    ESP_ERROR_CHECK(esp_timer_create(&args, &h));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(h, VOL_REPEAT_US));
 }
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER

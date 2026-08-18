@@ -15,7 +15,9 @@ volatile uint32_t sample_rate = 44100;
 uint32_t tx_rate = 44100;
 uint32_t rate_ema;
 volatile int32_t rate_trim_hz;
-volatile uint8_t audio_volume = AUDIO_VOL_MAX;
+volatile uint8_t audio_volume;  /* meaningless until audio_vol_known */
+volatile bool audio_vol_known;  /* sticky: set by the first level from the bridge */
+volatile uint32_t n_vol_tx;  /* MSG_VOL datagrams sent to listeners */
 #if CONFIG_DANCEFLOOR_ENABLE_MARKER
 volatile int64_t s_marker_at;
 #endif

@@ -85,6 +85,13 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
              * "something is happening". */
             status_led_set_connected(param->conn_stat.state ==
                                      ESP_A2D_CONNECTION_STATE_CONNECTED);
+            /* Audio starting is the moment a wrong level becomes audible, so
+             * re-state it here as well as on the AVRCP connect. The two events
+             * are not the same instant and neither reliably precedes the other;
+             * sending twice costs a byte and removes the ordering question. */
+            if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+                sbc_link_send_vol(avrcp_meta_volume());
+            }
         }
         if (event == ESP_A2D_AUDIO_CFG_EVT) {
             /* The codec the phone actually agreed to. max_bitpool here is the

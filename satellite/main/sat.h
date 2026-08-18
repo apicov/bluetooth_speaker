@@ -774,16 +774,50 @@ extern int32_t s_refill_frames;
 extern volatile int32_t rate_trim_hz;
 
 /*
- * Playback volume, 0-127, AUDIO_VOL_MAX being unity and the default it holds
- * until the hub says otherwise -- so a satellite that never hears a MSG_VOL
- * plays loud rather than silent.
+ * Playback volume, 0-127, AUDIO_VOL_MAX being unity.
  *
- * Written by rx_task, read by playback, applied at the output in
- * audio_apply_volume(). The hub sends full-scale audio and this level
- * separately, and both units run the same integer taper on it, so two speakers
- * told the same number produce the same level.
+ * MEANINGLESS UNTIL audio_vol_known. This used to default to AUDIO_VOL_MAX, on
+ * the rule that a satellite which never hears a MSG_VOL should play loud rather
+ * than silent; audio_vol_effective() in audio_out.h is where that rule was
+ * reconsidered and what replaced it. A satellite cannot play audio it has not
+ * been sent, and whoever sends the audio sends the level, so there is nothing to
+ * be loud for.
+ *
+ * Written by rx_task, read by playback, applied at the output. The hub sends
+ * full-scale audio and this level separately, and both units run the same
+ * integer taper on it, so two speakers told the same number produce the same
+ * level.
+ *
+ * WRITE ORDER IS LOAD-BEARING: rx_task stores the level and only then sets
+ * audio_vol_known. Both are single-byte volatile stores, so a reader that
+ * observes the flag has necessarily observed the level that goes with it, and no
+ * lock is needed for a pair this shape.
  */
 extern volatile uint8_t audio_volume;
+
+/*
+ * Whether anything has ever said how loud, this boot.
+ *
+ * Sticky. A hub going away does not make the last level wrong -- it takes the
+ * audio with it -- so nothing clears this. The fallback for a hub that never
+ * speaks at all is a deadline in the play task, not a reset of this flag; see
+ * audio_vol_effective() for why that distinction matters.
+ */
+extern volatile bool audio_vol_known;
+
+/*
+ * MSG_VOL messages taken, REPEATS INCLUDED.
+ *
+ * Counted before the change test, not after, which is the whole point: the fault
+ * this exists to make visible is a unit that hears audio and never hears a level,
+ * and that unit's symptom is silence on this counter while the level it is
+ * playing at is stale. A counter that only moved on change could not tell that
+ * apart from a level nobody has touched.
+ *
+ * On the TRIM line as `vol-rx`, so tools/soak/capture.py's KEYNUM pass turns it
+ * into a metrics column with no parser change.
+ */
+extern volatile uint32_t n_vol_rx;
 
 /*
  * Frames the fine rate trim has dropped from, and duplicated into, the stream.
@@ -934,7 +968,11 @@ void i2s_start(uint32_t rate);
 /* How many times the DMA has run out of audio to send -- see on_tx_starved().
  * A running total, not a rate; a retune contributes by construction. */
 uint32_t dma_starve_count(void);
-void write_audio(const uint8_t *pcm, size_t bytes);
+void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol);
+
+/* Put the output gain back to silence, so a stream starts with a fade in
+ * rather than an edge. Called by playback when it begins feeding. */
+void write_audio_reset_ramp(void);
 void retune_output(uint32_t hz);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 int64_t vis_master_to_local(int64_t master_us);
