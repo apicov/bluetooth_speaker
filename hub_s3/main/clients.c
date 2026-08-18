@@ -340,21 +340,38 @@ void streamer_send_vol(uint8_t volume)
  * Clamped rather than trusted -- it arrives from another chip, and a gain built
  * from a byte past full scale would amplify instead of attenuate.
  *
- * SENT THREE TIMES. A change is the one moment the level is provably wrong
- * everywhere else, and under multicast there is no link-layer retry to lean on.
- * Four bytes of extra air against a slider move a human is watching the result
- * of; the repeat every second would otherwise make a single lost frame audible
- * for that whole second, which at the bottom of the taper is a large step.
+ * A CHANGE IS SENT THREE TIMES; A RE-STATEMENT IS NOT SENT AT ALL. A change is
+ * the one moment the level is provably wrong everywhere else, and under
+ * multicast there is no link-layer retry to lean on -- four bytes of extra air
+ * against a slider move a human is watching the result of, where a single lost
+ * frame would otherwise be audible until the next second's repeat, which at the
+ * bottom of the taper is a large step.
+ *
+ * But most calls here are NOT changes. The bridge re-states the level on a 5 s
+ * heartbeat so a rebooted hub recovers, and every one of those arrives through
+ * this function. Bursting on them made the hub send 1.6 levels a second instead
+ * of one -- 96 per minute in logs-soak-20260818-150804, which is 60 from the
+ * repeat plus twelve heartbeats' worth of threes. Harmless in airtime, and wrong
+ * in two ways that matter more: the burst stopped meaning "something changed",
+ * and n_vol_tx stopped being readable for the staleness it exists to expose.
+ *
+ * So a re-statement sends nothing. The heartbeat's job is to tell THIS unit; the
+ * satellites are served by the 1 Hz repeat either way, and the first level after
+ * a boot is a change by this test because audio_vol_known is still false.
  */
 void streamer_set_volume(uint8_t volume)
 {
     const uint8_t v = volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX : volume;
-    if (v != audio_volume || !audio_vol_known) {
+    const bool changed = (v != audio_volume) || !audio_vol_known;
+    if (changed) {
         ESP_LOGW(TAG, "VOLUME %u/%d", v, AUDIO_VOL_MAX);
     }
     /* Level first, flag second, for the reason sat.h gives. */
     audio_volume = v;
     audio_vol_known = true;
+    if (!changed) {
+        return;
+    }
     for (int i = 0; i < VOL_CHANGE_REPEATS; i++) {
         streamer_send_vol(v);
     }
