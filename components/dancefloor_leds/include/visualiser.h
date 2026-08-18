@@ -25,10 +25,19 @@ extern "C" {
 /*
  * One analysis frame, in the form that can leave the unit that computed it.
  *
- * This is df::Frame minus the one field that cannot travel -- `mag`, 512 floats
- * pointing into an Analysis -- and with the spectrum in its reduced form. 123
- * bytes, so a stream of these at 43 Hz is ~5 kB/s against the 30-40 the audio
- * already uses on the same radio.
+ * This is df::Frame reduced to what a receiver cannot rebuild for itself: the
+ * timeline labels, the detector's input, and the spectrum. 96 bytes, so a
+ * stream of these at the 86 frames/s of hop 512 is ~8 kB/s against the 30-40
+ * the audio already uses on the same radio.
+ *
+ * The detector outputs are absent on purpose. band[] travels at FULL float
+ * precision -- it is beat_det_update()'s exact input, and the receiver runs
+ * the same detector over the same numbers (df::RemoteDetect in analysis.hpp),
+ * so the onset and boom a pattern sees are derived here rather than sent.
+ * spec[] could not serve that purpose: it is quantised to 8 bits through
+ * x/(1+x), and flux is a frame-to-frame difference, so the quantisation would
+ * land directly on the signal the detector runs on. beat_detect.h says this
+ * in full.
  *
  * Deliberately declared here and not in sync_proto.h. This component does not
  * depend on the audio protocol and must stay buildable on its own; the unit
@@ -36,24 +45,16 @@ extern "C" {
  * into whatever message it sends. Packed for the same reason -- the two ends
  * may not be the same build.
  *
- * A unit fed these instead of computing them cannot tell the difference from a
- * pattern's point of view, which is the whole purpose: the algorithm runs in
- * one place, so no algorithm has to be proved deterministic across units to
- * stay in sync.
+ * What still runs in one place is the FFT, and that is the part that could not
+ * be proved deterministic across units (esp-dsp, LX6 against LX7). The
+ * detector is plain C over identical input bytes, which needs no proof -- and
+ * a unit that missed a frame converges back onto its neighbours' threshold in
+ * bounded time, because the history it lost is the only state there is.
  */
 typedef struct __attribute__((packed)) {
     int64_t due_us;         /* master-clock instant this frame describes */
     int64_t index;          /* block number, from an origin all units share */
     float   band[VIS_BANDS];
-    float   flux;
-    float   threshold;
-    float   strength;
-    float   boom_strength;
-    float   boom_flux;
-    float   boom_threshold;
-    uint8_t onset;
-    uint8_t boom;
-    uint8_t unit;           /* which speaker computed it; 0 is the hub */
     uint8_t spec[VIS_SPEC_BINS];
 } vis_frame_t;
 

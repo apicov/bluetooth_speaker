@@ -313,4 +313,48 @@ const Frame &Analysis::process(const int16_t *stereo, int64_t index,
     return frame_;
 }
 
+/*
+ * The remote half, in the same file as the half it mirrors so the two cannot
+ * drift apart unnoticed -- a divergence here is a sync fault, not a local
+ * quality difference. See analysis.hpp for what runs where and why.
+ */
+void RemoteDetect::init()
+{
+    beat_det_init(&beat_);
+
+    /* The same three overrides Analysis::init() applies, for the same stated
+     * reasons -- the quieter single-band input, the drum's pulse rather than
+     * every stroke, and the floor the corpus measured. The reasoning lives
+     * there; this is the copy that must not disagree. */
+    beat_det_init(&boom_);
+    boom_.threshold_k   = BOOM_THRESHOLD_K;
+    boom_.refractory_us = BOOM_REFRACTORY_US;
+    boom_.flux_floor    = BOOM_FLUX_FLOOR;
+}
+
+void RemoteDetect::process(const float band[BEAT_BANDS], int64_t due_us,
+                           Frame *f)
+{
+    float strength = 0.0f;
+    const bool onset = beat_det_update(&beat_, band, due_us, &strength);
+
+    /* The low band alone, masked rather than reweighted -- the same lines as
+     * Analysis::process(): a band held at zero has a rise of exactly zero, so
+     * the weighted sum reduces to the bass band times its weight of 1.0, and
+     * the threshold adapts to the bass band's own statistics. */
+    float boom_band[BEAT_BANDS] = {0};
+    boom_band[0] = band[0];
+    float boom_strength = 0.0f;
+    const bool boom = beat_det_update(&boom_, boom_band, due_us, &boom_strength);
+
+    f->onset          = onset;
+    f->strength       = strength;
+    f->flux           = beat_det_last_flux(&beat_);
+    f->threshold      = beat_det_last_threshold(&beat_);
+    f->boom           = boom;
+    f->boom_strength  = boom_strength;
+    f->boom_flux      = beat_det_last_flux(&boom_);
+    f->boom_threshold = beat_det_last_threshold(&boom_);
+}
+
 }  // namespace df

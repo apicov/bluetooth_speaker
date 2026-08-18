@@ -27,7 +27,7 @@ CXXFLAGS += -DBEAT_HIST=$(HIST)
 endif
 
 BINS := test_align test_pattern test_beat_detect test_fft test_pattern_sync \
-        test_result_latch test_resample
+        test_result_latch test_resample test_remote_detect
 
 test_align: test_align.c
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) $< -o $@
@@ -63,6 +63,15 @@ test_pattern_sync: test_pattern_sync.cpp ../analysis.cpp ../patterns.cpp \
 	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) test_pattern_sync.cpp \
 		../analysis.cpp ../patterns.cpp fft_host.o beat_detect.o -o $@ -lm
 
+# The sender half from analysis.cpp, the wire struct from visualiser.h, the
+# receiver half from RemoteDetect -- every layer of the lighter lane except
+# visualiser.cpp itself, which is firmware and stays on the board.
+test_remote_detect: test_remote_detect.cpp ../analysis.cpp \
+                    ../include/analysis.hpp ../include/visualiser.h \
+                    fft_host.o beat_detect.o
+	env PATH=/usr/bin:/bin $(CXX) $(CXXFLAGS) test_remote_detect.cpp \
+		../analysis.cpp fft_host.o beat_detect.o -o $@ -lm
+
 .PHONY: check check-hops clean
 
 # Every supported hop, because the alignment arithmetic and the window slide are
@@ -94,6 +103,8 @@ check: $(BINS)
 	@./test_result_latch
 	@echo
 	@./test_resample
+	@echo
+	@./test_remote_detect
 	@echo
 
 clean:

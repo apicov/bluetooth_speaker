@@ -525,8 +525,10 @@ std::atomic<void (*)(const vis_frame_t *)> s_publish{nullptr};
 static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
 static_assert(VIS_SPEC_BINS == df::SPEC_BINS, "wire frame and spectrum disagree");
 
-/* df::Frame -> the form that can leave this unit. mag is the only field with
- * nowhere to go; everything else is a copy.
+/* df::Frame -> the form that can leave this unit. mag has nowhere to go -- 512
+ * floats pointing into an Analysis -- and the detector fields are not copies
+ * either, because the receiver derives them itself from the bands: see
+ * RemoteDetect, and visualiser_submit_frame() for where that runs.
  *
  * Only compiled where frames are produced here -- a unit that is given them
  * never converts one out. */
@@ -537,20 +539,24 @@ void to_wire(const df::Frame &f, vis_frame_t *w)
     w->index  = f.index;
     std::memcpy(w->band, f.band, sizeof(w->band));
     std::memcpy(w->spec, f.spec, sizeof(w->spec));
-    w->flux           = f.flux;
-    w->threshold      = f.threshold;
-    w->strength       = f.strength;
-    w->boom_strength  = f.boom_strength;
-    w->boom_flux      = f.boom_flux;
-    w->boom_threshold = f.boom_threshold;
-    w->onset = f.onset ? 1 : 0;
-    w->boom  = f.boom ? 1 : 0;
-    w->unit  = f.unit;
 }
 #endif
 
+/* The receiver's half of the detector. Owned by whoever calls
+ * visualiser_submit_frame() -- the rx task -- exactly as the analysis task owns
+ * the sender's half, and reset the same way: on a rate change, seen in
+ * submit_frame() rather than in the setter, because the setter runs on
+ * whatever task learned the rate and this state is not ours to touch from
+ * there. */
+#if DF_TAKES_REMOTE_FRAMES
+df::RemoteDetect s_remote_detect;
+#endif
+
 /* ... and back. mag stays null: it did not travel and a Pattern cannot read it
- * on a locally analysed frame either, since rendering is deferred.
+ * on a locally analysed frame either, since rendering is deferred. The
+ * detector fields did not travel either -- from_wire stays a copy, and
+ * submit_frame() fills them in, so the conversion and the derivation each do
+ * one thing.
  *
  * Only compiled where frames are taken from elsewhere -- a unit doing its own
  * analysis never converts one back. */
@@ -561,16 +567,10 @@ void from_wire(const vis_frame_t *w, df::Frame &f)
     f.index  = w->index;
     std::memcpy(f.band, w->band, sizeof(f.band));
     std::memcpy(f.spec, w->spec, sizeof(f.spec));
-    f.mag            = nullptr;
-    f.flux           = w->flux;
-    f.threshold      = w->threshold;
-    f.strength       = w->strength;
-    f.boom_strength  = w->boom_strength;
-    f.boom_flux      = w->boom_flux;
-    f.boom_threshold = w->boom_threshold;
-    f.onset = w->onset != 0;
-    f.boom  = w->boom != 0;
-    f.unit  = w->unit;
+    f.mag  = nullptr;
+    /* Did not travel, and nothing reads it -- but a Frame handed onward
+     * should not be carrying stack garbage either. */
+    f.unit = 0;
 }
 #endif
 
@@ -1352,8 +1352,41 @@ void visualiser_submit_frame(const vis_frame_t *f)
         prev_due   = f->due_us;
     }
 
+    /*
+     * A rate change re-cuts the sender's bands, so the flux history this unit's
+     * detector has built describes different frequencies now. The same argument
+     * the analysis task makes for its own detector at the top of its loop, and
+     * handled here rather than in visualiser_set_rate() for the same reason:
+     * that can be called from any task, and this state belongs to this one.
+     *
+     * seen_rate starts at 0, which no real rate is, so the first frame through
+     * here initialises the detector -- and that is load-bearing rather than
+     * tidy, because the boom tuning is three assignments in init() and static
+     * zero-initialisation would leave them unset.
+     *
+     * NOT on stream gaps. The analysis task spans those without resetting its
+     * own detector, and matching its reset points is part of matching its
+     * decisions.
+     */
+    {
+        static uint32_t seen_rate = 0;
+        const uint32_t rate = s_rate.load(std::memory_order_relaxed);
+        if (rate != seen_rate) {
+            seen_rate = rate;
+            s_remote_detect.init();
+        }
+    }
+
     df::Frame local;
     from_wire(f, local);
+    /*
+     * The detector's answers did not travel. Derived here from the same float
+     * bands the sender's own detector consumed, by the same code -- which is
+     * what makes this strip fire on the same pulses as the sender's without
+     * anything new being synchronised, and what keeps two strips taking the
+     * same frames bit-identical.
+     */
+    s_remote_detect.process(local.band, local.due_us, &local);
     /* A frame off the wire carries no results: this unit's slots are all
      * latched, and the results that fill them arrive as their own messages. */
     if (enqueue(local)) {

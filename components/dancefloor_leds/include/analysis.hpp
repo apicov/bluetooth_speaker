@@ -146,9 +146,10 @@ constexpr float SPEC_HI_HZ  = 16000.0f;
  * it, in Analysis::init().
  *
  * Same caveat as the wideband detector's constants: see the note at the top of
- * beat_detect.h about these becoming a cross-unit agreement rather than a local
- * preference once a satellite can be sent bands and run its own detector on
- * them. Frame::band carries what such a unit needs; Frame::spec does not.
+ * beat_detect.h about these being a cross-unit agreement rather than a local
+ * preference -- which they are now that satellites run their own detector on
+ * the bands they are sent. Frame::band carries what such a unit needs;
+ * Frame::spec does not.
  */
 constexpr float   BOOM_THRESHOLD_K  = 1.4f;
 constexpr float   BOOM_FLUX_FLOOR   = 0.02f;
@@ -190,7 +191,10 @@ struct Frame {
     float        threshold;  /* what flux had to beat to count as an onset */
     bool         onset;
     float        strength;   /* 0..1 on an onset, else 0 */
-    uint8_t      unit;       /* which speaker; 0 is the hub */
+    /* Which speaker computed the frame; 0 is the hub. Does not travel -- it was
+     * written here and read nowhere, so the wire dropped it. Kept because
+     * Analysis::process() reports it and a diagnostic may yet want it. */
+    uint8_t      unit;
 
     /*
      * The zabumba's boom, detected separately from everything else.
@@ -314,6 +318,52 @@ private:
     beat_det_t beat_;
     beat_det_t boom_;        /* the low band alone -- see Frame::boom */
     Frame      frame_;
+};
+
+/*
+ * The detector half of the analysis, run where the bands arrive rather than
+ * where the FFT ran.
+ *
+ * This is the second half of Analysis::process(), line for line: the same two
+ * beat_det_update() calls, on the same numbers, with the same tuning. A unit
+ * that takes frames from the hub receives the four band floats at full
+ * precision in vis_frame_t -- they are this class's entire input -- and derives
+ * onset, boom and the strengths locally instead of receiving them decided.
+ *
+ * Identical input bytes and the same plain-C detector mean identical decisions
+ * to the unit that computed the frame, which is what keeps a remote strip on
+ * the same pulses as the hub's without anything new being synchronised. The
+ * FFT -- the part that is only deterministic per-target, via esp-dsp -- is the
+ * part that still runs in exactly one place. This is the third source mode
+ * beat_detect.h describes, and its warnings apply in full: the constants are a
+ * cross-unit agreement now, and a unit that misses a frame disagrees on the
+ * marginal onsets until the history it lost has turned over.
+ *
+ * init() drops the flux history. Call it exactly where a local unit calls
+ * Analysis::init() -- on a rate change, which re-cuts the bands the flux was
+ * measured against -- and NOT on stream gaps, which Analysis also spans
+ * without reset: matching its reset points is part of matching its decisions.
+ *
+ * Two beat_det_t of state, ~0.5 kB. Owned by one task, like Analysis: on the
+ * firmware that is whoever calls process(), which is the rx task on a unit
+ * taking frames.
+ */
+class RemoteDetect {
+public:
+    void init();
+
+    /*
+     * Derive this frame's detector fields. `band` is the frame's own
+     * band[BEAT_BANDS], already normalised -- exactly what Analysis hands its
+     * own detector. Fills onset, strength, flux, threshold, boom,
+     * boom_strength, boom_flux and boom_threshold; every other field of `f`,
+     * including mag (null) and the spectrum, is the caller's.
+     */
+    void process(const float band[BEAT_BANDS], int64_t due_us, Frame *f);
+
+private:
+    beat_det_t beat_;
+    beat_det_t boom_;        /* the low band alone -- see Frame::boom */
 };
 
 }  // namespace df
