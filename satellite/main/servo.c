@@ -146,9 +146,10 @@ void servo_tick(void)
      * catch.
      *
      * A fresh stream starts below target by construction. RING_TARGET_MS is
-     * 200, matching the hub's LEAD_US, but the deepest prefill an anchor can
-     * ever buy is that lead MINUS transit -- the scheduled wait is the only
-     * thing that fills the ring before playback begins, so the best measured
+     * 250, matching the hub's LEAD_US -- both were 200 when the measurements
+     * below were taken, and both moved together -- but the deepest prefill an
+     * anchor can ever buy is that lead MINUS transit; the scheduled wait is the
+     * only thing that fills the ring before playback begins, so the best measured
      * start was 154 ms and a 107 ms one is unremarkable. The reading is
      * lower still in the first moments, because playback has begun consuming
      * while the rest of the stream is in flight: a run read `buffer 40 ms`

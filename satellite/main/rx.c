@@ -505,10 +505,10 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
          * A gap is worth `missing` whole packets and a packet is ~20 ms, so a
          * burst loss asks for more than the ring holds: one run's ten-packet
          * gap wanted 8960 frames -- 203 ms, against a 200 ms target depth and
-         * the 372 ms ring of the time -- and got 5120 of them in. (RING_BYTES
-         * is 80 kB now, so that particular gap would fit; a longer one still
-         * would not, and the arithmetic below is what makes the shortfall
-         * honest either way.) Pushing until it jams then
+         * the 372 ms ring of the time -- and got 5120 of them in. (RING_TARGET_MS
+         * is 250 now and RING_BYTES is 80 kB, so that particular gap would fit;
+         * a longer one still would not, and the arithmetic below is what makes
+         * the shortfall honest either way.) Pushing until it jams then
          * breaking out reached the same place, but it did so through seventy
          * failing sends, and the shortfall came out as a number nobody could
          * check against the ring's actual free space at the time.

@@ -354,7 +354,7 @@ and `TRACK DIVERGENCE`.
 ## Two ideas the whole thing rests on
 
 **Schedule the future, never the present.** The hub does not say "play now"; it
-says "play at master-time T", roughly 200 ms ahead. Each unit converts T to its
+says "play at master-time T", roughly 250 ms ahead. Each unit converts T to its
 own clock and waits. Network jitter stops mattering as long as the packet
 arrives before T.
 
@@ -454,6 +454,7 @@ you looked.
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | The way in. Concepts first, then the system, then the decisions. |
 | [`docs/clock-sync.md`](docs/clock-sync.md) | The sync maths, the phase servo, TSF, measured results. |
+| [`docs/sync-reference.md`](docs/sync-reference.md) | The sync system's functions, messages and every parameter, as tables. Start here to look something up; `clock-sync.md` for why it is that value. |
 | [`docs/sbc-link.md`](docs/sbc-link.md) | The wire between the two master chips. |
 | [`docs/two-chip-master.md`](docs/two-chip-master.md) | Why the master is split, with memory numbers. |
 | [`docs/tuning-corpus.md`](docs/tuning-corpus.md) | What the beat detector was tuned against, and the commands to do it again. |

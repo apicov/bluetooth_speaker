@@ -242,12 +242,12 @@ extern volatile bool phase_stepped;
 /*
  * What an anchorable packet looks like. See the refusals in handle_audio().
  *
- * The hub stamps every chunk LEAD_US = 200 ms ahead, so a healthy packet
+ * The hub stamps every chunk LEAD_US = 250 ms ahead, so a healthy packet
  * arrives with most of that still in front of it -- a good anchor was measured
- * at "in 154 ms". This is half of that lead, and the number is not arbitrary
- * caution: the scheduled wait below is the ONLY thing that prefills the ring,
- * so whatever lead survives to here is the prefill, and half the design depth
- * is the least worth starting on.
+ * at "in 154 ms", back when the lead was 200. This is half of that lead, and
+ * the number is not arbitrary caution: the scheduled wait below is the ONLY
+ * thing that prefills the ring, so whatever lead survives to here is the
+ * prefill, and half the design depth is the least worth starting on.
  *
  * It was 20 ms, chosen as "the floor below which prefill is not worth having",
  * and that was the wrong test. A run cleared it by four milliseconds: 144

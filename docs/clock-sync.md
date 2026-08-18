@@ -197,7 +197,7 @@ The maths above is the fiddly part. This is the part that makes it work, and it
 is much simpler.
 
 **The master never says "play now."** Every packet says *"play this at
-master-time T"*, where T is `LEAD_US` — 200 ms — ahead. Each satellite converts
+master-time T"*, where T is `LEAD_US` — 250 ms — ahead. Each satellite converts
 with `local = T − offset` and waits. (The M4 harness said "blink at T" instead;
 the sentence is the design, and the audio path inherited it unchanged.)
 
@@ -219,8 +219,9 @@ Each one keeps its own appointment independently. The measurement wire described
 in §12 observes the result; it plays no part in producing it.
 
 The cost is latency. Nothing can happen sooner than the lead time, so the
-satellite holds a ring around a 200 ms target to match, and total end-to-end
-delay is ~150–200 ms of Bluetooth plus that — roughly half a second. Fine for
+satellite holds a ring around a 250 ms target to match (`RING_TARGET_MS`, held
+equal to the lead by hand), and total end-to-end delay is ~150–200 ms of
+Bluetooth plus that — roughly half a second. Fine for
 music, useless for video.
 
 ---
@@ -346,7 +347,8 @@ rate in response to noise. Two units seeing different jitter end up with rates
 differing by ~0.03% at any moment, which is several ms of relative movement.
 
 Measured: 10-25 ms of wander between hub and satellite while each unit's own
-buffer sat perfectly stable at ~200 ms, with the satellite's rate visibly
+buffer sat perfectly stable at ~200 ms — its target then, 250 now — with the
+satellite's rate visibly
 hunting (44100 -> 44113 -> 44100 -> 44086).
 
 Every packet already carries the instant its first sample is due. Recording that
@@ -403,7 +405,7 @@ After convergence, with track-boundary corrections active:
 |---|---|
 | Smoothed phase | +4 to +12 ms standing offset, stable within ~3 ms |
 | Instantaneous phase | +-5 ms (satellite), +-15 ms (hub — see the wart) |
-| Buffer | 165-250 ms around a 200 ms target |
+| Buffer | 165-250 ms around the 200 ms target of the day (250 since) |
 | Hub-to-satellite audio, just after a splice | **0.1 to 0.5 ms** |
 | Hub-to-satellite audio, late in a track | 2 to 9 ms |
 | Playback start vs schedule | +5 us (hub), +1 us (satellite), same instant |
@@ -730,8 +732,16 @@ every 102.4 ms. They self-cancel and the servo sees the average.
 |---|---|
 | `components/dancefloor_sync/include/sync_proto.h` | Wire format, estimator state, `sync_to_local()` |
 | `components/dancefloor_sync/sync_proto.c` | Offset maths and min-RTT selection. No ESP-IDF deps |
+| `components/dancefloor_sync/include/audio_shift.h` | The faded catch-up: the clamps, and `audio_shift_chunk()` |
+| `components/dancefloor_sync/audio_shift.c` | The crossfade itself. Shared, so the two units cannot disagree |
 | `components/dancefloor_sync/test/` | Host tests — `make check` |
-| `satellite/main/main.c` | `clock_offset()` picks TSF or the estimator; `track_offset()` slews it |
+| `satellite/main/clock.c` | `clock_offset()` picks TSF or the estimator; `track_offset()` slews it. Was `main.c` until the satellite was split on 2026-08-12 |
+| `satellite/main/servo.c`, `hub_s3/main/servo.c` | One 5 s window of rate control, per role |
+| `satellite/main/play.c`, `hub_s3/main/play.c` | Phase crossings, the splice, the marker, the catch-up spend |
+| `hub_s3/main/timeline.c` | The published timeline: `play_at`, the slew, boundary flags |
+
+[`sync-reference.md`](sync-reference.md) is the lookup table for all of it — every
+function and parameter with its value and its file, without the reasoning.
 
 The estimator moved into a component when the hub and satellite came to need it
 too, and its tests moved in alongside it when the M4 blink harness that used to

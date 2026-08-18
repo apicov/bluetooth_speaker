@@ -318,8 +318,16 @@ typedef struct __attribute__((packed)) {
  * the SoftAP until the DTIM beacon releases it, occupying one static TX buffer
  * the whole time, and at 86 frames a second that is most of the pool. That is
  * what beacon_interval in the hub's wifi_start_ap() is set explicitly against,
- * and it is why raising ESP_WIFI_STATIC_TX_BUFFER_NUM past 36 makes things
- * WORSE rather than better -- a deeper queue does not drain faster.
+ * and it is why raising ESP_WIFI_STATIC_TX_BUFFER_NUM far past 36 makes things
+ * WORSE rather than better -- a deeper queue does not drain faster. 48 was the
+ * count that proved it, on anchors-refused.
+ *
+ * THE SHIPPED COUNT IS 38, since 2026-08-17, and that is not a walk back toward
+ * 48. The crowding was fixed at the source instead -- TX_FRAME_PACE_US in hub.h
+ * paces this lane so the burst does not form -- and the +2 is margin for the
+ * moment one begins anyway, cheap once the burst-former is gated and far enough
+ * below 48 that the bufferbloat finding is not in play. sdkconfig.defaults has
+ * the table, and says to come back to 36 if 38 ever reads like 48 did.
  */
 #define FRAME_PAYLOAD_MAX 160
 

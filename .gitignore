@@ -12,6 +12,7 @@ sdkconfig.old
 # are deliberately NOT matched here -- only the generated per-target output is.
 build.*/
 sdkconfig.s3
+sdkconfig.s3.old
 
 # Fetched by the component manager from idf_component.yml
 managed_components/

@@ -368,11 +368,13 @@
  * Local playback ring. The master delays its own audio by LEAD_US exactly like a
  * satellite, otherwise it would play ahead of every other speaker.
  *
- * THE LEAD IS ~35 kB, not the ~21 kB this said until 2026-08-12. LEAD_US is
- * 200 ms and 200 ms at 44.1 kHz stereo is 35,280 bytes; the old figure described
- * a shorter lead and was never updated when it grew. It mattered, because it made
- * this ring look far better provisioned than it was: 64 kB reads as three times
- * the lead against 21 kB and is only 1.86x against the real one.
+ * THE LEAD IS ~35 kB, not the ~21 kB this said until 2026-08-12. LEAD_US was
+ * 200 ms then and 200 ms at 44.1 kHz stereo is 35,280 bytes; the old figure
+ * described a shorter lead and was never updated when it grew. It mattered,
+ * because it made this ring look far better provisioned than it was: 64 kB reads
+ * as three times the lead against 21 kB and is only 1.86x against the real one.
+ * (The lead is 250 ms now -- 44,100 bytes -- which the paragraph on 80 kB below
+ * is sized against. Same trap, one size along.)
  *
  * 80 kB is 464 ms. It was 48 kB / 279 ms, and before that 64 kB / 371 ms; the
  * cut to 48 released 16 kB for WiFi static TX buffers, because this ring was 48%

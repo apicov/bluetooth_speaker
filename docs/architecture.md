@@ -988,14 +988,14 @@ paid for.
 
 | Setting | Value | Why |
 |---|---|---|
-| `LEAD_US` | 200 ms | Presentation lead. Enough to absorb WiFi jitter; every ms is latency |
-| `LOCAL_RING_BYTES` | **48 kB** | ~279 ms of stereo PCM. Was 64 kB; the 16 kB went to WiFi static TX buffers, and `hub.h` argues why 48 is the floor against the source's feed burst |
+| `LEAD_US` | **250 ms** | Presentation lead. Enough to absorb WiFi jitter; every ms is latency. Was 200; at 200 the budget was shared with delivery and at 250 it is not as tight (`hub.h`). `RING_TARGET_MS` and `ANCHOR_MIN_LEAD_US` moved with it |
+| `LOCAL_RING_BYTES` | **80 kB** | ~464 ms of stereo PCM. Was 64, cut to 48 to release 16 kB for WiFi static TX buffers, then past 64 to 80. `fed-drop` falsified 48 — 46,080 B and 42,496 B in three hours, both after an A2DP source stall — and the answer was no longer a trade against the transmit path, because `pcm_stream`'s 32 kB had moved to PSRAM. Still falsified by `fed-drop` |
 | `MAX_CLIENTS` | **15** | The radio's own ceiling (`ESP_WIFI_MAX_CONN_NUM`). Was 8, when audio and analysis frames were both unicast and airtime scaled with speaker count. Two other limits must match it: `wifi_config.ap.max_connection` and `CONFIG_LWIP_DHCPS_MAX_STATION_NUM` — the third fails *silently*, giving a satellite association but no address |
 | `CLIENT_TIMEOUT_US` | **2 s** | Was 10 s. Only covers the ungraceful departure now — see §4 for the 124 failed allocations that shortened it |
 | `MARKER_EVERY_PKTS` | 100 (~2 s) | Sync measurement pulses |
 | `ESP_WIFI_AMPDU_TX_ENABLED` | **`y`** | Was `n`, required only while `esp_wifi_internal_set_fix_rate()` was in use. The rate is no longer pinned, so the constraint is gone |
 | PHY rate | **not pinned** (`0`) | Rate adaptation on. Group frames still leave at the 6 Mbps OFDM basic rate, which the BSS basic rate set decides — see §16 |
-| `ESP_WIFI_STATIC_TX_BUFFER_NUM` | **32** | ~1.6 kB of internal SRAM each. 26 for a long time because that was all that fitted; 32 became affordable when the hub stopped running its analyser lane, and 32 is what the DTIM burst of group-addressed frames needs |
+| `ESP_WIFI_STATIC_TX_BUFFER_NUM` | **38** | ~1.6 kB of internal SRAM each. 26 for a long time because that was all that fitted; 32 became affordable when the hub stopped running its analyser lane, and that is what the DTIM burst of group-addressed frames needs. 48 was tried and was bufferbloat — it cost anchors-refused. 38 is 36 plus two, taken deliberately alongside the frame lane's proactive pace (`TX_FRAME_PACE_US` in `hub.h`), which stops the crowding burst forming at all; `sdkconfig.defaults` has the table and what to re-measure if it moves again |
 | `ESP_WIFI_CACHE_TX_BUFFER_NUM` | 0 | Deliberate. A PSRAM queue in front of the pool converts `tx-fail` — the counter the whole transmit story is written around — into silence. Tried, and it did not fix the loss it was meant to |
 | `DANCEFLOOR_AUDIO_MCAST` | `y` | Audio to `239.0.0.1` |
 | `DANCEFLOOR_MCAST_FRAMES` | `y` | Analysis frames to the same group. Needs the 32 buffers; at 26 it costs ~5% of the audio |
@@ -1031,7 +1031,7 @@ paid for.
 | Setting | Value | Why |
 |---|---|---|
 | `PROBE_PERIOD_MS` | 250 | Min-RTT *holds* its best sample, so a 10-probe window at 1 s meant up to 10 s of staleness — visible as a dead-straight −22 µs-per-announcement ramp. Same ten samples over 2.5 s instead |
-| `RING_TARGET_MS` | 200 | Matches the hub's lead |
+| `RING_TARGET_MS` | **250** | Matches the hub's lead, by hand — this image cannot see `LEAD_US`, and a mismatch does not fail loudly: the servo's depth net simply holds the unit at the wrong depth, which reads as a standing phase error nothing explains |
 | `MAX_SPLICE_MS` | 150 | Ceiling on a track-boundary correction; anything larger is a bug, not drift |
 | ~~`DANCEFLOOR_USE_INTERNAL_DAC`~~ | — | Was a build option for testing with no DAC wired: 8-bit, audibly poor. Removed 2026-08-12; see §5 |
 | `DANCEFLOOR_LED_SOURCE` | **`REMOTE`** | Draw the frames the hub sends rather than analyse locally. Was `LOCAL`; a locally-analysing satellite did not fit its RAM — 177 failed allocations and 396 bytes of free heap. See §12 |
@@ -1431,20 +1431,30 @@ budget.
 
 | Path | Responsibility |
 |---|---|
-| `components/dancefloor_sync/` | Wire formats and the clock estimator. **No ESP-IDF dependencies** — it is the part most likely to be subtly wrong, and hardware bring-up is a bad place to find out |
+| `components/dancefloor_sync/` | Wire formats, the clock estimator, the volume taper and the faded catch-up (`audio_shift.c`). **No ESP-IDF dependencies** — it is the part most likely to be subtly wrong, and hardware bring-up is a bad place to find out. Host-tested: `make -C components/dancefloor_sync/test check` |
 | `components/sbc_decoder/` | Vendored OI SBC decoder from Bluedroid |
 | `bt_bridge/main/sbc_spi.c` | Frames SBC onto the SPI link as master, `seq` assigned at enqueue |
 | `bt_bridge/main/avrcp_meta.c` | AVRCP controller (track metadata) and target (absolute volume) |
 | `bt_bridge/main/status_led.c` | The two front-panel LEDs — connected solid, streaming blinking |
-| `hub_s3/main/streamer.c` | SoftAP, sockets, client registry, timeline, DAC, phase servo, frame publisher |
+| `hub_s3/main/streamer.c` | Startup order, and `task_start()`. It was 2686 lines and nine concerns until 2026-08-12; `hub.h` says where each went |
+| `hub_s3/main/net.c` | SoftAP, sockets, the multicast group, reconnection |
+| `hub_s3/main/clients.c` | The client registry, and the meta/volume sends addressed off it |
+| `hub_s3/main/timeline.c` | The presentation timeline: `play_at`, the slew, boundary flags, fan-out |
+| `hub_s3/main/play.c` | The hub's own speaker — phase crossings, the splice, the marker, the write |
+| `hub_s3/main/out.c` | The I2S channel and retuning its clock |
+| `hub_s3/main/servo.c` | One 5 s window of rate control, and the ring monitor |
 | `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed |
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
 | `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
-| `satellite/main/main.c` | The whole satellite — receive, decode, servo, play, light |
+| `satellite/main/main.c` | `app_main` and nothing else: peripherals up, then the tasks. The behaviour is in the modules beside it, and the state they share is in `sat.h` — read that first |
+| `satellite/main/net.c` / `clock.c` / `rx.c` | Joining the AP; the probe task, TSF-or-estimator and offset slew; demux, anchor and gap policy, decode, ring feed |
+| `satellite/main/play.c` / `out.c` / `servo.c` | The scheduled start, phase, splice, marker; the I2S write path; one 5 s window of rate control |
 | `tools/pattern_lab/` | The LED pipeline over a WAV on a laptop, compiled from the component |
 | `tools/tuning/` | `sweep.py` and `converge.cpp` — the harness behind `tuning-corpus.md` |
 | `tools/soak/capture.py` | Reads every unit's console over serial, prints it, writes `metrics.csv` / `events.csv` / `raw.log` |
 | `tools/soak/analyse.py` | Reads a capture session and reports faults, divergence, trim, phase, buffer, heap and source stalls |
+| `tools/sat.py` | Builds, flashes and monitors either satellite target — one source tree, two images |
+| `tools/gen_vol_table.py` | Generates the dB volume taper pasted into `audio_out.h`. `FLOOR_DB` is the knob |
 
 ---
 

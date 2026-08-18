@@ -1,3 +1,21 @@
+/*
+ * The analysis pipeline: audio in, one Frame out, and the remote half that
+ * derives the same Frame fields from bands it did not compute itself.
+ *
+ * Two implementations of one thing, deliberately in one file. Analysis::process()
+ * is the local path -- window, FFT, bands, onset -- and RemoteDetect::process()
+ * is what a unit runs when the spectrum arrived over the air in a MSG_FRAME
+ * instead of coming out of its own DAC feed. Keeping them adjacent is the point:
+ * the two must agree field for field, and a divergence between them shows up as
+ * strips that disagree across a floor, which is a sync fault rather than a
+ * quality difference. Anything added to one belongs in the other in the same
+ * commit.
+ *
+ * Pure functions of the audio and the shared timeline -- no clock, no task, no
+ * strip -- so the host harness in tools/pattern_lab compiles this unchanged and
+ * gets the same lights. analysis.hpp states the rule that depends on it, and the
+ * window and hop it is cut by are in analysis_config.h.
+ */
 #include "analysis.hpp"
 
 #include <cmath>
