@@ -96,6 +96,7 @@
 
 #include "audio_out.h"
 #include "sync_proto.h"
+#include "audio_shift.h"
 #include "visualiser.h"
 #include "wifi_log.h"
 
@@ -227,6 +228,37 @@
 #define RESYNC_HARD_US 300000
 
 /*
+ * A hard jump is refused while the local ring is under this, since 2026-08-18.
+ *
+ * Normal delivery jitter swings the ring +-40 ms around the 250 ms lead, so
+ * 150 ms is 100 below target -- two and a half times the deepest normal
+ * trough. Below it, delivery is starving, and a starved ring makes `err` run
+ * past RESYNC_HARD_US with nothing wrong with the clock: next_play_at stops
+ * advancing while target keeps moving with `now`, so the error IS the
+ * starvation, measured twice -- the same fact the RESYNC_HARD_US note above
+ * caught from the other side ("a starved ring and a late phase are the same
+ * fact seen twice").
+ *
+ * Jumping anyway re-stamps every packet with an error the burst will unwind,
+ * and each jump arms a post-jump boundary: on the 2026-08-18 soak the source
+ * wandered +-10% for a minute (sbc_in eff 40106..48743 Hz), the ring sat at
+ * 27 ms, err swung +-310 ms across this threshold five times in 45 s, and
+ * every unit spliced four capped 150 ms inserts mid-track -- audible holes,
+ * then replay drains on top, then rings ballooned to the ceiling. Held
+ * instead, the same excursion recovered by itself: +241427 us slewed back
+ * within 13 ms of the resync threshold with no help from anyone.
+ *
+ * TIMELINE_HOLD_GIVE_UP_US bounds a hold that never ends (a wedged state in
+ * which new satellites cannot anchor on a play_at stuck in the past). The
+ * primary escape is cleaner and already exists: a ring starved all the way
+ * to empty ends in CHUNK_UNDERRUN -> s_underrun_recover -> start_timeline(),
+ * which restarts the timeline wholesale with every satellite re-anchoring,
+ * rather than stepping the one that exists.
+ */
+#define TIMELINE_HOLD_STARVE_MS   150
+#define TIMELINE_HOLD_GIVE_UP_US  30000000
+
+/*
  * How steadily the source must be delivering before a timeline may start.
  *
  * A timeline start publishes an origin every unit anchors to, and then playback
@@ -291,6 +323,46 @@
  * Falsified by tx-fail on the servo line: throttling is working while that drops.
  */
 #define TX_BACKOFF_US           40000   /* ~2 audio packets: yield, then probe again */
+
+/*
+ * The frame lane's PROACTIVE pace, beside TX_BACKOFF_US's reactive one: the
+ * minimum spacing between two frame sends, so the burst never forms in the
+ * first place.
+ *
+ * THE FAULT THIS IS FOR, from the 2026-08-17 soak. The analysis lane and the
+ * audio lane share one static TX pool, and the analysis task does not run at
+ * a steady 86/s: whenever the decoder hands it a lump -- a source stall
+ * unwinding, an A2DP catch-up -- it publishes back-to-back frames, and a burst
+ * of them crowds the pool badly enough that the AUDIO's sendto comes back
+ * ENOMEM. Measured as exactly the audible glitch moments: `tx-fail 22 (19
+ * audio) -- Not enough space 22 | cong-skip 38`, with both satellites
+ * gap-filling +40..+150 ms in the same second. TX_BACKOFF_US fires only after
+ * a send has already FAILED -- it protects the pool's recovery, not the audio
+ * that was refused while the burst was still going in.
+ *
+ * 3/4 of the frame period. In steady state the analysis already produces one
+ * frame per period, so this changes nothing at all -- a paced lane and an
+ * unpaced one are the same lane when the producer is on cadence. It binds
+ * only during a burst, where it caps the lane at 4/3 of its normal rate and
+ * staggers the frames a quarter-period apart (~2.9 ms at the 512 hop): the
+ * pool keeps a frame's worth of headroom, and the cost to the floor is a few
+ * frames skipped out of 86/s -- the same loss a failed send already was, and
+ * the visualiser is built to take it (frames are snapshots, not a protocol).
+ *
+ * Derived from the hop the analysis is configured for, the same selection
+ * DF_HOP_N makes (components/dancefloor_leds/include/analysis_config.h), at
+ * 44.1 kHz: 1024 -> 23220 us, 512 -> 11610, 256 -> 5805. The hop is a
+ * floor-wide agreement pinned in sdkconfig.defaults, so this follows it the
+ * same way rather than naming its own rate.
+ */
+#if defined(CONFIG_DANCEFLOOR_LED_HOP_1024)
+#  define TX_FRAME_PERIOD_US 23220
+#elif defined(CONFIG_DANCEFLOOR_LED_HOP_256)
+#  define TX_FRAME_PERIOD_US  5805
+#else
+#  define TX_FRAME_PERIOD_US 11610
+#endif
+#define TX_FRAME_PACE_US       ((TX_FRAME_PERIOD_US * 3) / 4)
 
 /*
  * Local playback ring. The master delays its own audio by LEAD_US exactly like a
@@ -435,6 +507,19 @@ extern volatile int32_t s_restart_pos;
  * splice will not fix, and 150 ms is audible even at a track change. */
 #define MAX_SPLICE_MS 150
 
+/*
+ * An insert may not push the ring past this far below capacity, since
+ * 2026-08-18. The same 50 ms as the catch-up drain's "level >= target + 50
+ * refuses inserts" -- the system's existing definition of "too deep to add
+ * to". The splice's insert takes DAC time and consumes nothing from the
+ * ring, so while its zeros play, receive keeps pushing: on the 2026-08-18
+ * soak, 150 ms inserts into already-brimming rings took both satellites to
+ * the 464 ms ceiling and 121/89 decoded blocks were dropped at rx. The skip
+ * side needs no such clamp -- its discard loop reads with a zero timeout
+ * and stops on an empty ring by construction.
+ */
+#define SPLICE_INSERT_HEADROOM_MS 50
+
 /* Held across a DAC retune, and the play task parks on it.
  * i2s_channel_write() returns immediately once the channel is disabled, so
  * without this the play task spins through the ring at memory speed -- a
@@ -516,6 +601,13 @@ extern volatile uint32_t s_tx_fail_audio;
  */
 extern volatile uint32_t n_tx_cong_skip;            /* non-audio sends skipped under ENOMEM backoff */
 extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-audio yields until it */
+
+/* ...and the proactive sibling: frames skipped because the last frame went out
+ * less than TX_FRAME_PACE_US ago. cong-skip says the pool was already
+ * exhausted; pace-skip says a burst was forming and never got to find out.
+ * Read together on the servo line, because a working pace should hold
+ * cong-skip at zero while a burst passes. Cleared in the same window. */
+extern volatile uint32_t n_tx_pace_skip;            /* frame sends skipped under TX_FRAME_PACE_US */
 
 /*
  * Every failed sendto() goes through this rather than incrementing s_tx_fail
@@ -686,6 +778,23 @@ extern volatile uint32_t n_short_frames;
  */
 extern volatile uint32_t n_trim_drops;
 extern volatile uint32_t n_trim_dups;
+
+/*
+ * The faded catch-up: audio_shift.h is the mechanism, and these are its state.
+ * Same meanings, same ownership split, same counters as the satellite's copy
+ * in sat.h: servo_tick arms the debt (signed FRAMES; positive = skip, late),
+ * playback is the only thing that shrinks it, one chunk's shift at a time as
+ * the crossfade spends it.
+ *
+ * On this unit the drain is not only for its own speaker: the knock it exists
+ * to pay off usually arrives on BOTH units at once -- the tx-fail burst that
+ * starves the satellites starves this ring too -- and paying it off at the
+ * same rate from the same code is what keeps the two from diverging while
+ * they do.
+ */
+extern volatile int32_t  catchup_frames;
+extern volatile uint32_t n_catchup_drops;
+extern volatile uint32_t n_catchup_dups;
 
 /*
  * How much audio goes into the DMA before a write first blocks.

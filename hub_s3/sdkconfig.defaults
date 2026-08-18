@@ -428,7 +428,24 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 #
 # Falsified by tx-fail itself, which is the counter CACHE_TX_BUFFER_NUM is pinned
 # to 0 further down to keep honest.
-CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=36
+#
+# 38, +2, 2026-08-17: a couple, deliberately, and not a lunge back toward 48.
+# The same soak that produced the table above caught the actual fault at the
+# source -- analysis-frame bursts crowding the pool until the AUDIO's sendto
+# came back ENOMEM at the exact audible-glitch moments -- and the fix that
+# ships with this change is the frame lane's proactive pace (TX_FRAME_PACE_US
+# in hub.h), which stops the burst from forming at all. The +2 is the other
+# half of the same repair: two more buffers of margin for the moment a burst
+# does begin, cheap now that the burst-former is gated, and far enough below
+# 48's bufferbloat that the anchors-refused finding is not in play. Memory
+# headroom is not the question (PSRAM move above): internal min 37704 leaves
+# room for far more than two.
+#
+# The re-measure that matters if this ever moves again is the table's, not a
+# free-bytes one: 38 has to answer anchors-refused and sat gaps/h against the
+# 36 row above. If 38 reads like 48 did, come back to 36 -- the pace gate
+# should already have carried the repair on its own.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=38
 
 # The socket's receive queue, in datagrams. IDF defaults to 6 and the boot
 # banner prints it as `udp mbox: 6`.

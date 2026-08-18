@@ -27,6 +27,7 @@
 
 #include "audio_out.h"
 #include "sync_proto.h"
+#include "audio_shift.h"
 #include "sbc_link.h"
 #include "sbc_decoder.h"
 #include "visualiser.h"
@@ -102,6 +103,74 @@ static int trim_due(void)
     return 0;
 }
 
+/*
+ * The catch-up read buffer. A pass that shifts k frames reads AUDIO_FRAMES + k
+ * in and crosses it down to AUDIO_FRAMES out (audio_shift_chunk reads both
+ * strands from the input while writing chunk), so it cannot land in chunk.
+ * Sized for the largest shift the constants allow plus the fine trim folded
+ * in: CATCHUP_SHIFT_MAX + 1.
+ */
+static int16_t s_cu_in[(AUDIO_FRAMES + CATCHUP_SHIFT_MAX + 1) * AUDIO_CHANNELS];
+
+/*
+ * How much catch-up this pass's shift is carrying, set by chunk_shift() and
+ * spent by the caller once the pass lands. Play task only.
+ */
+static int s_catchup_take;
+
+/*
+ * Frames of catch-up applied since the phase history was last aged. Each one
+ * moves this unit 23 us silently; after PHASE_STEP_LOG_US worth, every reading
+ * still in the history describes a unit that has moved, and it is dropped --
+ * the same call, for the same reason, as after a splice.
+ */
+static int32_t s_catchup_moved;
+
+/*
+ * The shift for this pass: the fine trim's 0/+-1, plus the armed catch-up debt
+ * while one is draining.
+ *
+ * While a debt is draining, the trim is FOLDED INTO the shift rather than
+ * taken separately, so one crossfaded pass carries both and the two
+ * mechanisms cannot each take a frame out of the same chunk. Outside a drain
+ * the return is the trim's 0/+-1 and the plain paths handle it exactly as
+ * they always did.
+ *
+ * Depth guard, because debt and depth are the same quantity on this unit:
+ * ring level is RING_TARGET_MS + lateness, so a unit 40 ms late legitimately
+ * holds 40 ms past target, and draining a debt drains the ring toward target
+ * -- which is what a late unit wants. The guard only says no when the ring
+ * does not have the margin the shift would spend: no dropping through a ring
+ * already below target (that is a unit refilling after trouble, not a late
+ * one), no inserting into one already past target + 50 ms.
+ */
+static int chunk_shift(void)
+{
+    s_catchup_take = 0;
+    const int trim = trim_due();
+
+    const int32_t debt = catchup_frames;
+    if (debt == 0) {
+        return trim;
+    }
+
+    const int32_t level_ms = (int32_t)((int64_t)(RING_BYTES -
+            (int64_t)xStreamBufferSpacesAvailable(ring)) * 1000
+            / ((int64_t)stream_rate * AUDIO_CHANNELS * 2));
+    if (debt > 0 && level_ms <= RING_TARGET_MS - 30) {
+        return trim;    /* dropping now would push a thin ring at the DAC */
+    }
+    if (debt < 0 && level_ms >= RING_TARGET_MS + 50) {
+        return trim;    /* inserting would stack onto an already-deep ring */
+    }
+
+    int32_t k = debt;
+    if (k >  CATCHUP_SHIFT_MAX_DROP) k =  CATCHUP_SHIFT_MAX_DROP;
+    if (k < -CATCHUP_SHIFT_MAX_DUP)  k = -CATCHUP_SHIFT_MAX_DUP;
+    s_catchup_take = (int)k;
+    return (int)k + trim;
+}
+
 void play_task(void *arg)
 {
     (void)arg;
@@ -147,6 +216,12 @@ void play_task(void *arg)
         /* Every reading in it was measured against the stream this anchor
          * replaces, so none of them describes where this unit now is. */
         sync_phase_reset(&phase_hist);
+        /* Same reason: an armed debt described a position on the stream this
+         * anchor replaces, and a replay debt draining into the freshly-reset
+         * thin ring is the audible stretch again. The servo re-arms from
+         * fresh readings if the error survives the re-anchor; the restart
+         * hold (CATCHUP_HOLD_US) gives them time to be medians first. */
+        catchup_frames = 0;
         /* Same reason, and it stops the first reading of this stream being
          * reported as a step from the last reading of the previous one. */
         s_phase_prev_valid = false;
@@ -216,14 +291,22 @@ void play_task(void *arg)
              * the dma_frame_num note in i2s_start(), which both units must
              * carry because it also sets the output pipeline latency the servo
              * absorbs at startup.
+             *
+             * A CATCH-UP pass (|shift| > 1) is the same statement at a larger
+             * size: it reads AUDIO_FRAMES + shift in, crosses the two strands
+             * under the fade, and still hands the DAC exactly one chunk. See
+             * audio_shift.h; the shift itself comes from chunk_shift() above.
              */
-            const int trim = trim_due();
+            const int shift = chunk_shift();
+            const bool cu = (shift > 1 || shift < -1);
             const size_t frame_bytes = AUDIO_CHANNELS * sizeof(int16_t);
-            const size_t want = (trim < 0) ? sizeof(chunk) - frame_bytes
-                                           : sizeof(chunk);
+            const size_t want = cu
+                ? (size_t)((int)AUDIO_FRAMES + shift) * frame_bytes
+                : (shift < 0) ? sizeof(chunk) - frame_bytes : sizeof(chunk);
 
             hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
-            size_t got = xStreamBufferReceive(ring, chunk, want, pdMS_TO_TICKS(500));
+            uint8_t *const dest = cu ? (uint8_t *)s_cu_in : chunk;
+            size_t got = xStreamBufferReceive(ring, dest, want, pdMS_TO_TICKS(500));
             if (got == 0) {
                 n_underruns++;
                 ESP_LOGW(TAG, "underrun, waiting for a new stream");
@@ -239,18 +322,65 @@ void play_task(void *arg)
              * Measured against `want`, not sizeof(chunk): on a duplicating pass
              * a read of one frame less than the chunk is what was ASKED for and
              * is not short. The pad still fills to sizeof(chunk), because that
-             * is what the DAC is given.
+             * is what the DAC is given. True of a catch-up want as well -- an
+             * insert's want is a frame count the plain path would happily
+             * have played.
              */
             int32_t consumed = (int32_t)(got / frame_bytes);
             if (got < want) {
                 n_short_reads++;
                 n_short_frames += (uint32_t)((want - got) / frame_bytes);
             }
-            if (got < sizeof(chunk)) {
-                memset(chunk + got, 0, sizeof(chunk) - got);
+
+            size_t have = got;      /* bytes of real audio now sitting in chunk */
+            if (cu && got == want) {
+                /*
+                 * The catch-up pass proper. Shift, count the input exactly as
+                 * consumed, and retire the debt this pass carried. The plain
+                 * trim block below does not run: this pass's shift already
+                 * includes whatever trim_due() asked for.
+                 *
+                 * The counters count the whole shift, trim included, so the
+                 * TRIM line's frames/s arithmetic keeps holding across a
+                 * drain: what was spent is what was counted.
+                 */
+                audio_shift_chunk((int16_t *)chunk, s_cu_in, AUDIO_FRAMES,
+                                  shift, CATCHUP_FADE_FRAMES, AUDIO_CHANNELS);
+                consumed = (int32_t)AUDIO_FRAMES + shift;
+                have = sizeof(chunk);
+                catchup_frames -= s_catchup_take;
+                if (shift > 0) n_catchup_drops += (uint32_t)shift;
+                else           n_catchup_dups  += (uint32_t)(-shift);
+                /*
+                 * Age the phase history as the drain moves this unit: every
+                 * reading older than CATCHUP_HIST_RESET_US worth of movement
+                 * describes a position this unit has left. Resetting here
+                 * keeps the splice median and the servo's next arming
+                 * decision dated from where we are, and phase_stepped drops
+                 * the servo's smoothing for the same reason it does at a
+                 * re-anchor: the EMA is describing a different world.
+                 */
+                s_catchup_moved += s_catchup_take < 0 ? -s_catchup_take
+                                                      : s_catchup_take;
+                if (s_catchup_moved >= (int32_t)((int64_t)CATCHUP_HIST_RESET_US *
+                                                 stream_rate / 1000000)) {
+                    s_catchup_moved = 0;
+                    sync_phase_reset(&phase_hist);
+                    phase_stepped = true;
+                }
+            } else if (cu) {
+                /* Short of the crossfade's want: play what arrived, plainly.
+                 * The debt stands and is spent by a later pass -- spending it
+                 * on a partial buffer would crossfade into the pad. */
+                const size_t copy = got < sizeof(chunk) ? got : sizeof(chunk);
+                memcpy(chunk, s_cu_in, copy);
+                have = copy;
+            }
+            if (have < sizeof(chunk)) {
+                memset(chunk + have, 0, sizeof(chunk) - have);
             }
 
-            if (trim > 0) {
+            if (!cu && shift > 0) {
                 /*
                  * Drop one frame: take it out of the ring and throw it away. A
                  * second receive rather than one oversized read, so that
@@ -274,7 +404,7 @@ void play_task(void *arg)
                 } else {
                     s_trim_owed += TRIM_ONE_FRAME;  /* still owed; retry next pass */
                 }
-            } else if (trim < 0) {
+            } else if (!cu && shift < 0) {
                 /* Duplicate one frame into the slot the shorter read left.
                  * Zero-order hold on a single sample, at 0.6 Hz in normal
                  * service. */
@@ -522,7 +652,35 @@ void play_task(void *arg)
                              (long)(applied * 1000 / (int32_t)stream_rate));
                     phase_stepped = true;
                 } else if (adj < 0) {
-                    /* Early: emit silence so the timeline catches up with us. */
+                    /*
+                     * Early: emit silence so the timeline catches up with us.
+                     *
+                     * HEADROOM, since 2026-08-18: the zeros take DAC time and
+                     * consume nothing from the ring, so receive keeps pushing
+                     * while they play -- the insert is the one splice that can
+                     * overflow the ring it is fixing. Clamp to what fits below
+                     * capacity minus SPLICE_INSERT_HEADROOM_MS; whatever the
+                     * clamp eats is left standing for the catch-up, which
+                     * re-arms from the median this splice is about to reset.
+                     * On the 2026-08-18 soak, 150 ms inserts into brimming
+                     * rings took both satellites to the 464 ms ceiling and
+                     * 121/89 decoded blocks were dropped at rx as ring-full.
+                     */
+                    const int32_t level_frames = (int32_t)((RING_BYTES -
+                            xStreamBufferSpacesAvailable(ring))
+                            / (AUDIO_CHANNELS * (int)sizeof(int16_t)));
+                    const int32_t room = (int32_t)(RING_BYTES /
+                            (AUDIO_CHANNELS * (int)sizeof(int16_t)))
+                            - (int32_t)stream_rate * SPLICE_INSERT_HEADROOM_MS / 1000
+                            - level_frames;
+                    if (-adj > room) {
+                        ESP_LOGW(TAG, "insert clamped: phase asked %ld ms, ring "
+                                      "has room for %ld ms",
+                                 (long)(-adj * 1000 / (int32_t)stream_rate),
+                                 (long)((room > 0 ? room : 0) * 1000
+                                        / (int32_t)stream_rate));
+                        adj = room > 0 ? -room : 0;
+                    }
                     static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
                     int32_t left = -adj;
                     while (left > 0) {
@@ -547,6 +705,18 @@ void play_task(void *arg)
                     /* Same reason phase_stepped is set above: every reading in
                      * the history was taken before this unit moved. */
                     sync_phase_reset(&phase_hist);
+                    /*
+                     * THE SPLICE IS THE PAYER AND THE ONLY PAYER, since
+                     * 2026-08-18. It moved this unit by `applied`, so any
+                     * debt the servo armed against that same error is now
+                     * double-counted -- on that soak, each capped 150 ms
+                     * insert was followed by ~20 s of the pre-armed debt
+                     * replaying on top. Zeroed here, the servo re-arms
+                     * whatever error REMAINS once a fresh median exists:
+                     * 150 of 250 ms paid by the splice, the rest re-armed
+                     * for the drain. Mirrored in hub_s3/main/play.c.
+                     */
+                    catchup_frames = 0;
                 }
                 splice_report_us = (int32_t)((int64_t)applied * 1000000 / stream_rate);
                 splice_report_phase = phase_valid ? phase_err_us : 0;

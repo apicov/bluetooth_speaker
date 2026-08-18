@@ -46,6 +46,12 @@ COUNTERS = {
     "decode-err", "recv-err", "sta-left", "wifi-over", "fec-trunc",
     "refill-withheld", "anchors-refused", "upgrades", "dropped", "dup",
     "wide-span", "sta-timeout",
+    # The faded catch-up's own pair, apart from the trim's dropped/dup because
+    # a drain runs at ~1376 skip / ~688 replay frames/s by design and would
+    # drown the trim's own frames/s arithmetic if mixed in. Expected: flat in
+    # a clean run, a burst of a few seconds per knock.
+    # See components/dancefloor_sync/audio_shift.h.
+    "catchup-drops", "catchup-dups",
 }
 
 # What must stay at zero for a soak to have gone well, and what a non-zero
@@ -78,8 +84,11 @@ def load(paths):
         mparts.append(pd.read_csv(m))
         if os.path.exists(e) and os.path.getsize(e) > 0:
             eparts.append(pd.read_csv(e))
-    met = pd.concat(mparts, ignore_index=True).sort_values("wall_s")
-    ev = (pd.concat(eparts, ignore_index=True).sort_values("wall_s")
+    # Stable: lines that arrived in the same millisecond (HEALTH/TRIM/MEM print
+    # back-to-back) must keep their arrival order, or esp_ms flips backwards at
+    # every burst and one boot shatters into thousands of fake ones.
+    met = pd.concat(mparts, ignore_index=True).sort_values("wall_s", kind="stable")
+    ev = (pd.concat(eparts, ignore_index=True).sort_values("wall_s", kind="stable")
           if eparts else pd.DataFrame(columns=["wall_s", "unit", "kind", "text"]))
     return met, ev
 
@@ -91,18 +100,31 @@ def boot_segments(df):
     reset. Detected per (unit, kind) because different lines are emitted on
     different cadences and interleave.
     """
-    df = df.sort_values(["unit", "wall_s"]).copy()
+    df = df.sort_values(["unit", "wall_s"], kind="stable").copy()
     df["boot"] = (df.groupby("unit")["esp_ms"].diff().fillna(0) < 0) \
         .groupby(df["unit"]).cumsum().astype(int)
     return df
 
 
 def counter_total(df, unit, metric):
-    """Sum the final value of `metric` across every boot segment of `unit`."""
-    s = df[(df["unit"] == unit) & (df["metric"] == metric)]
+    """Sum what `metric` gained across every boot segment of `unit`, in this window.
+
+    Counters are cumulative since boot, and a capture usually opens on boards
+    that booted hours ago: the first line already carries all that history, so
+    a raw total reports the past, not the soak. Each boot segment is therefore
+    baselined at its first observed value -- for a boot watched from esp=0 that
+    baseline is ~0 and nothing changes; for one joined mid-life it subtracts
+    everything that happened before the capture started.
+    """
+    # Only HEALTH and TRIM lines carry cumulative counters. The per-window RX 5s
+    # lines repeat metric names ('gaps 1', 'ring-full 0') as gauges, and mixing
+    # those into a cumulative series makes the baseline meaningless.
+    s = df[(df["unit"] == unit) & (df["metric"] == metric)
+           & df["kind"].isin(["health", "trim"])]
     if s.empty:
         return None
-    return int(s.groupby("boot")["value"].max().sum())
+    per_boot = s.groupby("boot")["value"]
+    return int((per_boot.max() - per_boot.first()).sum())
 
 
 def gauge(df, unit, kind, metric):
@@ -144,6 +166,11 @@ def main():
         note = "" if boots == 1 else f"  ** {boots} boots -- counters summed per segment **"
         print(f"  {u:8s}     uptime {fmt_dur(up) if up else '?':>10s}"
               f"  {len(um):,} rows{note}")
+        if boots > 5:
+            print(f"      ** {boots} boots is not {boots} resets. Almost certainly two"
+                  f" boards captured under one --unit name (or a corrupt capture);")
+            print(f"         every '{u}' number below mixes both streams and is"
+                  f" unreliable. Re-capture with unique names per board. **")
 
     # ---- 1. faults ----------------------------------------------------------
     head("FAULTS  (every one of these should read 0)")
@@ -188,8 +215,11 @@ def main():
     for u in units:
         drops = counter_total(met, u, "dropped") or 0
         dups = counter_total(met, u, "dup") or 0
+        cu_drops = counter_total(met, u, "catchup-drops") or 0
+        cu_dups = counter_total(met, u, "catchup-dups") or 0
         t = gauge(met, u, "trim", "trim_hz")
-        if t is None and drops == 0 and dups == 0:
+        if (t is None and drops == 0 and dups == 0
+                and cu_drops == 0 and cu_dups == 0):
             print(f"  {u}: no trim data")
             continue
         span = max(t1 - t0, 1.0)
@@ -199,6 +229,15 @@ def main():
                      f" (median {t['value'].median():+.0f})")
         print(line)
         print(f"      combined {(drops + dups) / span:.2f} frames/s over the run")
+        if cu_drops or cu_dups:
+            # The drain's own pair, kept out of the frames/s line above because
+            # a drain pays a knock in seconds at ~1376/~688 frames/s and would
+            # drown the trim's own arithmetic. Healthy shape: a short burst per
+            # knock, drops-side or nothing.
+            print(f"      catch-up: {cu_drops:,} skipped / {cu_dups:,} replayed")
+            if cu_dups > max(64, drops):
+                print("      ** catchup replay dominates -- the slower-and-not-"
+                      "continuous signature")
 
         # The rate must equal |trim_hz|: that is the mechanism's own arithmetic.
         if t is not None and len(t) > 1:

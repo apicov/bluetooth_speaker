@@ -129,6 +129,7 @@ void servo_tick(void)
                       "(median %+ld%s, smoothed %+ld us) | "
                       "tx-fail %" PRIu32 " (%" PRIu32 " audio)%s"
                       " | cong-skip %" PRIu32
+                      " | pace-skip %" PRIu32
                       " | %lu pkts/s"
                       " | xport %s fec %d frames %s",
                  (unsigned)filled,
@@ -137,7 +138,7 @@ void servo_tick(void)
                  (long)(s_phase_med_valid ? s_phase_med_us : 0),
                  s_phase_med_valid ? "" : " n/a",
                  (long)s_err_ema, s_tx_fail, s_tx_fail_audio, why,
-                 n_tx_cong_skip,
+                 n_tx_cong_skip, n_tx_pace_skip,
                  (unsigned long)(s_audio_pkts / (uint32_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S),
                  AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
                  FRAMES_TRANSPORT_TAG);
@@ -145,6 +146,7 @@ void servo_tick(void)
         s_tx_fail_audio = 0;   /* same window as the total it is a subset of */
         s_audio_pkts = 0;
         n_tx_cong_skip = 0;
+        n_tx_pace_skip = 0;    /* same window as the cong-skip it accompanies */
     }
 
     const int32_t target = (int32_t)(LEAD_US / 1000) *
@@ -194,6 +196,66 @@ void servo_tick(void)
     if (adj != adj_phase) {
         ESP_LOGW(TAG, "depth net: buffer %+ld ms, phase asked %+ld Hz -> %+ld Hz",
                  (long)depth_ms, (long)adj_phase, (long)adj);
+    }
+    /*
+     * THE LARGE-ERROR CATCH-UP, armed here, spent by playback.
+     *
+     * Same mechanism, same constants, same arithmetic as the satellite's copy
+     * -- audio_shift.c is shared, and a correction rate that differs between
+     * the units is itself a cross-unit sync error. The situation it exists
+     * for was this unit's to cause: a tx-fail burst on the radio below starves
+     * the satellites' audio AND this unit's own ring at once, and both sides
+     * then carry the same tens-of-ms knock that the 2.27 ms/s trim ceiling
+     * takes a minute or more to walk off.
+     *
+     * Armed from `err_in` for the same reason the servo itself reads it: the
+     * EMA's settling (~20 s) outlives the whole drain, so arming from the EMA
+     * would re-arm error the drain had already paid and overshoot to the other
+     * side. But since 2026-08-18 the ARM requires the published median to be
+     * VALID at the moment of the write -- the raw fallback no longer arms
+     * anything, for two reasons measured on that day's soak:
+     *
+     *   a splice zeroes the debt and invalidates the median precisely because
+     *   the readings before it described the error just paid, so arming on the
+     *   raw survivor is arming on the paid error itself; and between the read
+     *   of err_in at the top of this tick and the write below sits the status
+     *   print -- ~13 ms of UART at this log rate, ample for a splice to land
+     *   in -- so validity is re-tested at the write, not just at the read.
+     *
+     * The debt only grows here and only playback shrinks it; a sign flip
+     * replaces it outright. See the satellite's copy for the race note --
+     * writes race the play task's spend at 5 s against ~6 ms cadence, benign
+     * both ways.
+     */
+    {
+        /*
+         * The startup hold: a fresh timeline's first-minute phase (the DMA
+         * refill transient, -30285 us median on the 2026-08-18 soak) is past
+         * CATCHUP_ARM_US with nothing wrong, and armed 1347 frames of replay
+         * here at boot for an error the trim was already walking off. local_start
+         * rewrites at every timeline start, so the hold re-engages after an
+         * underrun restart too -- correct, the transient exists at every
+         * start. Only the ARM waits; the clear keeps working, because
+         * standing a stale debt down early is safe in a way arming one is not.
+         */
+        const bool held = esp_timer_get_time() - local_start < CATCHUP_HOLD_US;
+        const int32_t med = err_in;
+        if (!held && s_phase_med_valid &&
+            (med >= CATCHUP_ARM_US || med <= -CATCHUP_ARM_US)) {
+            const int32_t cap = (int32_t)((int64_t)CATCHUP_MAX_US * rate_ema
+                                          / 1000000);
+            int32_t want = (int32_t)((int64_t)med * rate_ema / 1000000);
+            if (want >  cap) want =  cap;
+            if (want < -cap) want = -cap;
+            const int32_t now = catchup_frames;
+            if ((want > 0) != (now > 0)) {
+                catchup_frames = want;              /* overshot: reversed */
+            } else if (want > 0 ? want > now : want < now) {
+                catchup_frames = want;              /* same side, deeper */
+            }
+        } else if (med < CATCHUP_CLEAR_US && med > -CATCHUP_CLEAR_US) {
+            catchup_frames = 0;   /* remainder is the fine trim's to finish */
+        }
     }
     uint32_t desired = (uint32_t)((int32_t)rate_ema + adj);
 

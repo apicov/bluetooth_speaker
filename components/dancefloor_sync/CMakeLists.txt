@@ -1,3 +1,3 @@
-idf_component_register(SRCS "sync_proto.c" "wifi_log.c"
+idf_component_register(SRCS "sync_proto.c" "wifi_log.c" "audio_shift.c"
                        INCLUDE_DIRS "include"
                        PRIV_REQUIRES log esp_timer lwip)

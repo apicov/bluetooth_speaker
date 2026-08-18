@@ -212,10 +212,19 @@ void telemetry_tick(void)
          * frame per ~1.6 s in one direction at ~14 ppm of real drift; flat
          * means the trim is off, and both climbing means it is hunting across
          * zero. See n_trim_drops.
+         *
+         * The catch-up pair beside them is the same instrument for the
+         * large-error drain (audio_shift.h): flat while |phase| stays under
+         * CATCHUP_ARM_US, a burst of a few seconds when a knock is being
+         * paid off. Deliberately their own keys and NOT part of the totals
+         * above -- a drain deliberately exceeds any rate the trim's own
+         * arithmetic could explain.
          */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
-                      " frames | retunes %" PRIu32 " coarse | volume %u/%d",
-                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes,
+                      " frames | catchup-drops %" PRIu32 " catchup-dups %"
+                      PRIu32 " | retunes %" PRIu32 " coarse | volume %u/%d",
+                 (long)rate_trim_hz, n_trim_drops, n_trim_dups,
+                 n_catchup_drops, n_catchup_dups, n_retunes,
                  audio_volume, AUDIO_VOL_MAX);
 
         ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32

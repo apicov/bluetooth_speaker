@@ -19,6 +19,7 @@ dependencies.lock
 
 # Host test binaries and their intermediates
 components/dancefloor_sync/test/test_sync_proto
+components/dancefloor_sync/test/test_audio_shift
 components/dancefloor_leds/test/test_align
 components/dancefloor_leds/test/test_pattern
 components/dancefloor_leds/test/test_beat_detect

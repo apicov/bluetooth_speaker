@@ -216,6 +216,19 @@ extern volatile bool phase_stepped;
 #define MAX_SPLICE_MS 150
 
 /*
+ * An insert may not push the ring past this far below capacity, since
+ * 2026-08-18. The same 50 ms as the catch-up drain's "level >= target + 50
+ * refuses inserts" -- the system's existing definition of "too deep to add
+ * to". The splice's insert takes DAC time and consumes nothing from the
+ * ring, so while its zeros play, receive keeps pushing: on the 2026-08-18
+ * soak, 150 ms inserts into already-brimming rings took both satellites to
+ * the 464 ms ceiling and 121/89 decoded blocks were dropped at rx as
+ * ring-full. The skip side needs no such clamp -- its discard loop reads
+ * with a zero timeout and stops on an empty ring by construction.
+ */
+#define SPLICE_INSERT_HEADROOM_MS 50
+
+/*
  * Beyond this, the phase reading is not describing our playback at all.
  *
  * Drift is ~0.8 ms per minute and delivery jitter is a few ms, so a whole
@@ -790,6 +803,27 @@ extern volatile uint8_t audio_volume;
  */
 extern volatile uint32_t n_trim_drops;
 extern volatile uint32_t n_trim_dups;
+
+/*
+ * The faded catch-up: audio_shift.h is the mechanism, and these are its state.
+ *
+ * catchup_frames is the debt, in signed FRAMES: positive means skip that many
+ * (playing late), negative means replay that many (early). servo_tick ARMS it
+ * -- raises it toward the measured error, or clears it under CATCHUP_CLEAR_US
+ * -- and play_task is the only thing that shrinks it, one chunk's shift at a
+ * time as the crossfade actually spends it. Read wherever the phase error is
+ * being reasoned about; the TRIM line prints the totals below it.
+ *
+ * The two counters are the catch-up's share of dropping/duplicating, kept
+ * apart from n_trim_drops/n_trim_dups because they measure a different
+ * mechanism with a different expected rate: the trim runs at |rate_trim_hz|
+ * frames/s in normal service, the catch-up at up to 1376 frames/s for the few
+ * seconds a large error takes to drain. On the soak this replaces, the same
+ * error took over a minute of the boundary splice's 150 ms jumps instead.
+ */
+extern volatile int32_t  catchup_frames;
+extern volatile uint32_t n_catchup_drops;
+extern volatile uint32_t n_catchup_dups;
 
 /*
  * What a retune costs. A COARSE-ONLY path since 2026-08-14 -- the servo reaches

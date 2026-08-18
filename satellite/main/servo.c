@@ -38,6 +38,7 @@
 
 #include "audio_out.h"
 #include "sync_proto.h"
+#include "audio_shift.h"
 #include "sbc_link.h"
 #include "sbc_decoder.h"
 #include "visualiser.h"
@@ -213,6 +214,81 @@ void servo_tick(void)
     if (adj != adj_phase) {
         ESP_LOGW(TAG, "depth net: buffer %+ld ms, phase asked %+ld Hz -> %+ld Hz",
                  (long)depth_ms, (long)adj_phase, (long)adj);
+    }
+    /*
+     * THE LARGE-ERROR CATCH-UP, armed here, spent by playback.
+     *
+     * The trim above is capped at RATE_TRIM_MAX_HZ = 2.27 ms/s. The soak of
+     * 2026-08-17 recorded both satellites knocked +40 to +150 ms in one
+     * stroke by a hub tx-fail burst, which is a minute or more at that rate
+     * -- a minute or more of audible echo, usually ended by the audible
+     * boundary splice rather than by the servo. So beyond CATCHUP_ARM_US the
+     * servo asks for the splice's own move -- skip or replay material -- and
+     * playback spends it a few frames per chunk under a crossfade
+     * (audio_shift.c): 31 ms/s, inaudible by construction, both units from
+     * the same code.
+     *
+     * Armed from the MEDIAN, not err_ema. The EMA's settling (~4 windows =
+     * 20 s) outlives the whole drain, so arming from it would re-arm error
+     * the drain had already paid and overshoot to the other side; the median
+     * is current to a few readings and ignores the scatter a single reading
+     * carries. Since 2026-08-18 the arm also requires that median to EXIST:
+     * under SYNC_PHASE_MIN readings it declines outright rather than falling
+     * back to the raw value -- the block below says why.
+     *
+     * The debt only grows here -- never shrinks -- and only playback shrinks
+     * it, as it spends. That split stops this loop from bidding against the
+     * drain, and makes the value mean one thing at all times: frames still
+     * to skip or replay. The one exception is a sign flip: if the drain has
+     * overshot, the old debt is pointing the wrong way and is replaced.
+     *
+     * Writes race the play task's decrements at 5 s against ~6 ms cadence.
+     * Benign in both directions, by the same reasoning as rate_trim_hz: the
+     * next window re-arms from a fresh median either way.
+     */
+    if (phase_valid) {
+        int32_t med = phase_err_us;
+        const bool have_med = sync_phase_median(&phase_hist, &med);
+        /*
+         * ARMED FROM A MEDIAN OR NOT AT ALL, and not in the first
+         * CATCHUP_HOLD_US of a stream, since 2026-08-18.
+         *
+         * The raw fallback was this block's input whenever the history was
+         * too short to offer a median -- the ~100 ms after a splice or a
+         * start. But a splice zeroes the debt and resets the history
+         * precisely because the readings before it described the error just
+         * paid, so arming on the raw survivor is arming on the paid error
+         * itself. Unlike the hub's copy there is no re-test at the write:
+         * the median here is taken inline, microns above the write it
+         * gates.
+         *
+         * The hold: an anchored stream's startup phase is past
+         * CATCHUP_ARM_US with nothing wrong -- this unit armed 1448 frames
+         * of replay in the first window of the 2026-08-18 soak -- and
+         * stream_start_local rewrites at every anchor, so the hold
+         * re-engages on a re-anchor, which is when the transient recurs.
+         * Only the ARM waits; the clear keeps the raw fallback and its
+         * timing, because standing a stale debt down early is safe in a
+         * way arming one is not.
+         */
+        const bool held = esp_timer_get_time() - stream_start_local
+                          < CATCHUP_HOLD_US;
+        if (!held && have_med &&
+            (med >= CATCHUP_ARM_US || med <= -CATCHUP_ARM_US)) {
+            const int32_t cap = (int32_t)((int64_t)CATCHUP_MAX_US * stream_rate
+                                          / 1000000);
+            int32_t want = (int32_t)((int64_t)med * stream_rate / 1000000);
+            if (want >  cap) want =  cap;
+            if (want < -cap) want = -cap;
+            const int32_t now = catchup_frames;
+            if ((want > 0) != (now > 0)) {
+                catchup_frames = want;              /* overshot: reversed */
+            } else if (want > 0 ? want > now : want < now) {
+                catchup_frames = want;              /* same side, deeper */
+            }
+        } else if (med < CATCHUP_CLEAR_US && med > -CATCHUP_CLEAR_US) {
+            catchup_frames = 0;   /* remainder is the fine trim's to finish */
+        }
     }
     uint32_t desired = (uint32_t)((int32_t)stream_rate + adj);
     /*

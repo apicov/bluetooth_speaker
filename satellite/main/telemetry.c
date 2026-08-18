@@ -99,15 +99,27 @@ void telemetry_tick(void)
      * Recorded there, printed here, for the reason the RX counters below are:
      * the play task is the audio path. Cleared as it is taken, so a quiet
      * window says nothing at all.
+     *
+     * pad is the WINDOW delta, differenced against the last value told. The
+     * play task records the since-boot cumulative n_short_frames, and printing
+     * that raw made every PHASE STEP line claim all padding since power-on --
+     * on a long soak the first step of the evening read 25299 frames of pad
+     * accumulated by delivery bursts hours old, which is a HEALTH figure, not
+     * a step figure. The delta here is the padding that rode along with THIS
+     * step; the cumulative keeps its home on the HEALTH line.
      */
     if (step_report_pending) {
         step_report_pending = false;
+        static uint32_t step_pad_told;
+        const uint32_t pad_total = step_report_pad;   /* read once: it moves */
         ESP_LOGW(TAG, "PHASE STEP: %+ld -> %+ld us (%+ld) | buffer %ld ms | "
                       "pad %" PRIu32 " frames | trim %+ld Hz",
                  (long)step_report_from, (long)step_report_to,
                  (long)(step_report_to - step_report_from),
-                 (long)step_report_ring, step_report_pad,
+                 (long)step_report_ring,
+                 pad_total - step_pad_told,
                  (long)step_report_trim);
+        step_pad_told = pad_total;
         step_report_mag = 0;
     }
 
@@ -243,10 +255,19 @@ void telemetry_tick(void)
          * frame per ~1.6 s in one direction at ~14 ppm of real drift; flat
          * means the trim is off, and both climbing means it is hunting across
          * zero. See n_trim_drops.
+         *
+         * The catch-up pair beside them is the same instrument for the
+         * large-error drain: flat while |phase| stays under CATCHUP_ARM_US,
+         * a burst of a few seconds when a knock is being paid off. They are
+         * NOT part of the trim's frames/s arithmetic -- a drain deliberately
+         * exceeds any rate the trim could claim -- which is why they get
+         * their own keys rather than riding the totals above.
          */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
-                      " frames | retunes %" PRIu32 " coarse | volume %u/%d",
-                 (long)rate_trim_hz, n_trim_drops, n_trim_dups, n_retunes,
+                      " frames | catchup-drops %" PRIu32 " catchup-dups %"
+                      PRIu32 " | retunes %" PRIu32 " coarse | volume %u/%d",
+                 (long)rate_trim_hz, n_trim_drops, n_trim_dups,
+                 n_catchup_drops, n_catchup_dups, n_retunes,
                  audio_volume, AUDIO_VOL_MAX);
 
         /* Its own line rather than four more fields above -- see the hub's

@@ -329,6 +329,13 @@ def main():
             if head and tail.isdigit():
                 port, baud = head, int(tail)
         units.append((name.strip(), port, baud))
+    # Two boards under one name cannot be told apart later: the CSVs carry the
+    # name, not the port, so their lines interleave into per-unit nonsense.
+    seen = [u[0] for u in units]
+    if len(set(seen)) != len(seen):
+        dup = sorted({n for n in seen if seen.count(n) > 1})
+        ap.error(f"duplicate unit name(s) {', '.join(dup)}: give each board its"
+                 f" own --unit NAME; a shared name cannot be separated afterwards")
 
     outdir = args.out or time.strftime("logs-soak-%Y%m%d-%H%M%S")
     session = Session(outdir)

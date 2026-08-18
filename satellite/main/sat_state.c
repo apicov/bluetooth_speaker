@@ -83,6 +83,9 @@ volatile uint32_t n_short_reads;
 volatile uint32_t n_short_frames;
 volatile uint32_t n_trim_drops;
 volatile uint32_t n_trim_dups;
+volatile int32_t  catchup_frames;
+volatile uint32_t n_catchup_drops;
+volatile uint32_t n_catchup_dups;
 volatile uint32_t n_tsf_wide;
 volatile int64_t wifi_down_at;
 volatile int64_t rejoined_at;  /* 0 = the next anchor is not the first */

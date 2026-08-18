@@ -43,6 +43,9 @@ static int64_t next_play_at;
 static int64_t s_last_pkt_us;
 static int64_t s_steady_since;
 static int64_t s_wait_since;
+/* When the starving-ring hold in steer_timeline() began; 0 = not holding.
+ * See TIMELINE_HOLD_STARVE_MS. */
+static int64_t s_hold_since;
 
 #if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
 /*
@@ -253,58 +256,109 @@ static void steer_timeline(int64_t now, int64_t target)
     const int64_t err = next_play_at - target;
 
     if (llabs(err) > RESYNC_HARD_US) {
-        /* Far beyond anything a slew could close in reasonable time, so
-         * something has gone wrong that gradual correction will not fix.
-         * Jump, and say so -- this is the old behaviour, kept for the case
-         * it was right for. */
-        next_play_at = target;
-        s_slewing = false;
         /*
-         * Tell the satellites, which nothing used to do.
+         * HELD, NOT JUMPED, while the local ring is starving, since
+         * 2026-08-18. See TIMELINE_HOLD_STARVE_MS for the full argument:
+         * a starved ring manufactures this error all by itself, because
+         * next_play_at stops advancing while target keeps moving with
+         * `now`. Jumping re-stamps the fleet to fix delivery, and each
+         * jump arms a boundary every unit splices at -- on the 2026-08-18
+         * soak, five jumps in 45 s during a minute of source rate wander,
+         * four audible splices per unit, the rings then ballooned past
+         * 430 ms by the inserts. Held, the same excursion recovered on
+         * its own the moment the burst arrived.
          *
-         * A jump of up to RESYNC_HARD_US lands on every unit as a step in the
-         * stamps it is receiving, with no splice hint and -- being below
-         * PHASE_INSANE_US -- no re-anchor either. Each one then walks it off
-         * through its servo at 2.27 ms/s, which for a 300 ms step is over two
-         * minutes of every speaker being audibly in a different place.
+         * Held means held: no jump, no s_jump_arm, nothing but the one log
+         * line. If the error is still past saving when the ring refills,
+         * the jump below takes it on the next packet; if the burst has
+         * unwound it, nothing was re-stamped and no unit ever spliced.
+         * s_slewing is left exactly as it was, and the trailing nudge
+         * still runs: at 20 us/packet a residual slew during the hold is
+         * a rounding error either way.
          *
-         * NOT flagged on this packet. A boundary makes each unit splice by
-         * its own phase reading, and right now those readings describe the
-         * timeline that just stopped existing -- the hub's own included. The
-         * flag is armed and fires a few packets later, once the reading it
-         * will act on was taken after the discontinuity. SYNC_PHASE_HIST
-         * packets is the natural delay: it is how many readings the splice's
-         * median window holds, so waiting that long is waiting for the window
-         * to be clear of the jump.
+         * The give-up bounds a hold that never ends. The cleaner escape
+         * usually arrives first: a ring starved all the way to empty ends
+         * in CHUNK_UNDERRUN -> s_underrun_recover -> start_timeline(), a
+         * wholesale restart every satellite re-anchors on, rather than a
+         * step in the one that exists.
          */
-        s_jump_arm = SYNC_PHASE_HIST;
-        ESP_LOGW(TAG, "timeline off by %lld us -- too far to slew, jumping; "
-                      "flagging a boundary in %d packets",
-                 err, (int)s_jump_arm);
-    } else if (llabs(err) > RESYNC_US) {
-        if (!s_slewing) {
-            s_slewing = true;
-            s_slew_since = now;
+        const int32_t level_ms = (int32_t)((int64_t)(LOCAL_RING_BYTES -
+                xStreamBufferSpacesAvailable(local_ring)) * 1000
+                / ((int64_t)sample_rate * AUDIO_CHANNELS * 2));
+        const bool starving = level_ms < TIMELINE_HOLD_STARVE_MS;
+        bool held = false;
+        if (starving && (!s_hold_since ||
+                         now - s_hold_since < TIMELINE_HOLD_GIVE_UP_US)) {
+            /* ONE line per episode, not one per packet: this branch is
+             * reached on every send for as long as the starvation lasts. */
+            if (!s_hold_since) {
+                s_hold_since = now;
+                ESP_LOGW(TAG, "timeline off by %lld us but local ring at "
+                              "%ld ms -- holding the jump; the source is "
+                              "starving, not the clock",
+                         err, (long)level_ms);
+            }
+            held = true;
+        } else {
+            s_hold_since = 0;   /* ring recovered, or the hold outlived its bound */
         }
-        /*
-         * Only worth reporting if it PERSISTS. err oscillates with the
-         * burst pattern -- the source leaves a ~100 ms gap in every window,
-         * so the trough routinely reaches -132 ms against a 120 ms
-         * threshold and recovers with the next burst about a second later.
-         * Announcing each of those was seven alarms in ninety seconds for
-         * something entirely normal.
-         */
-        if (!s_slew_told && now - s_slew_since > 5000000) {
-            s_slew_told = true;
-            ESP_LOGW(TAG, "timeline off by %lld us for 5 s, slewing back", err);
+        if (!held) {
+            /* Far beyond anything a slew could close in reasonable time, so
+             * something has gone wrong that gradual correction will not fix.
+             * Jump, and say so -- this is the old behaviour, kept for the case
+             * it was right for. */
+            next_play_at = target;
+            s_slewing = false;
+            /*
+             * Tell the satellites, which nothing used to do.
+             *
+             * A jump of up to RESYNC_HARD_US lands on every unit as a step in the
+             * stamps it is receiving, with no splice hint and -- being below
+             * PHASE_INSANE_US -- no re-anchor either. Each one then walks it off
+             * through its servo at 2.27 ms/s, which for a 300 ms step is over two
+             * minutes of every speaker being audibly in a different place.
+             *
+             * NOT flagged on this packet. A boundary makes each unit splice by
+             * its own phase reading, and right now those readings describe the
+             * timeline that just stopped existing -- the hub's own included. The
+             * flag is armed and fires a few packets later, once the reading it
+             * will act on was taken after the discontinuity. SYNC_PHASE_HIST
+             * packets is the natural delay: it is how many readings the splice's
+             * median window holds, so waiting that long is waiting for the window
+             * to be clear of the jump.
+             */
+            s_jump_arm = SYNC_PHASE_HIST;
+            ESP_LOGW(TAG, "timeline off by %lld us -- too far to slew, jumping; "
+                          "flagging a boundary in %d packets",
+                     err, (int)s_jump_arm);
         }
-    } else if (s_slewing && llabs(err) < RESYNC_US / 4) {
-        /* Hysteresis, so it does not chatter in and out around the
-         * threshold. */
-        s_slewing = false;
-        if (s_slew_told) {
-            s_slew_told = false;
-            ESP_LOGW(TAG, "timeline back within %lld us", err);
+    } else {
+        s_hold_since = 0;   /* the excursion is over; re-arm the one-shot log */
+        if (llabs(err) > RESYNC_US) {
+            if (!s_slewing) {
+                s_slewing = true;
+                s_slew_since = now;
+            }
+            /*
+             * Only worth reporting if it PERSISTS. err oscillates with the
+             * burst pattern -- the source leaves a ~100 ms gap in every window,
+             * so the trough routinely reaches -132 ms against a 120 ms
+             * threshold and recovers with the next burst about a second later.
+             * Announcing each of those was seven alarms in ninety seconds for
+             * something entirely normal.
+             */
+            if (!s_slew_told && now - s_slew_since > 5000000) {
+                s_slew_told = true;
+                ESP_LOGW(TAG, "timeline off by %lld us for 5 s, slewing back", err);
+            }
+        } else if (s_slewing && llabs(err) < RESYNC_US / 4) {
+            /* Hysteresis, so it does not chatter in and out around the
+             * threshold. */
+            s_slewing = false;
+            if (s_slew_told) {
+                s_slew_told = false;
+                ESP_LOGW(TAG, "timeline back within %lld us", err);
+            }
         }
     }
 

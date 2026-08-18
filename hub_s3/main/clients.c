@@ -318,10 +318,30 @@ void streamer_send_vol(uint8_t volume)
  */
 void publish_frame(const vis_frame_t *f)
 {
+    /* PROACTIVE first, reactive second -- the order is the point.
+     *
+     * The pace gate stops a burst from forming at all: no two frame sends
+     * closer together than TX_FRAME_PACE_US, which in steady state (frames
+     * arriving on the analysis cadence) never binds, and during a decoder
+     * lump staggers the frames a quarter-period apart instead of letting them
+     * crowd the pool the audio shares. Analysis task only -- s_pace_at needs
+     * no locking for the same reason the congestion gate does not.
+     *
+     * The backoff gate below then handles the failure the pace cannot: a pool
+     * exhausted by something else (audio's own burst, probes) still yields
+     * the lane until it recovers. */
+    static int64_t s_pace_at;
+    const int64_t now = esp_timer_get_time();
+    if (now < s_pace_at) {
+        n_tx_pace_skip++;
+        return;
+    }
+    s_pace_at = now + TX_FRAME_PACE_US;
+
     /* Yield the instant the TX pool is exhausted: see TX_BACKOFF_US. fan_out() --
      * the audio path -- is never gated, so this is what keeps a frame burst off the
      * buffers audio is being refused. */
-    if (esp_timer_get_time() < s_tx_congested_until) {
+    if (now < s_tx_congested_until) {
         n_tx_cong_skip++;
         return;
     }
