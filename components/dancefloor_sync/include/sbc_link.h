@@ -160,8 +160,9 @@ typedef struct __attribute__((packed)) {
  *
  * The bridge is the only unit the phone talks to, so it is the only one that
  * can hear this, and it forwards rather than acts: the speakers apply it, at
- * the output, in audio_apply_volume(). A whole SPI frame for one byte, which is
- * fine -- a volume change is a human moving a slider, not an audio-rate event.
+ * the output, in audio_volume_write_i32(). A whole SPI frame for one byte, which
+ * is fine -- a volume change is a human moving a slider, not an audio-rate
+ * event.
  */
 typedef struct __attribute__((packed)) {
     uint8_t volume;

@@ -9,7 +9,7 @@ CFLAGS  := -std=c11 -Wall -Wextra -I../include -I.
 # curve -- which is exactly what happened when the taper was replaced.
 test_sync_proto: test_sync_proto.c ../sync_proto.c ../include/sync_proto.h \
                  ../include/audio_out.h ../include/sbc_link.h
-	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) test_sync_proto.c ../sync_proto.c -o $@
+	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) test_sync_proto.c ../sync_proto.c -lm -o $@
 
 test_audio_shift: test_audio_shift.c ../audio_shift.c ../include/audio_shift.h
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) test_audio_shift.c ../audio_shift.c -lm -o $@

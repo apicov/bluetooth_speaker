@@ -354,7 +354,7 @@ _Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.paylo
 
 /*
  * Playback volume, hub -> listeners. Applied at each unit's output by
- * audio_apply_volume(); see that for the taper and why it lives there.
+ * audio_volume_write_i32(); see that for the taper and why it lives there.
  *
  * ADDRESSED LIKE THE AUDIO, which under DANCEFLOOR_AUDIO_MCAST means the group
  * and not the client list. This paragraph used to say the opposite -- "unicast
