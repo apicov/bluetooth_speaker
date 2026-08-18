@@ -69,6 +69,21 @@ menu "Dancefloor LEDs"
             together the whole chain agrees, and if one lags it is obvious with
             no console and no wiring.
 
+            The same LED also carries whether the unit is on the floor at all,
+            because "dark" was previously two completely different answers
+            wearing one face -- a satellite that never found the hub looked
+            exactly like a joined one waiting for music. Three states now:
+
+              dark        not joined -- booting, or dropped off the AP
+              solid lit   joined, nothing playing
+              flashing    audio is being drawn, one flash per master second
+
+            Only the flash is worth comparing between units; the other two are
+            per-unit facts. A satellite drives the level through
+            visualiser_marker_set_link() from its wifi events. The hub is the AP
+            and has nothing to join, so it never calls it and its LED keeps the
+            original two states: dark, or flashing.
+
             It shows something nothing else does. Every existing measurement
             covers the AUDIO path -- the audio marker, AUDIO SYNC, TRACK
             DIVERGENCE. Between playback and the pixels sit the analysis stream
@@ -145,8 +160,11 @@ menu "Dancefloor LEDs"
 
             IT MATTERS MORE THAN IT LOOKS, because getting it wrong does not
             produce a dark LED -- it produces an INVERTED one, lit for the 960
-            ms between flashes and dark for the 40 ms of the flash itself. That
-            reads as a working marker until you notice every unit is showing one
+            ms between flashes and dark for the 40 ms of the flash itself. On a
+            satellite it also inverts the two idle states, so an unjoined unit
+            glows and a joined one sits dark -- which is the one reading that
+            makes a healthy floor look broken. The flash reads as a working
+            marker until you notice every unit is showing one
             gap per second rather than one flash, and two units disagreeing
             about this look exactly like a sync fault.
 

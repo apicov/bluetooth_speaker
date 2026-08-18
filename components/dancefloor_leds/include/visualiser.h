@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -92,6 +93,35 @@ const char *visualiser_source_name(void);
  * two consoles settle it.
  */
 int visualiser_hop(void);
+
+/*
+ * Tell the marker LED whether this unit is joined to the floor.
+ *
+ * The marker has three states and this supplies one bit of them:
+ *
+ *   dark          not joined -- booting, or dropped off the AP
+ *   solid lit     joined, nothing playing
+ *   flashing      audio is being drawn, one flash per master-clock second
+ *
+ * Which makes the LED answer the two questions asked of a satellite from
+ * across a dark field, in the order they are usually asked: is it on the
+ * floor at all, and is the floor in step. Before this it only answered the
+ * second, and a unit that never joined looked exactly like a joined unit
+ * with nothing playing.
+ *
+ * The flash itself is unchanged, and still the only thing the eye should be
+ * compared between units -- see CONFIG_DANCEFLOOR_ENABLE_LED_MARKER. What is
+ * new is the level BETWEEN flashes, which is dark while audio is flowing and
+ * lit while it is not.
+ *
+ * Safe from any task; it stores a flag the render task reads. A unit that
+ * never calls this -- the hub, which is the AP and has nothing to join --
+ * keeps the original behaviour exactly: dark whenever nothing is playing.
+ *
+ * A no-op unless CONFIG_DANCEFLOOR_ENABLE_LED_MARKER is set, so callers need
+ * no #ifdef of their own.
+ */
+void visualiser_marker_set_link(bool up);
 
 /* Brings up the strip and starts the analysis and render tasks. Call once. */
 void visualiser_start(void);

@@ -206,6 +206,52 @@ constexpr int LED_MARKER_OFF = 1;
 constexpr int LED_MARKER_ON  = 1;
 constexpr int LED_MARKER_OFF = 0;
 #endif
+
+/*
+ * Whether this unit is joined to the floor -- see visualiser_marker_set_link().
+ *
+ * Written from whatever task notices the join or the drop (on the satellite,
+ * the wifi event handler) and read only by the render task, which owns the pin.
+ * One bit, so a flag rather than a queue: the render task looks at it every nap
+ * and the worst a missed store costs is one 20 ms nap of a stale LED.
+ *
+ * False by default, which is what makes this change invisible on the hub. It
+ * never calls the setter, so its idle level stays LED_MARKER_OFF and its marker
+ * behaves exactly as it did before this existed.
+ */
+std::atomic<bool> s_marker_link{false};
+
+/*
+ * The one place the marker pin is written, and the level it currently shows.
+ *
+ * The marker used to be a flash and nothing else, so writing the pin at the two
+ * instants that mattered was the whole driver. It now has a level to hold
+ * BETWEEN flashes as well, and that level has to be re-asserted whenever the
+ * link changes -- which is a thing that happens while the render task is
+ * napping with nothing to draw. Written naively that is a gpio_set_level() on
+ * every nap of every idle unit forever; filtered here it is one write per
+ * actual change, and the callers get to say "show this" without tracking what
+ * is already shown.
+ *
+ * Render task only. The one write outside it is in visualiser_start(), before
+ * that task exists, and it leaves `shown` at -1 so the first real call always
+ * reaches the pin.
+ */
+void marker_write(int level)
+{
+    static int shown = -1;
+    if (level == shown) return;
+    shown = level;
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), level);
+}
+
+/* What the marker holds when no audio is being drawn: lit if this unit is on
+ * the floor, dark if it is not. The flash is drawn on top of this. */
+int marker_idle_level()
+{
+    return s_marker_link.load(std::memory_order_relaxed) ? LED_MARKER_ON
+                                                         : LED_MARKER_OFF;
+}
 #endif
 
 /* Applied to the pattern's output on the way to the strip. A device concern,
@@ -1075,6 +1121,21 @@ void render_task(void *arg)
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
     int64_t last_sec = -1;
     int     lower_in = -1;
+    /*
+     * When a frame was last drawn, and whether the marker has fallen back to
+     * showing the link because none has been for a while.
+     *
+     * Deliberately NOT drawn_at, which the strip's own idle path zeroes once it
+     * has blanked -- after that it can no longer say how long ago anything
+     * happened, which is precisely the question here. This one is only ever set
+     * forward, so "nothing for RENDER_IDLE_US" stays answerable indefinitely.
+     *
+     * Starts idle, at 0: at boot nothing has been drawn and the link is down,
+     * so the first thing the marker shows is dark, which is what a satellite
+     * still looking for the hub should look like.
+     */
+    int64_t marker_at   = 0;
+    bool    marker_idle = true;
 #endif
 
     while (true) {
@@ -1156,6 +1217,28 @@ void render_task(void *arg)
                 show(pixels);
                 bump(s_idle_dark);
             }
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+            /*
+             * Nothing has been drawn for long enough to call it stopped, so the
+             * marker stops reporting the timeline and goes back to reporting
+             * the link.
+             *
+             * The same half-second the strip goes dark on, and for the same
+             * reason: it is well past any gap ordinary delivery produces at 43+
+             * frames a second, and short enough that a stopped floor reads as
+             * stopped. Sharing the figure also keeps the two consistent -- the
+             * strip going dark and the LED going solid are one event.
+             *
+             * Re-asserted every nap, not once, because the link can change
+             * while the unit sits here with nothing to draw -- which is exactly
+             * the case this whole state exists to show. marker_write() makes
+             * the repeat free.
+             */
+            if (esp_timer_get_time() - marker_at > RENDER_IDLE_US) {
+                marker_idle = true;
+                marker_write(marker_idle_level());
+            }
+#endif
             vTaskDelay(pdMS_TO_TICKS(RENDER_NAP_MS));
             continue;
         }
@@ -1235,11 +1318,30 @@ void render_task(void *arg)
          * property of the clocks alone.
          */
         const int64_t sec = f.due_us / LED_MARKER_PERIOD_US;
+        marker_at = t0;
+        if (marker_idle) {
+            /*
+             * Audio has started. Leave the link level and drop to dark, so the
+             * flashes that follow are flashes against darkness rather than
+             * against a lit pin, where they would be invisible.
+             *
+             * The current second is ADOPTED rather than fired on. Firing here
+             * would raise a pin that is already lit on a joined unit, and the
+             * only visible edge would be the LOWER two frames later -- a first
+             * "flash" that reads backwards, and against a neighbouring unit
+             * reads as a sync fault. The cost is waiting up to one second for
+             * the first real flash, which is the correct thing to wait for:
+             * every unit is waiting for the same boundary.
+             */
+            marker_idle = false;
+            lower_in = -1;
+            last_sec = sec;
+            marker_write(LED_MARKER_OFF);
+        }
         if (sec != last_sec) {
             last_sec = sec;
             lower_in = LED_MARKER_BLOCKS_HIGH;
-            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
-                           LED_MARKER_ON);
+            marker_write(LED_MARKER_ON);
             /*
              * Say so for the first few, then go quiet.
              *
@@ -1259,8 +1361,10 @@ void render_task(void *arg)
                          CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
             }
         } else if (lower_in > 0 && --lower_in == 0) {
-            gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
-                           LED_MARKER_OFF);
+            /* Dark between flashes, not the link level: while audio is flowing
+             * the marker's job is the timeline, and holding it lit would leave
+             * nothing for the flash to stand out against. */
+            marker_write(LED_MARKER_OFF);
         }
 #endif
 
@@ -1290,6 +1394,17 @@ void render_task(void *arg)
 }
 
 }  // namespace
+
+void visualiser_marker_set_link(bool up)
+{
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+    s_marker_link.store(up, std::memory_order_relaxed);
+#else
+    /* Nothing to show it on. Still callable, so the unit that knows about the
+     * link does not have to know whether this build has an LED. */
+    (void)up;
+#endif
+}
 
 void visualiser_set_clock(int64_t (*master_to_local)(int64_t))
 {
@@ -1672,15 +1787,26 @@ void visualiser_start(void)
          * Drive it dark before anything else can look at it. gpio_config()
          * leaves an output at 0, which on an active-low LED is LIT -- so
          * without this the marker glows from boot and stays glowing until the
-         * first frame arrives to lower it. On a unit that never receives audio
-         * it would glow forever, which is the one state this LED must not have:
-         * a solid LED is what "no timeline" is supposed to look like.
+         * render task gets far enough to take the pin over.
+         *
+         * Dark is also the correct FIRST state under the three-state scheme:
+         * nothing has been joined and nothing has been drawn, and dark is what
+         * both of those look like. It used to be the correct state for a much
+         * stronger reason -- a solid LED was what "no timeline" looked like and
+         * so was the one thing this pin must never do. That is no longer true:
+         * solid now means joined and idle, and only visualiser_marker_set_link()
+         * can produce it.
+         *
+         * Written directly rather than through marker_write(), because that
+         * belongs to the render task which does not exist yet. It leaves
+         * `shown` at -1, so the task's first call reaches the pin whatever it
+         * asks for.
          */
         gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
                        LED_MARKER_OFF);
-        ESP_LOGW(TAG, "LED marker on GPIO %d, active %s, one flash per "
-                      "master-clock second -- every unit flashes together; "
-                      "nothing corrects on it",
+        ESP_LOGW(TAG, "LED marker on GPIO %d, active %s -- dark until joined, "
+                      "solid when joined and idle, one flash per master-clock "
+                      "second while playing; nothing corrects on it",
                  CONFIG_DANCEFLOOR_LED_MARKER_GPIO,
                  LED_MARKER_ON == 0 ? "low" : "high");
     }

@@ -54,6 +54,23 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (wifi_down_at == 0) {
             wifi_down_at = esp_timer_get_time();
         }
+        /*
+         * Off the floor, so the marker LED stops claiming otherwise.
+         *
+         * Said on every drop of a streak rather than only the first, unlike
+         * wifi_down_at above: that one is dating an outage and must not be
+         * restarted by a retry, while this is asserting a level and repeating
+         * it costs nothing.
+         *
+         * Nothing here waits for playback to notice. Audio outlives a drop by
+         * roughly the ring's depth, so the LED goes dark a few hundred ms
+         * before the flashes stop -- and it is the flashes that stop late, not
+         * this that goes early. During those few hundred ms the render task is
+         * still drawing, so the marker is still flashing and this level is not
+         * shown until it falls idle. That is deliberate: audio still flowing IS
+         * the link working, whatever the association says.
+         */
+        visualiser_marker_set_link(false);
         ESP_LOGW(TAG, "disconnected from \"%s\" (reason %d), retrying",
                  AP_SSID, d->reason);
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -73,6 +90,22 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             wifi_down_at = 0;
             rejoined_at = esp_timer_get_time();
         }
+        /*
+         * On the floor. The marker LED goes solid until audio starts, which is
+         * the first thing this unit can say from across a dark field without a
+         * console -- and the thing it could not say before, when a satellite
+         * that never found the hub and a satellite waiting for music were both
+         * simply dark.
+         *
+         * Here rather than at association, because a lease is the point at
+         * which the unit can actually be sent audio. It also repeats on every
+         * rejoin, which is what re-lights the LED after a drop.
+         *
+         * Safe this early: the setter only stores a flag, and the render task
+         * picks it up whenever it starts -- visualiser_start() runs after
+         * wifi_start_sta() and a fast lease can beat it here.
+         */
+        visualiser_marker_set_link(true);
         ESP_LOGI(TAG, "joined \"%s\", IP " IPSTR, AP_SSID, IP2STR(&e->ip_info.ip));
         /*
          * Said here, not where it happened. task_start() logs the failure at
