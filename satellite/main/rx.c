@@ -828,6 +828,9 @@ void rx_task(void *arg)
              * gain that amplifies instead of attenuating. */
             const uint8_t vol = v->volume > AUDIO_VOL_MAX ? AUDIO_VOL_MAX
                                                           : v->volume;
+            /* Before the change test below, so repeats count too -- see n_vol_rx
+             * in sat.h for why the repeats are the interesting half. */
+            n_vol_rx++;
             /* Repeated once per telemetry window, so say something only when it
              * moved -- this is the audio path's log discipline, and a line every
              * 5 s saying nothing changed is the mistake the RX counters exist to

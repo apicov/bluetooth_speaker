@@ -295,6 +295,7 @@ void streamer_send_vol(uint8_t volume)
         if (snapshot[i].last_seen) {
             sendto(sock, &msg, sizeof(msg), 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr));
+            n_vol_tx++;
         }
     }
 }

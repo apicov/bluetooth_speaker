@@ -786,6 +786,20 @@ extern volatile int32_t rate_trim_hz;
 extern volatile uint8_t audio_volume;
 
 /*
+ * MSG_VOL messages taken, REPEATS INCLUDED.
+ *
+ * Counted before the change test, not after, which is the whole point: the fault
+ * this exists to make visible is a unit that hears audio and never hears a level,
+ * and that unit's symptom is silence on this counter while the level it is
+ * playing at is stale. A counter that only moved on change could not tell that
+ * apart from a level nobody has touched.
+ *
+ * On the TRIM line as `vol-rx`, so tools/soak/capture.py's KEYNUM pass turns it
+ * into a metrics column with no parser change.
+ */
+extern volatile uint32_t n_vol_rx;
+
+/*
  * Frames the fine rate trim has dropped from, and duplicated into, the stream.
  *
  * The instrument for rate_trim_hz, in before the trim was ever flashed: a

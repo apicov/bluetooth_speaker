@@ -1047,6 +1047,23 @@ extern volatile int32_t rate_trim_hz;
  */
 extern volatile uint8_t audio_volume;
 
+/*
+ * MSG_VOL datagrams sent to listeners, REPEATS INCLUDED.
+ *
+ * Counted before any change test, which is what makes it useful: the fault it
+ * exists to expose is a unit playing audio at a level nobody told it, and that
+ * reads as a satellite whose own vol-rx sits still while this counter climbs. A
+ * counter that only moved on change could not tell that apart from a slider
+ * nobody touched.
+ *
+ * The other direction is counted in sbc_in.c, on that module's own line, with
+ * its siblings -- it does not read hub.h and is not going to start.
+ *
+ * On the TRIM line as `vol-tx`, which tools/soak/capture.py's KEYNUM pass turns
+ * into a metrics column with no parser change.
+ */
+extern volatile uint32_t n_vol_tx;
+
 /* What a retune costs -- see the note on the satellite's copy. The channel down
  * is measurable here; the discarded DMA buffer is not measurable anywhere in
  * software, because those frames were counted as played.

@@ -68,6 +68,11 @@ static spi_slave_transaction_t s_trans[NFRAMES];
  * that audio_in.c needed -- with no shared clock there is no rate to measure,
  * so what matters now is whether packets arrive intact. */
 static uint32_t s_packets, s_bad_hdr, s_bad_crc, s_short, s_gaps, s_decode_err, s_dec_crc;
+/* Volume frames taken, REPEATS INCLUDED -- the bridge re-states the level on a
+ * timer, so a link that is dropping them reads as this sitting still while the
+ * phone is plainly being used. Here rather than in hub.h with the streamer's
+ * n_vol_tx because this module does not read hub.h; it reports its own. */
+static uint32_t s_vol;
 static uint64_t s_pcm_samples;
 
 /*
@@ -219,6 +224,9 @@ static void rx_task(void *arg)
             if (hdr.kind == LINK_KIND_VOL) {
                 if (hdr.len == sizeof(link_vol_t)) {
                     const link_vol_t *v = (const link_vol_t *)payload;
+                    /* Before the streamer decides whether it changed anything --
+                     * see s_vol above for why repeats are counted too. */
+                    s_vol++;
                     /* Through the streamer's interface, like the metadata and
                      * the restart request above: this module reads the link and
                      * hands over, and does not touch playback state itself. */
@@ -400,10 +408,11 @@ rearm:
                 ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
                               "hdr %" PRIu32 " crc %" PRIu32 " short %" PRIu32
                               " gaps %" PRIu32 " dec %" PRIu32 " dcrc %" PRIu32
+                              " | vol %" PRIu32
                               " | fed-drop %" PRIu32 " B | max gap %" PRIu32 " us",
                          s_packets, info.sample_rate, info.channels, eff,
                          s_bad_hdr, s_bad_crc, s_short, s_gaps, s_decode_err,
-                         s_dec_crc, dropped, s_max_gap_us);
+                         s_dec_crc, s_vol, dropped, s_max_gap_us);
             }
             s_pcm_samples = 0;
             /* Rate the decoder actually produced, which is what the DAC must match. */
@@ -411,6 +420,7 @@ rearm:
             /* Per-window, not cumulative: a rising total tells you far less than
              * a rate, and cumulative counters made 500 k look worse than it was. */
             s_packets = s_bad_hdr = s_bad_crc = s_short = s_gaps = s_decode_err = s_dec_crc = 0;
+            s_vol = 0;
             s_max_gap_us = 0;
             next_report = now + 5000000;
         }

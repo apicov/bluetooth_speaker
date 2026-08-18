@@ -222,10 +222,11 @@ void telemetry_tick(void)
          */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
                       " frames | catchup-drops %" PRIu32 " catchup-dups %"
-                      PRIu32 " | retunes %" PRIu32 " coarse | volume %u/%d",
+                      PRIu32 " | retunes %" PRIu32 " coarse | volume %u/%d "
+                      "vol-tx %" PRIu32,
                  (long)rate_trim_hz, n_trim_drops, n_trim_dups,
                  n_catchup_drops, n_catchup_dups, n_retunes,
-                 audio_volume, AUDIO_VOL_MAX);
+                 audio_volume, AUDIO_VOL_MAX, n_vol_tx);
 
         ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
                       ", largest %u) | total %" PRIu32 " (largest %u)",
