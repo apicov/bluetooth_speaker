@@ -15,6 +15,7 @@
  *   ./pattern_lab track.wav                    live in the terminal
  *   ./pattern_lab track.wav --png out.png      whole track as an image
  *   ./pattern_lab track.wav --csv trace.csv    per-frame numbers for tuning
+ *   ./pattern_lab track.wav --no-tty --dump s  per-frame spec/mag/band for notebooks
  *   ./pattern_lab --list                       available patterns
  *
  * Feed it the WAVs that the desktop client writes -- it lives in its own
@@ -47,6 +48,10 @@ void usage()
         "  --brightness P   percent, as the firmware applies it (default 10)\n"
         "  --png FILE       write the whole track as an image, one row per frame\n"
         "  --csv FILE       write per-frame bands, flux, threshold and onsets\n"
+        "  --dump PREFIX    write per-frame spec (u8 x64), mag (f32 x512) and\n"
+        "                   band (f32 x4) as binary, plus a PREFIX.meta sidecar\n"
+        "                   carrying the grid -- usually with --no-tty; read back\n"
+        "                   with dump_load.py\n"
         "  --no-tty         skip the live terminal render\n"
         "  --speed X        terminal playback rate (default 1.0, 0 = as fast as possible)\n"
         "  --unit N         value of Frame::unit, for cross-unit effects (default 0)\n"
@@ -62,7 +67,7 @@ void usage()
 
 int main(int argc, char **argv)
 {
-    std::string wav_path, pattern_name, png_path, csv_path;
+    std::string wav_path, pattern_name, png_path, csv_path, dump_prefix;
     int  leds = 8, unit = 0, brightness = 10;
     bool tty = true, list = false;
     double speed = 1.0;
@@ -81,6 +86,7 @@ int main(int argc, char **argv)
         else if (a == "--brightness") brightness = std::stoi(next("--brightness"));
         else if (a == "--png")        png_path = next("--png");
         else if (a == "--csv")        csv_path = next("--csv");
+        else if (a == "--dump")       dump_prefix = next("--dump");
         else if (a == "--no-tty")     tty = false;
         else if (a == "--speed")      speed = std::stod(next("--speed"));
         else if (a == "--unit")       unit = std::stoi(next("--unit"));
@@ -232,6 +238,61 @@ int main(int argc, char **argv)
         std::fprintf(csv, "\n");
     }
 
+    /*
+     * The per-frame dump, written by the same loop that feeds the strips -- so
+     * what a notebook trains against is what the firmware computed, not a
+     * re-derivation of it.
+     *
+     * spec is byte-for-byte what a satellite's analyser lane is handed. mag is
+     * the one field of Frame that no later consumer could recover: it points
+     * into `analysis` and dies at the next process(), so this loop is the last
+     * place it exists. band rides along because the wire carries it at full
+     * float precision and it costs sixteen bytes.
+     *
+     * Binary rather than CSV because a float32 survives a decimal round-trip
+     * only at nine significant digits -- and pipeline.py's validator measures
+     * differences well below what a %.4f column could even hold. The sidecar
+     * carries the grid for the same reason the CSV's provenance line does: two
+     * dumps cut at different hops must not be quietly comparable, and the
+     * dtype strings let dump_load.py size the arrays if DF_SPEC_BINS or FFT_N
+     * ever change. Native byte order, which is little-endian everywhere this
+     * builds.
+     */
+    std::FILE *dump_spec = nullptr, *dump_mag = nullptr, *dump_band = nullptr;
+    if (!dump_prefix.empty()) {
+        const std::string spec_path = dump_prefix + ".spec.bin";
+        const std::string mag_path  = dump_prefix + ".mag.bin";
+        const std::string band_path = dump_prefix + ".band.bin";
+        dump_spec = std::fopen(spec_path.c_str(), "wb");
+        if (!dump_spec) { std::perror(spec_path.c_str()); return 1; }
+        dump_mag = std::fopen(mag_path.c_str(), "wb");
+        if (!dump_mag)  { std::perror(mag_path.c_str()); return 1; }
+        dump_band = std::fopen(band_path.c_str(), "wb");
+        if (!dump_band) { std::perror(band_path.c_str()); return 1; }
+
+        const std::string meta_path = dump_prefix + ".meta";
+        std::FILE *meta = std::fopen(meta_path.c_str(), "w");
+        if (!meta) { std::perror(meta_path.c_str()); return 1; }
+        std::fprintf(meta,
+            "# pattern_lab per-frame dump; written by --dump, read by dump_load.py\n"
+            "# Row b is block b. index is 0..frames-1 and due_us is\n"
+            "# index*hop*1000000/rate in int64 -- derivable, but recorded so the\n"
+            "# derivation lives in one place.\n"
+            "window=%d\n"
+            "hop=%d\n"
+            "rate=%d\n"
+            "frames=%zu\n"
+            "spec_bins=%d\n"
+            "spec_dtype=u1\n"
+            "mag_bins=%d\n"
+            "mag_dtype=<f4\n"
+            "band_bins=%d\n"
+            "band_dtype=<f4\n",
+            df::FFT_N, df::HOP_N, wav.rate, blocks,
+            df::SPEC_BINS, df::BINS, BEAT_BANDS);
+        std::fclose(meta);
+    }
+
     TtyRender tty_render;
     if (tty) tty_render.begin(leds, pattern->name());
 
@@ -251,6 +312,15 @@ int main(int argc, char **argv)
         df::Frame f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
         if (f.onset) onsets++;
         if (f.boom)  booms++;
+
+        /* Before anything else touches the frame: f.mag points into `analysis`
+         * and is only readable until the next process(), which the dump is the
+         * whole reason to be here for -- see the block above. */
+        if (dump_spec) {
+            std::fwrite(f.spec, 1, df::SPEC_BINS, dump_spec);
+            std::fwrite(f.mag, sizeof(float), df::BINS, dump_mag);
+            std::fwrite(f.band, sizeof(float), BEAT_BANDS, dump_band);
+        }
 
         /* The same lanes the boards run, from the same source files, over the
          * same bytes -- f.spec is what travels to a satellite, so this drives
@@ -306,6 +376,15 @@ int main(int argc, char **argv)
 
     if (tty) tty_render.end();
     if (csv) { std::fclose(csv); std::fprintf(stderr, "wrote %s\n", csv_path.c_str()); }
+    if (dump_spec) {
+        std::fclose(dump_spec);
+        std::fclose(dump_mag);
+        std::fclose(dump_band);
+        std::fprintf(stderr, "wrote %s.spec.bin, %s.mag.bin, %s.band.bin, %s.meta "
+                             "(%zu frames)\n",
+                     dump_prefix.c_str(), dump_prefix.c_str(), dump_prefix.c_str(),
+                     dump_prefix.c_str(), blocks);
+    }
 
     if (!png_path.empty()) {
         if (png_write(png_path, image.data(), leds, int(blocks), err)) {
