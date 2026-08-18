@@ -43,16 +43,10 @@ static IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *fu
 
 void telemetry_tick(void)
 {
-    /*
-     * Repeat the volume to every listener once per window.
-     *
-     * Not because it changes -- sbc_in sends it the instant the phone moves it
-     * -- but because a satellite that joined afterwards, or missed that one
-     * packet, would otherwise play at a stale level until the next time somebody
-     * touched the slider. Two bytes per client at 0.2/s is cheaper than a join
-     * handshake and cannot get out of step.
-     */
-    streamer_send_vol(audio_volume);
+    /* The volume repeat used to be here, at one per 5 s window. It is a 1 Hz
+     * esp_timer now (vol_repeat_start(), clients.c): the interval stopped being
+     * a pure economy question once a unit that has not been told a level stays
+     * silent, because the interval became the silence. */
 
     /* Age the send list even when nothing is playing. Aging used to happen only
      * inside the audio send loop, so a satellite that vanished while the stream

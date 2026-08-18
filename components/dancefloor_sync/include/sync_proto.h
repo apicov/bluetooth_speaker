@@ -356,15 +356,21 @@ _Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.paylo
  * Playback volume, hub -> listeners. Applied at each unit's output by
  * audio_apply_volume(); see that for the taper and why it lives there.
  *
- * Sent when the phone changes it AND repeated every telemetry window, which is
- * what makes a satellite that joined late, or missed the change, converge on
- * the right level rather than sitting at a stale one forever. Two bytes at
- * 0.2/s is not worth a smarter scheme, and this way there is no join handshake
- * to get wrong.
+ * ADDRESSED LIKE THE AUDIO, which under DANCEFLOOR_AUDIO_MCAST means the group
+ * and not the client list. This paragraph used to say the opposite -- "unicast
+ * per client, like meta and unlike audio" -- and that was the written-down
+ * version of a real fault: a unit plays by being in the group, not by being on
+ * the list, so anything that cleared its slot left it hearing the stream and no
+ * longer hearing the level. streamer_send_vol() has the full argument.
  *
- * Unicast per client, like meta and unlike audio: it is rare, it must not be
- * held for a DTIM burst behind the audio it would delay, and a satellite that
- * missed one gets the next within the window.
+ * The reason given for unicast was that this "must not be held for a DTIM burst
+ * behind the audio it would delay". Not true on this build: both roles set
+ * WIFI_PS_NONE, so nothing is buffered for a DTIM at all.
+ *
+ * Sent three times when the phone changes it, pushed once when a satellite is
+ * given an address, and repeated once a second regardless -- which is what
+ * replaces the link-layer ACK a group frame does not get, and what bounds how
+ * long a unit that has never been told a level stays silent.
  */
 typedef struct __attribute__((packed)) {
     uint8_t type;           /* MSG_VOL */

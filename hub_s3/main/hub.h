@@ -889,6 +889,22 @@ extern int32_t s_refill_frames;
  */
 #define CLIENT_TIMEOUT_US 2000000
 
+/*
+ * How the volume is repeated, and how often.
+ *
+ * VOL_REPEAT_US is the interval of the standing repeat, and under the
+ * silent-until-told rule it is also the worst-case silence a joining satellite
+ * sits through when client_joined()'s push is lost. One second of two bytes is
+ * nothing to send and a short thing to hear.
+ *
+ * VOL_CHANGE_REPEATS covers the moment the level is provably wrong everywhere
+ * else. Group frames are not retried, so a change is sent more than once rather
+ * than trusted once; three is enough that losing all of them needs the link to
+ * be failing at a rate the audio would already be reporting.
+ */
+#define VOL_REPEAT_US     1000000
+#define VOL_CHANGE_REPEATS 3
+
 typedef struct {
     struct sockaddr_in addr;
     int64_t last_seen;
