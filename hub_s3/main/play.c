@@ -777,6 +777,10 @@ static uint8_t vol_now(void)
     return audio_vol_effective(audio_volume, audio_vol_known, due);
 }
 
+/* Zeroed at playback start, so a stream fades in over ~46 ms rather than
+ * starting on an edge. Playback-task only; see audio_ramp_t. */
+static audio_ramp_t s_out_ramp;
+
 static void write_chunk(void)
 {
     /* Last thing before the DMA buffer, and deliberately after every
@@ -792,7 +796,8 @@ static void write_chunk(void)
      * and the frame count is untouched. audio_out.h has the exactness argument
      * and the reason the ring stays 16-bit. */
     static audio_out_sample_t out32[AUDIO_FRAMES * AUDIO_CHANNELS];
-    audio_volume_write_i32(out32, (const int16_t *)chunk, AUDIO_FRAMES, vol_now());
+    audio_volume_write_i32(out32, (const int16_t *)chunk, AUDIO_FRAMES, vol_now(),
+                           &s_out_ramp);
     size_t written = 0;
     const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
     if (i2s_channel_write(i2s_tx, out32, sizeof(out32), &written,
@@ -826,6 +831,8 @@ static void write_chunk(void)
  */
 static void begin_playback(void)
 {
+/* Out of silence, not out of whatever the last stream ended at. */
+s_out_ramp.cur = 0;
 /* samples_played counts from the first sample played, which is the
  * first sample fed after the ring was reset at timeline start. Both
  * counters therefore share an origin -- do NOT reset s_samples_in here,

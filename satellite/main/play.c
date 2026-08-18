@@ -281,6 +281,9 @@ void play_task(void *arg)
          * the phase loop. Seeded so the first pass has a sane value. */
         int64_t wrote_at = esp_timer_get_time();
 
+        /* Out of silence, not out of whatever the last stream ended at. */
+        write_audio_reset_ramp();
+
         /* Something is now meant to be keeping the DAC fed, which is the only
          * condition under which a starved channel is a fault. See `playing`. */
         playing = true;

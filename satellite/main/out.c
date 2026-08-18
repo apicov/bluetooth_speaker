@@ -200,11 +200,25 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
  *
  * The staging buffer is static, not on the stack: 2 kB against a 4 kB task.
  */
+static audio_ramp_t s_ramp;
+
 void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol)
 {
     static audio_out_sample_t out[AUDIO_FRAMES * AUDIO_CHANNELS];
-    audio_volume_write_i32(out, frames, n_frames, vol);
+    audio_volume_write_i32(out, frames, n_frames, vol, &s_ramp);
     dac_write((const uint8_t *)out, n_frames * AUDIO_OUT_FRAME_BYTES);
+}
+
+/*
+ * Start every stream from silence.
+ *
+ * The DAC has just been handed its first samples after a park, so the ramp is
+ * what stands between the room and a cold-start edge. It costs 46 ms of fade at
+ * the top of a stream that is about to be spliced into position anyway.
+ */
+void write_audio_reset_ramp(void)
+{
+    s_ramp.cur = 0;
 }
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER

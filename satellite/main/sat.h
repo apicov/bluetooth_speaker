@@ -969,6 +969,10 @@ void i2s_start(uint32_t rate);
  * A running total, not a rate; a retune contributes by construction. */
 uint32_t dma_starve_count(void);
 void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol);
+
+/* Put the output gain back to silence, so a stream starts with a fade in
+ * rather than an edge. Called by playback when it begins feeding. */
+void write_audio_reset_ramp(void);
 void retune_output(uint32_t hz);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 int64_t vis_master_to_local(int64_t master_us);
