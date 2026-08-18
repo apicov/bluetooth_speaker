@@ -968,7 +968,7 @@ void i2s_start(uint32_t rate);
 /* How many times the DMA has run out of audio to send -- see on_tx_starved().
  * A running total, not a rate; a retune contributes by construction. */
 uint32_t dma_starve_count(void);
-void write_audio(const uint8_t *pcm, size_t bytes);
+void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol);
 void retune_output(uint32_t hz);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 int64_t vis_master_to_local(int64_t master_us);

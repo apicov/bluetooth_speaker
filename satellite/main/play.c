@@ -707,11 +707,23 @@ void play_task(void *arg)
                                         / (int32_t)stream_rate));
                         adj = room > 0 ? -room : 0;
                     }
-                    static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
+                    /* RING domain, unlike the hub's copy: write_audio() takes
+                     * a frame count and does the widening itself, so the trap
+                     * of a byte count that no longer matches the output width
+                     * does not exist on this side. */
+                    static const int16_t quiet[AUDIO_FRAMES * AUDIO_CHANNELS] = {0};
+                    _Static_assert(sizeof(quiet) == AUDIO_CHUNK_BYTES,
+                                   "the splice's silence is one ring-domain chunk");
                     int32_t left = -adj;
                     while (left > 0) {
                         int32_t n = left > (int32_t)AUDIO_FRAMES ? (int32_t)AUDIO_FRAMES : left;
-                        write_audio(quiet, (size_t)n * AUDIO_CHANNELS * sizeof(int16_t));
+                        /* In FRAMES. This used to pass a byte count computed
+                         * from sizeof(int16_t), and the output is 32-bit now --
+                         * an insert is a TIMING correction, so getting that
+                         * wrong would have silently halved every insert while
+                         * sounding exactly the same. Counting in frames is what
+                         * makes the mistake unavailable. */
+                        write_audio(quiet, (size_t)n, AUDIO_VOL_MAX);
                         left -= n;
                     }
                     applied = adj;
@@ -793,20 +805,17 @@ void play_task(void *arg)
              * samples_played and the phase queue are looking at the same
              * timeline whatever this unit's speaker is placed as.
              *
-             * Here rather than inside write_audio() because that is also called
-             * with the const `quiet` buffer a splice inserts, which must not be
-             * written to -- and needs nothing doing to it, since every mode
-             * maps silence to silence. */
+             * Still out here rather than inside write_audio(), unlike the level:
+             * this one is IN PLACE, and write_audio() is also called with the
+             * const `quiet` buffer a splice inserts. Silence needs nothing doing
+             * to it either way, since every mode maps silence to silence. */
             audio_apply_channel_mode((int16_t *)chunk, AUDIO_FRAMES);
-            /* Beside the channel mode and for the same reasons: in place, on
-             * the last buffer before the output, frame count untouched. The hub
-             * sends full scale and this level separately, and both units run the
-             * same integer taper, so the two speakers match. Not inside
-             * write_audio() because a splice calls that with the const `quiet`
-             * buffer -- and silence needs no attenuating. */
-            audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, vol_now());
-
-            write_audio(chunk, sizeof(chunk));
+            /* The level is applied inside write_audio() now, with the widening
+             * to 32-bit, because that conversion is out of place and the const
+             * `quiet` buffer can therefore go through it. The hub sends full
+             * scale and the level separately, and both units run the same
+             * integer taper, so the two speakers match. */
+            write_audio((const int16_t *)chunk, AUDIO_FRAMES, vol_now());
             /* Immediately: it is the instant the next pass dates its phase
              * reading from. */
             wrote_at = esp_timer_get_time();

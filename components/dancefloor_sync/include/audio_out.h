@@ -131,6 +131,67 @@ static inline void audio_apply_volume(int16_t *frames, size_t n_frames, uint8_t 
 }
 
 /*
+ * THE OUTPUT IS 32-BIT, AND THE RING IS NOT. Two byte-currencies, kept apart.
+ *
+ * AUDIO_CHUNK_BYTES (sync_proto.h) stays the RING domain: int16 frames, what the
+ * stream is made of, what samples_played counts, what audio_shift_chunk() moves
+ * around. AUDIO_OUT_* below is the DAC domain, and the only place a byte count
+ * crosses between them is the conversion in this header.
+ *
+ * WHY WIDEN AT ALL. Attenuating a 16-bit sample into 16 bits spends the
+ * attenuation out of the signal: at -37 dB, which is 15/127 on the taper, under
+ * ten of the sixteen bits survive and everything below 71 truncates to 0 or -1.
+ * That is not a quiet version of the music, it is a distorted one, and what it
+ * discards it discards as signal-correlated error rather than as noise -- which
+ * is why a quiet passage at a low setting stops sounding like anything at all.
+ * Widening first makes the multiply EXACT: all sixteen bits of programme
+ * material reach the DAC at every level, and the only thing attenuation changes
+ * is how far above the DAC's own fixed noise floor they sit.
+ *
+ * The frame COUNT is untouched by all of this, which is the property that keeps
+ * it safe here. samples_played, the phase queue, the splice arithmetic and the
+ * rate servo count frames, and a frame is still a frame; only its width on the
+ * wire to the DAC changed, at the last possible moment, after every counter has
+ * been updated.
+ */
+typedef int32_t audio_out_sample_t;
+#define AUDIO_OUT_FRAME_BYTES (AUDIO_CHANNELS * (int)sizeof(audio_out_sample_t))
+#define AUDIO_OUT_CHUNK_BYTES (AUDIO_FRAMES * AUDIO_OUT_FRAME_BYTES)
+
+/*
+ * Widen n_frames of interleaved int16 into the 32-bit output buffer, applying
+ * the level on the way.
+ *
+ * OUT OF PLACE, which is what lets the splice's `const quiet` buffer go through
+ * exactly the same path as real audio. The gain used to have to sit outside the
+ * write for that reason; it does not any more, and silence needs widening even
+ * though it needs no attenuating.
+ *
+ * THE MULTIPLY CANNOT OVERFLOW, and it is worth showing rather than asserting.
+ * The gain is q15 with unity 32768, so the doubling below puts unity at exactly
+ * 1 << 16:
+ *
+ *     in = -32768, g = 32768:  -1073741824 * 2 = -2147483648 = INT32_MIN, exact
+ *     in = +32767, g = 32768:   1073709056 * 2 =  2147418112 < INT32_MAX
+ *
+ * Every other (in, g) is smaller in magnitude than one of those two, so there is
+ * no saturation branch because there is nothing to saturate. There is no
+ * rounding term either, and no dither: nothing is discarded, so there is no
+ * quantisation error to round or to shape. That absence is deliberate and this
+ * paragraph is why it is not an oversight.
+ */
+static inline void audio_volume_write_i32(audio_out_sample_t *out,
+                                          const int16_t *in,
+                                          size_t n_frames, uint8_t vol)
+{
+    const int32_t g = audio_volume_q15(vol);
+    const size_t n = n_frames * AUDIO_CHANNELS;
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (int32_t)in[i] * g * 2;
+    }
+}
+
+/*
  * What to play when nobody has said how loud: NOTHING, for a while.
  *
  * "Never been told a level" and "was told full scale" used to be the same state,

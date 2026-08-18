@@ -636,12 +636,19 @@ static void apply_track_boundary(void)
                                 / (int32_t)sample_rate));
                 adj = room > 0 ? -room : 0;
             }
-            static const uint8_t quiet[AUDIO_CHUNK_BYTES] = {0};
+            /* Sized in the DAC domain, because that is what it is written to.
+             * An insert is a TIMING correction, so a byte count still computed
+             * from sizeof(int16_t) would have silently halved every insert while
+             * sounding exactly the same -- silence is silence at any width. The
+             * assert is the guard, since no ear could be. */
+            static const audio_out_sample_t quiet[AUDIO_FRAMES * AUDIO_CHANNELS] = {0};
+            _Static_assert(sizeof(quiet) == AUDIO_OUT_CHUNK_BYTES,
+                           "the splice's silence must be sized in output samples");
             int32_t left = -adj;
             size_t w = 0;
             while (left > 0) {
                 int32_t n = left > AUDIO_FRAMES ? AUDIO_FRAMES : left;
-                size_t bytes = (size_t)n * AUDIO_CHANNELS * sizeof(int16_t);
+                size_t bytes = (size_t)n * AUDIO_OUT_FRAME_BYTES;
                 i2s_channel_write(i2s_tx, quiet, bytes, &w, portMAX_DELAY);
                 left -= n;
             }
@@ -780,16 +787,21 @@ static void write_chunk(void)
     /* Beside the channel mode and for the same reasons: in place, on the last
      * buffer before the output, frame count untouched. What went to the
      * satellites was full scale; each unit attenuates its own. */
-    audio_apply_volume((int16_t *)chunk, AUDIO_FRAMES, vol_now());
+    /* Widened to the DAC's 32 bits with the level folded in -- out of place,
+     * into a static staging buffer, so the ring-domain chunk is left as it is
+     * and the frame count is untouched. audio_out.h has the exactness argument
+     * and the reason the ring stays 16-bit. */
+    static audio_out_sample_t out32[AUDIO_FRAMES * AUDIO_CHANNELS];
+    audio_volume_write_i32(out32, (const int16_t *)chunk, AUDIO_FRAMES, vol_now());
     size_t written = 0;
     const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
-    if (i2s_channel_write(i2s_tx, chunk, sizeof(chunk), &written,
+    if (i2s_channel_write(i2s_tx, out32, sizeof(out32), &written,
                           portMAX_DELAY) != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
     if (s_refill_active) {
         if (esp_timer_get_time() - w0 < REFILL_FAST_US) {
-            s_refill_frames += (int32_t)(written / (AUDIO_CHANNELS * sizeof(int16_t)));
+            s_refill_frames += (int32_t)(written / AUDIO_OUT_FRAME_BYTES);
         } else {
             s_refill_active = false;
             ESP_LOGW(TAG, "REFILL after start: %ld frames (%ld ms) before a "

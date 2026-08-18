@@ -127,7 +127,7 @@ void i2s_start(uint32_t rate)
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = CONFIG_DANCEFLOOR_I2S_BCK_PIN,
@@ -161,7 +161,7 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
     }
     if (s_refill_active) {
         if (esp_timer_get_time() - w0 < REFILL_FAST_US) {
-            s_refill_frames += (int32_t)(written / (AUDIO_CHANNELS * sizeof(int16_t)));
+            s_refill_frames += (int32_t)(written / AUDIO_OUT_FRAME_BYTES);
         } else {
             s_refill_active = false;
             ESP_LOGW(TAG, "REFILL after start: %ld frames (%ld ms) before a write "
@@ -188,9 +188,23 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
  * Anyone putting this back must put the scheduling back too, or the lights lead
  * the sound by the whole buffer again.
  */
-void write_audio(const uint8_t *pcm, size_t bytes)
+/*
+ * The one place the sample width changes, and the only caller of dac_write().
+ *
+ * Takes RING-domain frames and hands the DAC domain-converted ones, so every
+ * caller keeps counting in frames and no byte count crosses the boundary
+ * outside this function. The level is applied here now rather than by the
+ * caller: the conversion is out of place, so the splice's `const quiet` buffer
+ * -- which must not be written to, and which needs widening even though it
+ * needs no attenuating -- goes through the same path as real audio.
+ *
+ * The staging buffer is static, not on the stack: 2 kB against a 4 kB task.
+ */
+void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol)
 {
-    dac_write(pcm, bytes);
+    static audio_out_sample_t out[AUDIO_FRAMES * AUDIO_CHANNELS];
+    audio_volume_write_i32(out, frames, n_frames, vol);
+    dac_write((const uint8_t *)out, n_frames * AUDIO_OUT_FRAME_BYTES);
 }
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
