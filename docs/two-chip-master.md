@@ -123,12 +123,17 @@ Three separate firmwares:
 . ~/.espressif/v6.0.1/esp-idf/export.sh
 
 cd bt_bridge && idf.py -p /dev/ttyUSB0 flash monitor   # chip A, master enclosure
-cd hub       && idf.py -p /dev/ttyUSB1 flash monitor   # chip B, master enclosure
-cd satellite && idf.py -p /dev/ttyUSB2 flash monitor   # each satellite
+cd hub_s3    && idf.py -p /dev/ttyACM0 flash           # chip B, master enclosure
+tools/sat.py flash classic|s3                          # each satellite
 ```
 
 `bt_bridge` needs the 4 MB partition table (Bluedroid alone is ~950 kB). The hub
 and satellite are far smaller.
+
+Chip B is `hub_s3/` on an ESP32-S3; the classic-ESP32 `hub/` this said until
+2026-08-18 was retired and deleted on 2026-08-12. Its console is a separate
+UART0 wire at 921600, not the port it flashes over — see
+[`../hub_s3/README.md`](../hub_s3/README.md).
 
 ---
 

@@ -179,14 +179,14 @@ Every unit drives its own DAC — the hub is a full speaker, not a base station 
 and in every case **the ESP32 is the I2S master**, generating the clocks the DAC
 follows.
 
-| PCM5102A | classic hub | classic satellite | S3 hub (`hub_s3/`) | S3 satellite |
-|---|---|---|---|---|
-| BCK | GPIO 26 | GPIO 26 | **GPIO 7**, pad `D8` | **GPIO 7**, pad `D8` |
-| LRCK | GPIO 27 | GPIO 27 | **GPIO 8**, pad `D9` | **GPIO 8**, pad `D9` |
-| DIN | GPIO 25 | GPIO 25 | **GPIO 9**, pad `D10` | **GPIO 9**, pad `D10` |
-| VIN | 3V3 | 3V3 | 3V3 | 3V3 |
-| GND | GND | GND | GND | GND |
-| SCK | GND | GND | GND | GND |
+| PCM5102A | classic satellite | S3 hub (`hub_s3/`) | S3 satellite |
+|---|---|---|---|
+| BCK | GPIO 26 | **GPIO 7**, pad `D8` | **GPIO 7**, pad `D8` |
+| LRCK | GPIO 27 | **GPIO 8**, pad `D9` | **GPIO 8**, pad `D9` |
+| DIN | GPIO 25 | **GPIO 9**, pad `D10` | **GPIO 9**, pad `D10` |
+| VIN | 3V3 | 3V3 | 3V3 |
+| GND | GND | GND | GND |
+| SCK | GND | GND | GND |
 
 The last two columns are the same three pins because `hub_s3/` and `satellite/`
 read the same three Kconfig symbols, and the satellite's S3 defaults pin them to
@@ -230,12 +230,11 @@ future target would have had to carry. A unit needs a PCM5102A.
 ### The NeoPixel strip
 
 Every unit drives its own strip — the hub is a full speaker, not a base station
-— so this is identical on a hub, an S3 hub and a satellite except for the data
-pin.
+— so this is identical on the hub and a satellite except for the data pin.
 
-| | classic hub | S3 hub | classic satellite | S3 satellite |
-|---|---|---|---|---|
-| WS2812 data | **GPIO 18** | **GPIO 1**, pad `D0` | GPIO 18 | **GPIO 1**, pad `D0` |
+| | S3 hub | classic satellite | S3 satellite |
+|---|---|---|---|
+| WS2812 data | **GPIO 1**, pad `D0` | GPIO 18 | **GPIO 1**, pad `D0` |
 
 ```
    ESP32 / XIAO            74AHCT125            WS2812 strip
@@ -286,13 +285,13 @@ closes through — enabling or disabling them changes no behaviour, only whether
 the measurement exists.
 
 **There are two different markers and they are easy to confuse.** One measures
-audio, one measures light, and GPIO 21 swaps roles between the two hub builds:
+audio and one measures light:
 
-| | | classic hub | S3 hub |
-|---|---|---|---|
-| Audio marker | out | GPIO 4 | GPIO 4, pad `D3` |
-| Audio monitor | in | GPIO 21 | GPIO 5, pad `D4` |
-| LED marker | out | GPIO 2 | GPIO 2, pad `D1` |
+| | | S3 hub (`hub_s3/`) |
+|---|---|---|
+| Audio marker | out | GPIO 4, pad `D3` |
+| Audio monitor | in | GPIO 5, pad `D4` |
+| LED marker | out | GPIO 2, pad `D1` |
 
 **The audio marker pair** (`DANCEFLOOR_ENABLE_MARKER`, under *Dancefloor hub*)
 measures how far apart two units' *audio* really is, at the speaker rather than
@@ -380,19 +379,20 @@ Needs ESP-IDF v6.
 . ~/.espressif/v6.0.1/esp-idf/export.sh
 
 cd bt_bridge && idf.py -p /dev/ttyUSB0 flash monitor   # chip A
-cd hub       && idf.py -p /dev/ttyUSB1 flash monitor   # chip B
-cd satellite && idf.py -p /dev/ttyUSB2 flash monitor   # each satellite
+cd hub_s3    && idf.py -p /dev/ttyACM0 flash           # chip B, see below
+tools/sat.py flash classic|s3                          # each satellite
 ```
 
-For an S3 hub, use `hub_s3/` in place of `hub/` — same firmware, different
-target and pin map:
+**The hub takes two ports, not one.** Flashing goes over `ttyACM0` — the S3's own
+USB peripheral wired straight to the connector, so it disappears on every reboot
+— and the console does not: it is UART0 at 921600 on a separate wire. So
+`flash monitor` on one port does not work here, and
+[`hub_s3/README.md`](hub_s3/README.md) has the recipe and the reason.
 
-```sh
-cd hub_s3 && idf.py set-target esp32s3 && idf.py -p /dev/ttyACM0 flash monitor
-```
-
-Note `ttyACM0`, not `ttyUSB`. The XIAO has no USB-UART bridge — the S3's USB
-peripheral is the connector — so the port disappears on every reboot.
+**The satellite is one tree built two ways**, classic and S3, and the S3 form
+needs `-DSDKCONFIG` on *every* invocation or the build directory is silently
+reconfigured from the classic config. `tools/sat.py` assembles the line; see
+[`satellite/README.md`](satellite/README.md).
 
 Pins, LED count, brightness and pattern are under `idf.py menuconfig` ->
 **Dancefloor \***.

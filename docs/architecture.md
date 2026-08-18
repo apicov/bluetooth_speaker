@@ -1105,9 +1105,18 @@ another.
 . ~/.espressif/v6.0.1/esp-idf/export.sh
 
 cd bt_bridge && idf.py -p /dev/ttyUSB0 flash monitor   # chip A
-cd hub       && idf.py -p /dev/ttyUSB1 flash monitor   # chip B
-cd satellite && idf.py -p /dev/ttyUSB2 flash monitor   # each satellite
+cd hub_s3    && idf.py -p /dev/ttyACM0 flash           # chip B, two ports
+tools/sat.py flash classic|s3                          # each satellite
 ```
+
+`hub/` was the classic-ESP32 chip B, and this block said `cd hub` until
+2026-08-18 — six days after that directory was deleted, which is how long a
+build recipe can name a directory that is not there before anyone runs it from
+the top. `hub_s3/` is the only hub and it is not a drop-in substitution: it
+flashes over `ttyACM0` and its console is a separate UART0 wire at 921600, so
+`flash monitor` on one port does not work (`hub_s3/README.md`). The satellite
+needs `tools/sat.py` because its S3 form is not plain `idf.py`
+(`satellite/README.md`).
 
 Host-side unit tests need no hardware:
 

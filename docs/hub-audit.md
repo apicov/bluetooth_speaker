@@ -328,7 +328,7 @@ not after: it shrinks what has to move.
 
 `hub/` was deleted on 2026-08-12.
 
-- **`hub_s3/README.md`** opens "The same hub firmware as [`../hub`](../hub)",
+- **`hub_s3/README.md`** opens "The same hub firmware as `../hub`",
   tells the reader `diff -r ../hub .` "is meant to stay short enough to read",
   carries a "classic hub" column in two tables, and closes with "fold it back
   into `../hub`". Every one of those instructions now points at nothing.
