@@ -40,6 +40,12 @@
 static audio_msg_t msg;
 static uint32_t seq;
 static int64_t next_play_at;
+/*
+ * The sub-microsecond remainder of the advance below, in 1/sample_rate of a
+ * microsecond. See where it is spent for why a timeline that throws it away
+ * loses 93 ms an hour.
+ */
+static int64_t s_play_at_rem;
 static int64_t s_last_pkt_us;
 static int64_t s_steady_since;
 static int64_t s_wait_since;
@@ -185,6 +191,10 @@ static void start_timeline(int64_t target)
      * was read, so an early return above leaves it set for the next packet. */
     s_underrun_recover = false;
     next_play_at = target;
+    /* The carry described the timeline this call replaces. Same reason
+     * s_trim_owed is reset at a playback start in both play.c files: a fraction
+     * banked against a position nothing occupies any more is not owed. */
+    s_play_at_rem = 0;
     /*
      * local_start is assigned at the END of this call, not here.
      *
@@ -308,6 +318,7 @@ static void steer_timeline(int64_t now, int64_t target)
              * Jump, and say so -- this is the old behaviour, kept for the case
              * it was right for. */
             next_play_at = target;
+            s_play_at_rem = 0;      /* same reason as in start_timeline() */
             s_slewing = false;
             /*
              * Tell the satellites, which nothing used to do.
@@ -490,6 +501,31 @@ static void record_phase_point(bool started)
  * own function below so a reviewer reads one mode at a time; fan_out() is the
  * switch between them.
  */
+/*
+ * What became of one packet's sends, so fan_out() can time the gap between
+ * packets that actually REACHED THE AIR.
+ *
+ * The distinction is not academic and this counter was wrong without it. On the
+ * 2026-08-19 19:36 soak the hub refused 48 audio sends inside one minute --
+ * `tx-fail 51 (48 audio) -- Not enough space` -- while the satellite recorded
+ * arrival gaps of 742, 472 and 505 ms and starved its DAC for 1.75 s. The gauge
+ * read a perfectly normal 58 ms throughout, because fan_out() was CALLED on
+ * schedule every 20 ms; it was the sendto inside it that failed. An instrument
+ * built to say whether the hub emitted evenly answered "yes" for the one event
+ * where it emphatically had not.
+ *
+ * NO_LISTENERS is its own answer rather than folded into REFUSED, because the
+ * two mean opposite things about the link: nothing was refused, there was simply
+ * nobody to send to, and an empty floor must not accumulate a gap that then
+ * reads as a spike the moment a satellite joins. It can only arise on the
+ * unicast path; the group address is always a destination.
+ */
+typedef enum {
+    FANOUT_SENT,          /* at least one sendto took it */
+    FANOUT_REFUSED,       /* every sendto was refused -- a real hole */
+    FANOUT_NO_LISTENERS,  /* nothing to send to, so nothing to measure */
+} fanout_result_t;
+
 #if CONFIG_DANCEFLOOR_AUDIO_MCAST
 /*
  * One group-addressed sendto for the audio. Group frames are never acknowledged
@@ -502,7 +538,7 @@ static void record_phase_point(bool started)
  * as AUDIO specifically, because a refused audio packet is the only kind of
  * refusal the room can hear.
  */
-static void send_audio_to_group(size_t bytes)
+static fanout_result_t send_audio_to_group(size_t bytes)
 {
     /* MSG_DONTWAIT, not flags=0: this runs in the SBC receive task that also
      * decodes and feeds the hub's OWN local ring. A multicast sendto has no ACK
@@ -518,7 +554,9 @@ static void send_audio_to_group(size_t bytes)
     if (sendto(sock, &msg, bytes, MSG_DONTWAIT,
                (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
         tx_fail_note_audio(errno);
+        return FANOUT_REFUSED;
     }
+    return FANOUT_SENT;
 }
 #else
 /*
@@ -530,20 +568,31 @@ static void send_audio_to_group(size_t bytes)
  * Airtime now scales with speaker count, which is affordable at ~42 kB/s of
  * SBC and would not have been at 179 kB/s of PCM.
  */
-static void send_audio_to_clients(size_t bytes)
+static fanout_result_t send_audio_to_clients(size_t bytes)
 {
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
+    /* One satellite taking it is the packet reaching the air: the gauge asks
+     * whether the hub emitted, not whether every listener was served, and a
+     * per-listener failure is already counted by tx_fail_note_audio. */
+    bool any_listener = false, any_sent = false;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!snapshot[i].last_seen) {
             continue;
         }
+        any_listener = true;
         if (sendto(sock, &msg, bytes, 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
             tx_fail_note_audio(errno);
+        } else {
+            any_sent = true;
         }
     }
+    if (!any_listener) {
+        return FANOUT_NO_LISTENERS;
+    }
+    return any_sent ? FANOUT_SENT : FANOUT_REFUSED;
 }
 #endif
 
@@ -562,10 +611,52 @@ static void fan_out(size_t bytes, int64_t now)
     s_audio_pkts++;
     clients_age(now);
 #if CONFIG_DANCEFLOOR_AUDIO_MCAST
-    send_audio_to_group(bytes);
+    const fanout_result_t r = send_audio_to_group(bytes);
 #else
-    send_audio_to_clients(bytes);
+    const fanout_result_t r = send_audio_to_clients(bytes);
 #endif
+
+    /*
+     * How far apart two audio packets actually REACHED THE AIR -- the hub's
+     * half of the satellite's arrival gauges (sat.h, rx_gap_max_us).
+     *
+     * The satellite can see a 200 ms hole in its arrivals and cannot tell
+     * whether the packets were sent late or delayed on the way. This is the
+     * other end of that question, and it has to be measured on this side
+     * because this is the only place that knows when the hub let go of one.
+     * Steady state is the ~20 ms of one SBC packet, with the source's own
+     * lumpiness on top: the 2026-08-19 soak read 54-77 ms per window against a
+     * satellite seeing 39-95, which is the two ends agreeing that the air adds
+     * nothing.
+     *
+     * AFTER THE SEND, AND ONLY ON SUCCESS. It used to sit before it, timing
+     * calls rather than transmissions, and fanout_result_t's comment has the
+     * soak where that made the gauge say "even" through the worst minute in the
+     * capture. A refused packet now leaves the previous stamp standing, so the
+     * next success measures the WHOLE hole -- which is exactly the reading the
+     * satellite saw and this end did not.
+     *
+     * NO_LISTENERS resets the stamp instead: there is no hole when there is
+     * nobody to send to, and carrying one across an empty floor would report a
+     * spike at the moment a satellite joined.
+     *
+     * A gauge, cleared by the window that prints it.
+     */
+    static int64_t s_fanout_prev_at;
+    if (r == FANOUT_NO_LISTENERS) {
+        s_fanout_prev_at = 0;
+        return;
+    }
+    if (r != FANOUT_SENT) {
+        return;                     /* refused: the hole is still open */
+    }
+    if (s_fanout_prev_at) {
+        const int64_t gap = now - s_fanout_prev_at;
+        if (gap > n_fanout_gap_max_us) {
+            n_fanout_gap_max_us = (int32_t)(gap > INT32_MAX ? INT32_MAX : gap);
+        }
+    }
+    s_fanout_prev_at = now;
 }
 
 
@@ -633,6 +724,29 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     record_phase_point(started);
 
     msg.play_at = next_play_at;
+    /*
+     * How much lead this packet is going out with -- see n_lead_min_us in hub.h
+     * for what it is paired against and why it was the missing half.
+     *
+     * Here, at the stamp, and against the `now` read at the top of this call:
+     * that is the same instant the satellite's arrival lead is measured from at
+     * the other end, so the two subtract to a transit time. Everything between
+     * this line and the sendto is microseconds of FEC assembly, so it does not
+     * matter which side of it this sits.
+     */
+    {
+        const int64_t lead = next_play_at - now;
+        /* Refused rather than clamped, exactly as the satellite's copy is: a
+         * gauge that clamps reports its own rail as a measurement, which cost
+         * a whole run's summary on the 2026-08-19 23:19 soak. This end cannot
+         * see the offset step that did it there -- both terms are this board's
+         * own clock -- but the two ends must not disagree about what a lead is,
+         * and a bound that never fires is the cheap half of that. */
+        if (lead <= LEAD_INSANE_US && lead >= -LEAD_INSANE_US &&
+            lead < n_lead_min_us) {
+            n_lead_min_us = (int32_t)lead;
+        }
+    }
     memcpy(msg.payload, sbc, len);
 
     size_t bytes = AUDIO_MSG_BYTES(len);
@@ -696,9 +810,43 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     fec_prev[0].valid = true;
 #endif
 
-    /* The timeline advances by the audio actually sent, not by wall clock --
-     * stamping "now + lead" each time would fold task jitter into playback. */
-    next_play_at += (int64_t)frames * 1000000LL / (int64_t)sample_rate;
+    /*
+     * The timeline advances by the audio actually sent, not by wall clock --
+     * stamping "now + lead" each time would fold task jitter into playback.
+     *
+     * THE REMAINDER IS CARRIED, and throwing it away was the fault behind the
+     * whole "the floor loses sync every few minutes" complaint. This line runs
+     * ~50 times a second forever, and `frames` is a whole number of decoded SBC
+     * frames -- a multiple of the codec's 16/32/48/64/96/128 samples -- so the
+     * division is exact only when `frames` is a multiple of 441, which no SBC
+     * frame count ever is. 896 frames is 20317.4603 us and used to store 20317;
+     * 768 is 17414.9660 and stored 17414. Half a microsecond a packet, 26 us a
+     * second, 26 ppm, 93 ms an hour.
+     *
+     * What that bought, on the 2026-08-19 18:36 soak: the lead in front of every
+     * stamp shrank at 122 ms/hour (measured -122.2 on the hub's own ring and
+     * -121.5 on the satellite's ring-low, two independent estimators agreeing to
+     * three digits). Nothing corrects it -- steer_timeline() above only slews
+     * past RESYNC_US, 150 ms, and the servo's depth net only clamps past 120 ms,
+     * so the drift lives entirely inside both deadbands. After 45 minutes the
+     * satellite's margin was 87 ms, an ordinary 93 ms delivery gap emptied its
+     * ring, the DAC played auto_clear silence, and the catch-up drain corrected
+     * the resulting lateness at +3.1% for nine seconds. That is what the room
+     * heard, and it began here.
+     *
+     * Both symptoms have this sign: a next_play_at that advances slower than the
+     * audio it describes carries less lead than LEAD_US to the satellites, and
+     * starts this unit's own playback sooner relative to the audio fed
+     * (local_start below), so the local ring drains too.
+     *
+     * The accumulator is the same shape as the fine trim's TRIM_ONE_FRAME in
+     * both play.c files, and for the same reason: a correction far below the
+     * unit of the thing being corrected has to be banked until it is worth one.
+     * Exact over any number of packets -- the loss becomes zero, not smaller.
+     */
+    const int64_t advance = (int64_t)frames * 1000000LL + s_play_at_rem;
+    next_play_at += advance / (int64_t)sample_rate;
+    s_play_at_rem = advance % (int64_t)sample_rate;
 
     /*
      * Our own speaker joins the timeline, on the audio that will be at position

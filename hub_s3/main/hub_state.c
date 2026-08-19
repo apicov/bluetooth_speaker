@@ -49,6 +49,8 @@ volatile uint32_t s_audio_pkts;
 volatile uint32_t n_tx_cong_skip;
 volatile int64_t s_tx_congested_until;
 volatile uint32_t n_tx_pace_skip;
+volatile int32_t n_fanout_gap_max_us;
+volatile int32_t n_lead_min_us = LEAD_UNSEEN;
 volatile uint32_t n_underruns;
 volatile uint32_t n_restarts;
 volatile uint32_t n_splices;

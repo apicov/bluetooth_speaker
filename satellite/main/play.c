@@ -334,6 +334,29 @@ void play_task(void *arg)
                 : (shift < 0) ? sizeof(chunk) - frame_bytes : sizeof(chunk);
 
             hw_play = uxTaskGetStackHighWaterMark(NULL);   /* only valid in-task */
+            /*
+             * The shallowest the ring got, which is the number that ties a
+             * delivery hole to what the DAC did about it. See rx_lead_min_us in
+             * sat.h for what the pair is for.
+             *
+             * BEFORE the read, not after. After it, a pass that blocked on an
+             * empty ring measures the burst that unblocked it -- the refill,
+             * which is the one thing a low-water mark must not report. Before
+             * it, this is the depth the DAC actually had in hand, and it reads
+             * 0 for exactly the passes that starved.
+             *
+             * The same expression as chunk_shift() and step_report_ring, and
+             * cheap enough to take every pass: one word off the stream buffer
+             * every 5.8 ms.
+             */
+            {
+                const int32_t level_ms = (int32_t)((int64_t)(RING_BYTES -
+                        (int64_t)xStreamBufferSpacesAvailable(ring)) * 1000
+                        / ((int64_t)stream_rate * AUDIO_CHANNELS * 2));
+                if (level_ms < ring_low_ms) {
+                    ring_low_ms = level_ms;
+                }
+            }
             uint8_t *const dest = cu ? (uint8_t *)s_cu_in : chunk;
             size_t got = xStreamBufferReceive(ring, dest, want, pdMS_TO_TICKS(500));
             if (got == 0) {

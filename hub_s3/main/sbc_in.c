@@ -415,7 +415,28 @@ rearm:
                          s_dec_crc, s_vol, dropped, s_max_gap_us);
             }
             s_pcm_samples = 0;
-            /* Rate the decoder actually produced, which is what the DAC must match. */
+            /*
+             * The DECLARED rate from the SBC header, which is what the DAC, the
+             * timeline and the LED conversion are all keyed to. It is not `eff`
+             * above, and the comment here used to say it was.
+             *
+             * AND `eff` MUST NOT BE SUBSTITUTED, which is the obvious next idea
+             * and does not work. Across the 2026-08-19 18:36 soak it read
+             * 44097.6 +- 10.1 Hz with a standard deviation of 138 -- and that
+             * scatter is not the clock, it is this window's own boundary: one
+             * SBC packet is ~882 frames against the 220500 in five seconds, so
+             * whether the boundary falls before or after a packet is +-0.4%,
+             * against the 0.31% observed. Feeding it here would retune the DAC
+             * on quantisation noise a hundred times larger than the ~1 Hz that
+             * would be worth correcting.
+             *
+             * Measuring the source rate for real means counting frames BETWEEN
+             * PACKET ARRIVALS over minutes, where that quantisation cancels.
+             * Nothing needs it yet: the 26 ppm the timeline used to lose was
+             * arithmetic, not the source (see timeline.c's advance), and what is
+             * left after fixing that is what decides whether this is worth
+             * building.
+             */
             streamer_set_sample_rate(info.sample_rate ? info.sample_rate : 44100);
             /* Per-window, not cumulative: a rising total tells you far less than
              * a rate, and cumulative counters made 500 k look worse than it was. */

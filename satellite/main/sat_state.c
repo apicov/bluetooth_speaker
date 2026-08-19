@@ -83,6 +83,12 @@ volatile uint32_t n_anchor_soon;  /* anchors refused, one just happened */
 volatile uint32_t n_phase_drop;
 volatile uint32_t n_short_reads;
 volatile uint32_t n_short_frames;
+volatile uint32_t n_audio_rx;
+volatile int32_t  rx_gap_max_us;
+volatile uint32_t rx_burst_max;
+volatile int32_t  rx_lead_min_us = ARRIVAL_UNSEEN;
+volatile uint32_t n_lead_insane;
+volatile int32_t  ring_low_ms    = ARRIVAL_UNSEEN;
 volatile uint32_t n_trim_drops;
 volatile uint32_t n_trim_dups;
 volatile int32_t  catchup_frames;

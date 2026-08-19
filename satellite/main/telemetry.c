@@ -200,6 +200,94 @@ void telemetry_tick(void)
     fec_err_told = fec_err_now;
     short_frames_told = short_frames_now;
 
+    /*
+     * HOW THE AUDIO ARRIVED, and what the DAC did about it.
+     *
+     * UNCONDITIONAL, unlike the RX line above, and that is the point rather
+     * than an oversight. These are gauges: the interesting reading is a
+     * maximum against a steady state, so a window that prints nothing is
+     * indistinguishable from a window that was never measured. The TSF line
+     * carries the same lesson in its own comment -- twice in this experiment a
+     * diagnostic failed by staying quiet -- and the cost here is one line per
+     * CONFIG_DANCEFLOOR_LOG_PERIOD_S on a console that already carries several.
+     *
+     * WHAT A HEALTHY WINDOW LOOKS LIKE: ~250 packets over 5 s, gap max 20-30
+     * ms, burst max 1-2, lead min near the hub's LEAD_US of 250 ms, ring low
+     * near RING_TARGET_MS, starved 0 ms. A steady-state line that does not read
+     * like that is a bug in the measurement, and it is much cheaper to find
+     * before a soak than in one.
+     *
+     * WHAT TO READ WHEN IT IS NOT: gap max ~= the phase step beside it, with
+     * lead min collapsed toward zero, means the hub stamped on time and the
+     * transport held the packets. gap max the same size with lead min still
+     * near 250 ms means they were stamped late and the fault is upstream of the
+     * air -- compare the hub's own fan-out gap, which is the other half of the
+     * pair. Either way ring low and starved say what it cost.
+     *
+     * Cleared as they are read, so each line is its own window. The read and
+     * the clear are not atomic against the tasks that write them; losing one
+     * sample of a maximum to that race costs a diagnostic nothing, which is why
+     * these are gauges and the counters beside them are not.
+     */
+    static uint32_t audio_rx_told, starve_told, lead_insane_told;
+    const uint32_t audio_rx_now = n_audio_rx, starve_now = dma_starve_count();
+    const uint32_t lead_insane_now = n_lead_insane;
+    const int32_t gap_max = rx_gap_max_us;
+    const uint32_t burst_max = rx_burst_max;
+    const int32_t lead_min = rx_lead_min_us;
+    const int32_t ring_low = ring_low_ms;
+    rx_gap_max_us = 0;
+    rx_burst_max = 0;
+    rx_lead_min_us = ARRIVAL_UNSEEN;
+    ring_low_ms = ARRIVAL_UNSEEN;
+    /*
+     * Each starve callback is one DMA descriptor's worth of digital zero, and
+     * i2s_start() sets dma_frame_num to AUDIO_FRAMES -- so the count converts
+     * to the milliseconds of silence the room actually got. That conversion is
+     * the whole reason the figure moves here as well as onto HEALTH: as a bare
+     * count it needs arithmetic against a constant in another file before it
+     * can be compared with the phase step printed beside it.
+     */
+    const uint32_t starved_ms = (starve_now - starve_told) * AUDIO_FRAMES
+                              * 1000 / stream_rate;
+    /*
+     * The two minima print as text so "nothing measured" and "measured zero"
+     * cannot be read as each other. A window with no audio in it has no lead,
+     * and a window where the ring hit zero is the reading the line exists for;
+     * a single number would have to spell one of them with the other's value.
+     */
+    char lead_s[16], ring_s[16];
+    if (lead_min == ARRIVAL_UNSEEN) {
+        snprintf(lead_s, sizeof(lead_s), "none");
+    } else {
+        snprintf(lead_s, sizeof(lead_s), "%+ld ms", (long)(lead_min / 1000));
+    }
+    if (ring_low == ARRIVAL_UNSEEN) {
+        snprintf(ring_s, sizeof(ring_s), "none");
+    } else {
+        snprintf(ring_s, sizeof(ring_s), "%ld ms", (long)ring_low);
+    }
+    /*
+     * KEY THEN NUMBER, hyphenated, like ring-full and dma-starve and every other
+     * figure on these lines. tools/soak/capture.py scans for exactly that shape
+     * and turns each pair into a metrics.csv row, so "gap max 214" would land as
+     * a metric called `max` and collide with `burst max` on the same line. The
+     * house style is not decoration here; it is the wire format.
+     *
+     * "ARRIVAL 5s:" is literal, as "RX 5s:" above it is, because capture.py
+     * classifies on a literal prefix. The two windows are the same window and
+     * are labelled the same way.
+     */
+    ESP_LOGW(TAG, "ARRIVAL 5s: pkts %" PRIu32 " | gap-max %ld ms | "
+                  "burst-max %" PRIu32 " | lead-min %s | lead-drop %" PRIu32
+                  " | ring-low %s | starved %" PRIu32 " ms",
+             audio_rx_now - audio_rx_told,
+             (long)(gap_max / 1000), burst_max, lead_s,
+             lead_insane_now - lead_insane_told, ring_s, starved_ms);
+    audio_rx_told = audio_rx_now;
+    starve_told = starve_now;
+    lead_insane_told = lead_insane_now;
+
     /* Soak line, every 60 s, ahead of the streaming check below: if audio
      * has stopped, that is when the heap and the counters matter most.
      * Totals, not rates -- see the hub's copy. */

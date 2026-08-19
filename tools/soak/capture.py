@@ -86,6 +86,7 @@ KINDS = [
     ("TRIM:", "trim"),
     ("MEM:", "mem"),
     ("RX 5s:", "rx5s"),
+    ("ARRIVAL 5s:", "arrival"),
     ("TSF:", "tsf"),
     ("servo:", "servo"),
     ("TRACK DIVERGENCE", "divergence"),

@@ -581,6 +581,98 @@ extern volatile uint32_t n_phase_drop;
  */
 extern volatile uint32_t n_short_reads;
 extern volatile uint32_t n_short_frames;
+
+/*
+ * HOW AUDIO ARRIVES, as opposed to whether it arrives at all -- the measurement
+ * this unit did not have, and the one the 2026-08-19 soak needed.
+ *
+ * That soak recorded nine phase steps of +35 to +205 ms on this unit with the
+ * hub clean throughout: `local ring 230-295 ms`, phase within +-6 ms, tx-fail 0
+ * in 57 of 59 windows. Every step reported `buffer 0 ms`, and dma_starve_count()
+ * moved by the step size divided by a descriptor period -- so the ring emptied,
+ * the play task blocked, and auto_clear put digital zero on the DAC for as long
+ * as the hole lasted. Silence takes DAC time that samples_played does not count,
+ * which is what makes the unit permanently late and arms the catch-up drain the
+ * room hears as a semitone of pitch.
+ *
+ * What nothing could say is WHO HELD THE PACKETS. Every loss counter read zero
+ * -- seq-drop, decode-err, recv-err, wifi-drops, fec-err -- and the ring went
+ * from empty to 425 ms of a 464 ms capacity inside one window, dropping decoded
+ * blocks as ring-full at the far end of it. Nothing was lost; something was
+ * delayed and then released in a lump. Whether the lump formed in the hub's
+ * transmit path or on the air is the question, and neither unit measured the
+ * arrival cadence that would answer it.
+ *
+ * THE LEAD IS THE DISCRIMINATOR, and it costs no protocol change: audio_msg_t
+ * already carries play_at on the master clock, and rx_task already timestamps
+ * every datagram the instant recvfrom() returns. So
+ *
+ *     lead = play_at - (arrival converted to master)
+ *
+ * is how much of the hub's LEAD_US survived the trip. In steady state it is
+ * ~250 ms. If a gap in arrivals comes with a COLLAPSED lead, the hub stamped
+ * those packets on time and the transport held them. If the gap comes with the
+ * lead still near 250 ms, they were stamped late and the fault is upstream of
+ * the air. The hub's own fan-out interval (hub.h, n_fanout_gap_max_us) is the
+ * other half of that comparison.
+ *
+ * GAUGES, NOT COUNTERS: each is the extreme seen since the telemetry task last
+ * read it, and the telemetry task clears it as it reads. That is the same
+ * arrangement the TSF line's span_max already uses, and for the same reason --
+ * a maximum summed across windows is not a maximum of anything. rx_task is the
+ * only writer of the first three and the play task the only writer of the
+ * fourth, so the race is one-sided: a clear that lands between a reader's load
+ * and its store costs one window one sample, which is a price a diagnostic can
+ * pay and a counter cannot. n_audio_rx is a plain cumulative counter like its
+ * neighbours above, differenced for the window.
+ *
+ * The sentinel on the two minima is INT32_MAX, meaning "nothing measured this
+ * window" -- distinct from a measured zero, which is exactly the reading that
+ * matters. The line says so rather than printing a number nothing stands
+ * behind.
+ */
+#define ARRIVAL_UNSEEN INT32_MAX
+extern volatile uint32_t n_audio_rx;      /* audio datagrams taken */
+extern volatile int32_t  rx_gap_max_us;   /* longest silence between two of them */
+extern volatile uint32_t rx_burst_max;    /* longest run arriving < RX_BURST_US apart */
+extern volatile int32_t  rx_lead_min_us;  /* least of play_at - arrival, in master us */
+extern volatile uint32_t n_lead_insane;   /* ...and readings refused as not-a-lead */
+extern volatile int32_t  ring_low_ms;     /* shallowest the play task found the ring */
+
+/*
+ * Close enough together to be one release rather than two arrivals.
+ *
+ * Packets are stamped ~20 ms apart and paced by the hub's DAC, so anything
+ * under a millisecond or two did not travel independently: it came out of a
+ * queue that had been holding it. Two is comfortably clear of the ~20 ms
+ * cadence and of the jitter around it, and low enough that a merely early
+ * packet does not read as a burst.
+ */
+#define RX_BURST_US 2000
+
+/*
+ * Beyond this a lead reading is not a lead, and is REFUSED rather than clamped.
+ *
+ * The bound is PHASE_INSANE_US for the reason that constant already exists: at
+ * that size the number is not describing delivery, it is describing a timeline
+ * this unit is no longer on. A real lead lives inside LEAD_US plus the hub's
+ * RESYNC_US of wander, and the worst genuine reading ever recorded is -365 ms.
+ *
+ * MEASURED, on the 2026-08-19 23:19 soak. The hub was reflashed while this unit
+ * stayed up; it reconnected, and the first packets of the new stream were dated
+ * against an offset still describing the hub that had gone -- the TSF line beside
+ * it reads `steps tsf -11693006470 us`, an 11693-second step. The lead came out
+ * at about -11693 s, hit the int32 clamp, and printed as `lead-min -2147483 ms`.
+ * One sample then owned the window's minimum AND the whole run's summary, which
+ * reported `lead-min worst -2147483 ms` across 29 otherwise clean minutes.
+ *
+ * This is the same failure play.c's PHASE_INSANE_US branch was written for --
+ * "an hour of error wrapped to -699 seconds, the smoothing overflowed on top of
+ * it, and the servo asked for a 4.29 GHz sample rate" -- reappearing in a
+ * diagnostic instead of in the servo. A gauge that clamps is a gauge that lies
+ * about its own worst case, so this one refuses and says how often.
+ */
+#define LEAD_INSANE_US PHASE_INSANE_US
 /*
  * TSF samples whose read pair took longer than TSF_SPAN_MAX_US -- i.e. samples
  * something preempted between the two counter reads, so the offset they carry

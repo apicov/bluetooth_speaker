@@ -43,8 +43,15 @@ void streamer_set_sample_rate(uint32_t hz)
      * 1% threshold: measurement noise is ~0.3%, and retuning glitches audio.
      */
     /* Big initial mismatch (44100 nominal vs ~42600 actual) is corrected once,
-     * immediately. Everything finer is left to the servo, which uses the buffer
-     * level rather than the noisy rate estimate. */
+     * immediately. Everything finer is left to the servo.
+     *
+     * WHICH SERVOES PHASE, not the buffer level -- this said "the buffer level
+     * rather than the noisy rate estimate" and neither half was true of the
+     * code. df_servo_step() derives its correction purely from the phase EMA and
+     * consults depth only as a clamp past +-120 ms. That matters to a reader
+     * here because it is exactly why a slow drift inside that band went
+     * uncorrected for 45 minutes on the 2026-08-19 soak: nothing was watching
+     * depth, and the thing that was watching -- phase -- was fine. */
     if (i2s_tx && (hz > tx_rate + tx_rate / 100 || hz < tx_rate - tx_rate / 100)) {
         retune_dac(hz);
     } else {

@@ -10,8 +10,9 @@ exists to answer, in the order they matter:
   3. the rate trim             is it running, at the rate it claims, and stable
   4. phase                     where each unit settled and how far it wandered
   5. buffer depth              a slow drift is what a continuous trim can cause
-  6. heap                      the long-run question architecture.md 17 names
-  7. the source                stalls, which look like unit faults and are not
+  6. delivery                  whether audio arrived evenly, and what a hole cost
+  7. heap                      the long-run question architecture.md 17 names
+  8. the source                stalls, which look like unit faults and are not
 
 REBOOTS ARE HANDLED, and this is the part worth knowing about before trusting a
 number. Every counter on a HEALTH line is cumulative SINCE BOOT, so if a board
@@ -130,6 +131,20 @@ def counter_total(df, unit, metric):
 def gauge(df, unit, kind, metric):
     s = df[(df["unit"] == unit) & (df["kind"] == kind) & (df["metric"] == metric)]
     return s[["wall_s", "value"]].reset_index(drop=True) if not s.empty else None
+
+
+def nearest(df, wall_s):
+    """The value of `df` sampled closest in time to `wall_s`, or nan.
+
+    The lines being compared are printed by different tasks on different boards,
+    so they never share a timestamp; matching on the nearest one is what lets a
+    starved window on the satellite be read against the hub's fan-out gap for
+    the same few seconds.
+    """
+    if df is None or df.empty:
+        return float("nan")
+    i = (df["wall_s"] - wall_s).abs().values.argmin()
+    return df["value"].iloc[i]
 
 
 def fmt_dur(seconds):
@@ -287,7 +302,102 @@ def main():
         print(f"  {u}: {v.min():.0f}..{v.max():.0f} ms  median {v.median():.0f}"
               f"   trend {slope:+.1f} ms/hour{flag}")
 
-    # ---- 6. heap ------------------------------------------------------------
+    # ---- 6. delivery --------------------------------------------------------
+    head("DELIVERY  (did the audio arrive evenly, and what it cost when it did not)")
+    #
+    # The question this section exists to answer, and why it is not the buffer
+    # depth above:
+    #
+    # On the 2026-08-19 soak a satellite took nine phase steps of +35 to +205 ms
+    # while the hub stayed inside +-6 ms with tx-fail 0. Every step reported an
+    # empty ring, and dma-starve moved by the step size -- so the DAC played
+    # auto_clear silence for the length of the hole, which is time the timeline
+    # does not give back, which arms the catch-up drain the room hears as a
+    # semitone of pitch on one speaker and not the other.
+    #
+    # Nothing was LOST: seq-drop, decode-err, recv-err, wifi-drops and fec-err
+    # all read zero, and the ring went from empty to 425 of its 464 ms inside one
+    # window. So packets were held and released in a lump, and the only open
+    # question was where the lump formed. These four numbers answer it:
+    #
+    #   gap-max   longest silence between two arrivals   steady ~20 ms
+    #   lead-min  least of play_at minus arrival         steady ~LEAD_US (250 ms)
+    #   ring-low  shallowest the play task found         steady ~RING_TARGET_MS
+    #   starved   ms of digital zero the DAC emitted     steady 0
+    #
+    # A gap with the lead COLLAPSED means the hub stamped on time and the
+    # transport held them. The same gap with the lead still near 250 means they
+    # were stamped late, and the hub's own fanout-gap-max says so from the other
+    # end.
+    arr = met[met["kind"] == "arrival"]
+    if arr.empty:
+        print("  No ARRIVAL lines -- the units predate this instrument.")
+    else:
+        for u in sorted(arr["unit"].unique()):
+            g = gauge(met, u, "arrival", "gap-max")
+            ld = gauge(met, u, "arrival", "lead-min")
+            rl = gauge(met, u, "arrival", "ring-low")
+            st = gauge(met, u, "arrival", "starved")
+            bm = gauge(met, u, "arrival", "burst-max")
+            if g is None or g.empty:
+                continue
+            print(f"  {u}:")
+            print(f"      gap-max    median {g['value'].median():.0f} ms"
+                  f"   worst {g['value'].max():.0f} ms")
+            if bm is not None and not bm.empty:
+                print(f"      burst-max  median {bm['value'].median():.0f}"
+                      f"   worst {bm['value'].max():.0f} packets released together")
+            if ld is not None and not ld.empty:
+                print(f"      lead-min   median {ld['value'].median():.0f} ms"
+                      f"   worst {ld['value'].min():.0f} ms")
+            if rl is not None and not rl.empty:
+                print(f"      ring-low   median {rl['value'].median():.0f} ms"
+                      f"   worst {rl['value'].min():.0f} ms")
+            if st is None or st.empty:
+                continue
+            starved = st[st["value"] > 0]
+            if starved.empty:
+                print(f"      starved    never -- the DAC was fed for the whole run")
+                continue
+            print(f"      starved    {st['value'].sum():.0f} ms over"
+                  f" {len(starved)} window(s)  ** this is what the room heard **")
+            # Attribution, one line per starved window. The hub's fan-out gap in
+            # the same window is the other end of the comparison; without it the
+            # satellite's gap alone cannot tell a late send from a late arrival.
+            fan = met[(met["kind"] == "status") &
+                      (met["metric"] == "fanout-gap-max")][["wall_s", "value"]]
+            # The hub's lead at the moment it STAMPED, against the satellite's
+            # lead when the packet ARRIVED. The difference is the transit time,
+            # and it is the one number that says which side of sendto() a hole
+            # happened on. See n_lead_min_us in hub_s3/main/hub.h.
+            hub_ld = met[(met["kind"] == "status") &
+                         (met["metric"] == "lead-min")][["wall_s", "value"]]
+            print("        when          starved   gap-max   sat lead   hub lead"
+                  "   transit   hub fan-out")
+            for _, r in starved.iterrows():
+                hl = nearest(hub_ld, r["wall_s"])
+                sl = nearest(ld, r["wall_s"])
+                # nan means the gauge was not in that build; say so rather than
+                # printing it, since "nan ms" reads like a measurement.
+                hl_s = f"{hl:8.0f} ms" if hl == hl else "     n/a"
+                transit = f"{hl - sl:7.0f} ms" if hl == hl and sl == sl else "    n/a"
+                print(f"        +{r['wall_s'] - t0:7.0f}s   {r['value']:6.0f} ms"
+                      f"  {nearest(g, r['wall_s']):7.0f} ms"
+                      f"  {sl:8.0f} ms  {hl_s}"
+                      f"  {transit}  {nearest(fan, r['wall_s']):9.0f} ms")
+            if hub_ld.empty:
+                print("        (hub lead-min absent -- the hub predates that gauge,"
+                      " so transit cannot be computed)")
+            print("        transit large (hub lead healthy, sat lead collapsed)"
+                  " -> held AFTER sendto: driver queue, AP buffering, or the air.")
+            print("        transit small (both leads collapsed together)"
+                  " -> stamped late; the fault is upstream of the radio.")
+            print("        Check the hub's sbc_in `max gap` for the same window"
+                  " first: a source stall makes both collapse and is not a")
+            print("        delivery fault at all -- it was half the starvation"
+                  " on the 2026-08-19 20:04 soak.")
+
+    # ---- 7. heap ------------------------------------------------------------
     head("HEAP  (the long-run question: does anything leak)")
     for u in units:
         h = gauge(met, u, "health", "heap")
@@ -307,7 +417,7 @@ def main():
             print(f"      internal pool: min {i['value'].min():,.0f} B"
                   f"  (the one that constrains the hub)")
 
-    # ---- 7. the source ------------------------------------------------------
+    # ---- 8. the source ------------------------------------------------------
     head("SOURCE  (a stall here looks like a unit fault and is not one)")
     pk = met[(met["kind"] == "sbc_in") & (met["metric"] == "pkts")]
     if pk.empty:
@@ -326,7 +436,7 @@ def main():
             print(f"  longest silence between packets: {g['value'].max() / 1000:.0f} ms"
                   f"   (median window max {g['value'].median() / 1000:.0f} ms)")
 
-    # ---- 8. events ----------------------------------------------------------
+    # ---- 9. events ----------------------------------------------------------
     head("EVENTS")
     if ev.empty:
         print("  none recorded")

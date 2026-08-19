@@ -112,6 +112,16 @@ void servo_tick(void)
          * every log captured before this instrument existed. */
         char why[128];
         tx_fail_summary(why, sizeof(why));
+        /* Text, not a number, so "nothing stamped this window" cannot be read
+         * as a lead of zero -- the same reason the satellite's ARRIVAL line
+         * spells its two minima out. See n_lead_min_us. */
+        char lead_s[16];
+        const int32_t lead_min = n_lead_min_us;
+        if (lead_min == LEAD_UNSEEN) {
+            snprintf(lead_s, sizeof(lead_s), "none");
+        } else {
+            snprintf(lead_s, sizeof(lead_s), "%ld ms", (long)(lead_min / 1000));
+        }
         /* Raw, median and average side by side, because the change from feeding
          * the servo the raw reading to feeding it the median is only
          * falsifiable if a log shows both. Raw minus median IS the scatter this
@@ -122,7 +132,7 @@ void servo_tick(void)
                       "tx-fail %" PRIu32 " (%" PRIu32 " audio)%s"
                       " | cong-skip %" PRIu32
                       " | pace-skip %" PRIu32
-                      " | %lu pkts/s"
+                      " | %lu pkts/s | fanout-gap-max %ld ms | lead-min %s"
                       " | xport %s fec %d frames %s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
@@ -132,6 +142,7 @@ void servo_tick(void)
                  (long)err_ema, s_tx_fail, s_tx_fail_audio, why,
                  n_tx_cong_skip, n_tx_pace_skip,
                  (unsigned long)(s_audio_pkts / (uint32_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S),
+                 (long)(n_fanout_gap_max_us / 1000), lead_s,
                  AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
                  FRAMES_TRANSPORT_TAG);
         s_tx_fail = 0;
@@ -139,6 +150,11 @@ void servo_tick(void)
         s_audio_pkts = 0;
         n_tx_cong_skip = 0;
         n_tx_pace_skip = 0;    /* same window as the cong-skip it accompanies */
+        /* Beside the packet rate it qualifies: the rate says how many went, this
+         * says whether they went evenly. See hub.h for what the pair answers
+         * against the satellite's ARRIVAL line. */
+        n_fanout_gap_max_us = 0;
+        n_lead_min_us = LEAD_UNSEEN;
     }
 
     const int32_t target = (int32_t)(LEAD_US / 1000) *

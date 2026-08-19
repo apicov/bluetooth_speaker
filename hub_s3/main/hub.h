@@ -612,6 +612,101 @@ extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-a
 extern volatile uint32_t n_tx_pace_skip;            /* frame sends skipped under TX_FRAME_PACE_US */
 
 /*
+ * The widest interval between two audio packets REACHING THE AIR this window.
+ *
+ * THE HUB'S HALF OF A CROSS-UNIT QUESTION. On the 2026-08-19 soak a satellite
+ * took nine phase steps of +35 to +205 ms, every one of them with its ring at
+ * zero and its DAC playing auto_clear silence for the duration, while this unit
+ * logged a ring of 230-295 ms, phase within +-6 ms and tx-fail 0 in 57 of 59
+ * windows. Nothing was lost on the way -- the satellite's seq-drop, decode-err,
+ * recv-err, wifi-drops and fec-err all read zero -- so packets were delayed and
+ * released in a lump, and no counter anywhere said whether the lump formed here
+ * or on the air.
+ *
+ * Steady state is ~20 ms of SBC packet plus whatever lumpiness the source
+ * hands over: the 2026-08-19 18:36 soak read 54-77 ms per window against a
+ * satellite seeing 39-95, which is the two ends agreeing that the air adds
+ * nothing. This reading spiking at the same instant as the satellite's `gap
+ * max` means the packets left late; this one flat while that one spikes means
+ * they left on time. Read it beside the satellite's ARRIVAL line, which
+ * carries the other three numbers.
+ *
+ * ON SUCCESSFUL SENDS ONLY, since the first version of this gauge timed
+ * fan_out() CALLS and was therefore blind to the one fault it most needed to
+ * catch -- see fanout_result_t in timeline.c. A refused packet leaves the
+ * previous stamp standing so the next success measures the whole hole. It is
+ * still not a substitute for reading tx-fail beside it: this says how long the
+ * hole was, tx-fail says the hub made it.
+ *
+ * A GAUGE, not a counter: cleared by the window that prints it, exactly as the
+ * satellite's arrival gauges are, because a maximum accumulated across windows
+ * is not a maximum of anything.
+ */
+extern volatile int32_t n_fanout_gap_max_us;
+
+/*
+ * The least lead any packet carried when it was STAMPED this window, in us.
+ *
+ * THE OTHER HALF OF THE TRANSIT TIME, and the one number that separates a hole
+ * before sendto() from a hole after it. The satellite already reports the lead
+ * every packet had when it ARRIVED (sat.h, rx_lead_min_us): play_at minus the
+ * arrival instant on the master clock. This is the same quantity measured where
+ * the stamp is written, so
+ *
+ *     transit ~= this window's lead-min  minus  the satellite's lead-min
+ *
+ * with no protocol change, because both ends were already computing their half
+ * and only this one went unrecorded.
+ *
+ * WHY IT IS NEEDED. On the 2026-08-19 20:04 soak the satellite saw a 386 ms
+ * hole in arrivals at 20:49:56 with its lead collapsed to -169 ms, while the
+ * source read a healthy 50-77 ms all window, the hub's fan-out gap read 67-72
+ * ms on successful sends, and 248 of 250 packets arrived with one 20 ms
+ * sequence gap. The audio existed, this unit emitted it evenly, almost none was
+ * lost -- and it still did not turn up for 386 ms. Nothing measured whether
+ * those packets were still here or already on the air, because n_fanout_gap_max_us
+ * times when lwIP ACCEPTED a frame, not when the radio sent it.
+ *
+ * So: this flat while the satellite's collapses means the packets left on time
+ * and were held after sendto() -- the driver's TX queue, the SoftAP's group
+ * buffering, or the air. Both collapsing together means they were stamped late,
+ * and the fault is upstream of the radio entirely.
+ *
+ * A 20 s WINDOW against the satellite's 5 s, because this rides the status line
+ * and that is its cadence. Coarser, and it does not matter for the question: a
+ * hole drives the satellite's reading hundreds of ms negative, which no 20 s
+ * minimum of a healthy sender can imitate.
+ *
+ * Measured at the stamp rather than after the send, so a refused packet is
+ * included. That is the right way round for this question -- it asks when the
+ * timeline said the audio was due, not whether the radio took it -- and tx-fail
+ * beside it says whether any were refused at all.
+ *
+ * A GAUGE, cleared by the window that prints it, exactly as the two beside it.
+ * LEAD_UNSEEN means no packet was stamped this window, which is distinct from a
+ * measured zero and must not print as one.
+ */
+#define LEAD_UNSEEN INT32_MAX
+
+/*
+ * Beyond this a reading is not a lead, and is REFUSED rather than clamped.
+ *
+ * One second, the same number the satellite's LEAD_INSANE_US uses, because the
+ * two ends subtract to a transit time and must agree on what they are
+ * subtracting. Normal operation cannot approach it: the lead is LEAD_US plus at
+ * most RESYNC_HARD_US of timeline wander before the jump takes over, so 550 ms
+ * one way and a few hundred ms the other.
+ *
+ * This end has no known way to produce an insane one -- both terms are this
+ * board's own clock. The satellite's copy does, and the soak that found it has
+ * the story: see sat.h. The bound is here so a gauge cannot report its own rail
+ * as a measurement, which is a property worth having on both ends whether or
+ * not this one has ever needed it.
+ */
+#define LEAD_INSANE_US 1000000
+extern volatile int32_t n_lead_min_us;
+
+/*
  * Every failed sendto() goes through this rather than incrementing s_tx_fail
  * directly, so the reason is kept alongside the count. Call it with errno, at
  * the failure, before anything else can overwrite it. tx_fail_summary() renders

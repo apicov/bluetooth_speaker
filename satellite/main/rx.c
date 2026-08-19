@@ -44,6 +44,15 @@ static uint32_t expect_seq;
 static bool have_seq;
 
 /*
+ * The previous audio arrival, and how long the current run of near-simultaneous
+ * ones has been going. Here for the same reason as the pair above: rx_task is
+ * the only writer, so the published gauges in sat.h stay write-only from this
+ * side and the running state nobody else needs stays out of the header.
+ */
+static int64_t s_prev_audio_at;
+static uint32_t s_burst_run;
+
+/*
  * The tail of the last audio actually queued, kept so a gap can be concealed
  * with something other than digital zero.
  *
@@ -751,12 +760,32 @@ static void decode_into_ring(const audio_msg_t *msg)
  * between four screens of commentary, so the order could not be read without
  * reading all of it.
  */
-static void handle_audio(const audio_msg_t *msg, int n)
+static void handle_audio(const audio_msg_t *msg, int n, int64_t arrived_at)
 {
     int64_t offset;
     bool by_tsf = false;
     if (!clock_offset(&offset, &by_tsf)) {
         return;                              /* clock not trusted yet, discard */
+    }
+
+    /*
+     * How much of the hub's LEAD_US survived the trip -- see the note on
+     * rx_lead_min_us in sat.h, which is where the reasoning lives.
+     *
+     * Here rather than in rx_task because this is the first line that has an
+     * offset it is allowed to trust. A lead measured against an untrusted clock
+     * is a number about the clock, not about delivery, and it would land in the
+     * gauge indistinguishable from a real collapse.
+     *
+     * Before every early return below, so a packet refused by the anchor or the
+     * gap logic still says when it got here. Those are exactly the packets a
+     * delivery hole produces.
+     */
+    const int64_t lead = msg->play_at - (arrived_at + offset);
+    if (lead > LEAD_INSANE_US || lead < -LEAD_INSANE_US) {
+        n_lead_insane++;        /* see LEAD_INSANE_US: refused, not clamped */
+    } else if (lead < rx_lead_min_us) {
+        rx_lead_min_us = (int32_t)lead;
     }
     if (msg->format != AUDIO_FMT_SBC) {
         ESP_LOGW(TAG, "unexpected audio format %u -- hub and satellite disagree",
@@ -1000,7 +1029,31 @@ void rx_task(void *arg)
                      tsf_step, est_step, span, span_max);
             span_max = 0;
         } else if (buf[0] == MSG_AUDIO && n >= (int)AUDIO_MSG_BYTES(0)) {
-            handle_audio((const audio_msg_t *)buf, n);
+            /*
+             * The arrival cadence, before anything can decide the packet is not
+             * worth having. Counting only the packets that survive would hide
+             * the case being measured: a hole is followed by a lump, and the
+             * lump is where the refusals are.
+             *
+             * t4 is the stamp taken the instant recvfrom() returned, so this is
+             * the closest to the air the receive path can get. The first packet
+             * after boot has nothing to be a gap from.
+             */
+            n_audio_rx++;
+            if (s_prev_audio_at) {
+                const int64_t gap = t4 - s_prev_audio_at;
+                if (gap > rx_gap_max_us) {
+                    rx_gap_max_us = (int32_t)(gap > INT32_MAX ? INT32_MAX : gap);
+                }
+                s_burst_run = gap < RX_BURST_US ? s_burst_run + 1 : 1;
+            } else {
+                s_burst_run = 1;    /* the first packet is a run of one */
+            }
+            if (s_burst_run > rx_burst_max) {
+                rx_burst_max = s_burst_run;
+            }
+            s_prev_audio_at = t4;
+            handle_audio((const audio_msg_t *)buf, n, t4);
         }
     }
 }
