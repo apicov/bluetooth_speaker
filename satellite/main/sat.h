@@ -83,6 +83,7 @@
 #include "sdkconfig.h"
 
 #include "sync_proto.h"
+#include "audio_shift.h"
 
 extern const char *TAG;
 
@@ -734,20 +735,16 @@ extern int32_t s_refill_frames;
 /* ----------------------------------------------------------------- drift */
 
 /*
- * Widest trim the servo may ever ask for, and since 2026-08-14 also the
- * boundary between its two actuators. Real drift is ~14 ppm and the buffer
- * safety net asks for 20 Hz, so 100 Hz is already absurd -- anything beyond it
- * is a broken measurement, not a correction.
- *
- * Within it the correction is made in SOFTWARE, by dropping or duplicating one
- * frame at a time -- see rate_trim_hz. Beyond it, only the clock can help, and
- * on this unit that is not a hypothetical: i2s_start() is called with a
- * hardcoded 44100 before any stream exists, so a hub streaming a source
- * measured at ~42600 is matched by the servo walking tx_rate there in one step
- * through retune_output(). That is the coarse case, it happens once per stream,
- * and software could not absorb it -- 40000 ppm drains the ring in seconds.
+ * RATE_TRIM_MAX_HZ -- the widest trim the servo may ask for, and the boundary
+ * between its two actuators -- now lives in audio_shift.h, so that this unit
+ * and the hub cannot disagree about how fast either may correct. The general
+ * reasoning is there; what is this unit's own is that the COARSE case is not a
+ * hypothetical here. i2s_start() is called with a hardcoded 44100 before any
+ * stream exists, so a hub streaming a source measured at ~42600 is matched by
+ * the servo walking tx_rate there in one step through retune_output(). That
+ * happens once per stream, and software could not absorb it -- 40000 ppm drains
+ * the ring in seconds.
  */
-#define RATE_TRIM_MAX_HZ 100
 
 /*
  * The FINE rate correction, in Hz, written by the servo and read by playback.

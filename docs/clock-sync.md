@@ -736,7 +736,8 @@ every 102.4 ms. They self-cancel and the servo sees the average.
 | `components/dancefloor_sync/audio_shift.c` | The crossfade itself. Shared, so the two units cannot disagree |
 | `components/dancefloor_sync/test/` | Host tests — `make check` |
 | `satellite/main/clock.c` | `clock_offset()` picks TSF or the estimator; `track_offset()` slews it. Was `main.c` until the satellite was split on 2026-08-12 |
-| `satellite/main/servo.c`, `hub_s3/main/servo.c` | One 5 s window of rate control, per role |
+| `components/dancefloor_sync/df_servo.c` | The rate-control loop itself. Shared, so the two units cannot disagree about how fast either corrects |
+| `satellite/main/servo.c`, `hub_s3/main/servo.c` | What each role measures, actuates and logs around it |
 | `satellite/main/play.c`, `hub_s3/main/play.c` | Phase crossings, the splice, the marker, the catch-up spend |
 | `hub_s3/main/timeline.c` | The published timeline: `play_at`, the slew, boundary flags |
 

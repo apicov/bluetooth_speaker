@@ -831,39 +831,39 @@ static void write_chunk(void)
  */
 static void begin_playback(void)
 {
-/* Out of silence, not out of whatever the last stream ended at. */
-s_out_ramp.cur = 0;
-/* samples_played counts from the first sample played, which is the
- * first sample fed after the ring was reset at timeline start. Both
- * counters therefore share an origin -- do NOT reset s_samples_in here,
- * it has legitimately been counting the audio buffered during the wait. */
-s_samples_played = 0;
-/* The fraction of a frame owed described the stream that just ended.
- * rate_trim_hz itself is NOT reset: it is this unit's standing rate offset
- * against the source, exactly as tx_rate is, and it survives a restart for
- * the same reason. */
-s_trim_owed = 0;
-/* Every reading in it was measured against the timeline this start
- * replaces, so none of them describes where this unit now is. */
-sync_phase_reset(&s_phase_hist);
-s_phase_med_valid = false;
-/* Same reason: an armed debt described a position on the timeline this
- * start replaces, and a replay debt draining into the freshly-reset thin
- * ring is the audible stretch again. The servo re-arms from fresh readings
- * if the error survives the restart; the restart hold (CATCHUP_HOLD_US)
- * gives those readings time to be medians first. */
-catchup_frames = 0;
-/* The channel drained while this task was parked, so it is empty here
- * for the same reason it is empty after a disable. See s_refill_active. */
-s_refill_active = true;
-s_refill_frames = 0;
-/*
- * When the DAC last accepted a chunk -- the reference the phase reading
- * is dated against. See the note in the phase loop for why it is not a
- * clock read taken there. Seeded here so the first pass, before any
- * write has happened, has a sane value rather than zero.
- */
-s_wrote_at = esp_timer_get_time();
+    /* Out of silence, not out of whatever the last stream ended at. */
+    s_out_ramp.cur = 0;
+    /* samples_played counts from the first sample played, which is the
+     * first sample fed after the ring was reset at timeline start. Both
+     * counters therefore share an origin -- do NOT reset s_samples_in here,
+     * it has legitimately been counting the audio buffered during the wait. */
+    s_samples_played = 0;
+    /* The fraction of a frame owed described the stream that just ended.
+     * rate_trim_hz itself is NOT reset: it is this unit's standing rate offset
+     * against the source, exactly as tx_rate is, and it survives a restart for
+     * the same reason. */
+    s_trim_owed = 0;
+    /* Every reading in it was measured against the timeline this start
+     * replaces, so none of them describes where this unit now is. */
+    sync_phase_reset(&s_phase_hist);
+    s_phase_med_valid = false;
+    /* Same reason: an armed debt described a position on the timeline this
+     * start replaces, and a replay debt draining into the freshly-reset thin
+     * ring is the audible stretch again. The servo re-arms from fresh readings
+     * if the error survives the restart; the restart hold (CATCHUP_HOLD_US)
+     * gives those readings time to be medians first. */
+    catchup_frames = 0;
+    /* The channel drained while this task was parked, so it is empty here
+     * for the same reason it is empty after a disable. See s_refill_active. */
+    s_refill_active = true;
+    s_refill_frames = 0;
+    /*
+     * When the DAC last accepted a chunk -- the reference the phase reading
+     * is dated against. See the note in the phase loop for why it is not a
+     * clock read taken there. Seeded here so the first pass, before any
+     * write has happened, has a sane value rather than zero.
+     */
+    s_wrote_at = esp_timer_get_time();
 }
 
 void local_play_task(void *arg)

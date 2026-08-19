@@ -1451,13 +1451,14 @@ budget.
 | `hub_s3/main/timeline.c` | The presentation timeline: `play_at`, the slew, boundary flags, fan-out |
 | `hub_s3/main/play.c` | The hub's own speaker — phase crossings, the splice, the marker, the write |
 | `hub_s3/main/out.c` | The I2S channel and retuning its clock |
-| `hub_s3/main/servo.c` | One 5 s window of rate control, and the ring monitor |
+| `hub_s3/main/servo.c` | One 5 s window of rate control, and the ring monitor. The loop is `components/dancefloor_sync/df_servo.c` |
 | `hub_s3/main/sbc_in.c` | SPI slave receive, decode, feed |
+| `components/dancefloor_sync/df_servo.c` | Shared by hub and satellites: the output-rate servo loop, host-tested without an IDF |
 | `components/dancefloor_leds/` | Shared by hub and satellites: FFT → bands → onset → patterns, plus the LED Kconfig both use |
 | `components/led_strip_wrapper/` | RAII C++ strip driver, RMT or SPI backend |
 | `satellite/main/main.c` | `app_main` and nothing else: peripherals up, then the tasks. The behaviour is in the modules beside it, and the state they share is in `sat.h` — read that first |
 | `satellite/main/net.c` / `clock.c` / `rx.c` | Joining the AP; the probe task, TSF-or-estimator and offset slew; demux, anchor and gap policy, decode, ring feed |
-| `satellite/main/play.c` / `out.c` / `servo.c` | The scheduled start, phase, splice, marker; the I2S write path; one 5 s window of rate control |
+| `satellite/main/play.c` / `out.c` / `servo.c` | The scheduled start, phase, splice, marker; the I2S write path; one 5 s window of rate control around the shared loop |
 | `tools/pattern_lab/` | The LED pipeline over a WAV on a laptop, compiled from the component |
 | `tools/tuning/` | `sweep.py` and `converge.cpp` — the harness behind `tuning-corpus.md` |
 | `tools/soak/capture.py` | Reads every unit's console over serial, prints it, writes `metrics.csv` / `events.csv` / `raw.log` |

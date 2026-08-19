@@ -29,6 +29,30 @@
 #include <stdint.h>
 
 /*
+ * Widest trim the servo may ever ask for, in Hz, and since 2026-08-14 also the
+ * boundary between its two actuators.
+ *
+ * Within it the correction is made in SOFTWARE, by dropping or duplicating one
+ * frame at a time -- see rate_trim_hz. Beyond it, only the clock can help: a
+ * source measured at ~42600 against a 44100 output is 40000 ppm and drains a
+ * 250 ms buffer in five seconds, which no drop rate short of shredding the
+ * audio would absorb.
+ *
+ * Real drift is ~14 ppm, so a fine correction is ~0.6 Hz and this is 160x it.
+ * The buffer safety net asks for 20 Hz. Anything past 100 is a broken
+ * measurement rather than a correction.
+ *
+ * ONE NUMBER FOR BOTH UNITS, and it was two until 2026-08-19 -- the same value
+ * defined once in sat.h and once in hub.h. It is the ceiling on how fast either
+ * unit may correct, so the two disagreeing about it is a cross-unit sync error
+ * by exactly the argument at the top of this file. Each unit's own header keeps
+ * the half of the reasoning that is its own: the satellite's coarse case is not
+ * hypothetical (i2s_start() runs at a hardcoded 44100 before any stream exists),
+ * and the hub's is why the bound is deliberately NOT applied inside retune_dac().
+ */
+#define RATE_TRIM_MAX_HZ 100
+
+/*
  * Beyond this the servo arms a catch-up debt rather than leaving the error to
  * the fine trim. 25 ms is well clear of the +-7 ms deadband and the few ms of
  * delivery jitter the servo smooths through, and the fine trim's 2.27 ms/s

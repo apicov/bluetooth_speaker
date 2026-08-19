@@ -125,7 +125,7 @@ unknown one. The same rule burned `AUDIO_FMT_PCM = 0` in `audio_fmt_t`.
 | `streamer_mark_here()` | `timeline.c` | Tag the audio about to be fed as a marker point |
 | `streamer_request_restart()` | `timeline.c` | Flag the next packet as a track boundary |
 | `streamer_send_vol(v)` / `streamer_set_volume(v)` | `clients.c` | Send the level / change and send it. Addressed to the same set as the audio, by construction |
-| `servo_tick()` | `servo.c` | One 5 s window of rate control for the hub's own speaker |
+| `servo_tick()` | `servo.c` | One 5 s window of rate control for the hub's own speaker. Measures, actuates and logs; the loop itself is `df_servo_step()` |
 | `local_play_task()` | `play.c` | The hub's speaker: phase crossings, splice, marker, write. The hub delays its own audio by `LEAD_US` like everyone else |
 
 ### The satellite — `satellite/main/`
@@ -135,7 +135,7 @@ unknown one. The same rule burned `AUDIO_FMT_PCM = 0` in `audio_fmt_t`.
 | `probe_task()` | `clock.c` | Sends `MSG_TIME_REQ` every `PROBE_PERIOD_MS`; also where `MSG_SPLICE` is sent from (never from the audio path — a `sendto()` there costs a buffer) |
 | `clock_offset(*out, *used_tsf)` | `clock.c` | Fresh TSF if available, else the probe estimator. `used_tsf` reports which |
 | `track_offset()` | `clock.c` | Keep the local→master conversion current, **slewed at `OFFSET_SLEW_PPM`, never stepped**. Holding it fixed feeds the drift back in as the servo's own reference |
-| `servo_tick()` | `servo.c` | One 5 s window: smooth the phase, pick an actuator, arm or stand down the catch-up |
+| `servo_tick()` | `servo.c` | One 5 s window: smooth the phase, pick an actuator, arm or stand down the catch-up. The decision itself is `df_servo_step()`, shared with the hub |
 | `play_task()` | `play.c` | The scheduled start, phase measurement, splice, marker, catch-up spend |
 
 ---
@@ -182,10 +182,10 @@ unknown one. The same rule burned `AUDIO_FMT_PCM = 0` in `audio_fmt_t`.
 | Name | Value | Units | File |
 |---|---|---|---|
 | `PHASE_DEADBAND_US` | 7 000 | µs. **Shared, not a per-unit preference** — the worst case between any two units is twice this | `sync_proto.h` |
-| `RATE_TRIM_MAX_HZ` | 100 | Hz. Widest trim, **and** the fine/coarse actuator boundary. 2.27 ms/s at 44.1 kHz | `hub.h`, `sat.h` |
+| `RATE_TRIM_MAX_HZ` | 100 | Hz. Widest trim, **and** the fine/coarse actuator boundary. 2.27 ms/s at 44.1 kHz. **Shared** since 2026-08-19 — it was the same number defined in both headers | `audio_shift.h` |
 | servo window | 5000 | ms — `vTaskDelay` in `drift_task` / `ring_monitor_task` | `main.c`, `servo.c` |
-| `cooldown` | 4 | windows ≈ 20 s, against a ~40 s correction time | both `servo.c` |
-| EMA weight | 3:1 | `(err_ema * 3 + ph) / 4`, ~100 s loop | both `servo.c` |
+| `cooldown` | 4 | windows ≈ 20 s, against a ~40 s correction time | `df_servo.c` |
+| EMA weight | 3:1 | `(err_ema * 3 + err_in) / 4`, ~100 s loop | `df_servo.c` |
 | `DEPTH_NET_HOLD_US` | 20 000 000 | µs after an anchor during which depth is not evidence | `sat.h` |
 | `RING_TARGET_MS` | 250 | ms. **Held equal to the hub's `LEAD_US` by hand** | `sat.h` |
 | `RING_BYTES` | `DANCEFLOOR_RING_KB` × 1024, default 80 kB | 464 ms; must cover `LEAD_US + RESYNC_US` | `sat.h` |

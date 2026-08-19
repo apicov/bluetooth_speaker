@@ -1001,22 +1001,14 @@ extern volatile int64_t s_hub_splice_at;   /* 0 = no boundary yet */
 extern volatile int32_t s_hub_splice_alt_us;
 
 /*
- * Widest DRIFT correction the servo may ask for, in Hz, and since 2026-08-14
- * also the boundary between the servo's two actuators.
- *
- * Within it the correction is made in SOFTWARE, by dropping or duplicating one
- * frame at a time -- see rate_trim_hz. Beyond it, only the clock can help: a
- * source measured at ~42600 against a 44100 output is 40000 ppm and drains a
- * 250 ms buffer in five seconds, which no drop rate short of shredding the
- * audio would absorb. That is the case retune_dac() exists for, and it is why
- * this bound is still deliberately NOT applied inside it.
- *
- * Real drift is ~14 ppm, so a fine correction is ~0.6 Hz and this is 160x it.
- * The buffer safety net asks for 20 Hz. Anything past 100 is a broken
- * measurement rather than a correction, and routing it to the clock is what
- * puts it in front of RATE_SANE_MIN/MAX to be refused.
+ * RATE_TRIM_MAX_HZ -- the widest DRIFT correction the servo may ask for, and
+ * the boundary between its two actuators -- now lives in audio_shift.h, so that
+ * this unit and the satellite cannot disagree about how fast either may
+ * correct. The general reasoning is there; what is this unit's own is that the
+ * bound is deliberately NOT applied inside retune_dac(). A coarse correction is
+ * routed to the clock precisely so that it arrives in front of
+ * RATE_SANE_MIN/MAX below and is refused there if it is nonsense.
  */
-#define RATE_TRIM_MAX_HZ 100
 
 /* What could conceivably be an audio sample rate at all. Anything outside this
  * is a broken calculation, whoever asked for it. */

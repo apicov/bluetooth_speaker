@@ -459,7 +459,7 @@ std::atomic<uint32_t> s_marginal;
 std::atomic<uint32_t> s_drifts;
 std::atomic<int32_t>  s_last_drift_us;
 
-[[maybe_unused]] [[maybe_unused]] uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
+[[maybe_unused]] uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
 void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
 /* Running maximum. Four counters need one, and the CAS loop is the sort of thing
  * that is right three times and subtly wrong the fourth. */

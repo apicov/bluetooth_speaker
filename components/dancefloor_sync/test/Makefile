@@ -14,10 +14,18 @@ test_sync_proto: test_sync_proto.c ../sync_proto.c ../include/sync_proto.h \
 test_audio_shift: test_audio_shift.c ../audio_shift.c ../include/audio_shift.h
 	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) test_audio_shift.c ../audio_shift.c -lm -o $@
 
+# audio_shift.h and sync_proto.h are prerequisites because RATE_TRIM_MAX_HZ,
+# the CATCHUP_* thresholds and PHASE_DEADBAND_US all live in them -- a stale
+# binary would silently test the servo against the old boundaries.
+test_servo: test_servo.c ../df_servo.c ../include/df_servo.h \
+            ../include/audio_shift.h ../include/sync_proto.h
+	env PATH=/usr/bin:/bin $(CC) $(CFLAGS) test_servo.c ../df_servo.c -lm -o $@
+
 .PHONY: check clean
-check: test_sync_proto test_audio_shift
+check: test_sync_proto test_audio_shift test_servo
 	./test_sync_proto
 	./test_audio_shift
+	./test_servo
 
 clean:
-	rm -f test_sync_proto test_audio_shift
+	rm -f test_sync_proto test_audio_shift test_servo
