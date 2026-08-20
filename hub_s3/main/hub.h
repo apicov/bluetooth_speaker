@@ -252,9 +252,14 @@
  * anything about the slew.
  *
  * A satellite anchors on a packet whose play_at is still ahead of it, and the
- * lead it sees is LEAD_US plus this error. So at err = -100 ms the lead has
- * already fallen to the 100 ms a satellite insists on before it will anchor at
- * all, and past roughly -200 ms packets arrive with their play_at already gone.
+ * lead it sees is LEAD_US plus this error. The arithmetic below was written when
+ * LEAD_US was 250 and ANCHOR_MIN_LEAD_US read 100; at LEAD_US 350 the same two
+ * landmarks sit at err = -225 ms (lead down to the 125 ms a satellite insists on
+ * before it will anchor at all) and roughly -300 ms (packets arriving with their
+ * play_at already gone). Both are now BELOW this threshold rather than above it,
+ * which is the right way round: the jump is reached only once anchoring is
+ * already impossible. RESYNC_US, not this, is what keeps the lead off that floor
+ * in normal running -- see the note there.
  * Beyond that the timeline is not merely inaccurate, it is unusable: no
  * satellite can start, and any satellite already playing is being asked to
  * absorb an error far outside the +-100 Hz its servo can trim.
@@ -419,20 +424,67 @@
  * frames skipped out of 86/s -- the same loss a failed send already was, and
  * the visualiser is built to take it (frames are snapshots, not a protocol).
  *
- * Derived from the hop the analysis is configured for, the same selection
- * DF_HOP_N makes (components/dancefloor_leds/include/analysis_config.h), at
- * 44.1 kHz: 1024 -> 23220 us, 512 -> 11610, 256 -> 5805. The hop is a
- * floor-wide agreement pinned in sdkconfig.defaults, so this follows it the
- * same way rather than naming its own rate.
+ * ALL OF THE ABOVE IS THE RECORD OF A PACE THAT NO LONGER APPLIES, and it is
+ * kept because its reasoning was sound and its PREMISE was not. It assumed the
+ * lane's constraint is the rate the analysis produces at -- one frame per hop,
+ * 86/s at hop 512 -- so it derived the pace from the hop. The constraint is
+ * actually the rate the radio RELEASES group frames at, which is the DTIM
+ * beacon and nothing to do with the analysis. See TX_FRAME_PACE_US below.
+ *
+ * The hop rates it derived from, kept for the arithmetic elsewhere in this
+ * file: at 44.1 kHz, hop 1024 -> 23220 us, 512 -> 11610, 256 -> 5805. Not a
+ * macro any more, because an unused TX_FRAME_* constant sitting beside the pace
+ * reads as though the pace still comes from it.
  */
-#if defined(CONFIG_DANCEFLOOR_LED_HOP_1024)
-#  define TX_FRAME_PERIOD_US 23220
-#elif defined(CONFIG_DANCEFLOOR_LED_HOP_256)
-#  define TX_FRAME_PERIOD_US  5805
-#else
-#  define TX_FRAME_PERIOD_US 11610
-#endif
-#define TX_FRAME_PACE_US       ((TX_FRAME_PERIOD_US * 3) / 4)
+/*
+ * THE DTIM HOLD, and the pace that is actually derived from it.
+ *
+ * 100 TU x 1024 us. A SoftAP releases group-addressed frames only after a DTIM
+ * beacon, so this is how long a group frame occupies a static TX buffer in the
+ * worst case -- and it is a FIXED cost: 100 TU is the bottom of IDF's
+ * documented range and dtim_period is already 1. net.c carries the measurement
+ * that proved the field had never held anything else.
+ */
+#define DTIM_HOLD_US 102400
+
+/*
+ * One analysis frame per beacon, not three per four analysis periods.
+ *
+ * THE OLD PACE WAS DERIVED FROM THE WRONG CLOCK. (TX_FRAME_PERIOD_US * 3) / 4
+ * is ~8.7 ms at hop 512, which permits ~115 frames/s into a queue that opens
+ * 9.8 times a second. The extra 105 do not go out sooner; they sit in the pool
+ * holding buffers audio also needs, and the 2026-08-20 soak measured what that
+ * costs -- `cong-skip` in the hundreds per window right through the join
+ * transient, which is the frame lane discovering by failure what the beacon
+ * rate could have told it in advance.
+ *
+ * Pacing to the beacon makes the group burst DETERMINISTIC: audio's ~5 packets
+ * plus exactly one frame, every time, instead of audio's 5 plus however many
+ * frames the analysis task happened to emit since the last release.
+ *
+ * WHAT IT COSTS IS SMALLER THAN IT LOOKS. The satellites were already only
+ * receiving 26.6 frames/s (88,237 frames over 3,312 s, counted by the satellite
+ * itself), because the old pace gate was already discarding ~60% of what the
+ * analysis lane offered -- `pace-skip` ~52/s in every soak on file. This takes
+ * a rate that was 26.6 and lands it at 9.8, on a lane whose frames are
+ * SNAPSHOTS: a satellite that misses one shows a slightly staler spectrum, and
+ * df::RemoteDetect converges back onto its neighbours in bounded time because
+ * the history it lost is the only state there is (visualiser.h says this).
+ *
+ * If the floor visibly lags after this, the honest fix is fewer group packets
+ * elsewhere, not a faster pace -- a frame sent more often than the beacon
+ * releases is a frame that arrives no sooner and costs a buffer meanwhile.
+ *
+ * WHY IT STILL MATTERS AFTER THE LEAD FIX. This was written believing the TX
+ * pool was the fault; it was not (see LEAD_US). What it does is shorten the TAIL
+ * of delivery latency -- the occasional packet held for one or two DTIM periods
+ * because the queue ahead of it was deep. That tail is exactly what the lead
+ * margin has to absorb, and the 2026-08-20 soak caught its worst case at 153 ms
+ * on a packet the hub had transmitted cleanly. A smaller burst is a shorter
+ * tail, so the two changes work on the same failure from opposite ends: this one
+ * makes the worst case rarer, LEAD_US makes it survivable.
+ */
+#define TX_FRAME_PACE_US       DTIM_HOLD_US
 
 /*
  * Local playback ring. The master delays its own audio by LEAD_US exactly like a

@@ -174,7 +174,18 @@ menu "Dancefloor audio transport (multicast + FEC)"
           immediately with rate adaptation; at dtim_period 1 on a 100 ms beacon
           that is one burst per 100 ms. Audio alone is ~5 frames a burst, and
           86 analysis frames a second makes it ~15, each holding a static TX
-          buffer until its window opens. 26 could not hold that. 32 can, and 32
+          buffer until its window opens.
+
+          THE "100 ms BEACON" ABOVE IS RIGHT, and was the only place in the tree
+          that had it right. hub_s3/main/net.c spent a while asking the driver
+          for a 50 ms beacon and claiming a halved hold; the field is in TU with
+          a floor of 100, so the radio never took it, and a boot-time read-back
+          on 2026-08-20 printed `beacon_interval 100 TU (asked 50)`. The hold is
+          102.4 ms, it cannot go lower, and the frame lane's pace in hub.h is
+          now derived from it rather than from the analysis hop -- which also
+          takes the ~15 frames a burst above down to 1.
+
+          26 could not hold that. 32 can, and 32
           only became affordable when the hub stopped running the ML lane and
           got ~25 kB of internal SRAM back.
 
