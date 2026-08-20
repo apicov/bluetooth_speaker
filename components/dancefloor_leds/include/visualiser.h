@@ -109,10 +109,10 @@ int visualiser_hop(void);
  * second, and a unit that never joined looked exactly like a joined unit
  * with nothing playing.
  *
- * The flash itself is unchanged, and still the only thing the eye should be
- * compared between units -- see CONFIG_DANCEFLOOR_ENABLE_LED_MARKER. What is
- * new is the level BETWEEN flashes, which is dark while audio is flowing and
- * lit while it is not.
+ * The flash is still the only thing the eye should compare between units --
+ * see CONFIG_DANCEFLOOR_ENABLE_LED_MARKER, which carries what it now proves and
+ * what it stopped proving. What this adds is the level BETWEEN flashes, which
+ * is dark while audio is flowing and lit while it is not.
  *
  * Safe from any task; it stores a flag the render task reads. A unit that
  * never calls this -- the hub, which is the AP and has nothing to join --

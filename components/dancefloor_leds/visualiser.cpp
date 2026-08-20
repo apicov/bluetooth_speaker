@@ -153,11 +153,24 @@ constexpr int64_t LED_LOG_PERIOD_US = CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000LL
 /*
  * One flash per second of MASTER-CLOCK time, on every unit at once.
  *
- * The second boundary is taken from due_us, which is derived from the scheduled
- * instant the audio carries -- so every unit crosses the same boundary on the
- * same block of audio, with nothing sent between them and no local clock read.
- * That is the same property the strips themselves rely on; this just makes it
- * visible.
+ * The boundary is a master instant, converted to this board's clock by the same
+ * hook the render wait uses -- so every unit fires on the same instant, with
+ * nothing sent between them.
+ *
+ * IT USED TO BE TAKEN FROM due_us, on the frame being drawn, which is a stronger
+ * statement wherever it holds: the boundary is then crossed on the same BLOCK OF
+ * AUDIO everywhere, with no clock read at all. It stopped holding on a unit that
+ * is GIVEN its frames. Such a unit draws what the hub sends, and the hub paces
+ * that lane to the DTIM beacon (TX_FRAME_PACE_US in hub.h) -- ~9.8 frames a
+ * second. The drawn-frame grid is quantised to ~102 ms, so the flash landed
+ * anywhere in the 100 ms after the boundary and jittered frame to frame: five
+ * times what an eye resolves, on the one instrument whose whole job is to be
+ * compared by eye.
+ *
+ * So the flash no longer reports the instant the strip drew. It reports the
+ * clock, while audio is flowing -- which is the question actually being asked of
+ * it. How well frames are arriving is a different question and already has an
+ * instrument: `frames` in the periodic line.
  *
  * Watch two boards side by side: if the onboard LEDs flash together the whole
  * chain agrees, and if one lags it is obvious without a console. The eye
@@ -167,22 +180,38 @@ constexpr int64_t LED_LOG_PERIOD_US = CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000LL
 constexpr int64_t LED_MARKER_PERIOD_US = 1000000;
 
 /*
- * Held for two blocks -- ~46 ms -- rather than delayed for.
+ * Held for 40 ms -- measured on the clock, not waited for.
  *
  * The audio marker can afford a 200 us busy-wait; this cannot. It has to be
  * long enough to see, and blocking the render task for 40 ms would drop two
  * analysis frames and break the very alignment being demonstrated. Raising the
- * pin on one frame and lowering it a few later costs nothing.
+ * pin at one instant and lowering it at another costs nothing.
  *
- * Derived from a DURATION rather than a frame count, because "two frames" is
- * 46 ms at hop 1024 and 12 ms at hop 256 -- and a marker that exists to be seen
- * by eye must not quietly shrink below what an eye resolves when the frame rate
- * changes. Rounded up, so this is still exactly 2 at hop 1024.
+ * A DURATION, and NOW MEASURED AS ONE. It was a duration converted into a count
+ * of drawn frames -- ceil(40 ms / hop) -- which is right only where frames are
+ * drawn on the analysis cadence this build compiles in. On a unit fed from the
+ * hub they arrive on the beacon instead: the count was 4 and the hold was 4 x
+ * 102 ms = ~410 ms, an even on/off blink beside the hub's 46 ms pulse, and
+ * unmistakably a sync fault to anyone reading the LED the way it asks to be
+ * read. The hop is not this marker's clock and never was.
  */
 constexpr int64_t LED_MARKER_HIGH_US = 40000;
-constexpr int64_t LED_MARKER_HOP_US  = (int64_t)HOP_N * 1000000 / RATE;
-constexpr int LED_MARKER_BLOCKS_HIGH =
-    (int)((LED_MARKER_HIGH_US + LED_MARKER_HOP_US - 1) / LED_MARKER_HOP_US);
+
+/*
+ * How long the marker keeps reporting the timeline after the last frame drawn.
+ *
+ * Deliberately NOT the strip's RENDER_IDLE_US, which this shared until the
+ * frame lane was paced to the beacon. At ~9.8 frames a second half a second is
+ * five frames, so an ordinary congested patch (pace-skip, cong-skip in the hub's
+ * log) would flip a satellite to the solid "joined and idle" level in the middle
+ * of a song -- the LED reporting a stopped floor that never stopped.
+ *
+ * The strip keeps the shorter figure because it answers a different question:
+ * what is on the strip is stale the moment the frames stop, while the marker is
+ * only saying whether music is playing at all. The cost of the longer one is
+ * that a floor which really has stopped takes 1.5 s to go solid.
+ */
+constexpr int64_t MARKER_IDLE_US = 1500000;
 
 /*
  * Which level lights the LED, which is a property of the wiring and not of the
@@ -191,7 +220,7 @@ constexpr int LED_MARKER_BLOCKS_HIGH =
  * With the LED's anode on 3V3 and its cathode on the pin, the pin sinks the
  * current and a LOW level lights it. Everything below is written in terms of ON
  * and OFF rather than 1 and 0 so that the timing above -- fire on the second
- * boundary, hold for LED_MARKER_BLOCKS_HIGH -- reads the same either way, and
+ * boundary, hold for LED_MARKER_HIGH_US -- reads the same either way, and
  * so that a rewired board is a Kconfig change rather than a code change.
  *
  * Getting this wrong shows as an INVERTED marker rather than a dark one: lit
@@ -251,6 +280,82 @@ int marker_idle_level()
 {
     return s_marker_link.load(std::memory_order_relaxed) ? LED_MARKER_ON
                                                          : LED_MARKER_OFF;
+}
+
+/*
+ * Act on the marker's two deadlines, from wherever the render loop happens to
+ * be.
+ *
+ * The loop calls this on every pass rather than only where a frame is drawn.
+ * That is the whole point: on a unit fed from elsewhere the loop goes ~102 ms
+ * between frames, and an edge that waited for the next frame would be back to
+ * reporting delivery instead of the clock. Both naps in that loop clamp
+ * themselves to the nearest deadline, so "every pass" lands within a
+ * millisecond or two of the instant -- see marker_clamp_nap().
+ *
+ * Lower before raise, so a boundary coming due in the same pass as a pending
+ * lower is not cut short by it.
+ *
+ * Render task only, like marker_write(). Deadlines are passed in rather than
+ * kept here because they belong to that task's own state, and the pin is the
+ * only thing shared.
+ */
+void marker_service(int64_t now, int64_t *flash_at, int64_t *lower_at)
+{
+    if (*lower_at && now >= *lower_at) {
+        *lower_at = 0;
+        marker_write(LED_MARKER_OFF);
+    }
+    if (*flash_at && now >= *flash_at) {
+        *flash_at = 0;
+        *lower_at = now + LED_MARKER_HIGH_US;
+        marker_write(LED_MARKER_ON);
+        /*
+         * Say so for the first few, then go quiet.
+         *
+         * Without this, "the LED is not blinking" is three different faults
+         * wearing the same face: the code never runs (no audio, so no frame
+         * ever reaches the arming site), the code runs but the pin is not wired
+         * to an LED on this board, or the option was not built in. Those need
+         * completely different fixes and the console could not tell them apart.
+         * If these lines appear, the firmware is doing its job and the question
+         * is the pin.
+         */
+        static int told;
+        if (told < 3) {
+            told++;
+            ESP_LOGW(TAG, "LED marker fired on GPIO %d (%d of 3) -- if the "
+                          "LED is dark, this board's LED is not on that pin",
+                     CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
+        }
+    }
+}
+
+/*
+ * Shorten a nap so the render task is awake for the marker's next edge.
+ *
+ * Milliseconds in and out, never returning 0 where it clamps: a zero-tick delay
+ * would spin the loop, and at CONFIG_FREERTOS_HZ=1000 the deadline is at most a
+ * millisecond further off than the caller asked for anyway.
+ *
+ * This is what keeps the flash a property of the clock on a unit whose frames
+ * arrive ten times a second. Without it the edges would be quantised to the
+ * 20 ms idle nap, which is inside what an eye resolves but needlessly so.
+ */
+int64_t marker_clamp_nap(int64_t nap_ms, int64_t flash_at, int64_t lower_at)
+{
+    int64_t edge = flash_at;
+    if (!edge || (lower_at && lower_at < edge)) {
+        edge = lower_at;
+    }
+    if (!edge) {
+        return nap_ms;
+    }
+    const int64_t left = (edge - esp_timer_get_time()) / 1000;
+    if (left >= nap_ms) {
+        return nap_ms;
+    }
+    return left > 1 ? left : 1;
 }
 #endif
 
@@ -1119,8 +1224,24 @@ void render_task(void *arg)
     int64_t  last_report_us = esp_timer_get_time();
 #endif
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-    int64_t last_sec = -1;
-    int     lower_in = -1;
+    /*
+     * The marker's two edges, as LOCAL-clock deadlines, 0 when unarmed.
+     *
+     * flash_at is the next master second boundary put through this unit's
+     * conversion; lower_at is set from it when the pin goes up. Deadlines rather
+     * than the frame counters they replaced, because the loop that services them
+     * runs at the frame cadence -- and on a unit given its frames that cadence is
+     * the hub's beacon, not this build's hop. See LED_MARKER_HIGH_US.
+     */
+    int64_t flash_at = 0;
+    int64_t lower_at = 0;
+    /*
+     * The last master second this unit has armed a flash for, so it arms each
+     * one once. Never reset -- see the arming site for the late frame it is
+     * there to refuse, and note that resetting it on idle would re-open exactly
+     * that hole on the way back.
+     */
+    int64_t last_flash_sec = -1;
     /*
      * When a frame was last drawn, and whether the marker has fallen back to
      * showing the link because none has been for a while.
@@ -1139,6 +1260,15 @@ void render_task(void *arg)
 #endif
 
     while (true) {
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+        /* Before anything else, and on every path through this loop: the pin's
+         * edges are instants now, and nothing below is allowed to decide when
+         * one of them is noticed. Idle units have nothing armed, so this is two
+         * compares. */
+        if (!marker_idle) {
+            marker_service(esp_timer_get_time(), &flash_at, &lower_at);
+        }
+#endif
         const uint32_t flush = s_fq_flush.load(std::memory_order_acquire);
         if (flush != seen_flush) {
             seen_flush = flush;
@@ -1223,23 +1353,37 @@ void render_task(void *arg)
              * marker stops reporting the timeline and goes back to reporting
              * the link.
              *
-             * The same half-second the strip goes dark on, and for the same
-             * reason: it is well past any gap ordinary delivery produces at 43+
-             * frames a second, and short enough that a stopped floor reads as
-             * stopped. Sharing the figure also keeps the two consistent -- the
-             * strip going dark and the LED going solid are one event.
+             * On MARKER_IDLE_US rather than the strip's RENDER_IDLE_US above:
+             * the two used to share the figure and no longer can -- see the
+             * constant. So the strip going dark and the LED going solid are two
+             * events now, a second apart, and that gap is the point rather than
+             * an oversight.
+             *
+             * Any armed flash is dropped with it. It was armed off a frame that
+             * is now old enough to call the stream stopped, and firing it would
+             * put a pulse on a pin that has just been handed to the link.
              *
              * Re-asserted every nap, not once, because the link can change
              * while the unit sits here with nothing to draw -- which is exactly
              * the case this whole state exists to show. marker_write() makes
              * the repeat free.
              */
-            if (esp_timer_get_time() - marker_at > RENDER_IDLE_US) {
+            if (esp_timer_get_time() - marker_at > MARKER_IDLE_US) {
                 marker_idle = true;
+                flash_at = 0;
+                lower_at = 0;
                 marker_write(marker_idle_level());
             }
 #endif
-            vTaskDelay(pdMS_TO_TICKS(RENDER_NAP_MS));
+            {
+                int64_t nap_ms = RENDER_NAP_MS;
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+                /* A unit with nothing to draw still owes the pin its edges for
+                 * MARKER_IDLE_US after the last frame. */
+                nap_ms = marker_clamp_nap(nap_ms, flash_at, lower_at);
+#endif
+                vTaskDelay(pdMS_TO_TICKS(nap_ms));
+            }
             continue;
         }
 
@@ -1260,7 +1404,12 @@ void render_task(void *arg)
         if (wait > RENDER_SLACK_US) {
             /* Bounded, so a flush is acted on promptly even when the frame at
              * the head is not due for a couple of hundred milliseconds. */
-            const int64_t nap = wait / 1000 < RENDER_NAP_MS ? wait / 1000 : RENDER_NAP_MS;
+            int64_t nap = wait / 1000 < RENDER_NAP_MS ? wait / 1000 : RENDER_NAP_MS;
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+            /* The frame this is waiting for may be a hundred milliseconds out;
+             * the flash it was armed for may not be. */
+            nap = marker_clamp_nap(nap, flash_at, lower_at);
+#endif
             const int64_t asked = nap ? nap : 1;
             const int64_t before = esp_timer_get_time();
             vTaskDelay(pdMS_TO_TICKS(asked));
@@ -1309,15 +1458,18 @@ void render_task(void *arg)
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
         /*
-         * Raise when due_us crosses a second, lower two frames later.
+         * Arm the next flash. Nothing is written to the pin here -- the edges
+         * themselves belong to marker_service(), which runs whether or not a
+         * frame arrives.
          *
-         * It fires here rather than at analysis because what it exists to show
-         * is when a unit DRAWS, which is now a different instant from when it
-         * computed. Two boards side by side answer "do the strips share a
-         * timeline" without a console, and after this change the answer is a
-         * property of the clocks alone.
+         * That split is the change. The pin used to be raised on the frame that
+         * crossed the boundary and lowered a fixed number of frames later, which
+         * ties both edges to delivery; on a unit fed by the hub delivery is the
+         * beacon, ~9.8 frames a second, and both edges inherited its 102 ms
+         * grain. What a drawn frame genuinely establishes is that audio is
+         * flowing and WHICH master second is next, and that is all it is asked
+         * for now.
          */
-        const int64_t sec = f.due_us / LED_MARKER_PERIOD_US;
         marker_at = t0;
         if (marker_idle) {
             /*
@@ -1325,46 +1477,49 @@ void render_task(void *arg)
              * flashes that follow are flashes against darkness rather than
              * against a lit pin, where they would be invisible.
              *
-             * The current second is ADOPTED rather than fired on. Firing here
+             * The current second is skipped rather than fired on. Firing here
              * would raise a pin that is already lit on a joined unit, and the
-             * only visible edge would be the LOWER two frames later -- a first
+             * only visible edge would be the LOWER 40 ms later -- a first
              * "flash" that reads backwards, and against a neighbouring unit
              * reads as a sync fault. The cost is waiting up to one second for
              * the first real flash, which is the correct thing to wait for:
              * every unit is waiting for the same boundary.
              */
             marker_idle = false;
-            lower_in = -1;
-            last_sec = sec;
+            lower_at = 0;
             marker_write(LED_MARKER_OFF);
         }
-        if (sec != last_sec) {
-            last_sec = sec;
-            lower_in = LED_MARKER_BLOCKS_HIGH;
-            marker_write(LED_MARKER_ON);
+        /*
+         * due_us <= 0 means the feed had no timeline to date this audio
+         * against, so there is no master second to fire on and nothing is
+         * armed: the pin stays dark while such a stream is drawn. The frame
+         * counting version did the same thing by never crossing a boundary.
+         *
+         * Armed through the same conversion the wait above uses, and re-armed
+         * by every frame that lands while the flash is still pending. So a
+         * clock offset that slews between the arming and the boundary corrects
+         * the pending instant rather than firing at a stale one.
+         */
+        if (f.due_us > 0) {
+            const int64_t next_sec = f.due_us / LED_MARKER_PERIOD_US + 1;
             /*
-             * Say so for the first few, then go quiet.
+             * Each boundary is armed once, by whichever frame first names it,
+             * and re-armed after that only while it is still PENDING.
              *
-             * Without this, "the LED is not blinking" is three different faults
-             * wearing the same face: the code never runs (no audio, so no frame
-             * ever reaches here), the code runs but the pin is not wired to an
-             * LED on this board, or the option was not built in. Those need
-             * completely different fixes and the console could not tell them
-             * apart. If these lines appear, the firmware is doing its job and
-             * the question is the pin.
+             * A frame drawn late -- after the boundary its own second was
+             * flashed on -- names an instant that has already passed, and
+             * without this it would arm it again for a second pulse a few
+             * milliseconds behind the first. Frames are drawn in due order, so
+             * on a unit keeping up this never binds; it is the stall case, and
+             * the stall is reported by `late` rather than by a stutter on the
+             * one LED people read as a sync fault.
              */
-            static int told;
-            if (told < 3) {
-                told++;
-                ESP_LOGW(TAG, "LED marker fired on GPIO %d (%d of 3) -- if the "
-                              "LED is dark, this board's LED is not on that pin",
-                         CONFIG_DANCEFLOOR_LED_MARKER_GPIO, told);
+            if (next_sec > last_flash_sec || flash_at) {
+                last_flash_sec = next_sec;
+                const int64_t at = next_sec * LED_MARKER_PERIOD_US;
+                const auto to_local = s_to_local.load(std::memory_order_relaxed);
+                flash_at = to_local ? to_local(at) : at;
             }
-        } else if (lower_in > 0 && --lower_in == 0) {
-            /* Dark between flashes, not the link level: while audio is flowing
-             * the marker's job is the timeline, and holding it lit would leave
-             * nothing for the flash to stand out against. */
-            marker_write(LED_MARKER_OFF);
         }
 #endif
 
