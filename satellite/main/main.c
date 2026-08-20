@@ -160,7 +160,41 @@ void app_main(void)
     sync_est_init(&est);
     /* Link check only for now -- the SBC receive path lands in the next stage. */
     ESP_LOGI(TAG, "SBC decoder init: %s", sbc_decoder_init() ? "ok" : "FAILED");
+    /*
+     * SAY THE SIZE AND THE ROOM, BEFORE AND AFTER, because this allocation is
+     * the one most likely to fail on a classic ESP32 and the bare assert() that
+     * used to stand here failed as an unexplained reboot loop.
+     *
+     * RING_BYTES follows the hub's LEAD_US (see RING_TARGET_MS in sat.h) and
+     * grew 80 -> 96 kB when the lead went 250 -> 350. The ceiling is a
+     * CONTIGUOUS block on a board whose largest has been measured at ~106 kB, so
+     * the margin is real but thin, and it is the kind of thing that only a boot
+     * can settle -- exactly the trap hub_s3/sdkconfig.defaults records for the
+     * 40th TX buffer, which boot-looped for the same reason.
+     *
+     * Logged unconditionally, not only on failure: the successful number is what
+     * tells the next person how much room the next increase has.
+     */
+    const size_t ring_largest_before =
+            heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     ring = xStreamBufferCreate(RING_BYTES, AUDIO_CHUNK_BYTES);
+    if (!ring) {
+        ESP_LOGE(TAG, "PLAYBACK RING FAILED: wanted %u bytes (%lu ms), largest "
+                      "free block was %u -- lower DANCEFLOOR_RING_KB, and note "
+                      "it must still cover the hub's LEAD_US + RESYNC_US",
+                 (unsigned)RING_BYTES,
+                 (unsigned long)(RING_BYTES * 1000ULL /
+                                 (44100ULL * AUDIO_CHANNELS * 2)),
+                 (unsigned)ring_largest_before);
+    } else {
+        ESP_LOGI(TAG, "playback ring: %u bytes (%lu ms), largest free block "
+                      "%u -> %u",
+                 (unsigned)RING_BYTES,
+                 (unsigned long)(RING_BYTES * 1000ULL /
+                                 (44100ULL * AUDIO_CHANNELS * 2)),
+                 (unsigned)ring_largest_before,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
     assert(ring);
 
     wifi_start_sta();

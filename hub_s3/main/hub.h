@@ -128,22 +128,50 @@
  *     refused, exactly as the note on ANCHOR_MIN_LEAD_US predicts. Raising the
  *     centre lifts the whole distribution off that floor.
  *
- * The bound is unchanged and still binds: LEAD + RESYNC = 400 against the
- * satellite's 464 ms ring, 64 ms of margin. Three things move with this and
- * must stay in step -- RING_TARGET_MS on the satellite, ANCHOR_MIN_LEAD_US
- * beside it, and LOCAL_RING_BYTES below, which now has to hold 250 ms before a
- * feed burst arrives.
+ * NOW 350 ms, and the "ANCHORS ARE BEING REFUSED" bullet above turned out to be
+ * the whole fault rather than one symptom of it. Raising the centre from 200 to
+ * 250 lifted the distribution but left the MECHANISM in place, and the mechanism
+ * is RESYNC_US: see the note below it, which is the change that matters. This
+ * line widens the base margin on top.
+ *
+ * WHAT THE MARGIN HAS TO COVER, measured this session rather than assumed:
+ *
+ *   satellite anchor minimum   125 ms   ANCHOR_MIN_LEAD_US (satellite/main/sat.h)
+ *   worst-case DTIM hold       102 ms   beacon read-back in net.c: 100 TU
+ *   worst measured transit     153 ms   2026-08-20 soak, one packet, tx-fail 0
+ *
+ * The third is the one that decides it. A group frame that misses its beacon
+ * window waits a whole DTIM period, and two in a row is 205 ms -- so a floor
+ * anywhere near 100 ms is a floor below which ordinary, loss-free delivery puts
+ * packets past their play_at. With RESYNC_US at 70 the floor is 280 ms, which
+ * clears all three.
+ *
+ * THE PRICE, AND IT IS ON THIS UNIT'S OWN RING. LOCAL_RING_BYTES is 80 kB and
+ * holds the lead before any feed burst arrives: at 250 ms that left 214 ms of
+ * headroom, at 350 it leaves 114 ms (20,180 bytes). The worst `max gap` this
+ * unit has recorded is ~95 ms, so it still clears -- by 19 ms rather than by
+ * 119. It CANNOT be bought back by growing the ring: xStreamBufferCreate takes
+ * the default heap, SPIRAM_USE_CAPS_ALLOC means plain malloc never returns
+ * PSRAM, and this unit runs at `internal 12868 free`. So the hub ring stays at
+ * 80 kB and this is the constant to walk back if `refill-withheld`,
+ * `short-reads` or a hub underrun ever appears on the HEALTH line. 300 ms would
+ * restore 164 ms of headroom and still give a 230 ms floor.
+ *
+ * Three things move with this and must stay in step -- RING_TARGET_MS on the
+ * satellite (which forces CONFIG_DANCEFLOOR_RING_KB to 96, see the note there),
+ * ANCHOR_MIN_LEAD_US beside it, and LOCAL_RING_BYTES below.
  *
  * What it does NOT buy is tolerance for the transmit path refusing sends
- * outright, which is the fault this system has actually suffered. No lead
- * recovers a packet that was never transmitted.
+ * outright. No lead recovers a packet that was never transmitted -- but note
+ * that the 2026-08-20 soak showed the refusals FOLLOWING the starvation by ~30
+ * seconds, not causing it, so that caveat is smaller than it used to read.
  *
- * And the ceiling is still not this board's memory: the ring a lead must fit in
- * belongs to the SATELLITE, a classic ESP32 with no PSRAM and a largest free
- * block of 106 kB against the ~107 kB a 500 ms lead would need. The hub's PSRAM
- * buys the lead nothing; it bought LOCAL_RING_BYTES below, which is different.
+ * The ceiling is the SATELLITE's ring, a classic ESP32 with no PSRAM: 96 kB is
+ * 557 ms and holds 350 + the depth net's 120 ms swing with 87 ms to spare. A
+ * 500 ms lead would need ~107 kB against a ~106 kB largest free block, so that
+ * is still the wall.
  */
-#define LEAD_US   250000
+#define LEAD_US   350000
 
 /*
  * How far the presentation timeline may wander from real time before the slew
@@ -162,21 +190,39 @@
  * and stepping every unit's phase by the whole amount; the slew moves 1 ms/s,
  * so a trip that lasts a second costs 1 ms and the burst refill does the rest.
  *
- * Now raised past the swing, which is what this comment used to say it wanted
- * and could not have. The blocker was never this constant: LEAD + RESYNC bounds
- * how much a satellite must buffer, and at 200 + 120 = 320 against a 372 ms
- * ring there was no room to add the 30 ms that would clear a 132 ms trough.
+ * BACK DOWN TO 70, AND THIS IS THE FAULT FIX. Raising it past the swing was the
+ * wrong lesson from the right measurement, and it cost three soaks to see why.
  *
- * The satellite's ring is 80 kB now -- 464 ms -- so the bound is 200 + 150 =
- * 350 against 464, and a swing that reaches 132 no longer touches it. What
- * should disappear from the log is the "timeline off by ... slewing back" line
- * arriving about seven times a minute on entirely normal delivery. If it still
- * does, the swing is larger than 132 on this hardware and the number to look at
- * is sbc_in's max gap, not this one.
+ * `err` is `next_play_at - target` and `target` is `now + LEAD_US`, so err IS
+ * `lead - LEAD_US` -- nothing else. A deadband on err is therefore a licence for
+ * the lead to sit anywhere in `LEAD_US +- RESYNC_US`, and at 150 that meant
+ * NOTHING CORRECTED THE LEAD UNTIL IT HAD FALLEN TO 100 ms. Below three
+ * separately measured numbers: the satellite refuses to anchor under
+ * ANCHOR_MIN_LEAD_US (125 ms), a group frame can be held a whole DTIM period
+ * (102 ms, read back in net.c), and the worst transit measured on a loss-free
+ * packet was 153 ms. The 2026-08-20 soak sat in exactly that trap -- the
+ * sawtooth troughs read 96, 99 and 99 ms, the threshold itself, and each one
+ * that met a delayed packet emptied both satellite rings and ended in a
+ * re-anchor storm. `anchors refused 90 late` is that, stated by the satellite.
  *
- * NOTE the ordering: a satellite still running a 64 kB ring against this must
- * buffer 350 ms of a 372 ms ring, which fits but leaves little. Flash the
- * satellite first, or together.
+ * At 70 the floor is 280 ms and all three are cleared.
+ *
+ * YES, IT NOW TRIPS ON NORMAL DELIVERY, and that is the point rather than a
+ * cost. The -132 ms trough described above is bigger than 70, so the slew is
+ * active much of the time -- but err OSCILLATES around its mean, so the nudges
+ * above and below cancel and what survives is a correction proportional to the
+ * MEAN offset. That is exactly the controller this needs, and a 150 ms deadband
+ * gave it nothing to work with until the mean was already 100 ms wrong.
+ *
+ * The reason 150 looked necessary was the log line arriving seven times a
+ * minute. That is fixed where it belongs: steer_timeline() only reports after
+ * 5 s of PERSISTENT slewing, so an oscillation that recovers within a second
+ * or two says nothing at all. Tuning a control deadband to quieten a log was
+ * the mistake worth remembering here.
+ *
+ * The rate is unchanged and still bounded by what the servo can follow:
+ * 20 us/packet at ~50 packets/s is 1 ms/s against the +-100 Hz (2.27 ms/s) a
+ * unit can trim, so being in the slew more often costs nothing downstream.
  *
  * The original note, still true: SBC delivery is bursty, and the wire is not why.
  * A2DP packets arrive ~23/s, each
@@ -191,9 +237,12 @@
  *
  * This does not affect the local ring, which is governed by rate rather than by
  * the timeline. It does set how far a satellite's start time can be off, so
- * LEAD + RESYNC must fit the satellite ring: 200 + 150 = 350 ms against 464 ms.
+ * LEAD + RESYNC must fit the satellite ring: now 350 + 70 = 420 ms against the
+ * 557 ms a 96 kB ring holds. (That arithmetic read "200 + 150 = 350 against
+ * 464" for a while after LEAD_US had already moved to 250 -- worth a glance
+ * whenever either constant changes, since nothing checks it.)
  */
-#define RESYNC_US 150000
+#define RESYNC_US  70000
 
 /*
  * Past this the timeline is not merely off, it is wrong, and no gradual
@@ -293,6 +342,27 @@
 #define SOURCE_STALL_US    300000
 #define SOURCE_STEADY_US   500000
 #define SOURCE_GIVE_UP_US 5000000
+
+/*
+ * WHAT A REAL SOURCE STALL LOOKS LIKE, measured, so the next person reading a
+ * multi-second `max gap` on the sbc_in line does not go looking for a fault in
+ * the floor.
+ *
+ * 2026-08-20 19:15 soak, at a track boundary (TRACK #2 -> #3):
+ *
+ *   sbc_in: pkts 177 | eff 31160 Hz | fed-drop 16384 B | max gap 1443818 us
+ *
+ * 1.44 SECONDS with nothing arriving from the phone, across a track change.
+ * That is four times LEAD_US and nothing in this system can absorb it: the hub
+ * ran its own ring dry, took `local underrun, restarting timeline`, and both
+ * satellites re-anchored off the fresh timeline. It cost 470 ms of starvation
+ * on each and was over inside one 5 s window -- `lead-min +318 ms, starved 0`
+ * in the very next one, with anchors-refused still 0 for the whole session.
+ *
+ * So the recovery path handled it exactly as designed, and the number to check
+ * before suspecting anything here is sbc_in's `max gap`. It was the ONLY audible
+ * event in 53 minutes of that run, and it was not ours.
+ */
 
 /*
  * How far the timeline moves per packet while slewing back to real time.

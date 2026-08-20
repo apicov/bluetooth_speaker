@@ -786,12 +786,23 @@ extern char s_task_fail_names[64];
  * -- it is compiled into a different image -- so the two are held equal by
  * convention, and a mismatch does not fail loudly: the servo's depth safety net
  * would simply hold this unit at the wrong depth, which reads as a standing
- * phase error nothing explains. 250 since the lead became 250.
+ * phase error nothing explains. 350 since the lead became 350.
  *
- * Well inside RING_BYTES, which is 80 kB / 464 ms: the target leaves 214 ms for
- * a gap fill to land in, and GAP_RESYNC_MS above is 150.
+ * AND IT DRAGGED THE RING SIZE WITH IT, which is the part that is easy to miss.
+ * The depth net clamps at +-120 ms (df_servo.c), so an ordinary excursion sits
+ * at 350 + 120 = 470 ms -- past the 464 ms an 80 kB ring holds, which would drop
+ * audio on ring-full in normal running. CONFIG_DANCEFLOOR_RING_KB went 80 -> 96
+ * with this change: 96 kB is 557 ms and leaves 87 ms above that excursion, and
+ * 207 ms above the target itself, which is the 214 ms the 250/80 kB pairing had.
+ *
+ * The 16 kB comes out of a classic ESP32 with no PSRAM, which ran `heap 80584
+ * (min 74532, largest 73728)` before this. The ring is allocated at boot, when
+ * the largest block is at its biggest, so it should fit -- but this is the
+ * change to suspect first if this unit stops booting, and the wall is real:
+ * ~106 kB is the largest block there has ever been here, and a 500 ms lead
+ * would want ~107 kB.
  */
-#define RING_TARGET_MS 250
+#define RING_TARGET_MS 350
 
 /*
  * How much unpaced audio a playback START puts in before the DAC begins pacing.

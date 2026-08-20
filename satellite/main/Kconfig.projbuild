@@ -27,7 +27,7 @@ menu "Dancefloor satellite"
 
     config DANCEFLOOR_RING_KB
         int "Playback ring buffer (kB)"
-        default 80
+        default 96
         range 32 512
         help
             How much decoded audio this unit will hold between arrival and the
@@ -35,21 +35,31 @@ menu "Dancefloor satellite"
             delivery jitter -- LEAD_US + RESYNC_US -- which is how far the hub's
             timeline can legitimately be from real time when a chunk is stamped.
 
-            80 kB is 464 ms at 44.1 kHz stereo, and the number is a classic-ESP32
-            constraint: that board has ~117 kB free with a largest block of
-            106 kB, so 80 fits and 107 (what a 500 ms lead would need) will not
-            allocate at all.
+            96 kB is 557 ms at 44.1 kHz stereo. It was 80 (464 ms), and it moved
+            because the hub's LEAD_US moved 250 -> 350: RING_TARGET_MS tracks the
+            lead, the servo's depth net swings it +-120 ms either way, and
+            350 + 120 = 470 ms does not fit 464. An 80 kB ring would have dropped
+            audio on ring-full in ordinary running.
+
+            96 leaves 87 ms above that excursion and 207 ms above the target --
+            the same headroom the old 250 ms / 80 kB pairing had.
+
+            STILL A CLASSIC-ESP32 CONSTRAINT. That board has ~117 kB free with a
+            largest block of 106 kB, so 96 fits with 10 kB to spare and 107 (what
+            a 500 ms lead would need) will not allocate at all. This is the first
+            change to suspect if a classic satellite stops booting, and the
+            symptom would be the ring allocation failing outright rather than
+            anything subtle.
 
             THAT CEILING IS THE CLASSIC PART'S, NOT THE PROTOCOL'S. An S3
             satellite has 512 kB of internal SRAM and can afford considerably
-            more, which is what would let the hub's lead grow -- the buffer a
-            lead has to fit in is on the receiving board, and until now every
-            receiving board was a classic ESP32.
+            more, which is what would let the hub's lead grow further -- the
+            buffer a lead has to fit in is on the receiving board.
 
-            Left at 80 on both targets deliberately. Raising it on one unit and
+            Kept equal on both targets deliberately. Raising it on one unit and
             not another changes only that unit's tolerance for a delivery
-            stall, not its sync, but it has not been measured and a floor whose
-            units differ is harder to reason about than one that does not.
+            stall, not its sync, but a floor whose units differ is harder to
+            reason about than one that does not.
 
     # Which channels this unit plays lives in components/dancefloor_sync/Kconfig,
     # under "Dancefloor audio output" -- audio_out.h is what reads it, and a
