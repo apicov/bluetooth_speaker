@@ -878,7 +878,18 @@ void rx_task(void *arg)
             ESP_LOGW(TAG, "TRACK #%" PRIu32 ": \"%s\" - %s [%s]",
                      m->track_id, m->title, m->artist, m->album);
         } else if (buf[0] == MSG_FRAME && n >= (int)FRAME_MSG_BYTES(0)) {
-#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+/*
+ * GATED ON THE SOURCE, not just on the visualiser. It was the latter alone, and
+ * on a unit doing its own analysis that meant validating every batch and
+ * memcpying ~9 frames out of it, 9.8 times a second, into a
+ * visualiser_submit_frame() compiled down to `(void)f`. Harmless and pure
+ * waste -- and it kept n_frames_rx climbing on a unit whose strip owed the
+ * number nothing, which is worse than the wasted cycles.
+ *
+ * The datagram still ARRIVES on a local unit: it is group-addressed, and this
+ * unit is in the group for the audio. Only the parsing goes.
+ */
+#if CONFIG_DANCEFLOOR_ENABLE_VISUALISER && CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
             /*
              * A batch of analysis frames the hub computed. Each is drawn at the
              * instant it names, exactly like one this unit computed itself, so

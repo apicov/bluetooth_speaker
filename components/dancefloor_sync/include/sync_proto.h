@@ -336,10 +336,16 @@ typedef struct __attribute__((packed)) {
  * difference between ~316 and ~1490 packets a second, and it is the only thing
  * that makes the analysis lane free of speaker count entirely.
  *
- * ~8 kB/s per listener at 86 Hz, against the 30-40 the audio already costs. The
- * batch does not change that figure -- the same frames go out, nine to a
- * datagram instead of one -- it changes the PACKET rate, from 86/s offered and
- * 9.8/s sent to 9.8/s sent whole.
+ * ~2.8 kB/s at 86 Hz, against the 30-40 the audio already costs, and FLAT --
+ * one group transmission feeds every listener, so this is the hub's whole cost
+ * for the lane whatever N is. It reads "per listener" in older notes because
+ * that was the unicast arrangement, which is what the paragraph above replaced.
+ *
+ * It was ~8.3 kB/s until vis_frame_t lost spec[]; see FRAME_PAYLOAD_MAX for
+ * what came off and why. Neither the batch nor that shrink changes the PACKET
+ * rate -- the batch took it from 86/s offered and 9.8/s sent to 9.8/s sent
+ * whole, and the smaller frame makes each of those 9.8 datagrams a quarter the
+ * size without making them fewer.
  *
  * The cost is real and is paid elsewhere: a group-addressed frame is held by
  * the SoftAP until the DTIM beacon releases it, occupying one static TX buffer
@@ -359,12 +365,27 @@ typedef struct __attribute__((packed)) {
  * the table, and says to come back to 36 if 38 ever reads like 48 did.
  */
 /*
- * Room for a whole beacon's worth of frames: 12 x 96 bytes.
+ * Room for a whole beacon's worth of frames: 12 x 32 bytes.
  *
- * The 96 is sizeof(vis_frame_t), which this header deliberately cannot see --
+ * The 32 is sizeof(vis_frame_t), which this header deliberately cannot see --
  * the LED component does not depend on the protocol and must stay buildable on
  * its own, so the number is written out here and checked where the two do meet
  * (clients.c static-asserts TX_FRAME_BATCH frames against this cap).
+ *
+ * IT WAS 96, and the difference is the whole point of this change. Two thirds
+ * of a frame was spec[], the quantised spectrum, which only the pluggable
+ * analysers read -- so every satellite with DANCEFLOOR_ML off took 64 bytes 86
+ * times a second and threw them away. A frame now carries the timeline labels
+ * and the four detector bands, which is what the receiver actually consumes.
+ *
+ * WHAT IT BUYS IS AIRTIME, NOT BUFFERS, and the distinction matters because the
+ * buffers are what this lane has historically cost. A full batch goes from 1155
+ * bytes to 387 -- the lane from ~8.3 kB/s to ~2.8 -- but a static TX buffer
+ * holds one datagram whatever its size, so the ~9.8 datagrams a second and the
+ * DTIM window each one occupies are exactly as before. The knob for THAT is
+ * TX_FRAME_BATCH: at 32 bytes a frame, two beacons' worth is ~566 bytes and
+ * would halve the datagram rate, at the cost of up to ~205 ms against a 350 ms
+ * lead. Not taken here; it wants its own measurement.
  *
  * 12 rather than the 9 a beacon actually holds at hop 512: the analysis task
  * does not run at a metronomic 86/s, and a decoder lump hands it several frames
@@ -372,7 +393,7 @@ typedef struct __attribute__((packed)) {
  * itself short. It was 160 -- one frame and change -- while the lane sent one
  * frame per datagram.
  */
-#define FRAME_PAYLOAD_MAX 1152
+#define FRAME_PAYLOAD_MAX 384
 
 typedef struct __attribute__((packed)) {
     uint8_t type;           /* MSG_FRAME */
@@ -613,7 +634,7 @@ typedef struct __attribute__((packed)) {
 #define AUDIO_TX_PAYLOAD_MTU_MAX (AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0))
 
 /* The frame lane against the same MTU. Here rather than beside frame_msg_t
- * because that is where the MTU is defined; a full batch is 1155 bytes. */
+ * because that is where the MTU is defined; a full batch is 387 bytes. */
 _Static_assert(FRAME_MSG_BYTES(FRAME_PAYLOAD_MAX) <= AUDIO_UDP_MTU,
                "a full frame batch would fragment");
 

@@ -20,6 +20,13 @@
  * over, and agrees exactly again after that. The measured figures live in
  * tools/tuning/converge.cpp; what is pinned here is that the property holds
  * structurally, at every hop the Makefile sweeps.
+ *
+ * THIS TEST GOT MORE LOAD-BEARING, NOT LESS, when the satellites stopped
+ * agreeing with each other by construction. The floor is mixed now: an S3
+ * satellite analyses its own audio while a classic ESP32 takes frames off the
+ * wire, so "every strip agrees" rests on the two paths reaching identical
+ * decisions from identical bands -- which is exactly what mirror() asserts. It
+ * is the only place that property is checked anywhere, on any machine.
  */
 #include <cmath>
 #include <cstdint>
@@ -43,13 +50,17 @@ void check(const char *name, bool cond, const char *detail)
 }
 
 /*
- * The wire frame is 96 bytes: 8 + 8 + 4 floats + 64 bytes of spectrum, packed.
+ * The wire frame is 32 bytes: 8 + 8 + 4 floats, packed.
  * A change to that number is a protocol change -- the receiver's build guard
  * turns it into a strip that stays dark, which is the designed behaviour, but
  * it wants to be a decision rather than an accident, so the size is pinned
  * here where the frame is exercised, not only where it is declared.
+ *
+ * It was 96 while the frame also carried spec[], the 64-byte quantised
+ * spectrum. Only the pluggable analysers ever read that, so every satellite
+ * with DANCEFLOOR_ML off received two thirds of each frame and discarded it.
  */
-static_assert(sizeof(vis_frame_t) == 96, "vis_frame_t changed size");
+static_assert(sizeof(vis_frame_t) == 32, "vis_frame_t changed size");
 
 constexpr int BLOCKS = 900 * (df::FFT_N / df::HOP_N);   /* ~21 s at 44.1 kHz */
 constexpr int KICK_EVERY = df::RATE / 2;        /* 120 BPM */
@@ -107,7 +118,6 @@ void pack(const df::Frame &f, vis_frame_t *w)
     w->due_us = f.due_us;
     w->index  = f.index;
     std::memcpy(w->band, f.band, sizeof(w->band));
-    std::memcpy(w->spec, f.spec, sizeof(w->spec));
 }
 
 void unpack(const vis_frame_t *w, df::Frame &f)
@@ -115,14 +125,18 @@ void unpack(const vis_frame_t *w, df::Frame &f)
     f.due_us = w->due_us;
     f.index  = w->index;
     std::memcpy(f.band, w->band, sizeof(f.band));
-    std::memcpy(f.spec, w->spec, sizeof(f.spec));
+    /* Mirrors from_wire(): the spectrum did not travel, so the receiver's copy
+     * is silence rather than whatever the struct happened to hold. */
+    std::memset(f.spec, 0, sizeof(f.spec));
     f.mag  = nullptr;
     f.unit = 0;
 }
 
 /* Everything a pattern or a diagnostic reads that the wire was supposed to
  * preserve. mag is excluded by design: it never travels and is null on the
- * remote side. */
+ * remote side. spec[] left this list for the same reason -- it stopped
+ * travelling, and a unit taking frames cannot run the analysers that read it
+ * (DANCEFLOOR_ML depends on LED_SOURCE_LOCAL). No pattern reads either. */
 bool same_frame(const df::Frame &a, const df::Frame &b)
 {
     return a.onset == b.onset
@@ -135,8 +149,7 @@ bool same_frame(const df::Frame &a, const df::Frame &b)
         && a.boom_threshold == b.boom_threshold
         && a.index == b.index
         && a.due_us == b.due_us
-        && std::memcmp(a.band, b.band, sizeof(a.band)) == 0
-        && std::memcmp(a.spec, b.spec, sizeof(a.spec)) == 0;
+        && std::memcmp(a.band, b.band, sizeof(a.band)) == 0;
 }
 
 bool same_decision(const df::Frame &a, const df::Frame &b)

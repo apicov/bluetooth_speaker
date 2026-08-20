@@ -1,0 +1,49 @@
+# Satellite on a classic ESP32.
+#
+# ESP-IDF reads this IN ADDITION to sdkconfig.defaults when the target is esp32,
+# and after it, so anything here wins. Everything portable -- the tick rate, the
+# UDP mailbox depth, the LED hop and pattern, 240 MHz, QIO flash -- stays in
+# sdkconfig.defaults and applies to both targets. Only what is genuinely
+# classic-specific belongs in this file.
+#
+# It exists for one setting. See sdkconfig.defaults.esp32s3 for the other half
+# of the same decision.
+
+# WHERE THIS UNIT'S FRAMES COME FROM: the hub, not itself.
+#
+# THIS IS A MEMORY DECISION before it is anything else, and it is what keeps
+# this target on remote frames while the S3 moved to local analysis. A satellite
+# analysing locally holds the audio ring, a 32 kB CONTIGUOUS analysis stream, a
+# ~15.6 kB Analysis object, a 4 kB block accumulator and another task stack. On a
+# classic ESP32 that does not fit, and the way it does not fit is silent:
+#
+#   E ALLOCATION FAILED 177 time(s): largest request 4096 B (caps 0x804 INTERNAL)
+#   W HEALTH: up 5 s | heap 396 (min 92, window 396, largest 208) | stack play 0
+#
+# 396 bytes free. The 4096-byte requests are task stacks: probe, rx and play all
+# failed to start and only drift fitted, at 3072. `stack play 0` is the play
+# task's high-water mark never having been written, because the task does not
+# exist. A unit in that state still associates, still takes a DHCP lease, still
+# looks healthy from the hub -- and produces no audio, no LEDs and no anchors.
+# It reads exactly like a satellite waiting for a stream that never came, which
+# is how it was read for an evening. (Commit 82f4e8d, 2026-08-12.)
+#
+# THAT MEASUREMENT WAS TAKEN WITH AN 80 kB RING. The ring is 96 kB now, so the
+# margin is smaller rather than larger, and the 32 kB is one contiguous block
+# against a board whose largest free block was ~106 kB BEFORE the ring came out
+# of it. Nothing here has become affordable since; if anyone wants to retry it,
+# DANCEFLOOR_ANALYSIS_WINDOWS is not the first lever, the ring is, and the ring
+# is sized by the hub's LEAD_US.
+#
+# WHAT REMOTE STILL DOES LOCALLY, because the help text got this wrong for a
+# while: the DETECTOR runs here. A frame carries the four bands at full float
+# precision and df::RemoteDetect derives this unit's own onset and boom from
+# them. What arrives is the detector's input, not the hub's answer -- and
+# test_remote_detect.cpp is the standing proof that the two paths agree, which
+# is what a mixed floor now rests on.
+#
+# WHAT IT COSTS THIS UNIT: no analysers. DANCEFLOOR_ML depends on
+# LED_SOURCE_LOCAL, because the analysers read the quantised spectrum and the
+# spectrum stopped travelling. This target never had ML on, so nothing is lost
+# here -- but it is now a build rule rather than a choice, and that is why.
+CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE=y

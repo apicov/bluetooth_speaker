@@ -183,20 +183,68 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 # CONFIG_ESP_PHY_ENABLE_USB=n
 
+# WHERE THIS UNIT'S FRAMES COME FROM: itself.
+#
+# LOCAL, where the classic satellite is REMOTE (see sdkconfig.defaults.esp32).
+# It is set per-target rather than in the shared file because this is the one
+# setting on which the two boards genuinely differ, and the reason is what this
+# board has that the other does not: PSRAM for the 32 kB analysis stream, and a
+# use for the spectrum computing it produces.
+#
+# THE SPECTRUM IS THE REASON, not the FFT. DANCEFLOOR_ML below depends on this
+# option, because the analysers read the quantised spectrum and it no longer
+# travels -- see the block below for the whole argument. Turning ML off would
+# make REMOTE viable here again and save ~24 kB of internal SRAM.
+#
+# WHAT IT COSTS THE FLOOR is that the guarantee narrows from "every strip agrees"
+# to "units taking frames from the same source render identically" plus a proof
+# that the two sources agree. That proof is test_remote_detect.cpp's mirror(),
+# which asserts exact float equality between a unit running Analysis and one
+# running RemoteDetect over the same bands. Mixing is intended here, not
+# tolerated -- but it is intended BECAUSE that test exists.
+CONFIG_DANCEFLOOR_LED_SOURCE_LOCAL=y
+
 # THIS IS THE TINYML BOARD, and these two lines are the whole of what makes it
 # one. Everything else in this file is about the XIAO S3 Plus as a satellite.
 #
-# DANCEFLOOR_ML runs the pluggable analysers here. It does NOT require this unit
-# to analyse audio: LED_SOURCE stays REMOTE above, so this satellite still draws
-# the frames the hub sends it, and the analysers read the quantised spectrum
-# those frames already carry. That is the point of the whole arrangement -- the
-# model gets the hub's FFT for free and this board never runs one of its own.
+# DANCEFLOOR_ML runs the pluggable analysers here, and it is now what DECIDES
+# the line above rather than being independent of it.
 #
-# Computing the FFT locally is still available and independent of this: set
-# LED_SOURCE_LOCAL and the analysers see a locally-computed spectrum instead,
-# with no change to any analyser. It costs ~33 kB of internal SRAM here, which is
-# what commit 82f4e8d spent on a classic ESP32 before running out; measure the
-# MEM line before assuming an S3 has it spare.
+# THIS PARAGRAPH USED TO SAY THE OPPOSITE, and the change is worth stating
+# plainly because the old arrangement was the more elegant one: "It does NOT
+# require this unit to analyse audio: LED_SOURCE stays REMOTE, so this satellite
+# still draws the frames the hub sends it, and the analysers read the quantised
+# spectrum those frames already carry ... the model gets the hub's FFT for free
+# and this board never runs one of its own."
+#
+# What broke it is that the spectrum was free for this board and not for the
+# floor. spec[] is 64 of a frame's 96 bytes and ONLY an ML build ever reads it,
+# so every other satellite -- which is all of them, this being the only ML
+# board -- was taking two thirds of every frame 86 times a second and throwing
+# it away. Dropping it from the wire took the lane from ~8.3 kB/s to ~2.8, and
+# left this unit as the one that has to compute its own.
+#
+# It was the same sentence that predicted the price: "set LED_SOURCE_LOCAL and
+# the analysers see a locally-computed spectrum instead, with no change to any
+# analyser." That is exactly what happened -- analyser.hpp says an analyser
+# cannot tell where the bytes came from, and none of them changed.
+#
+# THE COST, and the old note said ~33 kB of internal SRAM. It is less here,
+# because visualiser.cpp asks for the 32 kB PCM stream with MALLOC_CAP_SPIRAM on
+# a board that has it: internal goes up by ~24 kB (Analysis ~15.6 kB of .bss, a
+# 4 kB block accumulator, a 4 kB task stack) and the stream lands in PSRAM. Two
+# things to read on the first boot rather than assume:
+#
+#   - the analysis-stream line must say PSRAM, not the internal fallback. The
+#     fallback is not a failure and does not log as one; it just spends the
+#     internal pool the WiFi TX buffers come from.
+#   - the MEM line, which the old note already told us to check.
+#
+# CPU is the other half: ~1.2-1.3 ms per frame at 86 fps is ~11% of one core, on
+# top of the ML fast lane's ~0.8 ms. The `vis` task runs at priority 4 on core 1,
+# below play at 8, and `vis: cost: analysis` on the periodic line is the
+# instrument. analyser.hpp records that task being seen take up to 21 ms against
+# an 11.6 ms budget, so this is worth watching rather than assuming.
 CONFIG_DANCEFLOOR_ML=y
 
 # The TFLM base -- the arena, the schema check and the interpreter. Nothing in

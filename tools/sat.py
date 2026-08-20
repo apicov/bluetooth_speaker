@@ -4,7 +4,7 @@ Build, flash and monitor the two satellites without retyping the incantation.
 
 One source tree produces two images that coexist permanently:
 
-    classic   sdkconfig.defaults                              -> build/,    sdkconfig
+    classic   sdkconfig.defaults + sdkconfig.defaults.esp32   -> build/,    sdkconfig
     s3        sdkconfig.defaults + sdkconfig.defaults.esp32s3 -> build.s3/, sdkconfig.s3
 
 The classic one is plain `idf.py`. The S3 one is not, and the difference is the

@@ -68,27 +68,54 @@ constexpr const char *TAG = "vis";
 /*
  * Whether the pluggable analysers run here.
  *
- * ONE SETTING, AND IT IS NOT ABOUT AUDIO. Analysers read the quantised spectrum
- * of a frame, and every frame carries it whether this unit computed it or took
- * it off the radio -- so this is independent of DF_ANALYSES_AUDIO in both
- * directions. A satellite given frames can run a model; a hub with all the audio
- * in the world can decline to.
+ * ONE SETTING, AND IT IS ABOUT THE SPECTRUM. Analysers read the quantised
+ * spectrum of a frame and nothing else -- run_fast_lane() and ml_lane_feed()
+ * below are the only two readers of Frame::spec in the tree.
  *
- * Both halves of that have been got wrong already, so both are written down:
+ * IT USED TO BE INDEPENDENT OF DF_ANALYSES_AUDIO IN BOTH DIRECTIONS, on the
+ * grounds that a unit given frames by the hub already had the spectrum and
+ * could run a model on it. That stopped being true when spec[] came off the
+ * wire: vis_frame_t carries the timeline labels and the four bands, and 64 of
+ * its 96 bytes were a spectrum only an ML build ever read. A satellite with the
+ * analysers off was receiving and discarding two thirds of every frame, 86
+ * times a second.
  *
- *   - It used to be a CHOICE, DANCEFLOOR_ML_SOURCE, because a unit that could
- *     not hold a model was given one's results instead. Nothing is distributed
- *     any more, so the question collapsed to "does this unit run them".
+ * So the independence now holds in exactly one direction, and the Kconfig says
+ * so rather than this file discovering it at runtime:
  *
- *   - Deriving it from LED_SOURCE instead compiles, links, and is wrong on the
- *     one unit it matters for: the hub analyses audio and must NOT run the lane.
- *     It gave up ~25 kB of internal SRAM to stop, which is the pool its WiFi TX
- *     buffers come from, and nothing about "has audio" says so.
+ *   - A unit that analyses audio MAY decline the analysers. The hub does, and
+ *     must: it gave up ~25 kB of internal SRAM to stop running the lane, which
+ *     is the pool its WiFi TX buffers come from, and nothing about "has audio"
+ *     says so.
+ *   - A unit that takes frames from the wire CANNOT run them. There is no
+ *     spectrum to read. DANCEFLOOR_ML depends on DANCEFLOOR_LED_SOURCE_LOCAL,
+ *     so the pair is unselectable instead of silently feeding models a buffer
+ *     from_wire() zeroed.
+ *
+ * That is what makes local analysis an S3 decision rather than a floor-wide
+ * one: a unit that wants models has to compute its own spectrum, and computing
+ * it costs the FFT, its 32 kB stream buffer and a task. The S3 has PSRAM for
+ * the first and room for the rest; the classic ESP32 has neither, which is what
+ * commit 82f4e8d measured the hard way.
  */
 #if CONFIG_DANCEFLOOR_ML
 #define DF_RUNS_ANALYSERS 1
 #else
 #define DF_RUNS_ANALYSERS 0
+#endif
+
+/*
+ * The pair Kconfig already forbids, refused here too.
+ *
+ * DANCEFLOOR_ML depends on DANCEFLOOR_LED_SOURCE_LOCAL, so menuconfig cannot
+ * offer this combination -- but sdkconfig is a generated file that people edit,
+ * and the failure it would produce is the quiet kind this project keeps losing
+ * evenings to: run_fast_lane() would read the spec[] from_wire() zeroed, every
+ * analyser would score silence, and the strip would look fine because no
+ * pattern reads spec[] anyway. Nothing would be wrong except the answers.
+ */
+#if DF_TAKES_REMOTE_FRAMES && DF_RUNS_ANALYSERS
+#error "DANCEFLOOR_ML needs LED_SOURCE_LOCAL: a frame off the wire carries no spectrum for an analyser to read (see vis_frame_t)."
 #endif
 
 using df::FFT_N;
@@ -674,7 +701,6 @@ std::atomic<void (*)(const vis_frame_t *)> s_publish{nullptr};
 
 /* BEAT_BANDS is a macro from beat_detect.h, not a df:: member. */
 static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
-static_assert(VIS_SPEC_BINS == df::SPEC_BINS, "wire frame and spectrum disagree");
 
 /* df::Frame -> the form that can leave this unit. mag has nowhere to go -- 512
  * floats pointing into an Analysis -- and the detector fields are not copies
@@ -689,7 +715,6 @@ void to_wire(const df::Frame &f, vis_frame_t *w)
     w->due_us = f.due_us;
     w->index  = f.index;
     std::memcpy(w->band, f.band, sizeof(w->band));
-    std::memcpy(w->spec, f.spec, sizeof(w->spec));
 }
 #endif
 
@@ -717,10 +742,13 @@ void from_wire(const vis_frame_t *w, df::Frame &f)
     f.due_us = w->due_us;
     f.index  = w->index;
     std::memcpy(f.band, w->band, sizeof(f.band));
-    std::memcpy(f.spec, w->spec, sizeof(f.spec));
     f.mag  = nullptr;
-    /* Did not travel, and nothing reads it -- but a Frame handed onward
-     * should not be carrying stack garbage either. */
+    /* Neither of these travelled, and on this unit nothing reads either --
+     * DANCEFLOOR_ML cannot be selected alongside a remote source, which is the
+     * whole reason spec[] came off the wire. Zeroed regardless: a Frame handed
+     * onward should not be carrying stack garbage, and a future reader finding
+     * silence is a better failure than one finding the last packet's bytes. */
+    std::memset(f.spec, 0, sizeof(f.spec));
     f.unit = 0;
 }
 #endif

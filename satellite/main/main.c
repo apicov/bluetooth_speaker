@@ -216,7 +216,35 @@ void app_main(void)
 #endif
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
+    /*
+     * The second big contiguous allocation on this board, and the second one
+     * worth a boot line either side of it.
+     *
+     * The playback ring above is logged this way because "the margin is real
+     * but thin, and it is the kind of thing that only a boot can settle". On a
+     * LED_SOURCE_LOCAL build the analysis stream is exactly that again: 32 kB
+     * in ONE block, taken after the ring has already come out of the largest
+     * one. On the S3 it is asked for in PSRAM and this pair should barely move;
+     * on a classic ESP32 it would come out of the same internal pool the tasks
+     * below need their stacks from, which is the failure commit 82f4e8d
+     * recorded and why that target is on REMOTE.
+     *
+     * Logged unconditionally rather than only on failure, for the reason the
+     * ring's copy is: visualiser.cpp already warns when the allocation falls
+     * back or fails, and what is missing without this is the SUCCESSFUL number
+     * -- the one that says how much room the next change has.
+     *
+     * Printed for both sources deliberately. A REMOTE unit allocates no stream,
+     * so its two numbers should be equal, and a pair that is NOT equal on a
+     * build that claims to be remote is worth seeing.
+     */
+    const size_t vis_largest_before =
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     visualiser_start();
+    ESP_LOGI(TAG, "visualiser started (%s): largest free internal block "
+                  "%u -> %u",
+             visualiser_source_name(), (unsigned)vis_largest_before,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     /*
      * The strip draws each frame when the instant it names comes round, and on
      * this board that instant has to be converted out of master time first.

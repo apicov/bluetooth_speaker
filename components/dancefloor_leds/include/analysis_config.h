@@ -77,9 +77,13 @@
  *
  * HERE rather than in analysis.hpp because analyser.hpp needs it for
  * Analyser::process() and analysis.hpp includes analyser.hpp, not the other way
- * round. It is also the width of the array on the wire, which visualiser.cpp
- * static_asserts against VIS_SPEC_BINS -- three headers agreeing on one number,
- * which is exactly what this file is for.
+ * round.
+ *
+ * IT IS NO LONGER A WIRE WIDTH. It used to be the width of the array in
+ * vis_frame_t as well, static_asserted against VIS_SPEC_BINS -- three headers
+ * agreeing on one number. The spectrum stopped travelling (see vis_frame_t),
+ * so a frame is 32 bytes of timeline labels and bands, and this number is a
+ * purely local one: two headers agreeing, and nothing on the air.
  */
 #define DF_SPEC_BINS 64
 

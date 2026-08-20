@@ -257,7 +257,7 @@ menu "Dancefloor LEDs"
     config DANCEFLOOR_ML
         bool "Run the pluggable analysers on this unit"
         default n
-        depends on DANCEFLOOR_ENABLE_VISUALISER
+        depends on DANCEFLOOR_ENABLE_VISUALISER && DANCEFLOOR_LED_SOURCE_LOCAL
         help
             Whether this unit runs the registered analysers beside the FFT, and
             therefore whether the lane, its task and its buffers are built at
@@ -267,9 +267,23 @@ menu "Dancefloor LEDs"
             THIS REPLACED A CHOICE, and the difference matters. There used to be
             DANCEFLOOR_ML_SOURCE -- local or remote -- because a unit that could
             not hold a model could be GIVEN one's results by the hub. Nothing is
-            given any more: analysers read the spectrum every unit already has,
-            so a unit either runs them or does without them, and this is that
-            question.
+            given any more: a unit either runs the analysers or does without
+            them, and this is that question.
+
+            IT REQUIRES LED_SOURCE_LOCAL, and that dependency is newer than the
+            paragraph above. Analysers read the quantised spectrum and nothing
+            else, and the spectrum stopped travelling: vis_frame_t carries the
+            timeline labels and the four detector bands, 32 bytes, because the
+            64 bytes of spec[] were read only by an ML build and every other
+            satellite discarded them 86 times a second. A unit taking frames off
+            the wire therefore has no spectrum to give a model, and this is
+            unselectable there rather than quietly running one on zeros.
+
+            So a unit that wants models must compute its own spectrum, which
+            costs it the FFT, a 32 kB stream buffer and a task. That is an S3
+            decision: it has PSRAM for the buffer and room for the rest. A
+            classic ESP32 has neither -- see the LED_SOURCE help below, and
+            satellite/sdkconfig.defaults.esp32 for what it cost when tried.
 
             Default n so that turning it on is a decision each build makes.
             The hub in particular must stay off: it gave up ~25 kB of internal
@@ -405,21 +419,34 @@ menu "Dancefloor LEDs"
         config DANCEFLOOR_LED_SOURCE_LOCAL
             bool "Local -- this unit analyses the audio it holds"
             help
-                What every unit did before frames could travel. Costs an FFT
-                and two detectors per frame, and gives the pattern the full
-                spectrum.
+                What every unit did before frames could travel. Costs an FFT,
+                a 32 kB PCM stream buffer and an analysis task, and gives this
+                unit the full spectrum -- which is why DANCEFLOOR_ML depends on
+                this option.
+
+                The buffer is one CONTIGUOUS 32 kB block. On a board with
+                SPIRAM it is taken from there and the internal cost is about
+                24 kB; without, all of it is internal and lands on a heap that
+                is already holding the playback ring.
 
         config DANCEFLOOR_LED_SOURCE_REMOTE
             bool "Remote -- this unit is given frames by the hub"
             help
-                No FFT and no detectors run here; the analysis task is not
-                even started. The strip follows the sending unit exactly,
-                whatever algorithm it runs, because there is only one copy of
-                the decision.
+                No FFT runs here and the analysis task is not started. The
+                DETECTOR still does: a frame carries the four bands at full
+                float precision and df::RemoteDetect derives this unit's own
+                onset and boom from them, so what arrives is the detector's
+                input rather than the sender's decision.
 
-                Frame::mag is not available under this option -- it is 512
-                floats and does not travel. Patterns using spec[] work either
-                way.
+                (That is a correction. This help used to say "no detectors run
+                here", which was written when the hub's decisions travelled and
+                was left behind when they stopped.)
+
+                Frame::mag is not available under this option -- 512 floats,
+                and it does not travel. Neither does spec[], which is why
+                DANCEFLOOR_ML cannot be selected alongside this: the analysers
+                read the spectrum and there is none to read. No pattern reads
+                either field, so patterns work unchanged.
 
     endchoice
 

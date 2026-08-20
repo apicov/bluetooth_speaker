@@ -116,11 +116,20 @@
  * said the room had returned -- that ring is 80 kB / 464 ms -- "but do not spend
  * it on the lead without a reason the lead itself can serve". There are two now:
  *
- *   - THE SATELLITE RUNS MODELS. The S3 satellite takes MSG_FRAME and runs the
- *     analyser lane on the spectrum it carries, and every frame names the
- *     instant it is drawn at. The lead is the whole budget between a frame
- *     arriving and being due, so it is what an inference has to finish inside.
- *     At 200 ms that budget is shared with delivery; at 250 it is not as tight.
+ *   - THE SATELLITE RUNS MODELS. The S3 satellite runs the analyser lane, and
+ *     every frame names the instant it is drawn at. The lead is the whole budget
+ *     between a frame existing and being due, so it is what an inference has to
+ *     finish inside. At 200 ms that budget is shared with delivery; at 250 it is
+ *     not as tight.
+ *
+ *     THIS BULLET NO LONGER ARGUES FROM THIS LANE, and the difference does not
+ *     change the number. It used to read "takes MSG_FRAME and runs the analyser
+ *     lane on the spectrum it carries" -- that unit is LED_SOURCE_LOCAL now and
+ *     computes its own spectrum, because spec[] came off the wire (see
+ *     vis_frame_t). So the inference budget is no longer bounded by DELIVERY at
+ *     all; it is bounded by the lead between analysis and render, which is the
+ *     same lead and the same figure. The second bullet is what actually holds
+ *     this constant up regardless.
  *   - ANCHORS ARE BEING REFUSED. 251 in three hours. A satellite will not anchor
  *     on a packet with less than ANCHOR_MIN_LEAD_US in front of it, RESYNC_US
  *     lets this timeline wander 150 ms below target, and the measured mean lead
@@ -387,8 +396,11 @@
  *
  * There was a second lane here, publish_ml, capped by its own
  * ML_PUBLISH_PERIOD_US at 10/s against a possible 86. It is gone: analysers read
- * the spectrum every unit already receives, so results are computed where they
- * are needed rather than shipped. That halves what this backoff is protecting.
+ * a spectrum, and a unit that wants one computes it, so results are computed
+ * where they are needed rather than shipped. That halves what this backoff is
+ * protecting. (The spectrum itself stopped being shipped too, later and for a
+ * different reason -- see vis_frame_t -- which is what makes "computes it" a
+ * build rule rather than a preference.)
  *
  * TX_BACKOFF_US is how long the non-audio lane stays silent after ANY sendto()
  * returns ENOMEM: the instant the pool is exhausted, non-audio yields, leaving

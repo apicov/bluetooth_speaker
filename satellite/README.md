@@ -93,7 +93,7 @@ switching, nothing to rewrite between them:
 
 | | classic | S3 |
 |---|---|---|
-| tracked config | `sdkconfig.defaults` | `sdkconfig.defaults` **+** `sdkconfig.defaults.esp32s3` |
+| tracked config | `sdkconfig.defaults` **+** `sdkconfig.defaults.esp32` | `sdkconfig.defaults` **+** `sdkconfig.defaults.esp32s3` |
 | generated config | `sdkconfig` | `sdkconfig.s3` |
 | build directory | `build/` | `build.s3/` |
 
@@ -135,7 +135,7 @@ after `sdkconfig.defaults` for **any** target, so this works in both directions:
 | file | applies to |
 |---|---|
 | `sdkconfig.defaults` | both |
-| `sdkconfig.defaults.esp32` | classic only — *does not exist yet; create it when something needs it* |
+| `sdkconfig.defaults.esp32` | classic only — `LED_SOURCE_REMOTE`, and the memory argument for it |
 | `sdkconfig.defaults.esp32s3` | S3 only |
 
 Code that belongs to one of them is a whole file wrapped in `#if
@@ -150,6 +150,20 @@ When a setting in `sdkconfig.defaults` stops being common to both, move it down
 into the two target files rather than leaving it in the base with an override on
 top. A base value that is always overridden reads as a shared default and is not
 one.
+
+`DANCEFLOOR_LED_SOURCE` is the worked example, and the reason
+`sdkconfig.defaults.esp32` exists at all. It sat in the base as `REMOTE` while
+both boards agreed. They stopped agreeing when `spec[]` came off the wire: the S3
+runs the ML analysers, analysers read a spectrum, and a unit taking frames no
+longer receives one — so the S3 went `LOCAL` and computes its own. Rather than
+leave `REMOTE` in the base and override it on one target, each target now states
+its own, with the reason beside it.
+
+The hop and the pattern stayed in the base, deliberately. Those must not differ
+across the floor, and a locally-analysing S3 and a frame-taking classic exchange
+nothing that would reveal a mismatch — the only instrument is reading `hop` off
+two consoles. Keeping them where both targets read them makes a mismatch require
+an edit rather than an omission.
 
 Changing target rewrites `sdkconfig` from the defaults, so re-check anything you
 had set by hand in `menuconfig`.

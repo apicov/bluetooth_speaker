@@ -732,11 +732,15 @@ nothing writes. That reads 0 now.
   from the hub, and produces nothing.
 - **The analyser lane IS compiled now**, on the S3 satellite
   (`DANCEFLOOR_ML=y`, `DANCEFLOOR_ML_TFLM=y` in `sdkconfig.defaults.esp32s3`).
-  It no longer needs audio: analysers read the quantised spectrum every frame
-  carries, so that unit stays `LED_SOURCE_REMOTE` and runs models on the hub's
-  FFT. The `tools/syntax_check.py --with DANCEFLOOR_ML_SOURCE_LOCAL` invocation
-  named here previously is gone with the setting; a build of the S3 target is
-  what exercises the lane now.
+  It reads the quantised spectrum and nothing else, and **that unit is
+  `LED_SOURCE_LOCAL` now**: `spec[]` came off the wire, because 64 of a frame's
+  96 bytes were travelling to every satellite for the benefit of the one board
+  that reads them. `DANCEFLOOR_ML` `depends on DANCEFLOOR_LED_SOURCE_LOCAL`, so
+  this unit computes its own FFT — ~24 kB of internal SRAM here, the 32 kB PCM
+  stream going to PSRAM. It briefly ran models on the hub's FFT for free; the
+  free was paid by every other unit. The `tools/syntax_check.py --with
+  DANCEFLOOR_ML_SOURCE_LOCAL` invocation named here previously is gone with the
+  setting; a build of the S3 target is what exercises the lane now.
 - **There is still no model.** TFLM compiles the interpreter, the arena and the
   schema check, and the two shipped analysers need no weights, so the image grew
   ~3.3 kB rather than megabytes. The real size and timing questions arrive with

@@ -95,45 +95,23 @@ CONFIG_DANCEFLOOR_LED_HOP_512=y
 # config difference.
 CONFIG_DANCEFLOOR_LED_PATTERN="boom"
 
-# Where this unit's frames and analyser results come from: the hub, not itself.
+# WHERE THIS UNIT'S FRAMES COME FROM IS NOW PER-TARGET, and so it is not set
+# here. See sdkconfig.defaults.esp32 (REMOTE, and why) and
+# sdkconfig.defaults.esp32s3 (LOCAL, and why).
 #
-# THIS IS A MEMORY DECISION before it is anything else, and it is pinned here
-# because the satellite did not fit without it. A satellite analysing locally
-# holds the 80 kB audio ring, a ~33 kB analysis stream, and -- with the slow lane
-# local as well -- a further ~13 kB buffer and two more task stacks. On a classic
-# ESP32 that does not fit, and the way it does not fit is silent:
+# It lived in this shared file while both targets agreed. They no longer do: the
+# S3 has PSRAM for the analysis stream and wants its own spectrum for the ML
+# analysers, and the classic ESP32 has neither and does not. Leaving a `choice`
+# member set here and overridden there would work by file ordering, which is a
+# thin thing to rest a floor-wide behaviour on -- so each target states its own.
 #
-#   E ALLOCATION FAILED 177 time(s): largest request 4096 B (caps 0x804 INTERNAL)
-#   W HEALTH: up 5 s | heap 396 (min 92, window 396, largest 208) | stack play 0
-#
-# 396 bytes free. The 4096-byte requests are task stacks: probe, rx and play all
-# failed to start and only drift fitted, at 3072. `stack play 0` is the play
-# task's high-water mark never having been written, because the task does not
-# exist. A unit in that state still associates, still takes a DHCP lease, still
-# looks healthy from the hub -- and produces no audio, no LEDs and no anchors.
-# It reads exactly like a satellite waiting for a stream that never came, which
-# is how it was read for an evening. The Kconfig help for ML_SOURCE_LOCAL had
-# already priced it: "about 25 kB ... against the ~52 kB a satellite has free
-# while analysing." That margin was spent.
-#
-# REMOTE costs the floor nothing it can see. Frames are drawn at the instant they
-# name, so a unit given them stays in step with the unit that made them -- more
-# tightly than two units analysing separately, because there is only one copy of
-# the decision. The hub already runs both analyses locally and publishes them
-# (MSG_FRAME, MSG_ML). The only thing that does not travel is Frame::mag, and no
-# pattern can use it anyway: it is gone before a queued frame is drawn, which
-# analysis.hpp says outright.
-#
-# There used to be a second line here, DANCEFLOOR_ML_SOURCE_REMOTE. That setting
-# is gone: analysers now read the quantised spectrum carried in every frame, so a
-# unit taking remote frames has everything a model needs and runs it locally or
-# not at all. Nothing is distributed, and there is no longer a choice to state.
-#
-# Floor-wide agreement, like the pattern and hop above: a unit analysing locally
-# may run a different algorithm, so what is guaranteed is only that units taking
-# frames from the same source render identically. The live source is printed at
-# startup and carried on the HEALTH line, so an unintended mismatch is visible.
-CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE=y
+# THE HOP AND THE PATTERN ABOVE STAY SHARED, and deliberately. They are the two
+# settings that must not differ across the floor: a locally-analysing S3 and a
+# frame-taking classic exchange nothing that would reveal a mismatch, so the
+# only instrument is reading `hop` off two consoles. Keeping them in the file
+# both targets read is what makes a mismatch require an edit rather than an
+# omission.
+
 
 # The LED sync marker, on by default on this unit.
 #

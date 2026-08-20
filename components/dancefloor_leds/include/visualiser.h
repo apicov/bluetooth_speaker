@@ -18,27 +18,40 @@
 extern "C" {
 #endif
 
-/* Mirrors df::BEAT_BANDS and df::SPEC_BINS, which are C++ and cannot be seen
- * from here. visualiser.cpp static_asserts that they still agree. */
+/* Mirrors df::BEAT_BANDS, which is C++ and cannot be seen from here.
+ * visualiser.cpp static_asserts that the two still agree. */
 #define VIS_BANDS      4
-#define VIS_SPEC_BINS 64
 
 /*
  * One analysis frame, in the form that can leave the unit that computed it.
  *
  * This is df::Frame reduced to what a receiver cannot rebuild for itself: the
- * timeline labels, the detector's input, and the spectrum. 96 bytes, so a
- * stream of these at the 86 frames/s of hop 512 is ~8 kB/s against the 30-40
- * the audio already uses on the same radio.
+ * timeline labels and the detector's input. 32 bytes, so a stream of these at
+ * the 86 frames/s of hop 512 is ~2.8 kB/s against the 30-40 the audio already
+ * uses on the same radio.
  *
  * The detector outputs are absent on purpose. band[] travels at FULL float
  * precision -- it is beat_det_update()'s exact input, and the receiver runs
  * the same detector over the same numbers (df::RemoteDetect in analysis.hpp),
  * so the onset and boom a pattern sees are derived here rather than sent.
- * spec[] could not serve that purpose: it is quantised to 8 bits through
- * x/(1+x), and flux is a frame-to-frame difference, so the quantisation would
- * land directly on the signal the detector runs on. beat_detect.h says this
- * in full.
+ *
+ * THE SPECTRUM NO LONGER TRAVELS, and that is what makes this 32 bytes rather
+ * than 96. spec[] is 64 of those bytes and only the pluggable analysers ever
+ * read it (run_fast_lane and ml_lane_feed, both under DF_RUNS_ANALYSERS) -- no
+ * pattern touches it. A satellite with the analysers off therefore received
+ * two thirds of every frame and discarded it, 86 times a second.
+ *
+ * The consequence is a build rule rather than a runtime one: a unit that takes
+ * frames from the wire can no longer run the analysers, because the bytes they
+ * read are not there. DANCEFLOOR_ML depends on DANCEFLOOR_LED_SOURCE_LOCAL for
+ * that reason, so the combination cannot be selected at all. A unit that wants
+ * models computes its own spectrum -- which costs it the FFT, and is why that
+ * is an S3 decision. See the block above DF_RUNS_ANALYSERS in visualiser.cpp.
+ *
+ * spec[] could not have served the detector's purpose anyway: it is quantised
+ * to 8 bits through x/(1+x), and flux is a frame-to-frame difference, so the
+ * quantisation would land directly on the signal the detector runs on.
+ * beat_detect.h says this in full.
  *
  * Deliberately declared here and not in sync_proto.h. This component does not
  * depend on the audio protocol and must stay buildable on its own; the unit
@@ -56,7 +69,6 @@ typedef struct __attribute__((packed)) {
     int64_t due_us;         /* master-clock instant this frame describes */
     int64_t index;          /* block number, from an origin all units share */
     float   band[VIS_BANDS];
-    uint8_t spec[VIS_SPEC_BINS];
 } vis_frame_t;
 
 /*

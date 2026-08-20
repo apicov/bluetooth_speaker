@@ -535,9 +535,10 @@ Three other message types share the socket. `MSG_TIME_REQ`/`MSG_TIME_RSP` are th
 clock probes (§10), `MSG_META` carries the track title and artist the bridge got
 over AVRCP, and `MSG_FRAME` carries a batch of analysis frames — the hub's own,
 for units built to draw what it decided rather than analyse for themselves (§12).
-Frames go to the group with the audio and cost ~8 kB/s per listener against the
-30–40 the audio already uses. The hub publishes them whenever its visualiser is
-enabled; a satellite doing its own analysis simply ignores them.
+Frames go to the group with the audio and cost ~2.8 kB/s against the 30–40 the
+audio already uses — **flat**, not per listener, because one group transmission
+feeds every satellite. The hub publishes them whenever its visualiser is enabled;
+a satellite doing its own analysis is not even compiled to parse them.
 
 **A batch, because the beacon rather than the analysis decides when this lane may
 transmit.** A SoftAP releases group-addressed frames only after a DTIM beacon —
@@ -862,12 +863,14 @@ Everything above is about making two units *independently* reach the same
 decision. There is now a second way to get agreement, which is to have only one
 decision: the hub publishes each frame it computes, and a unit built for
 `CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE` draws those instead of analysing anything.
-No FFT and no detector run there; the analysis task is not even started.
+No FFT runs there and the analysis task is not started — but the **detector
+does**: a frame carries the bands, not the sender's answers, so a remote unit
+derives its own onset and boom from them.
 
-| Source | What the unit does |
-|---|---|
-| `LOCAL` (default) | Runs its own FFT and both detectors. Costs the analysis, gives the pattern the full spectrum |
-| `REMOTE` | Runs no analysis. Draws the hub's frames at the instant each names |
+| Source | What the unit does | Who |
+|---|---|---|
+| `LOCAL` (default) | Own FFT and both detectors. Costs the analysis; gives this unit the spectrum, which is what `DANCEFLOOR_ML` needs | hub, S3 satellite |
+| `REMOTE` | No FFT. Runs the same two detectors over the bands it is sent, and draws each frame at the instant it names | classic ESP32 satellite |
 
 The received frame goes into the same queue local analysis fills and is drawn the
 same way, so the two sources are interchangeable by construction rather than by
@@ -897,21 +900,43 @@ cannot detect that its neighbour is on a different hop, because nothing crosses
 between locally analysing units, and that is exactly the property that makes them
 stay in step. Two consoles settle it.
 
-`Frame::mag` — 512 floats — does not travel and is null on any received frame.
-Patterns using the quantised `spec[]` work either way. This is also the constraint
-that shapes the detector's tuning: anything a remote unit might one day be asked
-to compute has to be derivable from the four `band` floats that do travel, which
+**A frame is 32 bytes, and only the four `band` floats are payload.** Neither
+`Frame::mag` — 512 floats — nor the quantised `spec[]` travels. That is the
+constraint shaping the detector's tuning: anything a remote unit might one day be
+asked to compute has to be derivable from the bands, which
 [`tuning-corpus.md`](tuning-corpus.md) §9 makes executable rather than a promise.
 
-**`spec[]` is what the pluggable analysers read**, and that is what lets a unit
-on `REMOTE` run a model. It is 64 log-spaced bins, quantised to `uint8` on a
-fixed compression curve (`raw / (1 + raw)`, not an AGC against a running
-maximum), so absolute level survives it and a feature wanting loudness may take
-it from these bins. The identical bytes are produced locally and unpacked off the
-radio — `visualiser.cpp` `static_assert`s that the two widths agree — so an
-analyser cannot tell which it got, and `DANCEFLOOR_ML` is therefore independent
-of this setting in both directions. The S3 satellite is `REMOTE` **and** runs
-models; the hub is `LOCAL` and runs none.
+**`spec[]` came off the wire, and that is what makes `DANCEFLOOR_ML` a local-only
+option.** It is 64 log-spaced bins quantised to `uint8` on a fixed compression
+curve (`raw / (1 + raw)`, not an AGC against a running maximum), so absolute
+level survives it and a feature wanting loudness may take it from these bins —
+and it is what the pluggable analysers read, and the *only* thing that reads it.
+No pattern touches it.
+
+That made it 64 of a frame's 96 bytes travelling for the benefit of one board.
+Every other satellite received the spectrum 86 times a second and discarded it,
+so the lane cost ~8.3 kB/s to deliver ~2.8 kB/s of used data. Dropping it is
+what took a full batch from 1155 bytes to 387.
+
+The arrangement it replaced was the more elegant one and is worth recording: an
+analyser cannot tell whether its bytes were computed locally or unpacked off the
+radio, so a satellite with no audio could run a model on the hub's FFT for free.
+What broke it was not the idea but the arithmetic — that "free" was paid by every
+unit that did not want it. So a unit that wants models now computes its own
+spectrum, which costs it the FFT, a 32 kB stream buffer and a task:
+`DANCEFLOOR_ML` `depends on DANCEFLOOR_LED_SOURCE_LOCAL`, and `visualiser.cpp`
+`#error`s on the pair as well, since `sdkconfig` is a generated file people edit.
+
+**So the floor is mixed, and deliberately.** The S3 satellite is `LOCAL` and runs
+models — it has PSRAM for the stream buffer. The classic ESP32 satellite is
+`REMOTE` and runs none — it has neither the PSRAM nor the internal heap, which
+§16 records it proving. The hub is `LOCAL` and runs no models.
+
+What holds a mixed floor together is that the two paths reach identical
+decisions from identical bands, and that is checked rather than assumed:
+`test_remote_detect.cpp`'s `mirror()` asserts exact float equality between a unit
+running `Analysis` and one running `RemoteDetect`, at every hop the Makefile
+sweeps. It is the only place that property is tested anywhere.
 
 #### Where the code lives
 
@@ -1059,8 +1084,8 @@ paid for.
 | `RING_TARGET_MS` | **250** | Matches the hub's lead, by hand — this image cannot see `LEAD_US`, and a mismatch does not fail loudly: the servo's depth net simply holds the unit at the wrong depth, which reads as a standing phase error nothing explains |
 | `MAX_SPLICE_MS` | 150 | Ceiling on a track-boundary correction; anything larger is a bug, not drift |
 | ~~`DANCEFLOOR_USE_INTERNAL_DAC`~~ | — | Was a build option for testing with no DAC wired: 8-bit, audibly poor. Removed 2026-08-12; see §5 |
-| `DANCEFLOOR_LED_SOURCE` | **`REMOTE`** | Draw the frames the hub sends rather than analyse locally. Was `LOCAL`; a locally-analysing satellite did not fit its RAM — 177 failed allocations and 396 bytes of free heap. See §12 |
-| `DANCEFLOOR_ML` | **`y` on the S3 only** | The S3 satellite runs the analysers; the classic one does not. Set in `sdkconfig.defaults.esp32s3`, which no other build reads. Independent of `LED_SOURCE`: analysers read the spectrum every frame carries, so this unit runs models on audio it never had |
+| `DANCEFLOOR_LED_SOURCE` | **per target** | `REMOTE` on the classic, `LOCAL` on the S3 — set in `sdkconfig.defaults.esp32` and `.esp32s3` respectively, not in the shared file, because this is the one setting on which the two boards genuinely differ. The classic stays remote on memory: a locally-analysing one did not fit its RAM — 177 failed allocations and 396 bytes of free heap. See §12 |
+| `DANCEFLOOR_ML` | **`y` on the S3 only** | The S3 satellite runs the analysers; the classic one does not. `depends on DANCEFLOOR_LED_SOURCE_LOCAL` — analysers read `spec[]` and `spec[]` no longer travels, so a unit taking frames has no spectrum to give a model. That dependency is *why* the S3 is `LOCAL`; turning ML off would make `REMOTE` viable there again and save ~24 kB of internal SRAM |
 | `DANCEFLOOR_ML_TFLM` | **`y` on the S3 only** | The TFLM interpreter and arena. `depends on SPIRAM` — `ml_arena` falls back to internal SRAM rather than failing, and that fallback surfaces an hour later as an audio dropout |
 | `DANCEFLOOR_WIFI_LOGS` | **`n`** | Must match the hub's; satellites ship to the hub and the hub relays |
 
