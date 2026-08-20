@@ -1,0 +1,32 @@
+# Zabumba segments -- which stretch of each recording is drumming and which is talking.
+#
+# Proposed by ./sweep.py segments (band-0 rise for the drum half, band 1 for the
+# speech half) and then CONFIRMED BY EAR. The proposal is a convenience for
+# finding boundaries, not evidence; what is checked in is what a human heard.
+# See docs/tuning-corpus.md for who confirmed it and against which decode.
+#
+# label: drum   -> the `zabumba` group, the positive corpus
+#        speech -> the `zabumba-speech` group, a real-world negative control
+#                  (a voice in a room, which the synthetic control is not)
+#
+# A boundary is an exact sample index into the cached full decode, so moving one
+# moves every label instant inside it. Change these only with the labels.
+file,start_s,end_s,label
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],0,6,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],10,15,speech
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],15,24,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],26,36,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],41,68,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],72,97,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],102,128,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],130,140,speech
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],147,157,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],157,162,speech
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],162,187,drum
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],187,225,speech
+Aula de zabumba Baião -  Zabumblog [SJ9mJsD_V0U],225,230,drum
+Contemporânea 18” Zabumba [lL2I5IAoaUc],0,34,drum
+How to Play Basic Zabumba Pattern for Baião ｜ Brazilian Forró Rhythm [y034EnVV6uA],5,15,drum
+Zabumba - Batida de xaxado com variação avançada [OL8PxPSULfQ],5,23,drum
+Zabumba 18'' - Holz - Izzo - A323010 [BOSkO5_Q__A],1,62,drum
+Zabumba 20＂ x 20 cm - aluminium - Contemporânea - A343621 [Qwd2QqwIoMw],0,56,drum
