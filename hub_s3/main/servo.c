@@ -106,12 +106,80 @@ void servo_tick(void)
     /* Printed once per log period, not every window. tx-fail accumulates
      * across the quiet windows so nothing is lost by not printing it. */
     static int status_left;
-    if (--status_left <= 0) {
-        status_left = CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
+    /*
+     * ...EXCEPT WHILE THE TRANSMIT PATH IS IN TROUBLE, when it prints every 5 s.
+     *
+     * The 20 s window is why the 2026-08-20 soak cannot be read. The satellites
+     * lost their lead at 16:20:31 and the first large tx-fail was reported at
+     * 16:20:47 -- both inside ONE window, so nothing in the capture says which
+     * came first, and "the queue filled and then refused" versus "something
+     * refused and the queue backed up behind it" are the two candidate stories.
+     * A 5 s cadence separates them; 20 s cannot, however long the run is.
+     *
+     * Armed by the failure itself rather than by a mode, so it costs nothing on
+     * a clean run and needs no way to be turned on: the interesting window is
+     * always the one after the one that went wrong. Held for ~60 s past the
+     * last refusal so the recovery is captured at the same resolution as the
+     * onset -- a storm that ends is as informative as one that starts, and this
+     * hub has now had both.
+     */
+    static int fast_left;
+    /* 5 s passes since the last print. The window is no longer a constant, and
+     * every RATE on this line is a count divided by it -- so it has to be
+     * measured rather than assumed, or `pkts/s` reads a quarter of the truth in
+     * exactly the windows anyone will be looking at. */
+    static int ticks;
+    ticks++;
+    if (s_tx_fail) {
+        fast_left = 60 / 5;
+    }
+    if (--status_left <= 0 || fast_left > 0) {
+        status_left = (fast_left > 0) ? 1 : CONFIG_DANCEFLOOR_LOG_PERIOD_S / 5;
+        if (fast_left > 0) {
+            fast_left--;
+        }
+        const uint32_t window_s = (uint32_t)ticks * 5;
+        ticks = 0;
         /* Empty unless something failed, so a clean line is unchanged from
          * every log captured before this instrument existed. */
         char why[128];
         tx_fail_summary(why, sizeof(why));
+        /* Which lanes were refused, and -- only when something was -- whether
+         * the refusals were beacon-spaced or one unbroken stall. See net.c. */
+        char lanes[96];
+        tx_fail_lanes(lanes, sizeof(lanes));
+        char burst[96];
+        tx_burst_summary(burst, sizeof(burst));
+        /*
+         * The station census, taken here rather than kept as a counter because
+         * association is a fact the driver already holds and a counter would
+         * only be a stale copy of it.
+         *
+         * `stations` is the first thing to read on a bad line. Every soak this
+         * project has on file with ONE satellite ran tx-fail at essentially
+         * zero, including a 3h11m one; the run that fell apart was the first
+         * with two. Under multicast the hub's downlink packet rate barely moves
+         * with satellite count, so if that correlation is real it is not the
+         * fill doing it -- and the first thing to establish is that both units
+         * were actually associated the whole time rather than flapping.
+         *
+         * rssi-min and phy-11n come free from the same call. The first says
+         * whether the air changed under the fault; the second whether a station
+         * associated without 11n, which would mean no aggregation to it and a
+         * transmit queue that drains a frame at a time.
+         */
+        wifi_sta_list_t sta = {0};
+        int8_t rssi_min = 0;
+        int n_11n = 0;
+        if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK) {
+            sta.num = -1;   /* says "not measured", which is not "none joined" */
+        }
+        for (int i = 0; i < sta.num; i++) {
+            if (i == 0 || sta.sta[i].rssi < rssi_min) {
+                rssi_min = sta.sta[i].rssi;
+            }
+            n_11n += sta.sta[i].phy_11n ? 1 : 0;
+        }
         /* Text, not a number, so "nothing stamped this window" cannot be read
          * as a lead of zero -- the same reason the satellite's ARRIVAL line
          * spells its two minima out. See n_lead_min_us. */
@@ -129,24 +197,28 @@ void servo_tick(void)
          * gone somewhere else and this filter is not earning its place. */
         ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us "
                       "(median %+ld%s, smoothed %+ld us) | "
-                      "tx-fail %" PRIu32 " (%" PRIu32 " audio)%s"
+                      "tx-fail %" PRIu32 " (%s)%s%s"
                       " | cong-skip %" PRIu32
                       " | pace-skip %" PRIu32
                       " | %lu pkts/s | fanout-gap-max %ld ms | lead-min %s"
+                      " | stations %d | rssi-min %d | phy-11n %d | churn %" PRIu32
                       " | xport %s fec %d frames %s",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
                  (long)s_phase_err_us,
                  (long)(s_phase_med_valid ? s_phase_med_us : 0),
                  s_phase_med_valid ? "" : " n/a",
-                 (long)err_ema, s_tx_fail, s_tx_fail_audio, why,
+                 (long)err_ema, s_tx_fail, lanes, why, burst,
                  n_tx_cong_skip, n_tx_pace_skip,
-                 (unsigned long)(s_audio_pkts / (uint32_t)CONFIG_DANCEFLOOR_LOG_PERIOD_S),
+                 (unsigned long)(s_audio_pkts / window_s),
                  (long)(n_fanout_gap_max_us / 1000), lead_s,
+                 (int)sta.num, (int)rssi_min, n_11n, n_join_churn,
                  AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
                  FRAMES_TRANSPORT_TAG);
         s_tx_fail = 0;
-        s_tx_fail_audio = 0;   /* same window as the total it is a subset of */
+        /* The lane counters are cleared inside tx_fail_lanes(), on the same
+         * pass that rendered them, for the reason tx_fail_summary() is: the
+         * total and its breakdown must not come to describe different windows. */
         s_audio_pkts = 0;
         n_tx_cong_skip = 0;
         n_tx_pace_skip = 0;    /* same window as the cong-skip it accompanies */
@@ -155,6 +227,8 @@ void servo_tick(void)
          * against the satellite's ARRIVAL line. */
         n_fanout_gap_max_us = 0;
         n_lead_min_us = LEAD_UNSEEN;
+        /* Same window as the refusals it is there to be correlated with. */
+        n_join_churn = 0;
     }
 
     const int32_t target = (int32_t)(LEAD_US / 1000) *

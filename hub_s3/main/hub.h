@@ -590,9 +590,57 @@ extern volatile uint32_t s_tx_fail;   /* sendto() rejections */
  * which is exactly when it mattered that they are different questions.
  */
 extern volatile uint32_t s_audio_pkts;
-/* ... and the subset of them that were AUDIO, which is the only subset that is
- * audible. See tx_fail_note_audio(). */
-extern volatile uint32_t s_tx_fail_audio;
+/*
+ * ... and the same total split by WHICH LANE was refused, because "how many"
+ * and "whose" are different questions and only the second one picks a fix.
+ *
+ * AUDIO is the subset that is audible, and was the only split this had. The
+ * 2026-08-20 soak is why the rest exist: `tx-fail 534 (454 audio)` left 80
+ * failures unexplained on a line where the whole argument was about which lane
+ * was holding the WiFi driver's transmit buffers. They were all publish_frame,
+ * as it happens -- but nothing on the line said so, and VOL, META and the probe
+ * replies were not counted AT ALL, so the printed total was not even the true
+ * total. A lane that cannot be seen cannot be exonerated.
+ *
+ * Ordered audible-first, which is also roughly worst-first: a refused audio
+ * packet is a hole in the sound on every satellite at once, a refused frame is
+ * one repaint, a refused level is covered by the 1 Hz repeat, and a refused
+ * probe reply is one clock sample out of four a second.
+ *
+ * Racy exactly as s_tx_fail is, and for the same reason -- see net.c.
+ */
+typedef enum {
+    TX_LANE_AUDIO = 0,   /* fan_out(): the only refusal the room can hear */
+    TX_LANE_FRAME,       /* publish_frame(): analysis frames */
+    TX_LANE_VOL,         /* streamer_send_vol() */
+    TX_LANE_META,        /* streamer_send_meta(): track metadata */
+    TX_LANE_PROBE,       /* probe_task(): time and TSF replies */
+    TX_LANE_N,
+} tx_lane_t;
+
+extern volatile uint32_t s_tx_lane_fail[TX_LANE_N];
+
+/*
+ * Stations arriving or leaving in this window, both counted together.
+ *
+ * The 2026-08-20 soak put its whole ENOMEM storm in the first five minutes,
+ * starting the minute the stream did, with both satellites re-joining after the
+ * hub was flashed -- and then ran eleven minutes clean. sdkconfig.defaults
+ * describes the same shape ("a satellite joining a playing stream measured 1016
+ * sendto() rejections in one 20 s window"), so a join is the leading suspect
+ * for what holds the transmit pool.
+ *
+ * That is still an INFERENCE from two timestamps lining up. This makes it a
+ * reading: if churn and refusals share a window, the join is the mechanism; if
+ * refusals arrive in windows with churn 0, it is not, and the suspicion dies
+ * instead of being carried forward.
+ *
+ * Arrivals and departures in one counter deliberately. They come in pairs on a
+ * re-join, the question is "was the AP doing association work", and two numbers
+ * that always move together are one number with extra width. `stations` on the
+ * same line already says what the floor settled at.
+ */
+extern volatile uint32_t n_join_churn;
 
 /*
  * Non-audio publish throttling, paired with TX_BACKOFF_US. tx_fail_note() raises
@@ -713,10 +761,23 @@ extern volatile int32_t n_lead_min_us;
  * the tally for the status line and clears it. Both live in net.c, which owns
  * the socket; the rationale for keeping the reason at all is there.
  */
-void tx_fail_note(int err);
-/* The audio downlink's own entry point, which also counts s_tx_fail_audio. */
+void tx_fail_note(tx_lane_t lane, int err);
+/* The audio downlink's own entry point. Kept as a name rather than folded into
+ * the call above because timeline.c's two send paths are the only callers and
+ * three of its comments refer to it by name. */
 void tx_fail_note_audio(int err);
 void tx_fail_summary(char *buf, size_t len);
+/* The lane breakdown for the status line, rendered and cleared together with
+ * the errno tally above so the two cannot describe different windows. */
+void tx_fail_lanes(char *buf, size_t len);
+/* ...and the shape of the ENOMEM storm behind them: whether refusals arrive in
+ * beacon-spaced clusters (the queue is deep) or one unbroken stall (the release
+ * has stopped). Writes an empty string when nothing was refused. See net.c. */
+void tx_burst_summary(char *buf, size_t len);
+/* Closes an open refusal stretch: an audio packet got through, so the pool
+ * freed a buffer. Called from fan_out() on FANOUT_SENT. See net.c for why
+ * audio, and only audio, is what may close one. */
+void tx_send_ok(void);
 /* Both units count the DMA running dry; see on_tx_starved() in out.c. */
 uint32_t dma_starve_count(void);
 

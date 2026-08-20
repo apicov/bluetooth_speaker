@@ -650,6 +650,10 @@ static void fan_out(size_t bytes, int64_t now)
     if (r != FANOUT_SENT) {
         return;                     /* refused: the hole is still open */
     }
+    /* The pool handed a buffer back. This is what closes a refusal stretch for
+     * tx_burst_summary(), and it has to be the audio lane that does it -- see
+     * the note above enomem_note_shape() in net.c. */
+    tx_send_ok();
     if (s_fanout_prev_at) {
         const int64_t gap = now - s_fanout_prev_at;
         if (gap > n_fanout_gap_max_us) {

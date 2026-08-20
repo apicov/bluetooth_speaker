@@ -29,11 +29,13 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
         n_sta_left++;
+        n_join_churn++;
         const wifi_event_ap_stadisconnected_t *ev = data;
         if (ev) {
             client_gone(ev->mac);
         }
     } else if (base == IP_EVENT && id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
+        n_join_churn++;
         /* Carries the address AND the MAC outright, so unlike the departure
          * above this needs no lease lookup and cannot fail to identify the
          * station -- which is what lets client_joined() seed ARP. */
@@ -82,31 +84,46 @@ void wifi_start_ap(void)
     wc.ap.channel = CONFIG_DANCEFLOOR_WIFI_CHANNEL;
     wc.ap.dtim_period = 1;
     /*
-     * 50 ms, half the IDF default, and the one lever that shortens the DTIM
-     * hold without changing what is multicast.
+     * 100 TU, which is IDF's floor, IDF's default, and -- measured -- the only
+     * value this field has ever actually held on this hub.
      *
      * A SoftAP cannot send group-addressed frames whenever it likes -- stations
      * may be asleep -- so it buffers them and releases them after each DTIM
-     * beacon. dtim_period is already 1, so that is every beacon; the interval is
-     * what is left. Until now it was 0 in the initialiser, which IDF reads as
-     * 100 ms, so every audio chunk and every analysis frame occupied one static
-     * TX buffer for up to 100 ms waiting for a window.
+     * beacon. dtim_period is already 1, so that is every beacon, and the
+     * interval is what is left. At 100 TU (1 TU = 1024 us) the hold is 102.4 ms
+     * and every audio chunk, analysis frame and level occupies one static TX
+     * buffer until its window opens.
      *
-     * That hold is why the pool exhausts: 50 audio/s plus 86 analysis frames/s
-     * all queue for a 10/s release. Halving the interval halves the average
-     * occupancy, and it does so without moving a packet off the group -- which
-     * matters, because the group is what keeps the hub's transmit rate flat in
-     * speaker count (see frame_msg_t). Raising the buffer count instead was
-     * tried and made things worse: a deeper queue does not drain faster, it
-     * just delivers later, and audio past its play_at is worth less than audio
-     * that never came.
+     * THIS LINE USED TO READ 50, AND THE RADIO NEVER TOOK IT. The field is
+     * specified in TU, "multiples of 100, range 100 ~ 60000" -- see
+     * wifi_ap_config_t in esp_wifi_types_generic.h -- and the comment that used
+     * to sit here reasoned about it in MILLISECONDS, halving 100 to 50 to halve
+     * the average occupancy. esp_wifi_set_config() returned ESP_OK, which says
+     * only that IDF does not validate the field on the way in. The read-back
+     * added below reports what the driver kept:
      *
-     * Costs beacon airtime, 10/s to 20/s -- a few ms per second at 6 Mbps
-     * against the ~14% duty cycle the stream already runs at. Power save is not
-     * a consideration here: every satellite sets WIFI_PS_NONE, so nothing is
-     * asleep between beacons and nothing depends on the listen interval.
+     *     AP beacon_interval 100 TU (asked 50), dtim_period 1 (asked 1)
+     *
+     * So the hold was 102.4 ms the whole time, the "halving" never happened,
+     * and any argument resting on it was resting on nothing. Set to 100 now so
+     * the source says what the radio does.
+     *
+     * AND IT CANNOT BE SHORTENED. 100 TU is the bottom of the documented range
+     * and dtim_period is already at its minimum of 1, so 102.4 ms is a FIXED
+     * cost that the group burst has to be designed against rather than tuned
+     * away. That is what TX_FRAME_PACE_US in hub.h is now derived from: the
+     * frame lane is paced to the beacon, because pacing it to anything faster
+     * only queues frames the beacon has not come round to release yet.
+     *
+     * Power save is not a consideration here -- every satellite sets
+     * WIFI_PS_NONE -- but note that this does NOT mean group frames go out
+     * immediately: the AP buffers them for DTIM regardless of whether any
+     * station is actually sleeping. The 2026-08-20 soak measured that directly,
+     * with ENOMEM refusals arriving at the beacon rate (median 40 bursts per
+     * 5 s window against 48.8 beacons). clients.c used to claim the opposite
+     * and has been corrected.
      */
-    wc.ap.beacon_interval = 50;
+    wc.ap.beacon_interval = 100;
     /* Matches ESP-IDF's own softAP example. Setting capable=true is a deviation
      * that some clients refuse, so leave it alone. */
     wc.ap.pmf_cfg.required = false;
@@ -119,6 +136,36 @@ void wifi_start_ap(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
+
+    /*
+     * What the driver ACTUALLY HOLDS, read back rather than assumed.
+     *
+     * This line is why the block above now reads 100. It was added while that
+     * one still said 50, and on its first boot it printed
+     * `beacon_interval 100 TU (asked 50)` -- the driver had been quietly
+     * discarding the value for as long as it had been written, because
+     * ESP_ERROR_CHECK passing says only that IDF does not validate the field on
+     * the way in, not that the driver kept it.
+     *
+     * KEPT NOW AS A REGRESSION GUARD, not as an open question. Everything the
+     * group burst is sized against -- TX_FRAME_PACE_US in hub.h, the buffer
+     * count in sdkconfig.defaults -- assumes a 102.4 ms hold. If a future IDF
+     * changes the floor, accepts a smaller interval, or silently rounds this
+     * somewhere else, that assumption breaks with no other symptom than audio
+     * going bad under load, which is the hardest kind of fault to trace back to
+     * a config field. One line at boot is a cheap standing check.
+     *
+     * A status field would be wrong: it cannot change while running.
+     */
+    wifi_config_t back = {0};
+    if (esp_wifi_get_config(WIFI_IF_AP, &back) == ESP_OK) {
+        ESP_LOGW(TAG, "AP beacon_interval %u TU (asked %u), dtim_period %u "
+                      "(asked %u) -- group frames are held for beacon x dtim",
+                 (unsigned)back.ap.beacon_interval, (unsigned)wc.ap.beacon_interval,
+                 (unsigned)back.ap.dtim_period, (unsigned)wc.ap.dtim_period);
+    } else {
+        ESP_LOGW(TAG, "AP config read-back failed -- beacon/DTIM hold unknown");
+    }
 
 #if CONFIG_DANCEFLOOR_AUDIO_MCAST
     /*
@@ -304,7 +351,206 @@ static struct {
 static uint32_t s_tx_err_other;   /* more distinct codes than slots */
 
 /*
- * The same, for the audio downlink specifically.
+ * THE SHAPE OF AN ENOMEM STORM, which is a different question from its size and
+ * is the one the 2026-08-20 soak could not answer.
+ *
+ * That run refused 54% of the audio stream for its last eight minutes, and the
+ * arithmetic says the FILL alone cannot do that: ~50 audio + ~27 frames + 1 vol
+ * is ~78 group packets/s, which is ~4 per beacon interval against 38 static TX
+ * buffers. For the pool to sit exhausted across twenty-five consecutive windows
+ * something has to be wrong with the DRAIN -- and nothing on this board could
+ * see the difference, because a count of refusals looks identical either way.
+ *
+ * The tell is PERIODICITY. A SoftAP releases group-addressed frames after the
+ * DTIM beacon, so if the release is happening on schedule and the queue is
+ * merely deeper than one release can clear, refusals arrive in clusters spaced
+ * one beacon apart -- ~51 ms, or ~102 ms if the out-of-range beacon_interval in
+ * wifi_start_ap() is being clamped to IDF's default. Read `burst-gap` against
+ * those two numbers. If instead one burst runs continuously for hundreds of ms
+ * with no spacing to speak of, the release itself has stalled and the frame
+ * lane is not the culprit however much of the pool it holds.
+ *
+ * A stretch of refusals ENDS WHEN AN AUDIO SEND SUCCEEDS, which is the physical
+ * event of interest -- a buffer came back -- rather than a timeout. A timeout
+ * was tried first and cannot work here, which is worth writing down so it is
+ * not tried again: audio offers 50 packets/s, so refusals are ~20 ms apart even
+ * in a total stall, while consecutive beacon-released clusters are separated by
+ * the beacon MINUS however long the cluster ran. There is no threshold that
+ * splits the second case without also splitting the first. A host test of the
+ * timeout version read four beacon-spaced clusters as two bursts.
+ *
+ * So: audio is the probe. It is the right one because it is the lane that is
+ * never gated -- fan_out() ignores the backoff by design -- so it keeps asking
+ * the pool at a steady 50/s throughout. The frame lane's successes would be a
+ * poor probe because it stops asking the moment it is refused.
+ *
+ * Gauges, cleared by the window that prints them, and raced like everything
+ * else on this path.
+ */
+static bool s_refusing;             /* a refusal stretch is open right now */
+static int64_t s_refuse_since;      /* when it opened */
+static int64_t s_prev_burst_at;     /* start of the previous stretch */
+static uint32_t n_enomem_bursts;    /* stretches that OPENED in this window */
+/*
+ * Refusals in this window, and the only thing that licenses the line to print.
+ *
+ * Without it a window that merely INHERITED an open stretch, and then saw it
+ * close with nothing refused, reported `enomem-bursts 1 | refuse-max 0 ms` --
+ * a burst that did not happen, on the very window that says the hub recovered.
+ * A host test caught it; the earlier hand-written version of that test did not,
+ * because it carried its own copy of this code.
+ */
+static uint32_t n_enomem_refusals;
+static bool s_carried_open;         /* a stretch was already open at window start */
+static int32_t n_refuse_max_us;
+
+/*
+ * WHERE THE STRETCHES FALL RELATIVE TO THE BEACON, as a histogram rather than a
+ * single number.
+ *
+ * This replaces a MINIMUM, which was the wrong statistic and nearly cost a
+ * wrong conclusion. A minimum is set by the single tightest pair in the window,
+ * so it read 4-30 ms through the 2026-08-20 join transient while the stretches
+ * were in fact arriving at the beacon rate -- the beacon-lock finding had to be
+ * argued from the stretch COUNT instead (median 40 per 5 s window against 48.8
+ * beacons), which is indirect and only works while the count is high.
+ *
+ * Four fixed buckets around the 102.4 ms hold, so the shape is legible at a
+ * glance without carrying an array of samples:
+ *
+ *   <25 ms     back-to-back: the pool is refusing continuously, not in clusters
+ *   25-75      sub-beacon: something is releasing faster than DTIM, or the
+ *              stretch is being broken by a unicast send getting through
+ *   75-150     THE BEACON. A pile here is the DTIM hold, stated directly.
+ *   >150       multi-beacon: a release came round and did not clear the backlog
+ *
+ * Read the buckets against each other, not the absolute counts: `gaps
+ * 2/1/44/3` is a beacon-locked queue, `gaps 61/0/0/0` is a stall that never
+ * lets go.
+ */
+#define BURST_GAP_BUCKETS 4
+static uint32_t n_burst_gap[BURST_GAP_BUCKETS];
+
+static void enomem_note_shape(int64_t now)
+{
+    n_enomem_refusals++;
+    if (!s_refusing) {
+        s_refusing = true;
+        s_refuse_since = now;
+        n_enomem_bursts++;
+        if (s_prev_burst_at) {
+            /* Start-to-start, not end-to-start: a beacon releases on a fixed
+             * period, so it is the period between stretches that should land on
+             * the beacon interval. An end-to-start gap would be that period
+             * minus however long the stretch ran, which is the quantity that
+             * made the timeout version unreadable. */
+            const int64_t gap_us = now - s_prev_burst_at;
+            const int32_t gap_ms = (int32_t)(gap_us / 1000);
+            const int b = (gap_ms < 25)  ? 0 :
+                          (gap_ms < 75)  ? 1 :
+                          (gap_ms < 150) ? 2 : 3;
+            n_burst_gap[b]++;
+        }
+        s_prev_burst_at = now;
+    }
+    const int64_t len = now - s_refuse_since;
+    if (len > n_refuse_max_us && len < INT32_MAX) {
+        n_refuse_max_us = (int32_t)len;
+    }
+}
+
+/*
+ * An audio packet reached the transmit path, so the pool has a buffer again.
+ * Called from fan_out() on FANOUT_SENT -- see the note above for why audio and
+ * not any other lane is what closes a stretch.
+ */
+void tx_send_ok(void)
+{
+    s_refusing = false;
+}
+
+/*
+ * Render the burst shape and clear it. Empty while nothing has been refused, so
+ * a clean window's line stays byte-for-byte what it was before this existed --
+ * the same rule tx_fail_summary() follows and for the same reason.
+ */
+void tx_burst_summary(char *buf, size_t len)
+{
+    if (!n_enomem_refusals) {
+        buf[0] = '\0';
+        /* Nothing was refused, so nothing is claimed -- but whether a stretch
+         * is open still has to reach the next window, or a stall that goes
+         * quiet for one window and resumes would read as two. */
+        s_carried_open = s_refusing;
+        return;
+    }
+    /* A stretch that OPENED before this window still ran through it, and is one
+     * of this window's bursts even though nothing here opened it. */
+    const uint32_t bursts = n_enomem_bursts + (s_carried_open ? 1u : 0u);
+    /*
+     * The buckets always print, even all-zero, and the labels are in the name:
+     * `gaps <25/25-75/75-150/>150`. A single stretch produces no gap at all --
+     * a gap needs two -- and four zeros say that plainly, where the old single
+     * figure had to print the word "none" to avoid being read as "no time
+     * between clusters", which is the opposite of what it meant.
+     */
+    snprintf(buf, len, " | enomem-bursts %" PRIu32 " | refuse-max %ld ms"
+                       " | gaps %" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32,
+             bursts, (long)(n_refuse_max_us / 1000),
+             n_burst_gap[0], n_burst_gap[1], n_burst_gap[2], n_burst_gap[3]);
+
+    /*
+     * A STRETCH STILL OPEN AT THE BOUNDARY IS CARRIED, NOT DROPPED.
+     *
+     * Dropping it made a multi-window stall -- the single worst thing this
+     * instrument exists to catch -- print once and then report nothing at all,
+     * because no NEW stretch ever began. Found by a host test, and it would
+     * have read as a hub that recovered.
+     *
+     * Carried as a FLAG rather than as a count, which was the second bug on the
+     * same line: a count survives into a window that refuses nothing, and
+     * prints a burst that did not happen. The flag is only ever honoured beside
+     * a real refusal, above.
+     *
+     * s_refusing and s_refuse_since survive, so refuse-max keeps growing from
+     * the true start and the next window says "this stall is now 3.4 s long"
+     * rather than restarting the clock. s_prev_burst_at survives too: a gap is
+     * a real interval whether or not a window boundary fell inside it.
+     */
+    s_carried_open = s_refusing;
+    n_enomem_bursts = 0;
+    n_enomem_refusals = 0;
+    n_refuse_max_us = 0;
+    memset(n_burst_gap, 0, sizeof(n_burst_gap));
+}
+
+/*
+ * Render the lane breakdown and clear it. Always non-empty -- it is printed
+ * inside the existing `(N audio)` parentheses, which have never been optional.
+ */
+void tx_fail_lanes(char *buf, size_t len)
+{
+    static const char *const name[TX_LANE_N] = {
+        "audio", "frame", "vol", "meta", "probe",
+    };
+    size_t off = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < TX_LANE_N; i++) {
+        const uint32_t n = s_tx_lane_fail[i];
+        s_tx_lane_fail[i] = 0;
+        /* AUDIO always prints, even at zero: it is the number the room cares
+         * about and its absence must not read as "not measured". The rest print
+         * only when they have something to say, so a clean line stays short. */
+        if (!n && i != TX_LANE_AUDIO) {
+            continue;
+        }
+        off += snprintf(buf + off, off < len ? len - off : 0, "%s%" PRIu32 " %s",
+                        off ? ", " : "", n, name[i]);
+    }
+}
+
+/*
+ * The audio downlink's own entry point.
  *
  * tx-fail was one number shared by audio, analysis frames, ML results, metadata
  * and the log shipper, so `tx-fail 92` could not say how many satellite gaps
@@ -314,20 +560,21 @@ static uint32_t s_tx_err_other;   /* more distinct codes than slots */
  * if the NEXT packet gets through, which under a burst of ENOMEM is exactly
  * what does not happen.
  *
- * A separate entry point rather than a flag on the existing one: the two audio
- * send paths are the only callers, they are three lines apart in timeline.c, and
- * a parameter would have to be passed correctly by six call sites that mostly
- * do not care.
+ * Kept as a named wrapper now that tx_fail_note() takes a lane: the two audio
+ * send paths are its only callers, they are three lines apart in timeline.c, and
+ * three comments there refer to it by name.
  */
 void tx_fail_note_audio(int err)
 {
-    s_tx_fail_audio++;
-    tx_fail_note(err);
+    tx_fail_note(TX_LANE_AUDIO, err);
 }
 
-void tx_fail_note(int err)
+void tx_fail_note(tx_lane_t lane, int err)
 {
     s_tx_fail++;
+    if ((unsigned)lane < TX_LANE_N) {
+        s_tx_lane_fail[lane]++;
+    }
     /*
      * ENOMEM is the WiFi pool out of TX buffers, and it is the one failure a
      * non-audio lane can do something about: back off for TX_BACKOFF_US so
@@ -337,7 +584,9 @@ void tx_fail_note(int err)
      * above stays the whole of the diagnosis; this is the reaction to it.
      */
     if (err == ENOMEM) {
-        s_tx_congested_until = esp_timer_get_time() + TX_BACKOFF_US;
+        const int64_t now = esp_timer_get_time();
+        enomem_note_shape(now);
+        s_tx_congested_until = now + TX_BACKOFF_US;
     }
     for (int i = 0; i < TX_ERR_SLOTS; i++) {
         if (s_tx_err[i].n == 0) {         /* free slot: claim it */

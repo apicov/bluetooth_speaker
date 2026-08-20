@@ -257,8 +257,11 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (snapshot[i].last_seen) {
-            sendto(sock, &msg, sizeof(msg), 0,
-                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr));
+            if (sendto(sock, &msg, sizeof(msg), 0,
+                       (struct sockaddr *)&snapshot[i].addr,
+                       sizeof(snapshot[i].addr)) < 0) {
+                tx_fail_note(TX_LANE_META, errno);
+            }
         }
     }
 }
@@ -289,10 +292,21 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
  * repeats it every second. Against the measured 0.2-0.3% group loss, exposure to
  * a stale level is P(loss) x 1 s, and only in the window after a change.
  *
- * The old comment here argued for unicast so the level "must not be held for a
- * DTIM burst behind the audio it would delay". That was never true on this
- * build: hub and satellite both set WIFI_PS_NONE, so nothing is buffered for a
- * DTIM at all -- net.c says so where it sets dtim_period.
+ * A DTIM NOTE THAT WAS WRONG, kept because the correction matters. This used to
+ * say the level "must not be held for a DTIM burst behind the audio it would
+ * delay" was "never true on this build: hub and satellite both set
+ * WIFI_PS_NONE, so nothing is buffered for a DTIM at all". The second half does
+ * not follow from the first, and the 2026-08-20 soak measured it false: a
+ * SoftAP buffers group-addressed frames for DTIM whether or not any station is
+ * actually sleeping, and the hub's ENOMEM refusals arrived AT THE BEACON RATE
+ * (median 40 bursts per 5 s window against 48.8 beacons). So this level IS held
+ * for up to 102.4 ms behind whatever else is in the burst.
+ *
+ * It stays on the group anyway, and the original argument for that is
+ * untouched: hearing the audio and hearing the level must be the same
+ * condition. A level that is up to a beacon late is not a fault -- the 1 Hz
+ * repeat below covers it -- where a level sent to a set that no longer matches
+ * the audio's set is.
  *
  * The unicast arm is kept for CONFIG_DANCEFLOOR_AUDIO_MCAST=n, where there is no
  * group, the satellite never joins one, and the client list IS the audio set.
@@ -319,6 +333,8 @@ void streamer_send_vol(uint8_t volume)
     if (sendto(sock, &msg, sizeof(msg), 0,
                (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) >= 0) {
         n_vol_tx++;
+    } else {
+        tx_fail_note(TX_LANE_VOL, errno);
     }
 #else
     client_t snapshot[MAX_CLIENTS];
@@ -326,9 +342,13 @@ void streamer_send_vol(uint8_t volume)
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (snapshot[i].last_seen) {
-            sendto(sock, &msg, sizeof(msg), 0,
-                   (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr));
-            n_vol_tx++;
+            if (sendto(sock, &msg, sizeof(msg), 0,
+                       (struct sockaddr *)&snapshot[i].addr,
+                       sizeof(snapshot[i].addr)) < 0) {
+                tx_fail_note(TX_LANE_VOL, errno);
+            } else {
+                n_vol_tx++;
+            }
         }
     }
 #endif
@@ -475,7 +495,7 @@ void publish_frame(const vis_frame_t *f)
      * because it shares a task with the hub's own ring feed. */
     if (sendto(sock, &msg, bytes, 0,
                (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
-        tx_fail_note(errno);
+        tx_fail_note(TX_LANE_FRAME, errno);
     }
 #else
     client_t snapshot[MAX_CLIENTS];
@@ -487,7 +507,7 @@ void publish_frame(const vis_frame_t *f)
         }
         if (sendto(sock, &msg, bytes, 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
-            tx_fail_note(errno);
+            tx_fail_note(TX_LANE_FRAME, errno);
         }
     }
 #endif

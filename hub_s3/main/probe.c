@@ -121,7 +121,10 @@ void probe_task(void *arg)
         msg.type = MSG_TIME_RSP;
         msg.t2 = t2;
         msg.t3 = esp_timer_get_time();              /* stamp immediately before send */
-        sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&from, from_len);
+        if (sendto(sock, &msg, sizeof(msg), 0,
+                   (struct sockaddr *)&from, from_len) < 0) {
+            tx_fail_note(TX_LANE_PROBE, errno);
+        }
 
         /*
          * Measurement only -- see tsf_msg_t. Sent on the back of the probe
@@ -153,6 +156,9 @@ void probe_task(void *arg)
             continue;
         }
         tsf_msg_t tm = { .type = MSG_TSF, .tsf = tsf, .local = now };
-        sendto(sock, &tm, sizeof(tm), 0, (struct sockaddr *)&from, from_len);
+        if (sendto(sock, &tm, sizeof(tm), 0,
+                   (struct sockaddr *)&from, from_len) < 0) {
+            tx_fail_note(TX_LANE_PROBE, errno);
+        }
     }
 }
