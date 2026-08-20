@@ -533,18 +533,30 @@ Forwarding SBC quartered both.
 
 Three other message types share the socket. `MSG_TIME_REQ`/`MSG_TIME_RSP` are the
 clock probes (§10), `MSG_META` carries the track title and artist the bridge got
-over AVRCP, and `MSG_FRAME` carries one analysis frame — the hub's own, for units
-built to draw what it decided rather than analyse for themselves (§12). Frames go
-unicast for the same reason the audio does, and cost ~5 kB/s per listener against
-the 30–40 the audio already uses. The hub publishes them whenever its visualiser
-is enabled; a satellite doing its own analysis simply ignores them.
+over AVRCP, and `MSG_FRAME` carries a batch of analysis frames — the hub's own,
+for units built to draw what it decided rather than analyse for themselves (§12).
+Frames go to the group with the audio and cost ~8 kB/s per listener against the
+30–40 the audio already uses. The hub publishes them whenever its visualiser is
+enabled; a satellite doing its own analysis simply ignores them.
 
-`MSG_FRAME` carries a `len` alongside the payload, which is the one piece of
-defensive framing in the protocol. A hub and a satellite on different builds is
-the mismatch this system is most likely to meet, and a frame of the wrong shape
-reinterpreted silently would put garbage on a strip rather than nothing. The
-receiver checks the length, refuses the frame, and says so exactly once —
-43 complaints a second would bury everything else in the log.
+**A batch, because the beacon rather than the analysis decides when this lane may
+transmit.** A SoftAP releases group-addressed frames only after a DTIM beacon —
+102.4 ms here, and it cannot go lower — so the hub sends one frame datagram per
+beacon carrying everything the analysis produced since the last one, ~9 frames at
+hop 512. It sent one frame and dropped the rest for one day, 2026-08-20, and the
+floor showed it from across the field: the satellites' detector measures flux
+between *consecutive* frames and keeps a history counted in frames, so a ninth of
+the rate is a different detector, not a staler one. The hub's strip followed the
+music; the satellites lurched. `TX_FRAME_BATCH` in `hub_s3/main/hub.h` is the
+knob, and it is also the loss granularity — a lost packet is now the whole batch.
+
+`MSG_FRAME` carries a `len` and a `count` alongside the payload, which is the one
+piece of defensive framing in the protocol. A hub and a satellite on different
+builds is the mismatch this system is most likely to meet, and a frame of the
+wrong shape reinterpreted silently would put garbage on a strip rather than
+nothing. The receiver checks both against the bytes that arrived, refuses the
+batch, and says so exactly once — ten complaints a second would bury everything
+else in the log.
 
 Message type **3 is a deliberate gap**. It was `MSG_BLINK`, for the M4 bring-up
 harness, and it is not reused: a board still running old firmware speaks a
@@ -861,6 +873,19 @@ The received frame goes into the same queue local analysis fills and is drawn th
 same way, so the two sources are interchangeable by construction rather than by
 agreement. Nothing is corrected against anything in either case — a remote unit
 still converts `due_us` with its own offset and keeps its own appointment.
+
+**The frames must arrive at the rate they were computed at, and that is not a
+detail of the transport.** A remote unit does not receive the hub's decisions; it
+receives the four `band` floats and runs the detector itself, so it needs the
+*series*, not samples of it. Flux is the difference between consecutive frames
+and `BEAT_HIST` is counted in frames, so delivering one frame in nine gives that
+unit a flux differenced across 102 ms instead of 11.6 and an adaptive window of
+4.4 s instead of 0.5 — which is a different detector, tuned at no hop anyone
+measured. This is the same fact §12 states about the hop itself: change the
+spacing of the frames and different strokes fire. It happened for one day when
+the frame lane was paced to the DTIM beacon a frame at a time (§9), and it was
+visible from across a field. The lane sends a whole beacon's worth per datagram
+now, and the satellites are back on the hub's own 86 frames a second.
 
 **Mixing the two across a floor is intended, not a hazard.** A unit on `LOCAL`
 can run a different pattern or a different detector entirely. What that costs is

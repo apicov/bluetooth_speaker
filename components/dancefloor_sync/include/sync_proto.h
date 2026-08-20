@@ -36,7 +36,7 @@ typedef enum {
     MSG_META     = 5,   /* master -> listeners, track metadata */
     MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
     MSG_TSF      = 7,   /* master -> satellite, measurement only, see tsf_msg_t */
-    MSG_FRAME    = 8,   /* master -> listeners, one analysis frame */
+    MSG_FRAME    = 8,   /* master -> listeners, a batch of analysis frames */
     MSG_LOG      = 9,   /* any wifi unit -> collector, one formatted log line */
     MSG_HEALTH   = 10,  /* any wifi unit -> collector, the structured HEALTH snapshot */
     MSG_LOG_SUB  = 11,  /* collector -> hub: "send logs here" (see log_sub_msg_t) */
@@ -287,15 +287,39 @@ typedef struct __attribute__((packed)) {
 /* Track metadata forwarded from the bridge. Carries link_meta_t verbatim, so
  * there is exactly one definition of the fields (see sbc_link.h). */
 /*
- * One analysis frame, for units that draw what another unit decided.
+ * Analysis frames, for units that draw what another unit decided.
  *
- * The payload is a vis_frame_t from components/dancefloor_leds -- copied in as
- * bytes rather than declared here, because that component does not depend on
- * this one and must stay buildable alone. `len` is carried so the two ends can
- * disagree about the frame's size and say so, instead of reading past it: a hub
- * and a satellite on different builds is the failure this protocol is most
- * likely to meet, and a silently reinterpreted frame would be worse than a
- * refused one.
+ * The payload is one or more vis_frame_t from components/dancefloor_leds --
+ * copied in as bytes rather than declared here, because that component does not
+ * depend on this one and must stay buildable alone. `len` is the size of ONE
+ * frame, carried so the two ends can disagree about it and say so instead of
+ * reading past it: a hub and a satellite on different builds is the failure this
+ * protocol is most likely to meet, and a silently reinterpreted frame would be
+ * worse than a refused one. `count` is how many of them follow, back to back.
+ *
+ * A BATCH, NOT A FRAME, and the reason is the beacon rather than the analysis.
+ * The hub computes 86 frames a second at hop 512 and draws every one of them;
+ * the satellites were receiving 9.8, because TX_FRAME_PACE_US paces this lane to
+ * the DTIM beacon and everything offered in between was dropped. That is a
+ * detector running at a ninth of the rate its thresholds were tuned at -- see
+ * BEAT_HIST, which is a frame COUNT, so the satellites' adaptive window was 4.4
+ * seconds against the hub's 0.5 -- and it is visible from across the field as a
+ * hub whose strip follows the music and satellites whose strips lurch.
+ *
+ * The pace is not the fault and stays: a group-addressed frame is held until the
+ * beacon whatever the sender does, so sending faster only occupies transmit
+ * buffers the audio needs. What changes is how much rides in the one datagram
+ * the beacon releases. One packet per beacon, every frame since the last one,
+ * and the burst the pace was introduced to prevent still does not form.
+ *
+ * WHAT IT COSTS is loss granularity: a lost packet is now ~9 consecutive frames
+ * (~102 ms) rather than one. At the 0.2-0.3% group loss measured below that is a
+ * hole every 30-50 s, and df::RemoteDetect converges back within its history
+ * length because the history it lost is the only state it has. If that ever
+ * reads as a stutter, the fix is to split the batch into a FIXED two or three
+ * sub-packets per beacon -- still deterministic, still nothing like the ~26
+ * packets a beacon the unpaced lane produced. TX_FRAME_BATCH in hub.h is the
+ * one knob.
  *
  * MULTICAST, to the same group as the audio. This paragraph used to say the
  * opposite in capitals -- "NOT multicast", on the grounds that group-addressed
@@ -312,15 +336,20 @@ typedef struct __attribute__((packed)) {
  * difference between ~316 and ~1490 packets a second, and it is the only thing
  * that makes the analysis lane free of speaker count entirely.
  *
- * ~5 kB/s per listener at 43 Hz, against the 30-40 the audio already costs.
+ * ~8 kB/s per listener at 86 Hz, against the 30-40 the audio already costs. The
+ * batch does not change that figure -- the same frames go out, nine to a
+ * datagram instead of one -- it changes the PACKET rate, from 86/s offered and
+ * 9.8/s sent to 9.8/s sent whole.
  *
  * The cost is real and is paid elsewhere: a group-addressed frame is held by
  * the SoftAP until the DTIM beacon releases it, occupying one static TX buffer
- * the whole time, and at 86 frames a second that is most of the pool. That is
- * what beacon_interval in the hub's wifi_start_ap() is set explicitly against,
- * and it is why raising ESP_WIFI_STATIC_TX_BUFFER_NUM far past 36 makes things
- * WORSE rather than better -- a deeper queue does not drain faster. 48 was the
- * count that proved it, on anchors-refused.
+ * the whole time. At 86 packets a second that was most of the pool, which is
+ * what the pace and now the batch exist to prevent -- one buffer per beacon,
+ * held for one beacon. That is what beacon_interval in the hub's
+ * wifi_start_ap() is set explicitly against, and it is why raising
+ * ESP_WIFI_STATIC_TX_BUFFER_NUM far past 36 makes things WORSE rather than
+ * better -- a deeper queue does not drain faster. 48 was the count that proved
+ * it, on anchors-refused.
  *
  * THE SHIPPED COUNT IS 38, since 2026-08-17, and that is not a walk back toward
  * 48. The crowding was fixed at the source instead -- TX_FRAME_PACE_US in hub.h
@@ -329,14 +358,30 @@ typedef struct __attribute__((packed)) {
  * below 48 that the bufferbloat finding is not in play. sdkconfig.defaults has
  * the table, and says to come back to 36 if 38 ever reads like 48 did.
  */
-#define FRAME_PAYLOAD_MAX 160
+/*
+ * Room for a whole beacon's worth of frames: 12 x 96 bytes.
+ *
+ * The 96 is sizeof(vis_frame_t), which this header deliberately cannot see --
+ * the LED component does not depend on the protocol and must stay buildable on
+ * its own, so the number is written out here and checked where the two do meet
+ * (clients.c static-asserts TX_FRAME_BATCH frames against this cap).
+ *
+ * 12 rather than the 9 a beacon actually holds at hop 512: the analysis task
+ * does not run at a metronomic 86/s, and a decoder lump hands it several frames
+ * at once. The spare three absorb that without the batch overflowing and cutting
+ * itself short. It was 160 -- one frame and change -- while the lane sent one
+ * frame per datagram.
+ */
+#define FRAME_PAYLOAD_MAX 1152
 
 typedef struct __attribute__((packed)) {
     uint8_t type;           /* MSG_FRAME */
-    uint8_t len;            /* bytes of payload that follow */
+    uint8_t len;            /* bytes per frame; every frame in the batch is this size */
+    uint8_t count;          /* frames that follow, back to back; >= 1 */
     uint8_t payload[FRAME_PAYLOAD_MAX];
 } frame_msg_t;
 
+/* On-wire bytes for n TOTAL payload bytes -- len * count, not one frame. */
 #define FRAME_MSG_BYTES(n) (sizeof(frame_msg_t) - FRAME_PAYLOAD_MAX + (n))
 
 /*
@@ -566,6 +611,11 @@ typedef struct __attribute__((packed)) {
  * TIMELINE_SLEW_US per unit of audio first.
  */
 #define AUDIO_TX_PAYLOAD_MTU_MAX (AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0))
+
+/* The frame lane against the same MTU. Here rather than beside frame_msg_t
+ * because that is where the MTU is defined; a full batch is 1155 bytes. */
+_Static_assert(FRAME_MSG_BYTES(FRAME_PAYLOAD_MAX) <= AUDIO_UDP_MTU,
+               "a full frame batch would fragment");
 
 /*
  * Which downlink this build speaks, as a short tag for the periodic status

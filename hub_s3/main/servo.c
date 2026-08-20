@@ -199,7 +199,7 @@ void servo_tick(void)
                       "(median %+ld%s, smoothed %+ld us) | "
                       "tx-fail %" PRIu32 " (%s)%s%s"
                       " | cong-skip %" PRIu32
-                      " | pace-skip %" PRIu32
+                      " | stale-skip %" PRIu32
                       " | %lu pkts/s | fanout-gap-max %ld ms | lead-min %s"
                       " | stations %d | rssi-min %d | phy-11n %d | churn %" PRIu32
                       " | xport %s fec %d frames %s",
@@ -221,7 +221,10 @@ void servo_tick(void)
          * total and its breakdown must not come to describe different windows. */
         s_audio_pkts = 0;
         n_tx_cong_skip = 0;
-        n_tx_pace_skip = 0;    /* same window as the cong-skip it accompanies */
+        /* Same window as the cong-skip it accompanies. It reads `stale-skip`
+         * on the line because that is what it counts now -- frames stranded
+         * in a batch a stopped stream never flushed. See hub.h. */
+        n_tx_pace_skip = 0;
         /* Beside the packet rate it qualifies: the rate says how many went, this
          * says whether they went evenly. See hub.h for what the pair answers
          * against the satellite's ARRIVAL line. */

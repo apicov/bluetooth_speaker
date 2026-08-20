@@ -435,7 +435,7 @@ void vol_repeat_start(void)
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 /*
- * Send one analysis frame to every listener.
+ * Take one analysis frame for the listeners, and send the batch when it is due.
  *
  * Registered as the visualiser's publisher, so it runs on the analysis task --
  * which means it must not block. sendto() on a UDP socket does not.
@@ -443,48 +443,84 @@ void vol_repeat_start(void)
  * One group send, or one per satellite -- see DANCEFLOOR_MCAST_FRAMES for why
  * the group is now the default and why the "~20% loss" objection that kept this
  * unicast was a measurement of the 1 Mbps basic rate rather than of multicast.
- * The frame is identical for every listener either way, which is what makes the
+ * The batch is identical for every listener either way, which is what makes the
  * choice a pure transport question.
  *
- * A failed send costs a satellite one frame out of 86 a second. It is counted
- * with the audio's own failures rather than separately -- the interesting
- * question is whether the link is dropping things, not which kind.
+ * A failed send now costs a satellite the whole batch -- ~9 frames out of 86 a
+ * second, ~102 ms of them -- where it used to cost one. It is still counted with
+ * the audio's own failures rather than separately: the interesting question is
+ * whether the link is dropping things, not which kind. TX_FRAME_BATCH carries
+ * what that granularity buys and what to do if it ever shows.
  */
+_Static_assert(TX_FRAME_BATCH * sizeof(vis_frame_t) <= FRAME_PAYLOAD_MAX,
+               "TX_FRAME_BATCH frames do not fit in frame_msg_t.payload");
+
 void publish_frame(const vis_frame_t *f)
 {
-    /* PROACTIVE first, reactive second -- the order is the point.
+    /*
+     * The batch under construction, and the instant it is due out.
      *
-     * The pace gate stops a burst from forming at all: no two frame sends
-     * closer together than TX_FRAME_PACE_US, which in steady state (frames
-     * arriving on the analysis cadence) never binds, and during a decoder
-     * lump staggers the frames a quarter-period apart instead of letting them
-     * crowd the pool the audio shares. Analysis task only -- s_pace_at needs
-     * no locking for the same reason the congestion gate does not.
-     *
-     * The backoff gate below then handles the failure the pace cannot: a pool
-     * exhausted by something else (audio's own burst, probes) still yields
-     * the lane until it recovers. */
-    static int64_t s_pace_at;
+     * Static rather than automatic: 1.2 kB is far past what the analysis task's
+     * stack should carry, and the whole point is that it survives between calls.
+     * Analysis task only, so none of this needs locking -- the same argument
+     * s_pace_at made on its own.
+     */
+    static frame_msg_t msg = { .type = MSG_FRAME, .len = (uint8_t)sizeof(vis_frame_t) };
+    static uint8_t     pending;
+    static int64_t     pending_due;          /* due_us of the newest frame held */
+    static int64_t     s_pace_at;
+
     const int64_t now = esp_timer_get_time();
-    if (now < s_pace_at) {
-        n_tx_pace_skip++;
+
+    /*
+     * A batch stranded by a stream that stopped mid-fill. Its frames name
+     * instants the floor has already passed, so posting them would put audio
+     * that is over onto the strips; the satellites would draw them late and
+     * blink out of time at the start of the next track. Dated by the frames
+     * themselves rather than by a wall-clock timeout, because the analysis runs
+     * a lead ahead of playback and a batch delayed by a decoder lump is still
+     * perfectly good.
+     */
+    if (pending && pending_due > 0 && now > pending_due) {
+        n_tx_pace_skip += pending;
+        pending = 0;
+    }
+
+    memcpy(msg.payload + (size_t)pending * sizeof(*f), f, sizeof(*f));
+    pending++;
+    pending_due = f->due_us;
+
+    /*
+     * Hold until the beacon comes round, or until the batch is full.
+     *
+     * The pace decides WHEN this lane may transmit -- no two sends closer
+     * together than TX_FRAME_PACE_US, which is the interval at which the SoftAP
+     * releases group-addressed frames at all. What used to happen in between was
+     * that every frame offered was dropped; now they accumulate, and the send
+     * that the beacon does allow carries all of them.
+     *
+     * The full-batch exit is for the analysis task's lumpiness rather than for
+     * the steady state: at hop 512 a beacon's worth is 8.8 frames against a
+     * TX_FRAME_BATCH of 12, so in steady state the pace is always what fires.
+     */
+    if (pending < TX_FRAME_BATCH && now < s_pace_at) {
         return;
     }
     s_pace_at = now + TX_FRAME_PACE_US;
 
+    const uint8_t count = pending;
+    pending = 0;
+
     /* Yield the instant the TX pool is exhausted: see TX_BACKOFF_US. fan_out() --
      * the audio path -- is never gated, so this is what keeps a frame burst off the
-     * buffers audio is being refused. */
+     * buffers audio is being refused. Counted in frames, not batches, so the
+     * number stays comparable with the 86/s the analysis produces. */
     if (now < s_tx_congested_until) {
-        n_tx_cong_skip++;
+        n_tx_cong_skip += count;
         return;
     }
-    if (sizeof(*f) > FRAME_PAYLOAD_MAX) {
-        return;                              /* refuse rather than truncate */
-    }
-    frame_msg_t msg = { .type = MSG_FRAME, .len = (uint8_t)sizeof(*f) };
-    memcpy(msg.payload, f, sizeof(*f));
-    const size_t bytes = FRAME_MSG_BYTES(sizeof(*f));
+    msg.count = count;
+    const size_t bytes = FRAME_MSG_BYTES((size_t)count * sizeof(*f));
 
 #if CONFIG_DANCEFLOOR_MCAST_FRAMES
     /* Blocking (flags=0), unlike the audio group send. This runs on the analysis

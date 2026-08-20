@@ -880,33 +880,51 @@ void rx_task(void *arg)
         } else if (buf[0] == MSG_FRAME && n >= (int)FRAME_MSG_BYTES(0)) {
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
             /*
-             * An analysis frame the hub computed. Drawn at the instant it
-             * names, exactly like one this unit computed itself, so the two
-             * sources are interchangeable -- which is what lets the hub run any
-             * algorithm at all without it having to be deterministic across
-             * units.
+             * A batch of analysis frames the hub computed. Each is drawn at the
+             * instant it names, exactly like one this unit computed itself, so
+             * the two sources are interchangeable -- which is what lets the hub
+             * run any algorithm at all without it having to be deterministic
+             * across units.
              *
-             * The length is checked rather than assumed. A hub and a satellite
-             * on different builds is the mismatch this protocol is most likely
-             * to meet, and reinterpreting a frame of the wrong shape would put
-             * garbage on the strip rather than nothing. Said once: it is a
-             * property of the pair of builds, so it will not stop happening,
-             * and 43 complaints a second would bury everything else.
+             * ONE DATAGRAM, A BEACON'S WORTH OF FRAMES. The hub cannot transmit
+             * to the group more often than the DTIM beacon lets it, so it fills
+             * a datagram with everything the analysis produced in between rather
+             * than sending one frame and dropping the rest -- which is what it
+             * did until 2026-08-20, and why this unit's strip lurched while the
+             * hub's followed the music. Submitted in the order they were
+             * computed, because df::RemoteDetect derives flux from the
+             * difference between consecutive frames and would read a shuffled
+             * batch as noise.
+             *
+             * The shape is checked rather than assumed: `len` is one frame and
+             * `count` how many follow, both against the bytes that actually
+             * arrived. A hub and a satellite on different builds is the mismatch
+             * this protocol is most likely to meet, and reinterpreting a frame
+             * of the wrong shape would put garbage on the strip rather than
+             * nothing. Said once: it is a property of the pair of builds, so it
+             * will not stop happening, and ten complaints a second would bury
+             * everything else.
              */
             const frame_msg_t *fm = (const frame_msg_t *)buf;
-            if (fm->len == sizeof(vis_frame_t) &&
-                n >= (int)FRAME_MSG_BYTES(fm->len)) {
-                vis_frame_t f;
-                memcpy(&f, fm->payload, sizeof(f));
-                visualiser_submit_frame(&f);
-                n_frames_rx++;
+            if (fm->len == sizeof(vis_frame_t) && fm->count >= 1 &&
+                (size_t)fm->count * fm->len <= FRAME_PAYLOAD_MAX &&
+                n >= (int)FRAME_MSG_BYTES((size_t)fm->count * fm->len)) {
+                for (unsigned i = 0; i < fm->count; i++) {
+                    vis_frame_t f;
+                    memcpy(&f, fm->payload + i * sizeof(f), sizeof(f));
+                    visualiser_submit_frame(&f);
+                }
+                /* Frames, not datagrams: the rate on the HEALTH line is then
+                 * directly comparable with the 86/s the hub analyses at, which
+                 * is the comparison that catches this lane being throttled. */
+                n_frames_rx += fm->count;
             } else {
                 static bool told;
                 if (!told) {
                     told = true;
-                    ESP_LOGE(TAG, "frame of %u bytes, expected %u -- hub and "
-                                  "satellite are not the same build",
-                             fm->len, (unsigned)sizeof(vis_frame_t));
+                    ESP_LOGE(TAG, "frame batch of %u x %u bytes in %d -- hub and "
+                                  "satellite are not the same build (frame is %u)",
+                             fm->count, fm->len, n, (unsigned)sizeof(vis_frame_t));
                 }
                 n_frames_bad++;
             }

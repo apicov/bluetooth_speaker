@@ -185,6 +185,16 @@ menu "Dancefloor audio transport (multicast + FEC)"
           now derived from it rather than from the analysis hop -- which also
           takes the ~15 frames a burst above down to 1.
 
+          ONE PACKET A BURST, NOT ONE FRAME. Pacing to the beacon first meant
+          sending one frame per beacon and dropping the other ~76, which
+          starved the satellites' detector: df::RemoteDetect measures flux
+          between consecutive frames and keeps a history counted in frames, so
+          a ninth of the rate is a different detector, and the floor showed it
+          -- the hub's strip following the music while the satellites lurched.
+          The datagram carries a whole beacon's worth of frames now
+          (TX_FRAME_BATCH in hub.h). Same one buffer a burst, same airtime to
+          within the headers, every frame delivered.
+
           26 could not hold that. 32 can, and 32
           only became affordable when the hub stopped running the ML lane and
           got ~25 kB of internal SRAM back.
@@ -213,12 +223,17 @@ menu "Dancefloor audio transport (multicast + FEC)"
           That measurement was taken at the 1 Mbps 11b basic rate, which is also
           what made audio multicast fail the first time. wifi_start_ap() drops 11b
           now, the group rate is the 6 Mbps OFDM basic rate, and measured group
-          loss is 0.2-0.3%. One frame in ~400 is not a visibly broken strip.
+          loss is 0.2-0.3%. One packet in ~400 is not a visibly broken strip --
+          though with the batch a lost packet is now ~9 consecutive frames
+          rather than one, which at 9.8 packets a second is a ~102 ms hole
+          every 30-50 s. The detector converges back within its history; if it
+          ever reads as a stutter, halve TX_FRAME_BATCH rather than touching
+          the pace.
 
           Separate from DANCEFLOOR_AUDIO_MCAST, which it depends on for the
           group membership, because the two have different loss tolerances: a lost
-          audio packet is a hole in the sound and a lost frame is one dropped
-          video frame on a strip redrawn 86 times a second. Turning this off
+          audio packet is a hole in the sound and a lost frame batch is a tenth
+          of a second of a strip redrawn 86 times a second. Turning this off
           returns the strips to ACKed unicast without giving up the audio
           transport, which is the experiment worth being able to run separately.
 

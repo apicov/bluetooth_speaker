@@ -462,18 +462,28 @@
  * plus exactly one frame, every time, instead of audio's 5 plus however many
  * frames the analysis task happened to emit since the last release.
  *
- * WHAT IT COSTS IS SMALLER THAN IT LOOKS. The satellites were already only
- * receiving 26.6 frames/s (88,237 frames over 3,312 s, counted by the satellite
- * itself), because the old pace gate was already discarding ~60% of what the
- * analysis lane offered -- `pace-skip` ~52/s in every soak on file. This takes
- * a rate that was 26.6 and lands it at 9.8, on a lane whose frames are
- * SNAPSHOTS: a satellite that misses one shows a slightly staler spectrum, and
- * df::RemoteDetect converges back onto its neighbours in bounded time because
- * the history it lost is the only state there is (visualiser.h says this).
+ * WHAT IT COSTS IS SMALLER THAN IT LOOKS -- AND THAT WAS WRONG. Kept because
+ * the mistake is instructive. The paragraph read: the satellites were already
+ * only receiving 26.6 frames/s (88,237 frames over 3,312 s, counted by the
+ * satellite itself), because the old pace gate was already discarding ~60% of
+ * what the analysis lane offered -- `pace-skip` ~52/s in every soak on file --
+ * so taking a rate that was 26.6 and landing it at 9.8 costs little on a lane
+ * whose frames are SNAPSHOTS.
  *
- * If the floor visibly lags after this, the honest fix is fewer group packets
- * elsewhere, not a faster pace -- a frame sent more often than the beacon
- * releases is a frame that arrives no sooner and costs a buffer meanwhile.
+ * FRAMES ARE SNAPSHOTS; THE DETECTOR THAT EATS THEM IS NOT. df::RemoteDetect
+ * derives flux from the DIFFERENCE between consecutive frames and builds its
+ * threshold from a history measured in FRAMES (BEAT_HIST, 43 of them). Decimate
+ * the series and every one of those changes: flux spans 102 ms instead of 11.6,
+ * so a kick's attack falls between two samples; the adaptive window stretches
+ * from 0.5 s to 4.4 s; and the pattern's envelope, which decays per frame drawn,
+ * turns a swell into a ten-hertz staircase. It was visible from across the field
+ * on the first evening -- the hub following the music and the satellites
+ * lurching -- which is what TX_FRAME_BATCH below is for.
+ *
+ * The pace itself survived that discovery unchanged, because it was never the
+ * part that was wrong: a frame sent more often than the beacon releases is a
+ * frame that arrives no sooner and costs a buffer meanwhile. What was wrong was
+ * sending one frame in the datagram the beacon does release.
  *
  * WHY IT STILL MATTERS AFTER THE LEAD FIX. This was written believing the TX
  * pool was the fault; it was not (see LEAD_US). What it does is shorten the TAIL
@@ -485,6 +495,46 @@
  * makes the worst case rarer, LEAD_US makes it survivable.
  */
 #define TX_FRAME_PACE_US       DTIM_HOLD_US
+
+/*
+ * How many frames ride in the one datagram the beacon releases.
+ *
+ * The pace above says WHEN the frame lane may transmit; this says what it takes
+ * with it. Every frame the analysis produces is now sent -- the satellites are
+ * back on the hub's own 86/s series, and the detector they run is back on the
+ * cadence its constants were swept at -- while the group burst stays what pacing
+ * made it: audio's ~5 packets plus exactly one frame packet, every beacon.
+ *
+ * 12, against the 8.8 a beacon holds at hop 512 (102400 / 11610). The spare
+ * three are for the analysis task's own lumpiness: it does not run at a
+ * metronomic 86/s, and a decoder lump hands it several windows at once, which
+ * without headroom would fill the batch early and cut it short. Frames are
+ * appended as they arrive and the batch goes out when the pace elapses, so a
+ * quiet period sends a short batch rather than a late one.
+ *
+ * Raising it past what FRAME_PAYLOAD_MAX holds is a compile error, not a
+ * fragmented packet -- clients.c static-asserts the product against the cap.
+ *
+ * IT IS ALSO THE LOSS-GRANULARITY KNOB. One lost group packet is now this many
+ * consecutive frames rather than one: ~102 ms of them, a hole every 30-50 s at
+ * the 0.2-0.3% loss measured on this link. If that ever reads as a stutter on
+ * the floor, halve this and send two batches per beacon -- two buffers instead
+ * of one, still deterministic, still nothing like the ~26 the unpaced lane put
+ * in the pool. Do not answer it by shortening the pace; that is the change this
+ * lane has already made twice and paid for twice.
+ *
+ * AND IT IS THE DELIVERY-MARGIN KNOB, which is the one to watch first. A frame
+ * appended just after a flush waits a whole batch period before it is even
+ * offered to the radio, and then however long the beacon phase costs it: call it
+ * ~200 ms worst case against the LEAD_US of 350 that the analysis runs ahead of
+ * playback. The remainder is what absorbs the delivery tail -- 153 ms at its
+ * worst on the 2026-08-20 soak -- so the margin is real but not large. The
+ * satellite already measures the outcome directly: `late` on its LED line counts
+ * frames that came due before the render task reached them. If that climbs,
+ * halving this halves the batching delay as well as the hole, because a batch
+ * that fills early is sent early. Zero is what it should read.
+ */
+#define TX_FRAME_BATCH         12
 
 /*
  * Local playback ring. The master delays its own audio by LEAD_US exactly like a
@@ -774,12 +824,17 @@ extern volatile uint32_t n_join_churn;
 extern volatile uint32_t n_tx_cong_skip;            /* non-audio sends skipped under ENOMEM backoff */
 extern volatile int64_t s_tx_congested_until;       /* esp_timer deadline; non-audio yields until it */
 
-/* ...and the proactive sibling: frames skipped because the last frame went out
- * less than TX_FRAME_PACE_US ago. cong-skip says the pool was already
- * exhausted; pace-skip says a burst was forming and never got to find out.
- * Read together on the servo line, because a working pace should hold
- * cong-skip at zero while a burst passes. Cleared in the same window. */
-extern volatile uint32_t n_tx_pace_skip;            /* frame sends skipped under TX_FRAME_PACE_US */
+/* ...and the proactive sibling, WHICH NOW MEANS SOMETHING ELSE. It used to
+ * count the frames the pace gate discarded between sends, which at one frame per
+ * datagram was ~76 of every 86 -- the decimation TX_FRAME_BATCH exists to end.
+ * Frames are batched now, so nothing is dropped for arriving early, and this
+ * counts the one case that still throws frames away: a batch stranded by a
+ * stream that stopped, whose instants have passed before the next frame arrives
+ * to flush it. Expect a handful per track boundary and zero in between. A
+ * standing rate here means frames are being computed with due times already in
+ * the past, which is a timeline fault rather than a transport one. Read beside
+ * cong-skip, which says the pool was exhausted; cleared in the same window. */
+extern volatile uint32_t n_tx_pace_skip;            /* frames dropped with a stranded batch */
 
 /*
  * The widest interval between two audio packets REACHING THE AIR this window.
