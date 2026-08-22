@@ -22,6 +22,7 @@ dependencies.lock
 components/dancefloor_sync/test/test_sync_proto
 components/dancefloor_sync/test/test_audio_shift
 components/dancefloor_sync/test/test_servo
+components/dancefloor_sync/test/test_time_filter
 components/dancefloor_leds/test/test_align
 components/dancefloor_leds/test/test_pattern
 components/dancefloor_leds/test/test_beat_detect
@@ -63,3 +64,7 @@ tools/tuning/*.o
 # per run, holding that run's all.jsonl and health.csv.
 tools/log_collector/logs-*/
 logs-*/
+
+# Kate's swap files, written beside the file being edited as .<name>.kate-swp
+# and left behind by a crash or a kill. Editor state, and nobody else's.
+.*.kate-swp
