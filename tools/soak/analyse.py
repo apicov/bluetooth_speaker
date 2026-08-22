@@ -74,6 +74,31 @@ FAULTS = [
     ("phase-drop",   "phase queue full, servo starved of input"),
 ]
 
+# capture.py's pseudo-unit for the 2.4 GHz sweep. Kept in step with AIR_UNIT
+# there; the two files agree on the name and on nothing else.
+AIR_UNIT = "air"
+
+
+# A refused send arrives in bursts, not at a rate, and the difference decides
+# what a soak can be judged on.
+#
+# The three 1-hour soaks of 2026-08-22 read 569 / 0 / 52 audio refusals and that
+# looked like wild variance in a rate. It was not: all 684 of soak 122631's
+# refusals fell inside one 80 s episode, and 2,212 of soak 165644's 2,219 fell
+# inside one 170 s episode that began 3h11m into a 3h53m run which was otherwise
+# perfectly clean -- 0 underruns, 0 dma-starve, 0 ring-full before it, and 39
+# quiet minutes after. Two major episodes in 7.5 h of steady-state logging,
+# covering ~1% of the time. (A third, in the 2-minute soak 165438, fired 14 s
+# after boot and is the startup transient sdkconfig.defaults documents, not
+# this.)
+#
+# So a per-hour mean spans a quiet run and a storm and describes neither, and
+# three 1-hour runs would read 0/0/0 roughly 45% of the time with nothing fixed;
+# three 3-hour runs, roughly 9%. What a change has to be judged on is how many
+# episodes a run had and how bad they were.
+EPISODE_GAP_S = 120     # quiet time that separates one episode from the next
+EPISODE_MAJOR = 50      # refused sends that make an episode worth counting
+
 
 def load(paths):
     """Concatenate one or more session directories into (metrics, events)."""
@@ -179,6 +204,44 @@ def tx_faults(df, unit):
     return out
 
 
+def error_faults(ev, unit):
+    """Level-E console lines, as FAULTS lines. Empty for a unit with none.
+
+    Not in the FAULTS table because these are log lines and not counters:
+    nothing on a HEALTH line reports them, and the case they exist for is the
+    one where HEALTH lines stop arriving altogether. A board that hard-hangs
+    prints its panic and then goes silent, so every counter freezes at its last
+    good value and the run reads clean -- which is exactly what
+    logs-soak-20260822-163605 did with 594 task_wdt rows in it.
+    """
+    if ev is None or ev.empty or "level" not in ev.columns:
+        return []
+    e = ev[(ev["unit"] == unit) & (ev["level"] == "E")]
+    if e.empty:
+        return []
+    out = [f"      {'error lines':18s} {len(e):>8,}   "
+           f"ESP_LOGE on the console -- read raw.log, not this summary"]
+    # The tag says which subsystem and one example says what it was; 594
+    # identical watchdog lines need one line here, not 594.
+    for tag, n in e["tag"].value_counts().items():
+        first = " ".join(str(e[e["tag"] == tag]["text"].iloc[0]).split())
+        out.append(f"          {tag}: {n:,} -- {first[:66]}")
+    return out
+
+
+def episodes(windows, gap_s=EPISODE_GAP_S):
+    """Group non-zero tx-fail windows into bursts separated by quiet time.
+
+    Returns a list of lists of rows, in time order. See EPISODE_GAP_S.
+    """
+    out = []
+    for _, r in windows.iterrows():
+        if not out or r["wall_s"] - out[-1][-1]["wall_s"] > gap_s:
+            out.append([])
+        out[-1].append(r)
+    return out
+
+
 def nearest(df, wall_s):
     """The value of `df` sampled closest in time to `wall_s`, or nan.
 
@@ -215,7 +278,10 @@ def main():
 
     met, ev = load(args.session)
     met = boot_segments(met)
-    units = sorted(met["unit"].unique())
+    # AIR_UNIT is not a board. It carries capture.py's 2.4 GHz sweeps, and it
+    # would otherwise collect a SESSION row, an uptime and a FAULTS verdict that
+    # mean nothing. Its own section is below.
+    units = sorted(u for u in met["unit"].unique() if u != AIR_UNIT)
 
     t0, t1 = met["wall_s"].min(), met["wall_s"].max()
     head("SESSION")
@@ -243,6 +309,7 @@ def main():
             if n:
                 bad.append(f"      {metric:18s} {n:>8,}   {meaning}")
         bad += tx_faults(met, u)
+        bad += error_faults(ev, u)
         if bad:
             any_fault = True
             print(f"  {u}:")
@@ -492,6 +559,42 @@ def main():
         buckets = [gauge(met, u, "status", f"burst-gap-{b}")
                    for b in ("lt25", "25-75", "75-150", "gt150")]
         have_buckets = all(b is not None and not b.empty for b in buckets)
+
+        # Episodes first, because this is the figure a verdict rests on and the
+        # per-hour number above is the one that misleads. See EPISODE_GAP_S.
+        eps = episodes(windows)
+        # The status line's own cadence, so an episode's duration counts its
+        # last window rather than ending at the instant that window started.
+        #
+        # The FASTEST cadence, not the median: the hub prints this line every
+        # 20 s when quiet and every 5 s once it has something to report, so the
+        # median is the quiet rate and every episode is sampled at the other
+        # one. Taking the median stretched a 170 s episode to 185 s and gave
+        # single-window episodes a 20 s duration they never had.
+        gaps = tf["wall_s"].diff()
+        gaps = gaps[gaps > 0.5]
+        period = gaps.min() if not gaps.empty else 5.0
+        majors = []
+        print(f"      {len(eps)} episode(s) in {span_h:.2f} h"
+              f"  (major = {EPISODE_MAJOR}+ refused)")
+        for e in eps:
+            n = int(sum(r["value"] for r in e))
+            a = sum(x for x in (nearest(aud, r["wall_s"]) for r in e) if x == x)
+            # Same "n/a" the per-window table below uses, for a session captured
+            # before the audio lane was split out of the tally.
+            a_s = f"{a:6,.0f}" if aud is not None else "   n/a"
+            dur = e[-1]["wall_s"] - e[0]["wall_s"] + period
+            if n >= EPISODE_MAJOR:
+                majors.append((e[0]["wall_s"], dur))
+            print(f"        +{e[0]['wall_s'] - t0:7.0f}s  {dur:6.0f}s"
+                  f"  {n:6,} refused ({a_s} audio)"
+                  f"  {'MAJOR' if n >= EPISODE_MAJOR else 'minor'}")
+        if majors:
+            cov = sum(d for _, d in majors)
+            print(f"      major episodes cover {cov:.0f}s ="
+                  f" {100 * cov / max(t1 - t0, 1.0):.1f}% of the run;"
+                  f" clean for {fmt_dur(majors[0][0] - t0)} before the first")
+
         print("        when        refused    audio   refuse-max   cong-skip"
               "   fan-out   burst gaps")
         for _, r in windows.iterrows():
@@ -516,6 +619,73 @@ def main():
         print("  No tx-fail gauge -- the hub predates this instrument.")
 
     # ---- 8. heap ------------------------------------------------------------
+    # ---- 7b. the air ---------------------------------------------------------
+    #
+    # The variable no soak before 2026-08-23 recorded, and the reason three of
+    # them failed to explain anything. An episode leaves every hub-local counter
+    # flat -- internal free, stations, churn, RSSI, the source -- so whatever
+    # starts one is outside this rig, and nothing was watching outside.
+    #
+    # Read the episode rows, not the run summary. A band that is busy all
+    # evening explains nothing; a channel that gets busier exactly when the hub
+    # starts refusing sends is the first real lead this fault has offered.
+    head("AIR  (what else was on the band, from capture.py's sweep)")
+    air = met[met["unit"] == AIR_UNIT]
+    if air.empty:
+        print("  No air data -- this session predates the sweep, or ran with")
+        print("  --air-interval 0. capture.py records it as the pseudo-unit"
+              f" '{AIR_UNIT}'.")
+    else:
+        chans = sorted({int(m[2:m.index("-")]) for m in air["metric"].unique()
+                        if m.startswith("ch") and "-dbm" in m})
+        sweeps = len(air[air["metric"] == f"ch{chans[0]}-dbm"]) if chans else 0
+        print(f"  {sweeps:,} sweeps")
+        print("  channel    median      min      max   nets")
+        run_median = {}
+        for c in chans:
+            d = gauge(met, AIR_UNIT, "other", f"ch{c}-dbm")
+            n = gauge(met, AIR_UNIT, "other", f"ch{c}-nets")
+            if d is None or d.empty:
+                continue
+            run_median[c] = d["value"].median()
+            nm = n["value"].median() if n is not None and not n.empty else float("nan")
+            print(f"  ch{c:<7d} {d['value'].median():6.0f} dBm"
+                  f" {d['value'].min():6.0f}   {d['value'].max():6.0f}"
+                  f"   {nm:4.0f}")
+
+        # The part worth having: what the band was doing while the hub refused.
+        tf = gauge(met, "hub", "status", "tx-fail")
+        majors = []
+        if tf is not None and not tf.empty:
+            for e in episodes(tf[tf["value"] > 0]):
+                if sum(r["value"] for r in e) >= EPISODE_MAJOR:
+                    majors.append(e)
+        if not majors:
+            print("\n  No major hub-TX episode in this run, so nothing to"
+                  " correlate against.")
+        else:
+            print("\n  during each MAJOR hub-TX episode, against the run median:")
+            for e in majors:
+                mid = e[len(e) // 2]["wall_s"]
+                cells = []
+                for c in chans:
+                    d = gauge(met, AIR_UNIT, "other", f"ch{c}-dbm")
+                    n = gauge(met, AIR_UNIT, "other", f"ch{c}-nets")
+                    if d is None or d.empty:
+                        continue
+                    v = nearest(d, mid)
+                    delta = v - run_median.get(c, v)
+                    nv = nearest(n, mid) if n is not None and not n.empty else float("nan")
+                    cells.append(f"ch{c} {v:.0f} dBm ({delta:+.0f})"
+                                 f" nets {nv:.0f}")
+                print(f"    +{e[0]['wall_s'] - t0:7.0f}s  " + "  ".join(cells))
+            print("  A channel well above its own median, or carrying networks"
+                  " it did not have, is")
+            print("  the lead. All three moving together is the whole band. A"
+                  " few dB is sweep noise --")
+            print("  capture.py measures ~10 dB of it on a busy channel; see"
+                  " air_scan() there.")
+
     head("HEAP  (the long-run question: does anything leak)")
     for u in units:
         h = gauge(met, u, "health", "heap")

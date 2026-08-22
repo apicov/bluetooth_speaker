@@ -57,9 +57,11 @@ power-cut soak keeps everything up to the last second.
 
 import argparse
 import csv
+import math
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -327,6 +329,118 @@ def reader(session, unit, port, baud):
             time.sleep(2.0)
 
 
+AIR_UNIT = "air"
+
+# The three non-overlapping 2.4 GHz channels, and the overlap rule. Channels sit
+# 5 MHz apart and are 22 MHz wide, so anything within four of a candidate lands
+# on top of it. Identical to survey_channel() in hub_s3/main/net.c, deliberately:
+# the hub prints one of these lines at boot from its own antenna, and the two are
+# only comparable if they are scored the same way.
+AIR_CANDIDATES = (1, 6, 11)
+AIR_OVERLAP = 4
+
+# Our own SoftAP, which this scan must not count as interference. It is the
+# loudest thing in the room from where the laptop sits -- nmcli reports it at
+# quality 100 -- so leaving it in pins whichever channel the hub chose at
+# maximum occupancy and makes the whole metric read backwards. The hub's own
+# survey has no such problem: it scans in STA mode before the AP is started and
+# physically cannot see itself. Matches AP_SSID in hub_s3/main/hub.h.
+AIR_OWN_SSID = "dancefloor"
+
+
+def air_scan():
+    """One 2.4 GHz sweep, as (nets_seen, {channel: (dbm, count)}), or None.
+
+    WHY THIS EXISTS. Three soaks have been read for a hub TX ENOMEM fault that
+    arrives in episodes, and nothing on the hub moves when one starts: internal
+    free flat, stations 2, churn 0, RSSI pinned, source clean. The episodes share
+    no time of day and no common uptime. What has never been recorded is what
+    else was on the air, and this is the cheapest instrument that records it.
+
+    WHAT IT DOES NOT MEASURE: airtime. A beacon says a network is PRESENT, not
+    that it is busy, so a quiet neighbour starting a large transfer looks like
+    nothing at all here. It will catch a network appearing, changing channel, or
+    changing level, which are the likelier triggers. `iw survey dump` would give
+    real channel busy time and is the upgrade if this proves too blunt -- it
+    needs root and the interface parked on the hub's channel.
+
+    IT IS ALSO NOISY, measured here at ~10 dB sweep to sweep on a busy channel
+    (ch1 read -60, -51, -61 in three consecutive sweeps) because a single scan
+    does not always catch every AP. A quiet channel is far steadier (-69, -70,
+    -70 on ch11 over the same three). So read a trend across several sweeps, not
+    one reading: a few dB between adjacent sweeps is this, not a neighbour.
+    """
+    try:
+        subprocess.run(["nmcli", "dev", "wifi", "rescan"],
+                       capture_output=True, timeout=20)
+    except Exception:                                           # noqa: BLE001
+        pass        # NetworkManager rate-limits rescans; the cached list is fine
+    out = subprocess.run(["nmcli", "-t", "-f", "SSID,CHAN,SIGNAL",
+                          "dev", "wifi", "list"],
+                         capture_output=True, text=True, timeout=20)
+    if out.returncode != 0:
+        raise RuntimeError((out.stderr or "nmcli failed").strip()[:120])
+
+    power = {c: 0.0 for c in AIR_CANDIDATES}
+    nets = {c: 0 for c in AIR_CANDIDATES}
+    seen = 0
+    for line in out.stdout.splitlines():
+        parts = line.rsplit(":", 2)         # SSIDs may contain ':'
+        if len(parts) != 3:
+            continue
+        if parts[0] == AIR_OWN_SSID:
+            continue
+        try:
+            chan, sig = int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if chan > 14:                       # 5 GHz shares no air with the hub
+            continue
+        seen += 1
+        # nmcli reports SIGNAL as 0-100 QUALITY, not dBm. This is wpa_supplicant's
+        # usual inverse and it is APPROXIMATE -- the hub's own survey line is the
+        # calibrated one. Good enough for tracking change over a run, which is
+        # the only thing being asked of it.
+        dbm = sig / 2.0 - 100.0
+        for c in AIR_CANDIDATES:
+            if abs(chan - c) <= AIR_OVERLAP:
+                power[c] += 10.0 ** (dbm / 10.0)
+                nets[c] += 1
+    # Linear sum back to dBm for printing, with a floor rather than -inf.
+    return seen, {c: (int(round(10.0 * math.log10(power[c]))) if power[c] > 0
+                      else -100, nets[c])
+                  for c in AIR_CANDIDATES}
+
+
+def air_watcher(session, interval):
+    """Sweep the band every `interval` seconds for as long as the soak runs.
+
+    Emits an ESP-shaped line so Session.emit() parses it with no special case,
+    and lands it under a pseudo-unit rather than a second file so that a scan and
+    a hub status line can be read against each other by wall_s. analyse.py drops
+    AIR_UNIT from its per-unit loops; nothing else needs to know.
+    """
+    while not session.stop.is_set():
+        try:
+            seen, per = air_scan()
+            body = " | ".join(
+                [f"nets {seen}"] +
+                [f"ch{c}-dbm {per[c][0]} ch{c}-nets {per[c][1]}"
+                 for c in AIR_CANDIDATES])
+            session.record(AIR_UNIT, f"I (0) air: {body}")
+        except FileNotFoundError:
+            session.record(AIR_UNIT, "--- capture: no nmcli, air scan off "
+                                     "for this session ---")
+            return
+        except Exception as e:                                  # noqa: BLE001
+            # One notice, then stop. A soak must not die, or fill its log, because
+            # the laptop's WiFi went away.
+            session.record(AIR_UNIT, f"--- capture: air scan failed ({e}), "
+                                     f"off for this session ---")
+            return
+        session.stop.wait(interval)
+
+
 def replay(outdir):
     """Rebuild metrics.csv and events.csv from an existing session's raw.log.
 
@@ -390,6 +504,10 @@ def main():
     ap.add_argument("--baud", type=int, default=115200,
                     help="baud for units that do not name their own "
                          "(default 115200, the IDF default)")
+    ap.add_argument("--air-interval", type=int, default=30, metavar="SECONDS",
+                    help="sweep 2.4 GHz every SECONDS and record what else is "
+                         "on the air, as the pseudo-unit 'air' (default 30, "
+                         "0 disables). Needs nmcli; a soak runs without it")
     ap.add_argument("--out", default=None,
                     help="session directory (default logs-soak-<timestamp>/, "
                          "which .gitignore already covers)")
@@ -427,14 +545,22 @@ def main():
     session = Session(outdir)
 
     print(f"capturing {len(units)} unit(s) into {outdir}/", file=sys.stderr)
+    if args.air_interval > 0:
+        print(f"  {'air':8s} 2.4 GHz sweep every {args.air_interval}s",
+              file=sys.stderr)
     for name, port, baud in units:
         print(f"  {name:8s} {port} @ {baud}", file=sys.stderr)
     print("Ctrl-C to stop\n", file=sys.stderr)
 
-    threads = [threading.Thread(target=reader,
-                                args=(session, name, port, baud),
-                                daemon=True)
-               for name, port, baud in units]
+    serial_threads = [threading.Thread(target=reader,
+                                       args=(session, name, port, baud),
+                                       daemon=True)
+                      for name, port, baud in units]
+    threads = list(serial_threads)
+    if args.air_interval > 0:
+        threads.append(threading.Thread(target=air_watcher,
+                                        args=(session, args.air_interval),
+                                        daemon=True))
     for t in threads:
         t.start()
 
@@ -447,7 +573,9 @@ def main():
     try:
         while not session.stop.is_set():
             time.sleep(0.5)
-            if not any(t.is_alive() for t in threads):
+            # The SERIAL readers decide when a soak is over. air_watcher
+            # retires by itself when nmcli is missing, and that must not end it.
+            if not any(t.is_alive() for t in serial_threads):
                 break
     finally:
         session.stop.set()
