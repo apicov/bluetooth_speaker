@@ -168,12 +168,23 @@ void probe_task(void *arg)
          *
          * This is the satellite's PRIMARY clock source -- clock_offset() in
          * satellite/main/clock.c prefers it and keeps the probe estimator only
-         * as a fallback -- and it goes stale at TSF_MAX_AGE_US, one second. The
-         * worst refusal stretch on the 2026-08-22 soaks ran 909 ms, so gating
-         * this would suppress about four of these and leave the satellite at
-         * the edge of that cliff; crossing it drops it onto the estimator at
-         * the exact moment the estimator's own input is worst, which is the
-         * trade the reply above is being skipped to avoid making.
+         * as a fallback -- and it goes stale at TSF_MAX_AGE_US, one second.
+         *
+         * This once read that the worst refusal stretch measured was 909 ms, so
+         * gating would leave the satellite at the edge of that cliff without
+         * pushing it over. THAT IS NO LONGER TRUE and the reasoning has to be
+         * stated the other way round. The 3h53m soak of 2026-08-22
+         * (logs-soak-20260822-165644) recorded four stretches past the second --
+         * 1003, 1284, 1298 and 1313 ms -- and sat_s3 fell onto the estimator
+         * twice during that episode, at +11523 s and +11580 s, with this
+         * message ungated the whole time.
+         *
+         * So the cliff gets crossed either way, and gating buys nothing against
+         * it. What gating would still cost is every TSF message in the stretches
+         * that stay under a second, which is most of them: it would remove
+         * samples that were doing their job without preventing the staleness
+         * that matters. That is why it stays ungated -- not because the
+         * satellite is safely inside the window.
          *
          * It is also the one message congestion does not corrupt: there is no
          * round trip in it, so it carries none of the path asymmetry (clock.c
