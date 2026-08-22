@@ -73,12 +73,26 @@ menu "Dancefloor hub"
     # that reads it -- had no way to insist either project did so.
 
     config DANCEFLOOR_WIFI_CHANNEL
-        int "SoftAP channel (1-13)"
-        default 11
+        int "SoftAP channel (0 = survey at boot, 1-13 = pin)"
+        range 0 13
+        default 0
         help
-            Pinned rather than driver-chosen: Bluetooth's adaptive frequency
-            hopping avoids a WiFi interferer far more effectively when it sits on
-            a fixed, known slice of the band. Costs nothing.
+            Fixed for the session either way, and that is the part that matters:
+            Bluetooth's adaptive frequency hopping avoids a WiFi interferer far
+            more effectively when it sits on a known slice of the band, and
+            bt_bridge is carrying the A2DP source over that same air. What AFH
+            does not need is the value being chosen at COMPILE time.
+
+            0 surveys the band once at boot, picks the quietest of 1, 6 and 11,
+            and then never moves. Default because this floor changes venue and a
+            number baked in at flash time cannot follow it. The 11 that used to
+            be the default here was never a measurement -- it was the Kconfig
+            default -- and a survey on 2026-08-22 found it the best of the three
+            in one workshop, which says nothing about a field.
+
+            1-13 pins the channel and skips the survey. Use it whenever a run
+            has to be comparable with another one: a soak judging a config
+            change must not have the channel moving underneath it.
 
     config DANCEFLOOR_WIFI_PHY_RATE_MBPS
         int "Pin the PHY rate in Mbps (6, 12, 24; 0 = rate adaptation)"

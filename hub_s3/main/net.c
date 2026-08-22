@@ -8,6 +8,9 @@
  */
 #include "hub.h"
 
+#include <math.h>
+#include <stdlib.h>
+
 #include "esp_private/wifi.h"
 #include "nvs_flash.h"
 
@@ -46,6 +49,124 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
 }
 
+#if CONFIG_DANCEFLOOR_WIFI_CHANNEL == 0
+/*
+ * Which channel to be an AP on, decided once, at boot.
+ *
+ * WHY NOT A CONSTANT. The channel has to be fixed for the session -- Bluetooth's
+ * AFH routes around a known interferer far better than a moving one, and
+ * bt_bridge carries the A2DP source over the same air -- but nothing in that
+ * argument says it has to be fixed at COMPILE time, and this floor changes
+ * venue. The 11 that used to be the default was the Kconfig default, never a
+ * measurement.
+ *
+ * ALL THIRTEEN CHANNELS ARE SCANNED, not just the three candidates, and the
+ * survey that prompted this is why. In one workshop channels 1 and 6 each
+ * looked nearly bare on their own centre; four networks sitting on channel 5
+ * were the largest contributor to both, and summed occupancy came out 533 and
+ * 608 against channel 11's 87. A scan restricted to 1/6/11 would have read 1
+ * and 6 as clear and picked one of them.
+ *
+ * SUMMED IN LINEAR POWER, because adding dBm figures is meaningless. The total
+ * is converted back to dBm only to print it, so the log line reads in the same
+ * unit as every other signal figure here.
+ *
+ * WHAT THIS DOES NOT MEASURE: airtime. A beacon says a network is present, not
+ * that it is busy, and three idle neighbours can cost less than one saturated
+ * one. This is the best guess available in about 1.6 s of boot, and what it
+ * really buys is never sitting on a channel nobody looked at.
+ */
+
+/* 2.4 GHz channels sit 5 MHz apart and are 22 MHz wide, so anything within
+ * four of a candidate lands on top of it. */
+#define CHANNEL_OVERLAP 4
+
+/* Where the survey lands if it cannot run at all. One of the non-overlapping
+ * three, and 11 because that is what this project ran on for its whole
+ * recorded history -- a fallback boot then behaves like every log already in
+ * tools/soak rather than like nothing that came before. */
+#define CHANNEL_FALLBACK 11
+
+/* A linear power sum back to dBm for printing. An untouched channel reports a
+ * floor rather than the -inf that log10(0) would give. */
+static int occupancy_dbm(float mw)
+{
+    return mw > 0.0f ? (int)lroundf(10.0f * log10f(mw)) : -100;
+}
+
+static int survey_channel(void)
+{
+    static const int cand[3] = {1, 6, 11};
+
+    /* Scanning needs STA mode and a started radio. No STA netif is created for
+     * it: a scan wants no IP stack, and the AP netif made above is untouched. */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* PASSIVE. This unit has no business transmitting probe requests into a
+     * room it is about to be the AP of, and a beacon interval is ~102 ms, so
+     * 120 ms a channel catches at least one from everything that is there.
+     * Thirteen channels at 120 ms is ~1.6 s, spent once. */
+    const wifi_scan_config_t sc = {
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_PASSIVE,
+        .scan_time = { .passive = 120 },
+    };
+    esp_err_t err = esp_wifi_scan_start(&sc, true);
+
+    float power[3] = {0};
+    int nets[3] = {0};
+    int seen = 0;
+
+    if (err == ESP_OK) {
+        /* One record at a time, which frees each as it goes -- the bulk call
+         * would want an array sized for a band this unit has not seen yet, and
+         * internal RAM here runs at ~12 kB free. Draining to ESP_FAIL is also
+         * what releases the list, so there is nothing left to clear. */
+        wifi_ap_record_t rec;
+        while (esp_wifi_scan_get_ap_record(&rec) == ESP_OK) {
+            seen++;
+            for (int k = 0; k < 3; k++) {
+                if (abs((int)rec.primary - cand[k]) <= CHANNEL_OVERLAP) {
+                    power[k] += powf(10.0f, rec.rssi / 10.0f);
+                    nets[k]++;
+                }
+            }
+        }
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_stop());
+
+    if (err != ESP_OK) {
+        /* Loud, because the quiet version of this is a board sitting on an
+         * unmeasured channel while the log implies one was chosen. */
+        ESP_LOGE(TAG, "channel survey FAILED (%s) -- using ch %d unmeasured; "
+                      "the band was never looked at",
+                 esp_err_to_name(err), CHANNEL_FALLBACK);
+        return CHANNEL_FALLBACK;
+    }
+
+    int best = 0;
+    for (int k = 1; k < 3; k++) {
+        if (power[k] < power[best]) {
+            best = k;
+        }
+    }
+
+    /* `key value` pairs so tools/soak/capture.py lands every figure in
+     * metrics.csv without a parser change, and a soak records the band it ran
+     * in rather than only the channel it picked. */
+    ESP_LOGW(TAG, "channel survey: nets-seen %d | ch1-dbm %d ch1-nets %d | "
+                  "ch6-dbm %d ch6-nets %d | ch11-dbm %d ch11-nets %d | chose %d",
+             seen,
+             occupancy_dbm(power[0]), nets[0],
+             occupancy_dbm(power[1]), nets[1],
+             occupancy_dbm(power[2]), nets[2],
+             cand[best]);
+    return cand[best];
+}
+#endif /* CONFIG_DANCEFLOOR_WIFI_CHANNEL == 0 */
+
 void wifi_start_ap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -65,6 +186,16 @@ void wifi_start_ap(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    /* Before the AP config below, because this is what wc.ap.channel gets, and
+     * after esp_wifi_init() because the scan needs a driver. */
+#if CONFIG_DANCEFLOOR_WIFI_CHANNEL == 0
+    const int channel = survey_channel();
+#else
+    const int channel = CONFIG_DANCEFLOOR_WIFI_CHANNEL;
+    ESP_LOGW(TAG, "channel pinned to %d, no survey -- runs that must compare "
+                  "with each other want this", channel);
+#endif
+
     /*
      * Fields below are set explicitly rather than left at zero from the
      * initialiser: dtim_period has a documented range of 1-10 and zero is
@@ -81,7 +212,7 @@ void wifi_start_ap(void)
      * ESP_WIFI_MAX_CONN_NUM. */
     wc.ap.max_connection = MAX_CLIENTS;
     wc.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    wc.ap.channel = CONFIG_DANCEFLOOR_WIFI_CHANNEL;
+    wc.ap.channel = channel;
     wc.ap.dtim_period = 1;
     /*
      * 100 TU, which is IDF's floor, IDF's default, and -- measured -- the only
@@ -241,8 +372,10 @@ void wifi_start_ap(void)
      * one chip; the two-chip split removed that need, and the cap did real harm
      * by denying rate adaptation the SNR margin it needs.
      *
-     * The channel stays pinned: it costs nothing and helps Bluetooth's adaptive
-     * frequency hopping route around us.
+     * The channel stays pinned for the session: it costs nothing and helps
+     * Bluetooth's adaptive frequency hopping route around us. WHICH channel is
+     * now chosen at boot rather than at compile time -- see survey_channel()
+     * above; AFH needs the value known and stationary, not known early.
      */
 #if CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS > 0
     /*
@@ -281,7 +414,7 @@ void wifi_start_ap(void)
     ESP_LOGW(TAG, "PHY rate adaptation is ON (rate not pinned)");
 #endif
     ESP_LOGI(TAG, "SoftAP \"%s\" pass \"%s\" ch %d, radio at defaults",
-             AP_SSID, AP_PASS, CONFIG_DANCEFLOOR_WIFI_CHANNEL);
+             AP_SSID, AP_PASS, channel);
 }
 
 /*
