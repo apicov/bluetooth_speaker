@@ -11,8 +11,9 @@ exists to answer, in the order they matter:
   4. phase                     where each unit settled and how far it wandered
   5. buffer depth              a slow drift is what a continuous trim can cause
   6. delivery                  whether audio arrived evenly, and what a hole cost
-  7. heap                      the long-run question architecture.md 17 names
-  8. the source                stalls, which look like unit faults and are not
+  7. the hub's refused sends    where a hole in the sound is most often made
+  8. heap                      the long-run question architecture.md 17 names
+  9. the source                stalls, which look like unit faults and are not
 
 REBOOTS ARE HANDLED, and this is the part worth knowing about before trusting a
 number. Every counter on a HEALTH line is cumulative SINCE BOOT, so if a board
@@ -133,6 +134,51 @@ def gauge(df, unit, kind, metric):
     return s[["wall_s", "value"]].reset_index(drop=True) if not s.empty else None
 
 
+def window_sum(df, unit, metric):
+    """Total of a per-window `status` gauge over the run.
+
+    tx-fail and the ENOMEM shape beside it are CLEARED by the window that
+    prints them -- see tx_fail_summary() and tx_burst_summary() in
+    hub_s3/main/net.c -- so the run total is a plain sum over windows.
+
+    counter_total() is the wrong helper for them twice over: it baselines each
+    boot segment against its first value, which is meaningless for a series
+    that returns to zero every window, and it reads only health and trim lines
+    while these live on the hub's `status` line.
+    """
+    s = gauge(df, unit, "status", metric)
+    return 0 if s is None or s.empty else int(s["value"].sum())
+
+
+def tx_faults(df, unit):
+    """The hub's refused sends, as FAULTS lines. Empty for a unit with none.
+
+    Here rather than in the FAULTS table because these are window gauges rather
+    than cumulative counters, and here AT ALL because a refused send is not a
+    hub-local inconvenience. The packet is never transmitted and never retried
+    -- send_audio_to_clients() in hub_s3/main/timeline.c drops it -- so it
+    reaches the floor as a hole.
+
+    Across the three 2026-08-22 soaks every one of the 20 starved windows had a
+    hub ENOMEM window within 25 s, none occurred without one, and the cost ran
+    at 11.2 and 12.6 ms of satellite starvation per refused audio packet. The
+    run that refused nothing starved not at all, and it was the longest of the
+    three. Before this was reported the analyser called that hub "clean".
+    """
+    total = window_sum(df, unit, "tx-fail")
+    if not total:
+        return []
+    out = [f"      {'tx-fail':18s} {total:>8,}   "
+           f"sendto() refused -- see HUB TX below"]
+    # Absent from sessions captured before the lane split was extracted;
+    # `capture.py --replay <dir>` rebuilds those from their raw.log.
+    audio = window_sum(df, unit, "tx_fail_audio")
+    if audio:
+        out.append(f"      {'of which audio':18s} {audio:>8,}   "
+                   f"never reached the air (~12 ms of starvation each)")
+    return out
+
+
 def nearest(df, wall_s):
     """The value of `df` sampled closest in time to `wall_s`, or nan.
 
@@ -196,6 +242,7 @@ def main():
             n = counter_total(met, u, metric)
             if n:
                 bad.append(f"      {metric:18s} {n:>8,}   {meaning}")
+        bad += tx_faults(met, u)
         if bad:
             any_fault = True
             print(f"  {u}:")
@@ -397,7 +444,78 @@ def main():
             print("        delivery fault at all -- it was half the starvation"
                   " on the 2026-08-19 20:04 soak.")
 
-    # ---- 7. heap ------------------------------------------------------------
+    # ---- 7. the hub's refused sends -----------------------------------------
+    #
+    # DELIVERY above says a hole was held AFTER sendto. This says whether the
+    # hub refused to make the send at all, which is the other candidate and the
+    # one that turned out to matter: on 2026-08-22 the hub read "clean" through
+    # three runs while refusing 684, 0 and 63 sends, because nothing looked.
+    #
+    # The shape matters as much as the size, and the four burst-gap buckets are
+    # what carry it -- back-to-back, sub-beacon, beacon-locked, or long
+    # stretches far apart are four different faults with four different fixes.
+    # The buckets are documented where they are measured, in hub_s3/main/net.c.
+    head("HUB TX  (a refused send is a hole in the sound, not a hub-local event)")
+    tx_any = False
+    for u in units:
+        tf = gauge(met, u, "status", "tx-fail")
+        if tf is None or tf.empty:
+            continue
+        tx_any = True
+        total = int(tf["value"].sum())
+        span_h = max(t1 - t0, 1.0) / 3600.0
+        if not total:
+            print(f"  {u}: nothing refused -- every send reached the driver")
+            continue
+        audio = window_sum(met, u, "tx_fail_audio")
+        enomem = window_sum(met, u, "space")
+        print(f"  {u}: {total:,} refused over the run ({total / span_h:.0f}/hour)")
+        if audio:
+            print(f"      {audio:,} of them audio  -> ~{audio * 12 / 1000.0:.1f} s of"
+                  f" starvation expected at the measured ~12 ms each")
+        else:
+            print("      (audio share not recorded in this session --"
+                  " `capture.py --replay <dir>` rebuilds it from raw.log)")
+        # ENOMEM and EHOSTUNREACH are different faults with different fixes:
+        # a pool/load problem against an ARP-seeding problem. net.c keeps the
+        # errno tally precisely so a bare count cannot conflate them.
+        if enomem and enomem < total:
+            print(f"      errno split: {enomem:,} ENOMEM, {total - enomem:,} other"
+                  f" -- raw.log carries the tally, and EHOSTUNREACH is an"
+                  f" ARP-seeding fault, not a pool one")
+
+        windows = tf[tf["value"] > 0]
+        rmax = gauge(met, u, "status", "refuse-max")
+        cong = gauge(met, u, "status", "cong-skip")
+        fan = gauge(met, u, "status", "fanout-gap-max")
+        aud = gauge(met, u, "status", "tx_fail_audio")
+        buckets = [gauge(met, u, "status", f"burst-gap-{b}")
+                   for b in ("lt25", "25-75", "75-150", "gt150")]
+        have_buckets = all(b is not None and not b.empty for b in buckets)
+        print("        when        refused    audio   refuse-max   cong-skip"
+              "   fan-out   burst gaps")
+        for _, r in windows.iterrows():
+            w = r["wall_s"]
+            a = nearest(aud, w)
+            a_s = f"{a:7.0f}" if a == a else "    n/a"
+            gaps = ("  " + "/".join(f"{nearest(b, w):.0f}" for b in buckets)
+                    if have_buckets else "   n/a")
+            print(f"        +{w - t0:7.0f}s  {r['value']:8.0f}  {a_s}"
+                  f"   {nearest(rmax, w):8.0f} ms"
+                  f"   {nearest(cong, w):9.0f}"
+                  f"   {nearest(fan, w):6.0f} ms{gaps}")
+        if have_buckets:
+            tot = [int(b["value"].sum()) for b in buckets]
+            print(f"        burst gaps <25 / 25-75 / 75-150 / >150 ms:"
+                  f"  {tot[0]} / {tot[1]} / {tot[2]} / {tot[3]}")
+            print("        a pile in <25 is a stall that never lets go; in 75-150"
+                  " the DTIM hold; in >150 isolated")
+            print("        long stretches far apart -- the drain, not the fill."
+                  " See hub_s3/main/net.c.")
+    if not tx_any:
+        print("  No tx-fail gauge -- the hub predates this instrument.")
+
+    # ---- 8. heap ------------------------------------------------------------
     head("HEAP  (the long-run question: does anything leak)")
     for u in units:
         h = gauge(met, u, "health", "heap")
@@ -417,7 +535,7 @@ def main():
             print(f"      internal pool: min {i['value'].min():,.0f} B"
                   f"  (the one that constrains the hub)")
 
-    # ---- 8. the source ------------------------------------------------------
+    # ---- 9. the source ------------------------------------------------------
     head("SOURCE  (a stall here looks like a unit fault and is not one)")
     pk = met[(met["kind"] == "sbc_in") & (met["metric"] == "pkts")]
     if pk.empty:
@@ -436,7 +554,7 @@ def main():
             print(f"  longest silence between packets: {g['value'].max() / 1000:.0f} ms"
                   f"   (median window max {g['value'].median() / 1000:.0f} ms)")
 
-    # ---- 9. events ----------------------------------------------------------
+    # ---- 10. events ----------------------------------------------------------
     head("EVENTS")
     if ev.empty:
         print("  none recorded")

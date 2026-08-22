@@ -118,7 +118,24 @@ KINDS = [
 # kind -> [(regex, metric name)]
 EXTRA = {
     "trim":       [(re.compile(r"TRIM:\s*([+-]?\d+)\s*Hz"), "trim_hz")],
-    "status":     [(re.compile(r"\((\d+) ms\)"), "ring_ms")],
+    "status":     [(re.compile(r"\((\d+) ms\)"), "ring_ms"),
+                   # The audio lane's own share of tx-fail. The generic scan sees
+                   # the total and stops at the parenthesis, but the split is the
+                   # whole point of the lane breakdown: a refused frame costs one
+                   # late repaint, a refused audio packet is never retried and
+                   # lands on the floor as a hole. Measured at ~11-13 ms of
+                   # satellite starvation per refused audio packet across the
+                   # three 2026-08-22 soaks.
+                   (re.compile(r"tx-fail \d+ \((\d+) audio"), "tx_fail_audio"),
+                   # The ENOMEM burst-gap histogram, four metrics rather than one
+                   # because they are read against each other: back-to-back vs
+                   # beacon-locked vs long stretches far apart are three different
+                   # faults. The buckets and how to read them are documented at
+                   # the histogram itself in hub_s3/main/net.c.
+                   (re.compile(r"\| gaps (\d+)/\d+/\d+/\d+"), "burst-gap-lt25"),
+                   (re.compile(r"\| gaps \d+/(\d+)/\d+/\d+"), "burst-gap-25-75"),
+                   (re.compile(r"\| gaps \d+/\d+/(\d+)/\d+"), "burst-gap-75-150"),
+                   (re.compile(r"\| gaps \d+/\d+/\d+/(\d+)"), "burst-gap-gt150")],
     "health":     [(re.compile(r"\((\d+) refused\)"), "retunes_refused")],
     "divergence": [(re.compile(r"->\s*([+-]?\d+) ms apart"), "apart_ms")],
     "servo":      [(re.compile(r"\((\d+) frames/s\)"), "frames_per_s")],
@@ -205,25 +222,39 @@ class Session:
         with self.lock:
             self.raw.write(f"{now:.3f}\t{iso}\t{unit}\t{clean}\n")
             self.n_lines += 1
-
-            m = ESP_LINE.match(clean)
-            if m:
-                level, esp_ms, tag, body = m.group(1), int(m.group(2)), \
-                    m.group(3).strip(), m.group(4)
-                kind, skip = classify(body)
-                for metric, value in numbers(kind, body, skip):
-                    self.metrics.writerow([f"{now:.3f}", iso, unit, esp_ms,
-                                           level, tag, kind, metric, value])
-                    self.n_metrics += 1
-                if kind in EVENT_KINDS or level == "E":
-                    self.events.writerow([f"{now:.3f}", iso, unit, esp_ms,
-                                          level, tag, kind, body])
-                    self.n_events += 1
+            self.emit(now, iso, unit, clean)
 
             if now - self.last_flush > 2.0:
                 self.mfile.flush()
                 self.efile.flush()
                 self.last_flush = now
+
+    def emit(self, now, iso, unit, clean):
+        """Derive metrics and events from one already-cleaned line.
+
+        Apart from record() so that replay() can re-derive metrics.csv from a
+        raw.log written earlier. raw.log is truth -- numbers() says so -- and a
+        parser that cannot be re-run over it means every improvement to the
+        extraction silently fails to reach the sessions already captured, which
+        is exactly the sessions a change is being measured against.
+
+        The caller holds the lock and owns the timestamp: replay takes both from
+        the file rather than from the clock.
+        """
+        m = ESP_LINE.match(clean)
+        if not m:
+            return
+        level, esp_ms, tag, body = m.group(1), int(m.group(2)), \
+            m.group(3).strip(), m.group(4)
+        kind, skip = classify(body)
+        for metric, value in numbers(kind, body, skip):
+            self.metrics.writerow([f"{now:.3f}", iso, unit, esp_ms,
+                                   level, tag, kind, metric, value])
+            self.n_metrics += 1
+        if kind in EVENT_KINDS or level == "E":
+            self.events.writerow([f"{now:.3f}", iso, unit, esp_ms,
+                                  level, tag, kind, body])
+            self.n_events += 1
 
     def close(self):
         with self.lock:
@@ -296,6 +327,51 @@ def reader(session, unit, port, baud):
             time.sleep(2.0)
 
 
+def replay(outdir):
+    """Rebuild metrics.csv and events.csv from an existing session's raw.log.
+
+    For when the extraction has learned something the session predates. The
+    three 2026-08-22 soaks were captured before tx-fail's lane split was pulled
+    out, so without this the baseline runs could never produce the one number a
+    fix for that fault has to be measured against.
+
+    raw.log is not touched, and the two derived files are rewritten from
+    nothing rather than appended to, so replaying twice is not additive.
+    """
+    raw_path = os.path.join(outdir, "raw.log")
+    if not os.path.exists(raw_path):
+        sys.exit(f"{raw_path} does not exist -- not a session directory")
+    for name in ("metrics.csv", "events.csv"):
+        path = os.path.join(outdir, name)
+        if os.path.exists(path):
+            os.remove(path)
+
+    session = Session(outdir)
+    kept = skipped = 0
+    with open(raw_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t", 3)
+            # capture.py's own banner lines ("--- capture: opened ... ---") have
+            # the same four fields but no ESP prefix, so emit() drops them; a
+            # line with fewer fields is a truncated write and is not guessed at.
+            if len(parts) < 4:
+                skipped += 1
+                continue
+            wall_s, iso, unit, clean = parts
+            try:
+                now = float(wall_s)
+            except ValueError:
+                skipped += 1
+                continue
+            session.emit(now, iso, unit, clean)
+            kept += 1
+    session.close()
+    print(f"replayed {kept:,} lines from {raw_path}"
+          + (f" ({skipped:,} unparseable)" if skipped else ""), file=sys.stderr)
+    print(f"  -> {session.n_metrics:,} metrics, {session.n_events:,} events",
+          file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Capture every unit's console to CSV for a soak run.",
@@ -305,9 +381,12 @@ def main():
                "The hub's console is 921600 in this repo's sdkconfig.defaults, on a\n"
                "custom UART; the satellite and bridge are the IDF default 115200.\n"
                "Reading a board at the wrong baud prints garbage, not an error.")
-    ap.add_argument("--unit", action="append", required=True,
-                    metavar="NAME=PORT[:BAUD]",
+    ap.add_argument("--unit", action="append", metavar="NAME=PORT[:BAUD]",
                     help="repeatable, one per board: hub=/dev/ttyUSB0:921600")
+    ap.add_argument("--replay", metavar="DIR",
+                    help="re-derive DIR/metrics.csv and DIR/events.csv from its "
+                         "raw.log with the current extraction, and exit; no "
+                         "boards are opened and raw.log is not modified")
     ap.add_argument("--baud", type=int, default=115200,
                     help="baud for units that do not name their own "
                          "(default 115200, the IDF default)")
@@ -315,6 +394,12 @@ def main():
                     help="session directory (default logs-soak-<timestamp>/, "
                          "which .gitignore already covers)")
     args = ap.parse_args()
+
+    if args.replay:
+        replay(args.replay)
+        return
+    if not args.unit:
+        ap.error("--unit is required (or --replay DIR to rebuild an old session)")
 
     units = []
     for spec in args.unit:
