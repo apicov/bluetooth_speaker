@@ -161,6 +161,57 @@ CONFIG_ESP_PHY_ENABLE_USB=n
 # the flip holds. Scaling to more satellites is still unmeasured (the airtime
 # model predicts ~30 at light aggregation); the satellite also logged 17 brief
 # STA re-associations that the play buffer absorbed without an audio gap.
+#
+# TURNING THIS OFF WAS TRIED, AND FAILED. Kept on, and the attempt recorded here
+# because the reasoning was sound and the next person will have it again.
+#
+# THE FAULT IT WAS AIMED AT is episodic, not a rate, which is why the 18-minute
+# re-measurement that decided the flip above could not have seen it. The
+# 2026-08-22 soaks refused 569 / 0 / 52 audio packets per hour; all 684 of the
+# first fell inside ONE 80 s episode, and the 3h53m soak
+# (logs-soak-20260822-165644) ran 3h11m perfectly clean -- 0 underruns, 0
+# dma-starve, 0 ring-full -- then refused 2,212 audio packets in 170 s.
+#
+# WHY AGGREGATION LOOKED LIKE THE CAUSE. Nothing hub-local moves during an
+# episode: internal free flat at 12,288 B through every refusal window (so the
+# static pool is drained by buffers IN FLIGHT, not starved by the allocator),
+# stations 2, churn 0, RSSI pinned at -33 dBm, the SBC source clean at 38-68 ms
+# max gap. Burst-gap buckets 7 / 15 / 4 / 68 -- 72% in the >150 ms bucket, which
+# is the drain, not the fill. TX_BA_WIN 6 holds up to six MPDUs' buffers through
+# one block-ack retry chain, and that is what a drain looks like.
+#
+# WHAT ACTUALLY HAPPENED, over 3.68 h (logs-soak-20260822-213041, AMPDU off)
+# against 3.88 h (logs-soak-20260822-165644, AMPDU on):
+#
+#                        AMPDU on    AMPDU off
+#   major episodes ....... 1           2
+#   audio refused/hour ... 571         370
+#   worst stretch ........ 1313 ms     486 ms
+#   starvation ........... 5101 ms/h   4289 ms/h
+#   satellite underruns .. 10 / 9      4 / 5
+#   HUB underruns ........ 0           1
+#   ring-full ............ 8 / 0       172 / 5
+#   gaps ................. 38 / 38     167 / 112
+#
+# The mechanism did what it was meant to -- the worst single refusal stretch
+# fell to 486 ms and satellite underruns roughly halved -- but that was never
+# the fault. The episodes kept coming, and there were more of them.
+#
+# THE COST THE ESTIMATE MISSED. Block-ack is also efficient selective
+# retransmission; without it a lost frame is simply lost. `gaps` more than
+# tripled. That is not a continuous tax -- it lands almost entirely inside the
+# second episode (36 -> 167 between t=3.40 h and t=3.60 h) -- so removing
+# aggregation made one episode do a different and worse kind of damage,
+# including the first hub-side underrun this project has recorded.
+#
+# Honest limits: one run each, two events against one, nowhere near significant
+# on those counts, and the runs sat at different times of night. What can be
+# said is that it did not do what it was for, while adding a failure mode.
+#
+# DO NOT RE-OPEN THIS without a new reason. The next question is not which
+# mitigation to try -- three soaks have now failed to find the trigger, and
+# nothing on this board moves when an episode starts. It is what else is on the
+# air, which tools/soak/capture.py now records.
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
 CONFIG_ESP_WIFI_TX_BA_WIN=6
 
