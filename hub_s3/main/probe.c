@@ -121,10 +121,38 @@ void probe_task(void *arg)
         msg.type = MSG_TIME_RSP;
         msg.t2 = t2;
         msg.t3 = esp_timer_get_time();              /* stamp immediately before send */
-        if (sendto(sock, &msg, sizeof(msg), 0,
+        /*
+         * The reply yields to the ENOMEM backoff, because it is non-audio and
+         * that is the contract: s_tx_congested_until in hub.h says non-audio
+         * publishing stands down so the buffers audio is being refused are left
+         * for audio, and publish_frame has honoured it since it was written.
+         * This lane did not, and the 2026-08-22 soak's worst window shows it --
+         * `tx-fail 251 (213 audio, 4 vol, 34 probe)` with the frame lane already
+         * fully suppressed at cong-skip 191.
+         *
+         * A refused sendto costs no buffer, so this frees nothing directly; it
+         * stops probe winning the race for buffers as they come back, which at
+         * ~16 probe sends/s against audio's ~100 is a modest share and is not
+         * expected to fix anything on its own.
+         *
+         * Skipping a reply is close to free on its own terms. A round trip
+         * measured through a congested link carries inflated and asymmetric
+         * transit, which is precisely the error the estimator cannot see and
+         * cannot remove, so the sample withheld here is one it is better off
+         * not having. The satellite asks again in 250 ms.
+         *
+         * Not counted on the status line. cong-skip is documented as a count of
+         * FRAMES, kept comparable with the 86/s the analysis produces, and
+         * mixing probe datagrams into it would break that; a suppressed reply
+         * is visible anyway as the probe lane's share of tx-fail going to zero.
+         */
+        if (t2 >= s_tx_congested_until &&
+            sendto(sock, &msg, sizeof(msg), 0,
                    (struct sockaddr *)&from, from_len) < 0) {
             tx_fail_note(TX_LANE_PROBE, errno);
         }
+        /* Either way execution continues to the TSF message below, which is
+         * deliberately not gated -- see the reason where it is sent. */
 
         /*
          * Measurement only -- see tsf_msg_t. Sent on the back of the probe
@@ -134,6 +162,23 @@ void probe_task(void *arg)
          *
          * The pair is read as close together as it can be: the gap between them
          * is skew that lands directly in the comparison.
+         *
+         * NOT GATED BY THE ENOMEM BACKOFF, unlike the reply just above, and the
+         * asymmetry is deliberate.
+         *
+         * This is the satellite's PRIMARY clock source -- clock_offset() in
+         * satellite/main/clock.c prefers it and keeps the probe estimator only
+         * as a fallback -- and it goes stale at TSF_MAX_AGE_US, one second. The
+         * worst refusal stretch on the 2026-08-22 soaks ran 909 ms, so gating
+         * this would suppress about four of these and leave the satellite at
+         * the edge of that cliff; crossing it drops it onto the estimator at
+         * the exact moment the estimator's own input is worst, which is the
+         * trade the reply above is being skipped to avoid making.
+         *
+         * It is also the one message congestion does not corrupt: there is no
+         * round trip in it, so it carries none of the path asymmetry (clock.c
+         * says so where it chooses between the two). 17 bytes at 4/s is not
+         * what exhausts a 38-buffer pool.
          */
         const int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_AP);
         const int64_t now = esp_timer_get_time();
