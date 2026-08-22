@@ -158,10 +158,12 @@ void servo_tick(void)
          * `stations` is the first thing to read on a bad line. Every soak this
          * project has on file with ONE satellite ran tx-fail at essentially
          * zero, including a 3h11m one; the run that fell apart was the first
-         * with two. Under multicast the hub's downlink packet rate barely moves
-         * with satellite count, so if that correlation is real it is not the
-         * fill doing it -- and the first thing to establish is that both units
-         * were actually associated the whole time rather than flapping.
+         * with two. The hub's downlink packet rate is 50 + 96xN, so a second
+         * satellite roughly triples it -- which makes satellite count and
+         * transmit load the same variable, and the first thing to establish is
+         * that both units were actually associated the whole time rather than
+         * flapping. (This read the other way while the downlink was multicast
+         * and the rate was flat in N; that is no longer the build.)
          *
          * rssi-min and phy-11n come free from the same call. The first says
          * whether the air changed under the fault; the second whether a station
@@ -202,7 +204,7 @@ void servo_tick(void)
                       " | stale-skip %" PRIu32
                       " | %lu pkts/s | fanout-gap-max %ld ms | lead-min %s"
                       " | stations %d | rssi-min %d | phy-11n %d | churn %" PRIu32
-                      " | xport %s fec %d frames %s",
+                      " | fec %d",
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
                  (long)s_phase_err_us,
@@ -213,8 +215,7 @@ void servo_tick(void)
                  (unsigned long)(s_audio_pkts / window_s),
                  (long)(n_fanout_gap_max_us / 1000), lead_s,
                  (int)sta.num, (int)rssi_min, n_11n, n_join_churn,
-                 AUDIO_TRANSPORT_TAG, (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH,
-                 FRAMES_TRANSPORT_TAG);
+                 (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH);
         s_tx_fail = 0;
         /* The lane counters are cleared inside tx_fail_lanes(), on the same
          * pass that rendered them, for the reason tx_fail_summary() is: the

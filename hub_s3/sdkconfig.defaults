@@ -319,7 +319,7 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 # margin hub.h argues for.
 #
 # 32 WAS MEASURED, over 125 s, and it was enough for the DTIM burst that
-# DANCEFLOOR_MCAST_FRAMES creates: the hub read `tx-fail 0 (0 audio)` and the
+# multicast analysis frames created: the hub read `tx-fail 0 (0 audio)` and the
 # satellite `gaps 0`, where 26 gave `tx-fail 14-27 audio` per 20 s window. 40 was
 # written here briefly and never reached a board, and the standing instruction
 # was not to raise it on the strength of that.
@@ -343,8 +343,9 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 # see this ceiling. Only a boot can.
 #
 # So the pool is not the lever here. The next one costs no memory at all: the
-# DTIM hold, where 86 group-addressed analysis frames a second each occupy one
-# of these buffers until the beacon releases it. See DANCEFLOOR_MCAST_FRAMES.
+# rate the frame lane offers packets at, which TX_FRAME_PACE_US and
+# TX_FRAME_BATCH in hub.h decide. See the note further down on what the
+# multicast experiment measured and what removing it gave back.
 #
 # WHAT ARGUED FOR RAISING IT, kept because the fault is real and still open. A
 # 45-minute soak that 125 s could not have shown
@@ -890,32 +891,29 @@ CONFIG_LWIP_DHCPS_MAX_STATION_NUM=15
 # practical. Until then this line is what keeps them off here.
 CONFIG_DANCEFLOOR_ML=n
 
-# MEASURED, AND IT WORKS AT 32 BUFFERS. Overrides the Kconfig default of n,
-# which stays n because it is the right answer for a hub with the 26 static TX
-# buffers that default implies. This one has 32, which is the whole point of the
-# two settings above -- they belong together and neither is safe alone.
+# DANCEFLOOR_MCAST_FRAMES WAS SET HERE, sending the analysis frames to the same
+# multicast group as the audio. Both it and DANCEFLOOR_AUDIO_MCAST are gone --
+# every lane is unicast to the client list now -- and the measurements are kept
+# because they are what the transmit-buffer count above is still spent on.
 #
 # The question was narrow: does a 32-buffer pool absorb a DTIM burst of ~15
-# group frames, where 26 could not? It does. The run:
+# group frames, where 26 could not? It did.
+#
+#   frames unicast, 26 buffers   tx-fail 0        sat gaps 0.17/s
+#   frames MCAST,   26 buffers   tx-fail 14-27    sat gaps 1.1/s
+#   frames MCAST,   32 buffers   tx-fail 0        sat gaps 0 in 125 s
+#
+# The 32-buffer run in full:
 #
 #   hub  tx-fail 0 (0 audio) | cong-skip 0 | 50 pkts/s | frames mcast
 #   sat  gaps 0 (0 short, 0 too big) ring-full 0        -- at 65 s AND 125 s
 #   sat  leds remote hop 512 (rx 5012 -> 10181, bad 0)  -- 86.1 frames/s, none bad
 #
-# Zero audio gaps across the whole run, against 8 in 545 s on the unicast-frames
-# build and 0.17/s when this branch started. The strips get every frame.
+# What it bought was the only thing that made the hub's transmit rate FLAT in
+# speaker count: 50 + 96xN packets/s became ~146, whatever N is. At fifteen
+# satellites that is ~316/s against ~1490/s. Removing multicast gives that back:
+# the rate is 50 + 96xN again, and the buffer count above is what absorbs it.
 #
-# What it buys is the only thing that makes the hub's transmit rate FLAT in
-# speaker count: 50 + 96xN packets/s becomes ~146, whatever N is. At fifteen
-# satellites that is ~316/s against ~1490/s, and only the probe traffic still
-# scales.
-#
-# If this is ever turned on WITHOUT the 32 buffers it reproduces the failure it
-# came from -- `tx-fail 14-27 audio` per 20 s and the satellite's gap rate
-# tracking it one for one at 1.1/s. The burst, not the average, is what empties
-# the pool, so the two settings move together or not at all.
-#
-# STILL ONLY MEASURED AT TWO SATELLITES. The arithmetic says the frames stop
-# scaling; nothing has put more than two on the floor to check it, and the
-# probe traffic that does still scale has never been measured past two either.
-CONFIG_DANCEFLOOR_MCAST_FRAMES=y
+# STILL ONLY MEASURED AT TWO SATELLITES, and that matters more now than it did
+# while the frames were flat in N. Nothing has put more than two on the floor,
+# and the probe traffic scaled with N even then.

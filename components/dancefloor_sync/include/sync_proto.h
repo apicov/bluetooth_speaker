@@ -297,10 +297,10 @@ typedef struct __attribute__((packed)) {
  * protocol is most likely to meet, and a silently reinterpreted frame would be
  * worse than a refused one. `count` is how many of them follow, back to back.
  *
- * A BATCH, NOT A FRAME, and the reason is the beacon rather than the analysis.
+ * A BATCH, NOT A FRAME, and the reason is the pace rather than the analysis.
  * The hub computes 86 frames a second at hop 512 and draws every one of them;
- * the satellites were receiving 9.8, because TX_FRAME_PACE_US paces this lane to
- * the DTIM beacon and everything offered in between was dropped. That is a
+ * the satellites were receiving 9.8, because TX_FRAME_PACE_US gates this lane
+ * to one send per 102.4 ms and everything offered in between was dropped. That is a
  * detector running at a ninth of the rate its thresholds were tuned at -- see
  * BEAT_HIST, which is a frame COUNT, so the satellites' adaptive window was 4.4
  * seconds against the hub's 0.5 -- and it is visible from across the field as a
@@ -321,25 +321,22 @@ typedef struct __attribute__((packed)) {
  * packets a beacon the unpaced lane produced. TX_FRAME_BATCH in hub.h is the
  * one knob.
  *
- * MULTICAST, to the same group as the audio. This paragraph used to say the
- * opposite in capitals -- "NOT multicast", on the grounds that group-addressed
- * frames are never acknowledged and so never retried, measured at ~20% loss at
- * every PHY rate tried. That measurement was taken at the 1 Mbps basic rate
- * 802.11b forces; with 11b dropped the group goes at 6 Mbps OFDM and loss is
- * 0.2-0.3%, which a strip cannot see. See DANCEFLOOR_MCAST_FRAMES for the
- * measurements in the order they were taken, and for the transmit-buffer count
- * that has to come with it.
+ * UNICAST, to each satellite on the hub's client list, like every other lane.
+ * The batch is byte-identical for all of them, so this is N copies of one
+ * datagram and the cost scales with the floor: ~2.8 kB/s per listener at 86 Hz,
+ * against the 30-40 the audio already costs that same listener.
  *
- * The reason it stays multicast is not loss, it is SCALING: one transmission
- * feeds every listener, so the hub's packet rate is flat in speaker count --
- * ~146/s whatever N is, against 50 + 96xN. At fifteen satellites that is the
- * difference between ~316 and ~1490 packets a second, and it is the only thing
- * that makes the analysis lane free of speaker count entirely.
+ * IT WAS MULTICAST FOR A WHILE, and the argument was scaling rather than loss:
+ * one transmission feeds every listener, so the hub's packet rate would be flat
+ * in speaker count -- ~146/s whatever N is, against 50 + 96xN. At fifteen
+ * satellites that is ~316 against ~1490 packets a second. It worked, at 6 Mbps
+ * OFDM with 11b dropped and 32 transmit buffers, and measured 0.2-0.3% loss.
  *
- * ~2.8 kB/s at 86 Hz, against the 30-40 the audio already costs, and FLAT --
- * one group transmission feeds every listener, so this is the hub's whole cost
- * for the lane whatever N is. It reads "per listener" in older notes because
- * that was the unicast arrangement, which is what the paragraph above replaced.
+ * It was removed anyway, because the floor is run on unicast and unicast is
+ * what proved stable in use. Nothing about the batch or the frame format came
+ * from the group; the scaling claim above is what was given up, and it has not
+ * been paid for again -- the hub's transmit rate is 50 + 96xN once more, and
+ * nothing has measured past two satellites.
  *
  * It was ~8.3 kB/s until vis_frame_t lost spec[]; see FRAME_PAYLOAD_MAX for
  * what came off and why. Neither the batch nor that shrink changes the PACKET
@@ -430,21 +427,18 @@ _Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.paylo
  * Playback volume, hub -> listeners. Applied at each unit's output by
  * audio_volume_write_i32(); see that for the taper and why it lives there.
  *
- * ADDRESSED LIKE THE AUDIO, which under DANCEFLOOR_AUDIO_MCAST means the group
- * and not the client list. This paragraph used to say the opposite -- "unicast
- * per client, like meta and unlike audio" -- and that was the written-down
- * version of a real fault: a unit plays by being in the group, not by being on
- * the list, so anything that cleared its slot left it hearing the stream and no
- * longer hearing the level. streamer_send_vol() has the full argument.
- *
- * The reason given for unicast was that this "must not be held for a DTIM burst
- * behind the audio it would delay". Not true on this build: both roles set
- * WIFI_PS_NONE, so nothing is buffered for a DTIM at all.
+ * ADDRESSED LIKE THE AUDIO -- the client list, which is what the audio walks.
+ * That is the requirement, not an implementation detail: a unit must hear the
+ * level exactly when it hears the stream. It was briefly broken, while the
+ * audio went to a multicast group and this still went to the list, and
+ * streamer_send_vol() has the full argument.
  *
  * Sent three times when the phone changes it, pushed once when a satellite is
- * given an address, and repeated once a second regardless -- which is what
- * replaces the link-layer ACK a group frame does not get, and what bounds how
- * long a unit that has never been told a level stays silent.
+ * given an address, and repeated once a second regardless. The repeats predate
+ * unicast -- they replaced the link-layer ACK a group frame never got -- and
+ * they still earn their place: a level is state rather than a stream, so a unit
+ * that missed the one packet carrying it stays wrong until something says so
+ * again, and this bounds how long a unit that was never told stays silent.
  */
 typedef struct __attribute__((packed)) {
     uint8_t type;           /* MSG_VOL */
@@ -639,33 +633,16 @@ _Static_assert(FRAME_MSG_BYTES(FRAME_PAYLOAD_MAX) <= AUDIO_UDP_MTU,
                "a full frame batch would fragment");
 
 /*
- * Which downlink this build speaks, as a short tag for the periodic status
- * lines. It is a compile-time choice (see DANCEFLOOR_AUDIO_MCAST), and until it
- * appeared here the two builds were indistinguishable in any log window: the
- * only tell was a one-time boot line that scrolls out of a capture the moment a
- * run starts. FEC depth rides along because it is the other half of the same
- * experiment and changes between bench phases (Phase 1 = fec 0, Phase 2 = fec 1).
+ * AUDIO_TRANSPORT_TAG and FRAMES_TRANSPORT_TAG were here, printing "mcast" or
+ * "unicast" on the periodic status lines. They existed because two builds were
+ * otherwise indistinguishable in any log window -- the only tell was a one-time
+ * boot line that scrolls out of a capture the moment a run starts.
+ *
+ * There is one build now. Every lane is unicast to the hub's client list, so a
+ * field that always reads "unicast" tells a reader nothing they could not get
+ * from the source. FEC depth stayed on those lines: it is a real Kconfig knob
+ * that changes between bench phases.
  */
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-#define AUDIO_TRANSPORT_TAG "mcast"
-#else
-#define AUDIO_TRANSPORT_TAG "unicast"
-#endif
-
-/*
- * The same for the analysis frames, which are a separate switch
- * (DANCEFLOOR_MCAST_FRAMES) because they are a separate loss budget. Printed by
- * the hub only -- a satellite receives frames and has no transport to report --
- * and printed for the same reason as the audio tag: at 86 frames a second per
- * satellite this is the difference between a hub that transmits ~146 packets a
- * second and one that transmits over a thousand, which is far too large a
- * difference to have to infer from a boot line that has scrolled away.
- */
-#if CONFIG_DANCEFLOOR_MCAST_FRAMES
-#define FRAMES_TRANSPORT_TAG "mcast"
-#else
-#define FRAMES_TRANSPORT_TAG "unicast"
-#endif
 
 typedef struct __attribute__((packed)) {
     uint16_t red_len;        /* bytes of red_payload that follow; 0 == none */

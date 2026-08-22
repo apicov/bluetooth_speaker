@@ -493,13 +493,10 @@ static void record_phase_point(bool started)
 
 
 /*
- * The audio downlink. One destination under multicast, one sendto per satellite
- * under unicast -- and that is the WHOLE difference between the two. Everything
- * else about a packet (its format, the FEC redundancy attached in
+ * The audio downlink: one sendto per registered satellite. Everything else
+ * about a packet (its format, the FEC redundancy attached in
  * streamer_send_sbc(), the socket it leaves on, the satellite's receive path)
- * is shared, so the two transports are just two send targets. Each lives in its
- * own function below so a reviewer reads one mode at a time; fan_out() is the
- * switch between them.
+ * is decided elsewhere, so all that happens here is the walk over the list.
  */
 /*
  * What became of one packet's sends, so fan_out() can time the gap between
@@ -517,8 +514,7 @@ static void record_phase_point(bool started)
  * NO_LISTENERS is its own answer rather than folded into REFUSED, because the
  * two mean opposite things about the link: nothing was refused, there was simply
  * nobody to send to, and an empty floor must not accumulate a gap that then
- * reads as a spike the moment a satellite joins. It can only arise on the
- * unicast path; the group address is always a destination.
+ * reads as a spike the moment a satellite joins.
  */
 typedef enum {
     FANOUT_SENT,          /* at least one sendto took it */
@@ -526,39 +522,6 @@ typedef enum {
     FANOUT_NO_LISTENERS,  /* nothing to send to, so nothing to measure */
 } fanout_result_t;
 
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-/*
- * One group-addressed sendto for the audio. Group frames are never acknowledged
- * or retried, so this trades reliability for airtime that no longer scales with
- * speaker count -- the residual loss is what the FEC redundancy attached in
- * streamer_send_sbc() exists to recover, and what the 6 Mbps group rate
- * (wifi_start_ap drops 11b) keeps off the 1 Mbps basic rate that could not fit
- * the stream. A failure is counted by the same tx_fail_note_audio the unicast
- * path uses, so the status line tells the same story either mode -- and counted
- * as AUDIO specifically, because a refused audio packet is the only kind of
- * refusal the room can hear.
- */
-static fanout_result_t send_audio_to_group(size_t bytes)
-{
-    /* MSG_DONTWAIT, not flags=0: this runs in the SBC receive task that also
-     * decodes and feeds the hub's OWN local ring. A multicast sendto has no ACK
-     * and can wait for a TX slot -- a group frame is buffered and drained at the
-     * basic rate -- and blocking here starves the local feed, so the hub's own
-     * speaker underruns while it waits to send to the satellites. (Unicast does
-     * not hit this: its link-layer ACK completes the send fast.) Non-blocking
-     * returns the moment lwIP has the frame; a momentarily full queue comes back
-     * as EAGAIN, tallied by tx_fail_note_audio, and the task moves on to feed
-     * and decode the next packet. The satellites still receive: the queue drains
-     * faster than the stream fills it, so EAGAIN is meant to be the exception --
-     * `tx-fail N (M audio)` on the status line is what says whether it is. */
-    if (sendto(sock, &msg, bytes, MSG_DONTWAIT,
-               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
-        tx_fail_note_audio(errno);
-        return FANOUT_REFUSED;
-    }
-    return FANOUT_SENT;
-}
-#else
 /*
  * Unicast to each registered listener. Multicast was removed entirely: it is
  * never acknowledged and never retried, which cost ~20% of packets at every
@@ -594,27 +557,21 @@ static fanout_result_t send_audio_to_clients(size_t bytes)
     }
     return any_sent ? FANOUT_SENT : FANOUT_REFUSED;
 }
-#endif
 
 /*
  * Send the audio packet built in streamer_send_sbc() to whoever is listening.
- * Age the client list first so the unicast path's snapshot only ever skips a
- * cleared slot, never acts on a stale one; telemetry.c ages it too, so under
- * multicast -- which never snapshots -- the age is redundant but cheap. Then
- * hand off to the one transport this build speaks.
+ * Age the client list first so the snapshot below only ever skips a cleared
+ * slot, never acts on a stale one; telemetry.c ages it too, so the second age
+ * is redundant but cheap.
  */
 static void fan_out(size_t bytes, int64_t now)
 {
-    /* Counted here rather than at either sendto, so it is the rate the
+    /* Counted here rather than at the sendto, so it is the rate the
      * timeline slews at and the rate the TX pool sees, not the rate that
      * happened to succeed. See s_audio_pkts. */
     s_audio_pkts++;
     clients_age(now);
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-    const fanout_result_t r = send_audio_to_group(bytes);
-#else
     const fanout_result_t r = send_audio_to_clients(bytes);
-#endif
 
     /*
      * How far apart two audio packets actually REACHED THE AIR -- the hub's

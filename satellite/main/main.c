@@ -2,8 +2,7 @@
  * Dancefloor satellite -- startup and task wiring.
  *
  * Joins the master's SoftAP, keeps its clock aligned with the master's, receives
- * SBC packets -- from a multicast group by default, per-unit unicast behind the
- * same switch (DANCEFLOOR_AUDIO_MCAST) -- decodes them, and plays each at the
+ * SBC packets addressed to this unit, decodes them, and plays each at the
  * instant it was stamped for.
  *
  * No Bluetooth here: the master owns the phone connection. This board only

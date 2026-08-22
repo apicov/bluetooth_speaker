@@ -145,55 +145,69 @@ never retransmitted.** A unicast frame that collides is retried at the link
 layer within microseconds and usually gets through. A multicast frame that
 collides is simply gone, and nothing anywhere notices.
 
-That is a 20% packet loss floor that no amount of tuning can reach, and for a
-long time the decision was unicast to every registered listener: with ≤8
-speakers the extra airtime is affordable and the loss goes to approximately zero.
+That is a 20% packet loss floor that no amount of tuning can reach, and the
+decision is **unicast to every registered listener**: with ≤8 speakers the extra
+airtime is affordable and the loss goes to approximately zero. Every lane —
+audio, the volume level, analysis frames, metadata, clock probes — is addressed
+to one unit at a time. The hub's transmit rate is 50 + 96×N packets/s.
 
-**That decision has been reversed, and the 20% figure is the reason it took
-three attempts to reverse it.** Audio and analysis frames both go to a multicast
-group now (`239.0.0.1`); everything else is still per-station unicast. What
-changed:
+**The 20% turned out to be an artefact, and multicast was brought back and then
+removed again.** That round trip is worth recording, because the measurement
+that killed the first two attempts was real and its conclusion was still wrong:
 
 - **The 20% was measured against the 1 Mbps basic rate.** Group frames go out at
   the lowest rate in the BSS basic set, and with 802.11b enabled that is 1 Mbps,
-  where the stream did not even fit the airtime. `wifi_start_ap()` now drops 11b
-  (`WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N`), which moves the group to the 6 Mbps
-  OFDM basic rate. Measured loss there is **0.2–0.3%**, not 20%.
-- **The residual is concealed, not corrected.** Piggyback FEC was tried and is
-  off: a whole redundant copy needs `2 × 825 + 29` bytes against a 1472-byte MTU
-  and does not fit, and shrinking the payload to make it fit doubles the packet
-  rate — which exhausts the transmit buffers *and* doubles the timeline slew,
-  because `TIMELINE_SLEW_US` is per packet. See
-  `DANCEFLOOR_AUDIO_FEC_DEPTH`. What the satellite does instead is fade a lost
-  packet out and the resuming audio back in, so the two discontinuities — which
-  are most of what a dropout sounds like — go, even though the missing audio
-  cannot.
-- **The constraint was never airtime.** It is the **DTIM burst**: a SoftAP holds
-  group-addressed frames and releases them after each beacon, so they arrive in
-  one clump per 100 ms while unicast leaves immediately. At 26 static TX buffers
-  that clump emptied the pool and cost ~5% of the audio; at 32 it does not. The
-  32 only became affordable when the hub gave up its local analyser lane.
+  where the stream did not even fit the airtime. Dropping 11b
+  (`WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N`) moved the group to the 6 Mbps OFDM
+  basic rate, where measured loss was **0.2–0.3%**, not 20%.
+- **The real constraint was never airtime, it was the DTIM burst.** A SoftAP
+  holds group-addressed frames and releases them after each beacon, so they
+  arrive in one clump per 102.4 ms while unicast leaves immediately. At 26
+  static TX buffers that clump emptied the pool and cost ~5% of the audio; at 32
+  it did not, and 32 only became affordable when the hub gave up its local
+  analyser lane.
+- **It worked.** Two satellites, `tx-fail 0`, zero audio gaps over a 125 s run,
+  and a transmit rate of ~146 packets/s flat in speaker count against the
+  ~1490/s a fifteen-speaker unicast fan-out would need.
 
-What this buys is the thing unicast could never give: **the hub's transmit rate
-no longer grows with speaker count.** ~136 packets/s flat — 50 audio, 86
-analysis — plus ~8/s per satellite of clock-sync traffic. At fifteen speakers
-that is ~256/s against the ~1490/s the unicast fan-out would have needed.
+**It was removed anyway**, and the reason is not in any of those numbers: the
+floor is run on unicast, and unicast is what has proved stable in extended use.
+Multicast is the arrangement that measures better on a bench over two minutes
+and depends on a chain of conditions to do it — 11b dropped from the AP, a
+32-buffer pool, a frame lane paced to the beacon, no FEC widening the packets.
+Unicast depends on none of them: it has a link-layer ACK, needs no group
+membership, and has no burst to size a pool against. The scaling is the price,
+and it is a price this floor can pay.
 
-Measured with two satellites: `tx-fail 0`, and zero audio gaps over a 125 s run.
-**Nothing past two has ever been run**, and the per-satellite clock traffic is
-the part still unmeasured at scale.
+The multicast code is gone rather than left behind a Kconfig switch. A build
+option that nobody selects is a second configuration that no longer gets
+measured, and this project already has more of those than it can soak.
+
+**What removing it costs, stated plainly:** the analysis frames scale with
+speaker count again. `TX_FRAME_BATCH` keeps that to ~9.8 datagrams/s per
+satellite rather than 86, so the rate is 50 + 96×N and not 50 + 86×N × 1. It
+has never been run past two satellites either way.
+
+**Piggyback FEC is off and unrelated to any of this.** A whole redundant copy
+needs `2 × 825 + 29` bytes against a 1472-byte MTU and does not fit, and
+shrinking the payload to make it fit doubles the packet rate — which exhausts
+the transmit buffers *and* doubles the timeline slew, because `TIMELINE_SLEW_US`
+is per packet. See `DANCEFLOOR_AUDIO_FEC_DEPTH`. What the satellite does instead
+is fade a lost packet out and the resuming audio back in, so the two
+discontinuities — which are most of what a dropout sounds like — go, even though
+the missing audio cannot.
 
 Registration is implicit and has a pleasant property: the hub sends a satellite
-its metadata, and used to send it audio, on the strength of a **time-sync probe**
-received recently. A unit that is keeping its clock synchronised is by definition
-alive and listening, so one mechanism does both jobs and there is nothing to
-configure. Stop probing and you stop being on the list.
+its audio, its level, its analysis frames and its metadata on the strength of a
+**time-sync probe** received recently. A unit that is keeping its clock
+synchronised is by definition alive and listening, so one mechanism does both
+jobs and there is nothing to configure. Stop probing and you stop being on the
+list.
 
-The list matters much less than it did, and that is worth saying plainly: with
-audio and analysis frames both group-addressed, a stale entry no longer costs a
-stream of undeliverable unicasts. It still gates metadata and it is still what
-`sta-timeout` reports on, but the failure below is now a historical one — read it
-as why the window is 2 seconds, not as something a current build can still do.
+The list is load-bearing again. While audio and analysis frames were
+group-addressed a stale entry cost almost nothing; now it costs a stream of
+undeliverable unicasts, which is exactly the failure the 2-second window below
+was shortened to bound.
 
 "Recently" is **2 seconds**, and it used to be 10. The window mattered more than a
 registry timeout usually does, because during it the hub kept unicasting audio
@@ -325,17 +339,22 @@ DMA buffer immediately before the write. The audio on both hops stays full
 scale, so nothing spends dynamic range carrying a level decision, and one number
 reaches every speaker rather than every speaker guessing.
 
-**And it is addressed the same way the audio is.** Under `DANCEFLOOR_AUDIO_MCAST`
-that means the group, not the client list. Those are different sets, and for as
-long as the level went to the list, the difference was exactly the set of units
-playing audio at a level nobody told them: a satellite plays by being in the
-group, so anything that cleared its slot — two seconds without a probe, a
-disassociation, the gap between re-associating and its first probe — left it
-still hearing the stream and no longer hearing the level. A group frame is never
-retried, so the repetition is what replaces the link-layer ACK: three copies on a
-change, one pushed when a satellite is given an address, and one a second
-regardless. The bridge re-states the level on its own 5 s heartbeat, which is
-what lets a rebooted hub recover without anyone touching the phone.
+**And it is addressed the same way the audio is** — the client list, which is
+what `fan_out()` walks. That is the requirement rather than an implementation
+detail: a unit must hear the level exactly when it hears the stream. It was
+broken for a while, when the audio went to a multicast group and the level still
+went to the list; the difference between those two sets was exactly the set of
+units playing audio at a level nobody told them, since anything that cleared a
+slot — two seconds without a probe, a disassociation, the gap between
+re-associating and its first probe — left a unit still hearing the stream and no
+longer hearing the level. One transport removed the way the sets could differ.
+
+The level is still repeated, and that is not redundancy left over from the group
+frame it once had to replace: a level is *state*, not a stream, so a unit that
+missed the one packet carrying it stays wrong until something says so again.
+Three copies on a change, one pushed when a satellite is given an address, and
+one a second regardless. The bridge re-states the level on its own 5 s heartbeat,
+which is what lets a rebooted hub recover without anyone touching the phone.
 
 That last step lives in `audio_volume_write_i32()`, called from the same place
 `audio_apply_channel_mode()` is and for the same reason: neither changes the
@@ -1044,11 +1063,9 @@ paid for.
 | `CLIENT_TIMEOUT_US` | **2 s** | Was 10 s. Only covers the ungraceful departure now — see §4 for the 124 failed allocations that shortened it |
 | `MARKER_EVERY_PKTS` | 100 (~2 s) | Sync measurement pulses |
 | `ESP_WIFI_AMPDU_TX_ENABLED` | **`y`** | Was `n`, required only while `esp_wifi_internal_set_fix_rate()` was in use. The rate is no longer pinned, so the constraint is gone |
-| PHY rate | **not pinned** (`0`) | Rate adaptation on. Group frames still leave at the 6 Mbps OFDM basic rate, which the BSS basic rate set decides — see §16 |
-| `ESP_WIFI_STATIC_TX_BUFFER_NUM` | **38** | ~1.6 kB of internal SRAM each. 26 for a long time because that was all that fitted; 32 became affordable when the hub stopped running its analyser lane, and that is what the DTIM burst of group-addressed frames needs. 48 was tried and was bufferbloat — it cost anchors-refused. 38 is 36 plus two, taken deliberately alongside the frame lane's proactive pace (`TX_FRAME_PACE_US` in `hub.h`), which stops the crowding burst forming at all; `sdkconfig.defaults` has the table and what to re-measure if it moves again |
+| PHY rate | **not pinned** (`0`) | Rate adaptation on, which is what fixed the 23% loss a fixed 24 Mbps caused. Pinning was mandatory only while audio was group-addressed — see §16 |
+| `ESP_WIFI_STATIC_TX_BUFFER_NUM` | **38** | ~1.6 kB of internal SRAM each. 26 for a long time because that was all that fitted; 32 became affordable when the hub stopped running its analyser lane, which is what the DTIM burst of group-addressed frames needed while multicast was in use. 48 was tried and was bufferbloat — it cost anchors-refused. 38 is 36 plus two, taken deliberately alongside the frame lane's proactive pace (`TX_FRAME_PACE_US` in `hub.h`), which stops the crowding burst forming at all; `sdkconfig.defaults` has the table and what to re-measure if it moves again |
 | `ESP_WIFI_CACHE_TX_BUFFER_NUM` | 0 | Deliberate. A PSRAM queue in front of the pool converts `tx-fail` — the counter the whole transmit story is written around — into silence. Tried, and it did not fix the loss it was meant to |
-| `DANCEFLOOR_AUDIO_MCAST` | `y` | Audio to `239.0.0.1` |
-| `DANCEFLOOR_MCAST_FRAMES` | `y` | Analysis frames to the same group. Needs the 32 buffers; at 26 it costs ~5% of the audio |
 | `DANCEFLOOR_AUDIO_FEC_DEPTH` | **0** | Piggyback redundancy off — it cannot fit the MTU whole, and making it fit doubles the packet rate. See §4 |
 | `DANCEFLOOR_ML` | **`n`** | The hub runs no pluggable analysers. Freed ~25 kB of internal SRAM, which is what the TX buffers are spent from. Replaced the `DANCEFLOOR_ML_SOURCE` choice when analyser results stopped being distributed |
 | `DANCEFLOOR_WIFI_LOGS` | **`n`** | Log shipping compiles out. It is bursty unicast from the same buffer pool, and burstiest exactly when something is wrong |
@@ -1496,7 +1513,7 @@ budget.
 | `bt_bridge/main/avrcp_meta.c` | AVRCP controller (track metadata) and target (absolute volume) |
 | `bt_bridge/main/status_led.c` | The two front-panel LEDs — connected solid, streaming blinking |
 | `hub_s3/main/streamer.c` | Startup order, and `task_start()`. It was 2686 lines and nine concerns until 2026-08-12; `hub.h` says where each went |
-| `hub_s3/main/net.c` | SoftAP, sockets, the multicast group, reconnection |
+| `hub_s3/main/net.c` | SoftAP, sockets, reconnection, the transmit-failure counters |
 | `hub_s3/main/clients.c` | The client registry, and the meta/volume sends addressed off it |
 | `hub_s3/main/timeline.c` | The presentation timeline: `play_at`, the slew, boundary flags, fan-out |
 | `hub_s3/main/play.c` | The hub's own speaker — phase crossings, the splice, the marker, the write |

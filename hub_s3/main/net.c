@@ -109,19 +109,20 @@ void wifi_start_ap(void)
      * the source says what the radio does.
      *
      * AND IT CANNOT BE SHORTENED. 100 TU is the bottom of the documented range
-     * and dtim_period is already at its minimum of 1, so 102.4 ms is a FIXED
-     * cost that the group burst has to be designed against rather than tuned
-     * away. That is what TX_FRAME_PACE_US in hub.h is now derived from: the
-     * frame lane is paced to the beacon, because pacing it to anything faster
-     * only queues frames the beacon has not come round to release yet.
+     * and dtim_period is already at its minimum of 1, so 102.4 ms was a FIXED
+     * cost that the group burst had to be designed against rather than tuned
+     * away. TX_FRAME_PACE_US in hub.h is still that number, though nothing on
+     * this build waits for a beacon any more -- every lane is unicast now. See
+     * the note beside TX_FRAME_PACE_US for what the pace is still doing and
+     * what has not been re-measured.
      *
-     * Power save is not a consideration here -- every satellite sets
-     * WIFI_PS_NONE -- but note that this does NOT mean group frames go out
-     * immediately: the AP buffers them for DTIM regardless of whether any
-     * station is actually sleeping. The 2026-08-20 soak measured that directly,
-     * with ENOMEM refusals arriving at the beacon rate (median 40 bursts per
-     * 5 s window against 48.8 beacons). clients.c used to claim the opposite
-     * and has been corrected.
+     * WHY THE HOLD WAS REAL, kept because the correction was hard-won. Power
+     * save is not a consideration here -- every satellite sets WIFI_PS_NONE --
+     * and that does NOT mean group frames went out immediately: the AP buffers
+     * them for DTIM regardless of whether any station is sleeping. The
+     * 2026-08-20 soak measured it directly, with ENOMEM refusals arriving at
+     * the beacon rate (median 40 bursts per 5 s window against 48.8 beacons).
+     * clients.c claimed the opposite and was corrected.
      */
     wc.ap.beacon_interval = 100;
     /* Matches ESP-IDF's own softAP example. Setting capable=true is a deviation
@@ -147,55 +148,25 @@ void wifi_start_ap(void)
      * ESP_ERROR_CHECK passing says only that IDF does not validate the field on
      * the way in, not that the driver kept it.
      *
-     * KEPT NOW AS A REGRESSION GUARD, not as an open question. Everything the
-     * group burst is sized against -- TX_FRAME_PACE_US in hub.h, the buffer
-     * count in sdkconfig.defaults -- assumes a 102.4 ms hold. If a future IDF
-     * changes the floor, accepts a smaller interval, or silently rounds this
-     * somewhere else, that assumption breaks with no other symptom than audio
-     * going bad under load, which is the hardest kind of fault to trace back to
-     * a config field. One line at boot is a cheap standing check.
+     * KEPT NOW AS A REGRESSION GUARD, though a weaker one than it was. The
+     * numbers it guards -- TX_FRAME_PACE_US in hub.h, the buffer count in
+     * sdkconfig.defaults -- were derived when a 102.4 ms hold applied to the
+     * audio and frame lanes, and both are unicast now, so a change in the
+     * interval would no longer break them the way it once would. It stays
+     * because the derivation is still what the source says, and one line at
+     * boot is a cheap way to notice if the premise moves.
      *
      * A status field would be wrong: it cannot change while running.
      */
     wifi_config_t back = {0};
     if (esp_wifi_get_config(WIFI_IF_AP, &back) == ESP_OK) {
         ESP_LOGW(TAG, "AP beacon_interval %u TU (asked %u), dtim_period %u "
-                      "(asked %u) -- group frames are held for beacon x dtim",
+                      "(asked %u) -- any group frame is held for beacon x dtim",
                  (unsigned)back.ap.beacon_interval, (unsigned)wc.ap.beacon_interval,
                  (unsigned)back.ap.dtim_period, (unsigned)wc.ap.dtim_period);
     } else {
         ESP_LOGW(TAG, "AP config read-back failed -- beacon/DTIM hold unknown");
     }
-
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-    /*
-     * Audio goes out by multicast -- see fan_out() in timeline.c. The one thing
-     * that made that unworkable before was the group frame rate: group-addressed
-     * frames transmit at the lowest basic rate, which is 1 Mbps while 11b is in
-     * the basic set, and at 1 Mbps a ~1 kB SBC packet costs 8.3 ms -- the stream
-     * needs more airtime than a second has, so half of it was dropped in the
-     * queue (net.c history, ~20% loss measured at every rate tried).
-     *
-     * Dropping 11b from the AP protocol leaves 11g/11n, whose basic rates start
-     * at 6 Mbps. That is an OFDM rate: the same ~1 kB packet costs ~1.4 ms, the
-     * stream fits with room to spare, and unicast keeps its g/n rate adaptation
-     * (this is not esp_wifi_internal_set_fix_rate(), which pins ALL TX and was
-     * removed for the 23% loss disabling adaptation caused). Must precede start.
-     *
-     * esp_wifi_config_80211_tx() (esp_wifi.h, IDF 6) is NOT a fallback for this.
-     * Its wifi_tx_rate_config_t has no multicast/broadcast field -- it pins the
-     * rate for the whole AP interface, unicast included, which disables rate
-     * adaptation. That is the 23% loss esp_wifi_internal_set_fix_rate() caused
-     * before it was removed, applied here all over again. Dropping 11b via
-     * set_protocol() is the fix that moves the group rate without touching
-     * unicast adaptation; there is no second lever, so the group rate must be
-     * confirmed at 6 Mbps another way -- by the loss floor, not the air rate.
-     */
-    const esp_err_t proto = esp_wifi_set_protocol(
-        WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    ESP_LOGW(TAG, "multicast audio: AP protocol 11G|11N (11b dropped, group rate "
-                  "->6 Mbps): %s", esp_err_to_name(proto));
-#endif
 
     /*
      * 20 MHz, not the 40 the driver comes up with.
@@ -642,34 +613,3 @@ void socket_start(void)
     };
     assert(bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0);
 }
-
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-/*
- * The group every satellite is listening to, resolved once.
- *
- * Lives here, beside the socket it is sent on, because it now has two senders:
- * the audio path in timeline.c and the analysis frames in clients.c. It began as
- * a static in timeline.c when audio was the only thing addressed to the group,
- * and a second copy in clients.c would be two parses of one Kconfig string that
- * nothing checks agree -- the same shape of fault as the SSID that used to be
- * #defined once per firmware.
- *
- * Built lazily rather than in socket_start() so it stays independent of start
- * order; inet_pton on a compile-time constant is not worth guarding beyond the
- * once-only flag.
- */
-static struct sockaddr_in s_mcast_addr;
-static bool s_mcast_addr_ready;
-
-const struct sockaddr_in *mcast_addr(void)
-{
-    if (!s_mcast_addr_ready) {
-        s_mcast_addr.sin_family = AF_INET;
-        s_mcast_addr.sin_port = htons(SYNC_PORT);
-        inet_pton(AF_INET, CONFIG_DANCEFLOOR_AUDIO_MCAST_GROUP,
-                  &s_mcast_addr.sin_addr);
-        s_mcast_addr_ready = true;
-    }
-    return &s_mcast_addr;
-}
-#endif

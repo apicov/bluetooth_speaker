@@ -757,20 +757,20 @@ TSF message all go to the station that asked. That is the right shape for them
 whatever else the socket carries: a probe is a question from one unit, its
 answer belongs to that unit, and there are only 4 a second of each per satellite.
 
-The socket is shared with traffic that is *not* unicast any more, and the history
-is worth keeping straight because it reversed. The M4 harness announced over
-multicast on the reasoning that one transmission feeding every satellite keeps
-airtime independent of unit count; the measurement went the other way, since
+**So is everything else the socket carries.** The history is worth keeping
+straight because it went round twice. The M4 harness announced over multicast on
+the reasoning that one transmission feeding every satellite keeps airtime
+independent of unit count; the measurement went the other way, since
 group-addressed frames are never acknowledged and so never retried, which put a
-~20% loss floor under the audio. Multicast was removed from the whole system and
-`SYNC_MCAST_ADDR` went with the harness.
+~20% loss floor under the audio. Multicast was removed and `SYNC_MCAST_ADDR`
+went with the harness. It came back for audio and analysis frames once that 20%
+turned out to be an artefact of the 1 Mbps basic rate 802.11b forces — at 6 Mbps
+OFDM the loss is 0.2–0.3% — and then went again, in favour of the transport the
+floor is actually run on. `architecture.md` §4 has all three attempts.
 
-**Audio and analysis frames are group-addressed again**, to `239.0.0.1`. The 20%
-was measured at the 1 Mbps basic rate that 802.11b forces; with 11b dropped the
-group goes at 6 Mbps OFDM and loss is 0.2–0.3%. See `architecture.md` §4 for what
-else had to be true first. Nothing about the clock changed — the estimator still
-sees only unicast round trips, and the reason a satellite must keep probing is
-still that probing is what puts it on the metadata list.
+Nothing about the clock ever changed through any of it: the estimator has only
+ever seen unicast round trips, and the reason a satellite must keep probing is
+still that probing is what puts it on the hub's send list.
 
 ---
 

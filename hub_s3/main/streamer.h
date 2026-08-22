@@ -5,26 +5,25 @@
  * and sends undecoded SBC tagged with the master-clock instant each packet
  * should be played at.
  *
- * MULTICAST to one group by default (DANCEFLOOR_AUDIO_MCAST), with the
- * per-listener unicast path kept behind the same switch.
+ * UNICAST to each registered listener, not multicast. Airtime scales with
+ * speaker count as a result: the hub's packet rate is 50 + 96xN.
  *
- * This paragraph used to say the opposite, in capitals: "unicast to each
- * registered listener, not multicast", because group-addressed frames are never
- * acknowledged and so never retried, measured at ~20% loss at every PHY rate
- * tried. That measurement was real and its conclusion was wrong -- it was taken
- * at the 1 Mbps basic rate 802.11b forces, and with 11b dropped the group goes
- * at 6 Mbps OFDM and loss is 0.2-0.3%, which a speaker cannot hear.
+ * MULTICAST WAS TRIED THREE TIMES AND IS GONE. The first two attempts died on
+ * loss -- group-addressed frames are never acknowledged and so never retried,
+ * ~20% lost at every PHY rate. That measurement turned out to be an artefact of
+ * the 1 Mbps basic rate 802.11b forces; with 11b dropped the group ran at 6 Mbps
+ * OFDM and lost 0.2-0.3%, and the third attempt worked. What it bought was
+ * SCALING -- one transmission feeds every listener, so the packet rate would be
+ * flat in speaker count.
  *
- * What makes it the default is not loss, it is SCALING: one transmission feeds
- * every listener, so this hub's packet rate is FLAT in speaker count, where
- * unicasting the same two lanes costs 50 + 96xN. The claim that "airtime scales
- * with speaker count as a result" is exactly what no longer holds; README.md
- * and sync_proto.h carry the packet-rate figures.
+ * It was removed anyway, in favour of the transport the floor is actually run
+ * on. Unicast has a link-layer ACK and retransmission, it needs no group
+ * membership, no 11b drop, and no DTIM burst to size the transmit pool against,
+ * and it is what measured stable in use. The scaling is the price.
  *
- * sync_proto.h has the measurements in the order they were taken, and the
- * transmit-buffer count that has to come with the choice. The code is in net.c
- * (sockets, the group) and timeline.c (fan_out); this file is startup order and
- * the API, and has not held that code since 2026-08-12.
+ * sync_proto.h carries the packet-rate figures. The code is in net.c (sockets)
+ * and timeline.c (fan_out); this file is startup order and the API, and has not
+ * held that code since 2026-08-12.
  */
 #pragma once
 

@@ -615,8 +615,8 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
          * responses and nothing could tell them apart.
          *
          * Duplicates should be impossible: the hub sends each packet once, and
-         * a group frame is not retried. If this moves under multicast it means
-         * something is duplicating on the air or in lwIP. Reordering should be
+         * the link layer retries below the socket rather than above it. If this
+         * ever moves, something is duplicating on the air or in lwIP. Reordering should be
          * near-impossible too on a single-hop link with one traffic class -- and
          * if it is happening, the gap that preceded it was not a loss at all,
          * so the silence filled for it was inserted against a packet that did

@@ -505,6 +505,28 @@
  * on a packet the hub had transmitted cleanly. A smaller burst is a shorter
  * tail, so the two changes work on the same failure from opposite ends: this one
  * makes the worst case rarer, LEAD_US makes it survivable.
+ *
+ * ITS PREMISE IS GONE AND THE NUMBER HAS NOT BEEN RE-MEASURED. Everything above
+ * reasons about the rate a SoftAP releases GROUP-ADDRESSED frames. Multicast was
+ * removed -- this lane is unicast to each satellite now, it goes out immediately
+ * with rate adaptation, and it waits for no beacon. So DTIM_HOLD_US is a number
+ * here rather than a reason.
+ *
+ * It is left exactly as it was, deliberately, because the pace is doing a second
+ * job the beacon argument never named: it is what holds the frame lane to ~9.8
+ * datagrams a second per satellite instead of 86, and with airtime scaling in N
+ * again that is the difference between a hub sending 50 + 96xN packets and one
+ * sending far more. That job is real whatever the transport.
+ *
+ * WHAT TO MEASURE IF THIS IS REVISITED. The open question is the delivery TAIL:
+ * batching up to 102.4 ms of frames may now be ADDING the latency the pace was
+ * introduced to remove, since there is no longer a DTIM queue in front of it.
+ * Soak with the pace here and at one analysis hop (~11.6 ms at 512), reading
+ * cong-skip, pace-skip and tx-fail (N audio) on the hub against gaps and
+ * frames/s on the satellite -- and load the fan-out with tools/satsim, because
+ * the cost of an unpaced lane is per satellite. Do not change it on the
+ * arithmetic alone; the last time this lane was retuned on arithmetic it
+ * starved the satellites' detector (see the paragraphs above).
  */
 #define TX_FRAME_PACE_US       DTIM_HOLD_US
 
@@ -1483,11 +1505,6 @@ void retune_dac(uint32_t hz);
 /* net.c -- SoftAP and the sync socket. */
 void wifi_start_ap(void);
 void socket_start(void);
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-/* The group address, resolved once and owned by net.c. Both the audio path and
- * the analysis frames send to it; see the note beside the definition. */
-const struct sockaddr_in *mcast_addr(void);
-#endif
 
 /* clients.c -- the send list, and every fan-out over it.
  *

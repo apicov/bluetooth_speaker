@@ -62,19 +62,19 @@ under a short crossfade (`audio_shift_chunk()`). → `audio_shift.h`.
 
 ## 2. Messages on the wire
 
-All UDP on port `SYNC_PORT` (5001), defined in `sync_proto.h`. "Group" means the
-multicast address under `DANCEFLOOR_AUDIO_MCAST`; the per-client unicast path is
-kept behind the same switch.
+All UDP on port `SYNC_PORT` (5001), defined in `sync_proto.h`. Every lane is
+unicast. "Client list" means the hub's registered listeners — one `sendto` per
+satellite — where the rest are addressed to a single unit.
 
 | # | Type | Struct | Direction | Addressing | Cadence |
 |---|---|---|---|---|---|
 | 1 | `MSG_TIME_REQ` | `time_msg_t` | satellite → hub | unicast | 4/s (`PROBE_PERIOD_MS`) |
 | 2 | `MSG_TIME_RSP` | `time_msg_t` | hub → satellite | unicast — the answer belongs to the unit that asked | one per request |
-| 4 | `MSG_AUDIO` | `audio_msg_t` | hub → listeners | **group** | ~50/s |
+| 4 | `MSG_AUDIO` | `audio_msg_t` | hub → listeners | client list | ~50/s |
 | 5 | `MSG_META` | `meta_msg_t` | hub → listeners | client list | on track change |
 | 6 | `MSG_SPLICE` | `splice_msg_t` | satellite → hub | unicast | per track boundary |
 | 7 | `MSG_TSF` | `tsf_msg_t` | hub → satellite | unicast | one per probe, 4/s — **measurement only** |
-| 8 | `MSG_FRAME` | `frame_msg_t` | hub → listeners | group (`DANCEFLOOR_MCAST_FRAMES`) | analysis rate, ~43–86/s |
+| 8 | `MSG_FRAME` | `frame_msg_t` | hub → listeners | client list | batched: ~9.8 datagrams/s carrying the ~86/s analysis rate |
 | 9 | `MSG_LOG` | `log_msg_t` | any unit → collector | unicast via the hub | per log line |
 | 10 | `MSG_HEALTH` | `health_msg_t` | any unit → collector | unicast via the hub | ~60 s |
 | 11 | `MSG_LOG_SUB` | `log_sub_msg_t` | collector → hub | unicast | every few seconds |

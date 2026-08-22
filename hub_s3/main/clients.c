@@ -174,8 +174,7 @@ void client_joined(const uint8_t mac[6], const esp_ip4_addr_t *ip)
     /* The level, at the one moment a unit provably has none. The ARP entry was
      * seeded three lines up, which is the condition that makes a first unicast
      * land -- the whole subject of this function's comment -- so this is a second
-     * and natural user of it. Under multicast it goes to the group like every
-     * other copy; either way it closes the join window from "up to one repeat
+     * and natural user of it. It closes the join window from "up to one repeat
      * interval" to one packet time, and with a unit that stays silent until told,
      * that window is silence rather than full scale. */
     streamer_send_vol(audio_volume);
@@ -269,48 +268,34 @@ void streamer_send_meta(const uint8_t *meta, uint16_t len)
 /*
  * Playback volume, hub -> listeners.
  *
- * ADDRESSED TO THE SAME SET AS THE AUDIO, BY CONSTRUCTION. That is the whole
- * point of the #if below, and it is what this got wrong for as long as the audio
- * has been multicast: fan_out() addresses a GROUP and this addressed the CLIENT
- * LIST, and those are different sets. The difference is exactly the set of units
- * that play audio at a level nobody told them -- anything that clears a slot
- * (CLIENT_TIMEOUT_US of no probe, a disassociation, the gap between
- * re-associating and the first probe) leaves a unit still hearing the stream and
- * no longer hearing the level. Under multicast, hearing the audio and hearing
- * the level are now the same condition.
+ * ADDRESSED TO THE SAME SET AS THE AUDIO, BY CONSTRUCTION. fan_out() walks the
+ * client list and so does this, so a unit hears the level exactly when it hears
+ * the stream. That property is the requirement; the client list is what
+ * satisfies it now that the audio is unicast to that same list.
  *
- * The satellite needs nothing for this. net.c joins the group on the same socket
- * it binds INADDR_ANY:SYNC_PORT on, and rx_task demuxes by type from one
- * recvfrom, so a group-addressed MSG_VOL lands in the branch that already
- * existed.
+ * IT WAS NOT ALWAYS SATISFIED. While the audio went to a multicast group, this
+ * still addressed the CLIENT LIST -- two different sets, and the difference was
+ * exactly the set of units playing audio at a level nobody told them: anything
+ * that cleared a slot (CLIENT_TIMEOUT_US of no probe, a disassociation, the gap
+ * between re-associating and the first probe) left a unit still hearing the
+ * stream and no longer hearing the level. Removing the group removed the way
+ * the two sets could differ.
  *
- * WHAT A GROUP FRAME COSTS, AND HOW IT IS PAID FOR. It is never acknowledged and
- * never retried, where a unicast has a link-layer ACK. For two bytes that is
- * cheap to buy back with repetition, and there are three repetitions:
- * streamer_set_volume() sends the change three times, client_joined() pushes it
- * at the one moment a unit provably has none, and vol_repeat_start() below
- * repeats it every second. Against the measured 0.2-0.3% group loss, exposure to
- * a stale level is P(loss) x 1 s, and only in the window after a change.
+ * IT IS STILL REPEATED, and that is not redundant. A unicast MSG_VOL has a
+ * link-layer ACK, but the level is state rather than a stream -- a unit that
+ * missed the one packet carrying it stays wrong until something says so again.
+ * There are three sayings: streamer_set_volume() sends a change three times,
+ * client_joined() pushes it at the one moment a unit provably has none, and
+ * vol_repeat_start() below repeats it every second.
  *
- * A DTIM NOTE THAT WAS WRONG, kept because the correction matters. This used to
- * say the level "must not be held for a DTIM burst behind the audio it would
- * delay" was "never true on this build: hub and satellite both set
- * WIFI_PS_NONE, so nothing is buffered for a DTIM at all". The second half does
- * not follow from the first, and the 2026-08-20 soak measured it false: a
- * SoftAP buffers group-addressed frames for DTIM whether or not any station is
- * actually sleeping, and the hub's ENOMEM refusals arrived AT THE BEACON RATE
- * (median 40 bursts per 5 s window against 48.8 beacons). So this level IS held
- * for up to 102.4 ms behind whatever else is in the burst.
- *
- * It stays on the group anyway, and the original argument for that is
- * untouched: hearing the audio and hearing the level must be the same
- * condition. A level that is up to a beacon late is not a fault -- the 1 Hz
- * repeat below covers it -- where a level sent to a set that no longer matches
- * the audio's set is.
- *
- * The unicast arm is kept for CONFIG_DANCEFLOOR_AUDIO_MCAST=n, where there is no
- * group, the satellite never joins one, and the client list IS the audio set.
- * That build is unchanged.
+ * A DTIM NOTE, kept because the correction matters and the measurement is
+ * still the reason TX_FRAME_PACE_US exists. An earlier version of this comment
+ * claimed nothing on this build is ever buffered for a DTIM, since hub and
+ * satellite both set WIFI_PS_NONE. That does not follow, and the 2026-08-20
+ * soak measured it false: a SoftAP buffers GROUP-ADDRESSED frames for DTIM
+ * whether or not any station is sleeping, and the hub's ENOMEM refusals arrived
+ * at the beacon rate (median 40 bursts per 5 s window against 48.8 beacons).
+ * It does not apply to this send, which is unicast and goes out immediately.
  */
 void streamer_send_vol(uint8_t volume)
 {
@@ -324,19 +309,6 @@ void streamer_send_vol(uint8_t volume)
     }
     vol_msg_t msg = { .type = MSG_VOL, .volume = volume };
 
-#if CONFIG_DANCEFLOOR_AUDIO_MCAST
-    /* flags=0, unlike the audio's MSG_DONTWAIT. This runs on the timer task or
-     * an event handler, never on the SBC receive task that also feeds the hub's
-     * own ring, so there is no local feed here for a blocking send to starve --
-     * and a two-byte frame that waits for a TX slot is the outcome we want over
-     * one that is dropped. */
-    if (sendto(sock, &msg, sizeof(msg), 0,
-               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) >= 0) {
-        n_vol_tx++;
-    } else {
-        tx_fail_note(TX_LANE_VOL, errno);
-    }
-#else
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
@@ -351,7 +323,6 @@ void streamer_send_vol(uint8_t volume)
             }
         }
     }
-#endif
 }
 
 /*
@@ -361,11 +332,13 @@ void streamer_send_vol(uint8_t volume)
  * from a byte past full scale would amplify instead of attenuate.
  *
  * A CHANGE IS SENT THREE TIMES; A RE-STATEMENT IS NOT SENT AT ALL. A change is
- * the one moment the level is provably wrong everywhere else, and under
- * multicast there is no link-layer retry to lean on -- four bytes of extra air
- * against a slider move a human is watching the result of, where a single lost
- * frame would otherwise be audible until the next second's repeat, which at the
- * bottom of the taper is a large step.
+ * the one moment the level is provably wrong everywhere else. The repeats cost
+ * four bytes of extra air against a slider move a human is watching the result
+ * of, where a single lost frame would otherwise be audible until the next
+ * second's repeat, which at the bottom of the taper is a large step. (Written
+ * when the level went to a multicast group and had no link-layer retry to lean
+ * on. It is unicast and ACKed now, so the case is weaker -- but a level is
+ * state, not a stream, and nothing else re-states it inside the second.)
  *
  * But most calls here are NOT changes. The bridge re-states the level on a 5 s
  * heartbeat so a rebooted hub recovers, and every one of those arrives through
@@ -440,11 +413,10 @@ void vol_repeat_start(void)
  * Registered as the visualiser's publisher, so it runs on the analysis task --
  * which means it must not block. sendto() on a UDP socket does not.
  *
- * One group send, or one per satellite -- see DANCEFLOOR_MCAST_FRAMES for why
- * the group is now the default and why the "~20% loss" objection that kept this
- * unicast was a measurement of the 1 Mbps basic rate rather than of multicast.
- * The batch is identical for every listener either way, which is what makes the
- * choice a pure transport question.
+ * One sendto per registered satellite. The batch is byte-identical for every
+ * listener -- computing analysis in one place is exactly what makes that true --
+ * so this is N copies of one datagram, and the hub's transmit rate grows with
+ * the floor. See TX_FRAME_BATCH for what keeps N x 86/s down to N x ~9.8/s.
  *
  * A failed send now costs a satellite the whole batch -- ~9 frames out of 86 a
  * second, ~102 ms of them -- where it used to cost one. It is still counted with
@@ -491,16 +463,24 @@ void publish_frame(const vis_frame_t *f)
     pending_due = f->due_us;
 
     /*
-     * Hold until the beacon comes round, or until the batch is full.
+     * Hold until the pace interval is up, or until the batch is full.
      *
      * The pace decides WHEN this lane may transmit -- no two sends closer
-     * together than TX_FRAME_PACE_US, which is the interval at which the SoftAP
-     * releases group-addressed frames at all. What used to happen in between was
-     * that every frame offered was dropped; now they accumulate, and the send
-     * that the beacon does allow carries all of them.
+     * together than TX_FRAME_PACE_US. Frames offered in between accumulate
+     * rather than being dropped, and the send that does happen carries all of
+     * them: one datagram per satellite per interval instead of 86 a second.
+     *
+     * THE INTERVAL IS STILL THE DTIM BEACON (102.4 ms), which is now a number
+     * rather than a reason. It was derived from the rate a SoftAP releases
+     * GROUP-ADDRESSED frames, and this lane is unicast -- it goes out
+     * immediately with rate adaptation and waits for no beacon. What the pace
+     * still buys is the packet rate: at 86 frames/s per satellite the batching
+     * is what keeps the hub's transmit rate off the pool. Whether 102.4 ms is
+     * the right interval for a unicast lane has not been measured; see
+     * TX_FRAME_PACE_US in hub.h.
      *
      * The full-batch exit is for the analysis task's lumpiness rather than for
-     * the steady state: at hop 512 a beacon's worth is 8.8 frames against a
+     * the steady state: at hop 512 an interval's worth is 8.8 frames against a
      * TX_FRAME_BATCH of 12, so in steady state the pace is always what fires.
      */
     if (pending < TX_FRAME_BATCH && now < s_pace_at) {
@@ -522,18 +502,6 @@ void publish_frame(const vis_frame_t *f)
     msg.count = count;
     const size_t bytes = FRAME_MSG_BYTES((size_t)count * sizeof(*f));
 
-#if CONFIG_DANCEFLOOR_MCAST_FRAMES
-    /* Blocking (flags=0), unlike the audio group send. This runs on the analysis
-     * task, which is below playback and feeds nothing on the audio path, so a
-     * moment spent waiting for a transmit buffer costs a late frame rather than
-     * a hole in the sound -- and waiting is better than the drop that
-     * MSG_DONTWAIT would make of it. The audio path cannot make that trade
-     * because it shares a task with the hub's own ring feed. */
-    if (sendto(sock, &msg, bytes, 0,
-               (const struct sockaddr *)mcast_addr(), sizeof(struct sockaddr_in)) < 0) {
-        tx_fail_note(TX_LANE_FRAME, errno);
-    }
-#else
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
@@ -546,7 +514,6 @@ void publish_frame(const vis_frame_t *f)
             tx_fail_note(TX_LANE_FRAME, errno);
         }
     }
-#endif
 }
 #endif
 

@@ -118,127 +118,12 @@ menu "Dancefloor radio pairing"
 
 endmenu
 
-menu "Dancefloor audio transport (multicast + FEC)"
+menu "Dancefloor audio transport (FEC)"
 
-    comment "Audio goes to a WiFi multicast group by default, with piggyback redundancy"
-    comment "(FEC) so a single lost datagram is recovered at the far end instead of"
-    comment "becoming a gap. Unsetting DANCEFLOOR_AUDIO_MCAST restores the per-satellite"
-    comment "unicast downlink -- ACKed and retried, but airtime scales with speaker count."
-
-    config DANCEFLOOR_AUDIO_MCAST
-        bool "Send audio to a multicast group instead of per-satellite unicast"
-        default y
-        help
-          One group-addressed sendto instead of one per satellite: airtime stops
-          scaling with speaker count. The cost is reliability -- group frames are
-          never acknowledged or retried -- which is why multicast was removed once
-          before (measured ~20% loss, and at the 1 Mbps basic rate the stream did
-          not even fit). Two things let us try again: IGMP is on by default in the
-          IDF v6 lwip port (satellites join with no config), and wifi_start_ap()
-          drops 11b so the group rate moves off 1 Mbps to the 6 Mbps OFDM basic
-          rate. DANCEFLOOR_AUDIO_FEC_DEPTH then recovers the residual no-ACK loss.
-
-          Only audio moves to the group. Probes, analysis frames, ML results and
-          metadata stay per-station unicast -- a satellite still probes to be
-          clock-synced and to receive them.
-
-          Coordinated: the hub sends to the group and the satellite joins it, so
-          both ends must set this the same way.
-
-    config DANCEFLOOR_AUDIO_MCAST_GROUP
-        string "Multicast group address for the audio downlink"
-        default "239.0.0.1"
-        depends on DANCEFLOOR_AUDIO_MCAST
-        help
-          IPv4 administratively-scoped group (239.x). On-link under the SoftAP, so
-          the default IP_MULTICAST_TTL of 1 is correct and no routing is involved.
-          Both ends must match.
-
-    config DANCEFLOOR_MCAST_FRAMES
-        bool "Send LED analysis frames to the group too"
-        default n
-        depends on DANCEFLOOR_AUDIO_MCAST
-        help
-          WORKS, BUT ONLY WITH ENOUGH TRANSMIT BUFFERS -- which is why the
-          default is still n, since the default buffer count cannot carry it.
-          The measurements, in the order they were taken:
-
-            frames unicast, 26 buffers   tx-fail 0        sat gaps 0.17/s
-            frames MCAST,   26 buffers   tx-fail 14-27    sat gaps 1.1/s
-            frames MCAST,   32 buffers   tx-fail 0        sat gaps 0 in 125 s
-
-          The first attempt was argued on airtime -- 96xN unicast sends becoming
-          ~96 -- and that arithmetic is right and was the wrong question. What
-          decides it is the BURST. A SoftAP buffers group-addressed frames and
-          releases them after each DTIM beacon, while unicast goes out
-          immediately with rate adaptation; at dtim_period 1 on a 100 ms beacon
-          that is one burst per 100 ms. Audio alone is ~5 frames a burst, and
-          86 analysis frames a second makes it ~15, each holding a static TX
-          buffer until its window opens.
-
-          THE "100 ms BEACON" ABOVE IS RIGHT, and was the only place in the tree
-          that had it right. hub_s3/main/net.c spent a while asking the driver
-          for a 50 ms beacon and claiming a halved hold; the field is in TU with
-          a floor of 100, so the radio never took it, and a boot-time read-back
-          on 2026-08-20 printed `beacon_interval 100 TU (asked 50)`. The hold is
-          102.4 ms, it cannot go lower, and the frame lane's pace in hub.h is
-          now derived from it rather than from the analysis hop -- which also
-          takes the ~15 frames a burst above down to 1.
-
-          ONE PACKET A BURST, NOT ONE FRAME. Pacing to the beacon first meant
-          sending one frame per beacon and dropping the other ~76, which
-          starved the satellites' detector: df::RemoteDetect measures flux
-          between consecutive frames and keeps a history counted in frames, so
-          a ninth of the rate is a different detector, and the floor showed it
-          -- the hub's strip following the music while the satellites lurched.
-          The datagram carries a whole beacon's worth of frames now
-          (TX_FRAME_BATCH in hub.h). Same one buffer a burst, same airtime to
-          within the headers, every frame delivered.
-
-          26 could not hold that. 32 can, and 32
-          only became affordable when the hub stopped running the ML lane and
-          got ~25 kB of internal SRAM back.
-
-          So this needs ESP_WIFI_STATIC_TX_BUFFER_NUM at 32 or more, and the
-          hub's sdkconfig.defaults sets both together for that reason. Turning
-          this on without the buffers reproduces the middle row.
-
-          What it buys is the only thing that makes the hub's transmit rate FLAT
-          in speaker count: 50 + 96xN packets/s becomes ~146 whatever N is. At
-          fifteen satellites that is ~316/s against ~1490/s, and the analysis
-          frames stop scaling entirely -- only the probe traffic still does.
-
-
-          An analysis frame is byte-identical for every satellite -- the whole
-          point of computing it in one place is that no algorithm has to be proved
-          deterministic across units -- and it was still sent once per satellite.
-          At ~86 frames a second that made the hub's transmit rate 50 + ~96xN
-          packets, so the analysis traffic passed the audio at two satellites and
-          buried it at ten. This makes it ~96, flat, and it is what lets a floor
-          scale past the handful the bench has run.
-
-          THE OBJECTION IN THE CODE WAS REAL AND IS NOW OBSOLETE. publish_frame()
-          carried "group-addressed frames are never acknowledged, measured at ~20%
-          loss here, and a fifth of the frames missing is a visibly broken strip".
-          That measurement was taken at the 1 Mbps 11b basic rate, which is also
-          what made audio multicast fail the first time. wifi_start_ap() drops 11b
-          now, the group rate is the 6 Mbps OFDM basic rate, and measured group
-          loss is 0.2-0.3%. One packet in ~400 is not a visibly broken strip --
-          though with the batch a lost packet is now ~9 consecutive frames
-          rather than one, which at 9.8 packets a second is a ~102 ms hole
-          every 30-50 s. The detector converges back within its history; if it
-          ever reads as a stutter, halve TX_FRAME_BATCH rather than touching
-          the pace.
-
-          Separate from DANCEFLOOR_AUDIO_MCAST, which it depends on for the
-          group membership, because the two have different loss tolerances: a lost
-          audio packet is a hole in the sound and a lost frame batch is a tenth
-          of a second of a strip redrawn 86 times a second. Turning this off
-          returns the strips to ACKed unicast without giving up the audio
-          transport, which is the experiment worth being able to run separately.
-
-          No satellite change: a satellite already joins the group for audio and
-          already receives MSG_FRAME on that socket.
+    comment "Audio, the volume level and the analysis frames all go to the hub's"
+    comment "client list, one sendto per satellite -- ACKed and retried by the link"
+    comment "layer, and airtime scales with speaker count. Piggyback redundancy (FEC)"
+    comment "is available below and is off by default; see its help for why."
 
     config DANCEFLOOR_AUDIO_FEC_DEPTH
         int "Piggyback redundancy depth (previous packets carried)"
@@ -284,9 +169,11 @@ menu "Dancefloor audio transport (multicast + FEC)"
           packet per K recovers any single loss for 1/K overhead instead of 1x,
           and leaves packets at ~851 B.
 
-          Independent of DANCEFLOOR_AUDIO_MCAST: a receiver parses trailing
-          redundancy by length, so it recovers from any sender that attached it,
-          and an older sender that did not is read unchanged.
+          A receiver parses trailing redundancy by length, so it recovers from
+          any sender that attached it, and an older sender that did not is read
+          unchanged. Nothing about it is tied to how the packet was addressed --
+          the measurements below were taken while audio went to a multicast
+          group, and the airtime argument is what carried over, not the group.
 
 endmenu
 
