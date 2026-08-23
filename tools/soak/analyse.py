@@ -136,8 +136,17 @@ def boot_segments(df):
     different cadences and interleave.
     """
     df = df.sort_values(["unit", "wall_s"], kind="stable").copy()
-    df["boot"] = (df.groupby("unit")["esp_ms"].diff().fillna(0) < 0) \
-        .groupby(df["unit"]).cumsum().astype(int)
+    # ONLY THE INSTRUMENTED KINDS VOTE ON A RESET. The generic word-then-number
+    # scan lifts "metrics" out of prose too -- a build banner's date became
+    # `aug`, an address line became `ip` -- and those carry whatever esp_ms
+    # their line had, which for a boot banner is single digits. On the
+    # 2026-08-23 15:56 soak that reported "3 boots" and "2 boots" for two
+    # satellites that never restarted: their uptime counters rose monotonically
+    # across the whole 7 h and their final `up` covered the entire run. A false
+    # split re-baselines every counter mid-run, so this has to be narrow.
+    real = df["kind"].isin(["health", "trim", "status"])
+    step = df["esp_ms"].where(real).groupby(df["unit"]).diff()
+    df["boot"] = (step.fillna(0) < 0).groupby(df["unit"]).cumsum().astype(int)
     return df
 
 
@@ -657,9 +666,22 @@ def main():
                       " is drained by something that is not us:")
                 print("      the driver's own retries, which is the air. A"
                       " hub-side lane fix cannot reach that.")
-        if rtry is not None and not rtry.empty:
+        if rtry is not None and not rtry.empty and (rok is None or rok.empty):
+            # Recoverable, and worth recovering: a retry that SUCCEEDS skips
+            # tx_fail_note_audio, so the audio lane's own failure count is
+            # exactly the retries that did not go. Reported as derived, because
+            # it holds only while every audio refusal is ENOMEM.
             n_t = rtry["value"].sum()
-            n_o = rok["value"].sum() if rok is not None and not rok.empty else 0
+            aud_f = window_sum(met, "hub", "tx_fail_audio")
+            print(f"\n      THE RETRY: {n_t:,.0f} attempts, and audio-retry-ok"
+                  " was TRUNCATED off the status line by servo.c's 96-byte")
+            print(f"      burst buffer (fixed since). Derived instead:"
+                  f" {max(n_t - aud_f, 0):,.0f} went"
+                  f" -- attempts minus the {aud_f:,.0f} audio refusals still"
+                  " counted.")
+        elif rtry is not None and not rtry.empty:
+            n_t = rtry["value"].sum()
+            n_o = rok["value"].sum()
             print(f"      THE RETRY: {n_o:,.0f} of {n_t:,.0f} second attempts"
                   f" went ({100 * n_o / max(n_t, 1):.0f}%)"
                   f" -- {n_o:,.0f} holes that would have reached the floor.")
