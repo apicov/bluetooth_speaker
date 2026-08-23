@@ -717,8 +717,39 @@ def main():
             print(f"  ** {len(stalls)} window(s) with ZERO packets -- the phone or the"
                   f" SPI link stopped **")
             print(f"     first at +{stalls['wall_s'].iloc[0] - t0:.0f}s into the run")
-        else:
-            print("  No stalls: the source never stopped.")
+
+        # STOPPING is not the only way a source fails, and it is the rarer one.
+        # On 2026-08-23 the A2DP link HALVED for ten seconds -- sbc_in went 251
+        # packets and 44233 Hz to 128 and 22553 -- which starved the hub's own
+        # ring, jumped the timeline 4.8 s, and re-anchored both satellites five
+        # times. No window read zero and no single gap passed 266 ms, so the
+        # test above called it "the source never stopped" for the run whose
+        # entire fault was the source under-delivering.
+        #
+        # `eff` is the measure that catches it: an effective sample rate, so it
+        # does not care that these windows are a fixed packet count of varying
+        # duration. Compared against the run's own median rather than a nominal
+        # 44100, so a session at another rate still reads correctly; a few bad
+        # windows cannot move a median.
+        eff = met[(met["kind"] == "sbc_in") & (met["metric"] == "eff")]
+        if not eff.empty:
+            nominal = eff["value"].median()
+            weak = eff[eff["value"] < 0.9 * nominal]
+            if len(weak):
+                print(f"  ** {len(weak)} window(s) UNDER-DELIVERED -- source fed"
+                      f" below 90% of its own {nominal:.0f} Hz median **")
+                print(f"     worst {weak['value'].min():.0f} Hz"
+                      f" ({100 * weak['value'].min() / nominal:.0f}%)"
+                      f" at +{weak.loc[weak['value'].idxmin(), 'wall_s'] - t0:.0f}s")
+                print(f"     when: " + ", ".join(
+                    f"+{w - t0:.0f}s" for w in weak["wall_s"].head(8)))
+                print("     A source that halves starves the hub's own ring, and the"
+                      " timeline jump that")
+                print("     follows re-anchors every satellite. It is not a radio"
+                      " fault; check the phone,")
+                print("     the A2DP link and bt_bridge before anything on this side.")
+        if not len(stalls) and (eff.empty or not len(weak)):
+            print("  No stalls: the source never stopped, and never slowed.")
         g = met[(met["kind"] == "sbc_in") & (met["metric"] == "gap")]
         if not g.empty:
             print(f"  longest silence between packets: {g['value'].max() / 1000:.0f} ms"
