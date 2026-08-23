@@ -623,6 +623,49 @@ def main():
                   " the DTIM hold; in >150 isolated")
             print("        long stretches far apart -- the drain, not the fill."
                   " See hub_s3/main/net.c.")
+            if tot[2] <= max(1, sum(tot) // 20):
+                print("        75-150 is the 102.4 ms beacon. Near-empty here is"
+                      " the DTIM drain STAYING fixed;")
+                print("        the group lanes went unicast and the signature"
+                      " went with them. Do not re-open it.")
+
+        # ---- who held the pool, and whether the retry caught anything -------
+        #
+        # Both counters are new with the 2026-08-23 instrumentation and absent
+        # from every soak before it, so their absence is reported as "not
+        # measured" rather than as a zero -- the distinction the AIR section's
+        # -100 floor got wrong and this must not repeat.
+        near = gauge(met, "hub", "status", "refuse-near-frame")
+        rtry = gauge(met, "hub", "status", "audio-retry")
+        rok = gauge(met, "hub", "status", "audio-retry-ok")
+        if near is None or near.empty:
+            print("\n      No refuse-near-frame gauge -- this hub predates the"
+                  " 2026-08-23 instrumentation.")
+        else:
+            n_near, n_ref = near["value"].sum(), windows["value"].sum()
+            print(f"\n      WHO HELD THE POOL: {n_near:,.0f} of {n_ref:,.0f}"
+                  f" refusals had a frame batch in flight"
+                  f" ({100 * n_near / max(n_ref, 1):.0f}%).")
+            # The fork this instrument exists to resolve. See hub.h's
+            # n_refuse_near_frame for why nothing before it could.
+            if n_near >= 0.5 * max(n_ref, 1):
+                print("      The frame lane is still the competitor and"
+                      " TX_FRAME_PACE_US is not enough -- pace it harder or"
+                      " give audio its own headroom.")
+            else:
+                print("      The frame lane is mostly NOT in flight, so the pool"
+                      " is drained by something that is not us:")
+                print("      the driver's own retries, which is the air. A"
+                      " hub-side lane fix cannot reach that.")
+        if rtry is not None and not rtry.empty:
+            n_t = rtry["value"].sum()
+            n_o = rok["value"].sum() if rok is not None and not rok.empty else 0
+            print(f"      THE RETRY: {n_o:,.0f} of {n_t:,.0f} second attempts"
+                  f" went ({100 * n_o / max(n_t, 1):.0f}%)"
+                  f" -- {n_o:,.0f} holes that would have reached the floor.")
+            if n_t and n_o < 0.1 * n_t:
+                print("      Near zero: the pool stays empty longer than a"
+                      " syscall, so the retry is not earning its place.")
     if not tx_any:
         print("  No tx-fail gauge -- the hub predates this instrument.")
 

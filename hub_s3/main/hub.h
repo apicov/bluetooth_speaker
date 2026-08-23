@@ -827,6 +827,69 @@ typedef enum {
 extern volatile uint32_t s_tx_lane_fail[TX_LANE_N];
 
 /*
+ * WHO WAS ON THE POOL WHEN AUDIO WAS REFUSED -- the instrument eight dead
+ * hypotheses have needed and none of them had.
+ *
+ * Every ENOMEM diagnosis so far has been inferred from counters that do not
+ * move. Ruled out, each against a soak: A-MPDU TX off (worse -- see
+ * sdkconfig.defaults), the channel (the boot survey picks 11 correctly), the
+ * SPI link (hdr/crc/short 0 over ~3M packets), heap (internal free flat at
+ * ~12,288 B through every refusal), the source (the hub never starves during a
+ * satellite dropout), the pool size (36->48 bought bufferbloat and
+ * anchors-refused; 38 is the settled value), a 2.4 GHz blackout (the 2026-08-23
+ * 01:38 run had two major episodes with the band wide open -- see analyse.py's
+ * section 7b), DTIM group buffering (fixed: every lane is unicast now, and the
+ * beacon-rate signature is gone -- 0 of 41 and 0 of 32 burst gaps in the
+ * 75-150 ms bucket during that run's two episodes, against a median 40 bursts
+ * per window measured on 2026-08-20).
+ *
+ * What none of that could see is the inside of the pool. IDF exposes no numeric
+ * count of free static TX buffers -- esp_wifi_statis_dump() prints to the
+ * console and cannot be sampled at the millisecond a burst lives on -- so the
+ * pool's own occupancy is not measurable from here.
+ *
+ * This measures the next best thing and the only mechanism still standing: hub.h
+ * above documents the frame lane crowding the pool until AUDIO's sendto comes
+ * back ENOMEM, measured at the audible glitch moments of the 2026-08-17 soak.
+ * TX_FRAME_PACE_US was the fix. Whether it is ENOUGH has never been tested,
+ * because nothing recorded whether a frame send was in flight at the instant
+ * audio was refused. Now it does: publish_frame stamps s_tx_frame_sent_us, and
+ * an audio ENOMEM within TX_NEAR_US of that stamp increments n_refuse_near_frame.
+ *
+ * HOW TO READ IT. `refuse-near-frame` close to the window's audio refusals says
+ * the frame lane is still the competitor and the pace is not enough. Close to
+ * zero says the pool is being drained by something that is not us -- the
+ * driver's own retries, which is the air -- and that is a different repair
+ * entirely. It is the first reading that can tell those two apart.
+ */
+#define TX_NEAR_US              5000    /* "in flight": ~4 audio packets' grace */
+extern volatile int64_t  s_tx_frame_sent_us;   /* esp_timer stamp of the last frame fan-out */
+extern volatile uint32_t n_refuse_near_frame;  /* audio ENOMEMs with a frame send just before */
+
+/*
+ * The refused audio packet's second chance, and the counters that judge it.
+ *
+ * fan_out() used to count a refusal and drop the packet, which is the hole the
+ * room hears -- and under FEC a hole is recoverable only if the NEXT packet
+ * gets through, which during a burst is exactly what does not happen. The pool
+ * frees buffers as frames complete, on a timescale far below one audio period,
+ * so an immediate second sendto costs one syscall and may well find room.
+ *
+ * DELIBERATELY NOT A QUEUE. A deferred resend would arrive after a newer packet
+ * and the satellite would count it seq-drop and bin it, so the retry has to be
+ * now or never. One attempt, ENOMEM only: any other errno is a real error and
+ * retrying it would just hide it.
+ *
+ * JUDGE IT ON THE PAIR. `audio-retry N | audio-retry-ok M` -- if M tracks N
+ * the pool is transiently empty and this recovers most of the fault; if M
+ * stays near zero the pool is empty for longer than a syscall and the retry
+ * should come out again. Either reading is worth more than the drop it
+ * replaces.
+ */
+extern volatile uint32_t n_audio_retry;        /* audio ENOMEMs that got a second sendto */
+extern volatile uint32_t n_audio_retry_ok;     /* ...of which the second one went */
+
+/*
  * Stations arriving or leaving in this window, both counted together.
  *
  * The 2026-08-20 soak put its whole ENOMEM storm in the first five minutes,

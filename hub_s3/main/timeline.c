@@ -547,6 +547,27 @@ static fanout_result_t send_audio_to_clients(size_t bytes)
         any_listener = true;
         if (sendto(sock, &msg, bytes, 0,
                    (struct sockaddr *)&snapshot[i].addr, sizeof(snapshot[i].addr)) < 0) {
+            /*
+             * ONE IMMEDIATE RETRY, ENOMEM ONLY. The pool frees buffers as
+             * frames complete, well inside one audio period, so a second
+             * sendto costs a syscall and may find room where the first did
+             * not. It cannot be deferred: a resend arriving after a newer
+             * packet is seq-drop on the satellite. See n_audio_retry in hub.h.
+             *
+             * The refusal is still counted when the retry also fails, so
+             * tx-fail keeps meaning what it has always meant and stays
+             * comparable with every soak before this one.
+             */
+            if (errno == ENOMEM) {
+                n_audio_retry++;
+                if (sendto(sock, &msg, bytes, 0,
+                           (struct sockaddr *)&snapshot[i].addr,
+                           sizeof(snapshot[i].addr)) >= 0) {
+                    n_audio_retry_ok++;
+                    any_sent = true;
+                    continue;
+                }
+            }
             tx_fail_note_audio(errno);
         } else {
             any_sent = true;

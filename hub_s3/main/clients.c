@@ -505,6 +505,13 @@ void publish_frame(const vis_frame_t *f)
     client_t snapshot[MAX_CLIENTS];
     clients_snapshot(snapshot);
 
+    /* Stamped BEFORE the loop, not after: the question this answers is whether
+     * a frame batch was on the pool when audio was refused, and the buffers are
+     * held from the first sendto onwards. Stamping after would date the batch
+     * from the moment it finished and miss exactly the overlap being looked
+     * for. See n_refuse_near_frame in hub.h. */
+    s_tx_frame_sent_us = now;
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!snapshot[i].last_seen) {
             continue;

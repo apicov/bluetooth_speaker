@@ -599,9 +599,18 @@ void tx_burst_summary(char *buf, size_t len)
      * between clusters", which is the opposite of what it meant.
      */
     snprintf(buf, len, " | enomem-bursts %" PRIu32 " | refuse-max %ld ms"
-                       " | gaps %" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32,
+                       " | gaps %" PRIu32 "/%" PRIu32 "/%" PRIu32 "/%" PRIu32
+                       " | refuse-near-frame %" PRIu32
+                       " | audio-retry %" PRIu32 " | audio-retry-ok %" PRIu32,
              bursts, (long)(n_refuse_max_us / 1000),
-             n_burst_gap[0], n_burst_gap[1], n_burst_gap[2], n_burst_gap[3]);
+             n_burst_gap[0], n_burst_gap[1], n_burst_gap[2], n_burst_gap[3],
+             n_refuse_near_frame, n_audio_retry, n_audio_retry_ok);
+    /* Cleared here, with the burst shape they are read against: all of it
+     * describes one window and a counter that outlived its window would be
+     * attributed to the next one's refusals. */
+    n_refuse_near_frame = 0;
+    n_audio_retry = 0;
+    n_audio_retry_ok = 0;
 
     /*
      * A STRETCH STILL OPEN AT THE BOUNDARY IS CARRIED, NOT DROPPED.
@@ -691,6 +700,14 @@ void tx_fail_note(tx_lane_t lane, int err)
         const int64_t now = esp_timer_get_time();
         enomem_note_shape(now);
         s_tx_congested_until = now + TX_BACKOFF_US;
+        /* Only AUDIO asks the question, because only audio is the victim: a
+         * frame refused while another frame is in flight is the lane queueing
+         * behind itself, which says nothing about who starved the room. See
+         * n_refuse_near_frame in hub.h for what the two readings mean. */
+        if (lane == TX_LANE_AUDIO
+            && now - s_tx_frame_sent_us <= TX_NEAR_US) {
+            n_refuse_near_frame++;
+        }
     }
     for (int i = 0; i < TX_ERR_SLOTS; i++) {
         if (s_tx_err[i].n == 0) {         /* free slot: claim it */
