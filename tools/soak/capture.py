@@ -387,11 +387,29 @@ def air_scan():
     real channel busy time and is the upgrade if this proves too blunt -- it
     needs root and the interface parked on the hub's channel.
 
+    IT MEASURES AN INTERFERER AS LOSS OF DECODE, NOT AS A RISE IN LEVEL. This
+    was built expecting a busy channel to read louder during a hub TX episode.
+    A passive scan only counts beacons it successfully decodes, so somebody
+    shouting on a channel makes that channel's neighbours vanish from this list
+    instead. It shows up as the count falling -- at the limit `ch{c}-nets 0`
+    with `ch{c}-dbm -100`, which is the floor substituted below and not a
+    measured level. analyse.py's AIR section reads it that way round and calls
+    the zeros out; see the long comment on its section 7b for how far that got,
+    which is not as far as it first looked.
+
     IT IS ALSO NOISY, measured here at ~10 dB sweep to sweep on a busy channel
     (ch1 read -60, -51, -61 in three consecutive sweeps) because a single scan
     does not always catch every AP. A quiet channel is far steadier (-69, -70,
     -70 on ch11 over the same three). So read a trend across several sweeps, not
     one reading: a few dB between adjacent sweeps is this, not a neighbour.
+
+    THE 30 s DEFAULT IS NOT ABOUT COST. NetworkManager rate-limits `nmcli dev
+    wifi rescan` to roughly every 10-15 s, so sweeping faster returns the CACHED
+    list: one real blackout would repeat across several sweeps and read as a
+    long one, manufacturing evidence for the very thing the sweep exists to
+    test. Both blackouts seen so far were a single isolated sweep with normal
+    readings either side, which is only meaningful while a sweep is an
+    independent look at the band.
     """
     try:
         subprocess.run(["nmcli", "dev", "wifi", "rescan"],

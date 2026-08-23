@@ -99,6 +99,14 @@ AIR_UNIT = "air"
 EPISODE_GAP_S = 120     # quiet time that separates one episode from the next
 EPISODE_MAJOR = 50      # refused sends that make an episode worth counting
 
+# How far either side of an episode the air sweep is read. capture.py sweeps
+# every 30 s by default, so a short blackout is caught by AT MOST ONE sweep, and
+# not necessarily the one nearest the episode: on 2026-08-23 the first blind
+# sweep fell 26 s before its episode and nearest() sampled straight past it onto
+# a sweep that read one network. Two sweeps wide, so an adjacent blackout is
+# found from either direction and one missing sweep does not hide it.
+AIR_LEAD_S = 60
+
 
 def load(paths):
     """Concatenate one or more session directories into (metrics, events)."""
@@ -626,9 +634,49 @@ def main():
     # flat -- internal free, stations, churn, RSSI, the source -- so whatever
     # starts one is outside this rig, and nothing was watching outside.
     #
-    # Read the episode rows, not the run summary. A band that is busy all
-    # evening explains nothing; a channel that gets busier exactly when the hub
-    # starts refusing sends is the first real lead this fault has offered.
+    # READ IT FOR DISAPPEARANCE, NOT OCCUPANCY. This was built expecting a
+    # channel to get BUSIER during an episode. It does the opposite, and the
+    # reason is what the instrument actually measures: a passive scan counts the
+    # beacons it can DECODE, so a strong local interferer first stops the laptop
+    # hearing that channel's neighbours, and moments later stops the hub getting
+    # packets onto it -- retries hold TX buffers, the pool empties, sendto is
+    # refused. It is the same reason RSSI never moves through an episode: that
+    # measures the satellites' signal, not whether someone else is shouting over
+    # it.
+    #
+    # A LEAD THAT DID NOT SURVIVE ITS SECOND RUN, kept here because the next
+    # reader will otherwise find it again and be as pleased with it.
+    #
+    # 2026-08-23 10:04 (4.23 h, 507 sweeps): ch11 decoded zero networks exactly
+    # twice, and each zero was the sweep immediately before one of the run's two
+    # major episodes -- 26 s and 15 s ahead. The scan had not failed; total
+    # networks read 8 and 13 in those same sweeps and ch1/ch6 decoded normally.
+    # Two for two, and the coincidence is not cheap: with 2 zeros loose in the
+    # run, landing both in the ~4 sweeps that precede a major episode is order
+    # 1e-4. It looked like the first real lead this fault had offered.
+    #
+    # Two things in the same directory kill it as a cause.
+    #
+    # 1. The 01:38 run, 8.42 h and 1,008 sweeps on the SAME build (flashed at
+    #    01:36:42, two minutes before it started), NEVER went blind on any
+    #    channel and still produced two major episodes -- 430 and 415 refused,
+    #    both bigger than either of 10:04's. ch11 read 7 and 5 networks in the
+    #    minute before them. So a blackout is not necessary for an episode, and
+    #    whatever the mechanism is, it runs without one.
+    #
+    # 2. Zero is one step, not a cliff. Both 10:04 zeros came out of a stretch
+    #    already sitting at 1-2 networks against a run median of 4, and went
+    #    1 -> 0 -> 2. Only ONE marginal AP dropped out. Reading 1 is ordinary --
+    #    34 of 507 sweeps here, 14 of 1,008 in the 01:38 run -- so the sharp
+    #    line between 0 and 1 is a threshold on a noisy count near its floor,
+    #    not a physical difference.
+    #
+    # What is left is worth keeping instrumented and not worth acting on: the
+    # timing coincidence is real and unexplained, the cost of watching it is one
+    # nmcli call every 30 s, and at most it is one trigger among several. The
+    # BLIND SWEEPS block below counts it in BOTH directions on purpose, so a run
+    # that breaks the pattern says so as loudly as one that repeats it. That is
+    # how the 01:38 run got a hearing at all.
     head("AIR  (what else was on the band, from capture.py's sweep)")
     air = met[met["unit"] == AIR_UNIT]
     if air.empty:
@@ -639,52 +687,172 @@ def main():
         chans = sorted({int(m[2:m.index("-")]) for m in air["metric"].unique()
                         if m.startswith("ch") and "-dbm" in m})
         sweeps = len(air[air["metric"] == f"ch{chans[0]}-dbm"]) if chans else 0
+        # One row per sweep, columns the metrics. The blind-sweep block needs
+        # every channel's count and the total from the SAME sweep -- that is
+        # what tells "one channel went deaf" from "the scan failed" -- and
+        # pivoting once is what lets them be read together.
+        by_sweep = air.pivot_table(index="wall_s", columns="metric",
+                                   values="value").sort_index()
+
         print(f"  {sweeps:,} sweeps")
-        print("  channel    median      min      max   nets")
-        run_median = {}
+        print("  channel    median      min      max   nets   blind")
+        run_median, dbm, nets = {}, {}, {}
         for c in chans:
             d = gauge(met, AIR_UNIT, "other", f"ch{c}-dbm")
             n = gauge(met, AIR_UNIT, "other", f"ch{c}-nets")
             if d is None or d.empty:
                 continue
-            run_median[c] = d["value"].median()
+            dbm[c], nets[c] = d, n
+            # A sweep that decoded nothing reports air_scan()'s -100 floor,
+            # which is a sentinel and not a level. Folding it into the median
+            # and the min claims the channel was quieter than it was ever
+            # measured to be, so the dBm stats are over the sweeps that heard
+            # something and the deaf ones are counted in their own column.
+            ncol = f"ch{c}-nets"
+            heard = (by_sweep[by_sweep[ncol] > 0][f"ch{c}-dbm"]
+                     if ncol in by_sweep else d["value"])
+            blind = sweeps - len(heard)
+            if heard.empty:
+                print(f"  ch{c:<7d}    deaf for every sweep"
+                      f"                 {blind:5d}")
+                continue
+            run_median[c] = heard.median()
             nm = n["value"].median() if n is not None and not n.empty else float("nan")
-            print(f"  ch{c:<7d} {d['value'].median():6.0f} dBm"
-                  f" {d['value'].min():6.0f}   {d['value'].max():6.0f}"
-                  f"   {nm:4.0f}")
+            print(f"  ch{c:<7d} {heard.median():6.0f} dBm"
+                  f" {heard.min():6.0f}   {heard.max():6.0f}"
+                  f"   {nm:4.0f}   {blind:5d}")
 
-        # The part worth having: what the band was doing while the hub refused.
         tf = gauge(met, "hub", "status", "tx-fail")
-        majors = []
-        if tf is not None and not tf.empty:
-            for e in episodes(tf[tf["value"] > 0]):
-                if sum(r["value"] for r in e) >= EPISODE_MAJOR:
-                    majors.append(e)
+        eps = (episodes(tf[tf["value"] > 0])
+               if tf is not None and not tf.empty else [])
+        majors = [e for e in eps if sum(r["value"] for r in e) >= EPISODE_MAJOR]
+
+        # ---- the call-out this section exists for ---------------------------
+        blinds = []
+        for w, row in by_sweep.iterrows():
+            gone = [c for c in chans if row.get(f"ch{c}-nets", 1) == 0]
+            if gone:
+                blinds.append((w, gone, row))
+
+        def episode_near(w, lo, hi):
+            """The one episode starting within [w+lo, w+hi], and its size."""
+            for e in eps:
+                off = e[0]["wall_s"] - w
+                if lo <= off <= hi:
+                    return e, sum(r["value"] for r in e), off
+            return None, 0.0, 0.0
+
+        if not blinds:
+            print(f"\n  No blind sweep: every channel decoded at least one"
+                  f" network in all {sweeps:,} sweeps.")
+        else:
+            print(f"\n  BLIND SWEEPS  ({len(blinds)} of {sweeps:,})  -- a"
+                  " channel that decoded NOTHING while")
+            print("  the others did -- possibly somebody loud on it, possibly"
+                  " one marginal AP")
+            print("  dropping out. The counts either side say which.")
+            hits = 0
+            idx = list(by_sweep.index)
+            for w, gone, row in blinds:
+                deaf = "/".join(f"ch{c}" for c in gone)
+                others = "  ".join(f"ch{c} {row.get(f'ch{c}-nets', np.nan):.0f}"
+                                   for c in chans)
+                print(f"    +{w - t0:7.0f}s  {deaf} blind   total nets"
+                      f" {row.get('nets', np.nan):.0f}   ({others})")
+                # What the channel read either side, and its median. Without
+                # these a 1 -> 0 -> 2 wobble on a channel that only ever hears
+                # two APs prints exactly like one that went dark from a
+                # healthy dozen, and the two mean nothing alike.
+                i = idx.index(w)
+                for c in gone:
+                    col = f"ch{c}-nets"
+                    def side(j):
+                        # A blackout on the first or last sweep of a run has
+                        # only one neighbour, and 'nan' reads like a reading.
+                        return (f"{by_sweep[col].iloc[j]:.0f}"
+                                if 0 <= j < len(idx) else "no sweep")
+                    print(f"                 ch{c} read {side(i - 1)} before"
+                          f" and {side(i + 1)} after, median"
+                          f" {by_sweep[col].median():.0f} for the run")
+                e, n, off = episode_near(w, 0.0, AIR_LEAD_S)
+                if e is None:
+                    print("                 -> no hub-TX episode followed")
+                else:
+                    kind = "MAJOR" if n >= EPISODE_MAJOR else "minor"
+                    hits += kind == "MAJOR"
+                    print(f"                 -> {kind} episode {off:.0f}s later"
+                          f", {n:.0f} refused")
+            # Both directions, because only the pair can falsify: blackouts that
+            # lead nowhere and episodes that arrive out of a clear band each say
+            # the lead is wrong, and each is invisible from the other side.
+            def blind_before(e):
+                return any(0.0 <= e[0]["wall_s"] - w <= AIR_LEAD_S
+                           for w, _, _ in blinds)
+
+            back = sum(blind_before(e) for e in majors)
+            minors = [e for e in eps if sum(r["value"] for r in e)
+                      < EPISODE_MAJOR]
+            print(f"  {hits} of {len(blinds)} blind sweeps were followed by a"
+                  f" MAJOR episode within {AIR_LEAD_S}s;")
+            print(f"  {back} of {len(majors)} major episodes had a blind sweep"
+                  f" in the {AIR_LEAD_S}s before.")
+            print(f"  The control: {len(minors)} minor episodes,"
+                  f" {sum(blind_before(e) for e in minors)} of them with a"
+                  " blind sweep before.")
+
         if not majors:
             print("\n  No major hub-TX episode in this run, so nothing to"
                   " correlate against.")
         else:
-            print("\n  during each MAJOR hub-TX episode, against the run median:")
+            print(f"\n  during each MAJOR hub-TX episode, against the run"
+                  f" median  (nets = fewest in the {AIR_LEAD_S}s before):")
             for e in majors:
                 mid = e[len(e) // 2]["wall_s"]
+                # The lowest count in the run-up, not the nearest one. The
+                # nearest sweep to an episode's middle can sit past a blackout
+                # that a sweep or two earlier caught -- which is exactly how the
+                # 2026-08-23 10:04 run hid the first of its two.
+                lead = by_sweep[(by_sweep.index >= e[0]["wall_s"] - AIR_LEAD_S)
+                                & (by_sweep.index <= mid)]
                 cells = []
                 for c in chans:
-                    d = gauge(met, AIR_UNIT, "other", f"ch{c}-dbm")
-                    n = gauge(met, AIR_UNIT, "other", f"ch{c}-nets")
-                    if d is None or d.empty:
+                    if c not in dbm:
                         continue
-                    v = nearest(d, mid)
-                    delta = v - run_median.get(c, v)
-                    nv = nearest(n, mid) if n is not None and not n.empty else float("nan")
-                    cells.append(f"ch{c} {v:.0f} dBm ({delta:+.0f})"
-                                 f" nets {nv:.0f}")
+                    ncol = f"ch{c}-nets"
+                    nv = (lead[ncol].min() if ncol in lead and not lead.empty
+                          else nearest(nets[c], mid))
+                    # A blind sweep's dBm is the -100 floor. Printing it as a
+                    # level reads as 28 dB below median -- the opposite of the
+                    # alarm it is.
+                    if nearest(nets[c], mid) == 0:
+                        cell = f"ch{c} no decode"
+                    else:
+                        v = nearest(dbm[c], mid)
+                        cell = f"ch{c} {v:.0f} dBm ({v - run_median.get(c, v):+.0f})"
+                    cells.append(cell + f" nets {nv:.0f}"
+                                 + (" BLIND" if nv == 0 else ""))
                 print(f"    +{e[0]['wall_s'] - t0:7.0f}s  " + "  ".join(cells))
-            print("  A channel well above its own median, or carrying networks"
-                  " it did not have, is")
-            print("  the lead. All three moving together is the whole band. A"
-                  " few dB is sweep noise --")
-            print("  capture.py measures ~10 dB of it on a busy channel; see"
-                  " air_scan() there.")
+
+        if blinds or majors:
+            print("  Read this for DISAPPEARANCE, not occupancy: a passive"
+                  " scan counts what it can")
+            print("  decode, so an interferer makes a channel go quiet HERE"
+                  " rather than loud. A channel")
+            print("  that LOSES its networks is the thing to look at, not one"
+                  " that gets busier.")
+            print("  BUT DO NOT CALL IT THE CAUSE. The 2026-08-23 01:38 run"
+                  " went 8.42 h and 1,008")
+            print("  sweeps without a single blind sweep and still had two"
+                  " major episodes, larger")
+            print("  than either of the run that suggested this. A blackout is"
+                  " not necessary for an")
+            print("  episode; check whether the deaf channel had more than one"
+                  " or two networks to")
+            print("  lose before reading anything into a zero. All three"
+                  " channels moving together is")
+            print("  the whole band. A few dB is sweep noise -- capture.py"
+                  " measures ~10 dB of it on a")
+            print("  busy channel; see air_scan() there.")
 
     head("HEAP  (the long-run question: does anything leak)")
     for u in units:
