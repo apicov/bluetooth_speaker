@@ -148,7 +148,15 @@ void servo_tick(void)
          * the refusals were beacon-spaced or one unbroken stall. See net.c. */
         char lanes[96];
         tx_fail_lanes(lanes, sizeof(lanes));
-        char burst[96];
+        /*
+         * SIZED FOR THE WHOLE LINE, NOT FOR A TYPICAL ONE. At 96 this silently
+         * truncated: the 2026-08-23 15:56 soak logged `audio-retry 21 |  |`
+         * with the audio-retry-ok value cut clean off, and snprintf reports a
+         * truncation nobody was checking. Worst case is every counter at
+         * UINT32_MAX -- 6 fields, ~190 bytes -- so anything added here has to
+         * be added to this number too.
+         */
+        char burst[224];
         tx_burst_summary(burst, sizeof(burst));
         /*
          * The station census, taken here rather than kept as a counter because
