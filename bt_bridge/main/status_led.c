@@ -80,7 +80,6 @@ void status_led_note_audio(void)
     s_last_audio_us = esp_timer_get_time();
 }
 
-#if HAVE_CONNECTED || HAVE_STREAMING
 static const char *TAG = "status_led";
 
 /*
@@ -94,20 +93,48 @@ static const char *TAG = "status_led";
  */
 static void led_task(void *arg)
 {
-#if HAVE_STREAMING
     bool blink = false;
     bool was_streaming = false;
     int since_edge_ms = 0;
-#endif
+    int64_t edge_us = 0;
 
     while (1) {
 #if HAVE_CONNECTED
         gpio_set_level(PIN_CONNECTED, s_connected ? LED_ON : LED_OFF);
 #endif
-#if HAVE_STREAMING
+        /*
+         * DELIBERATELY NOT UNDER #if HAVE_STREAMING, though the LED it also
+         * drives is. This same test is the only thing on this chip that knows
+         * the A2DP source has gone quiet, and a soak needs it said out loud:
+         * when the phone stops feeding, nothing else here logs anything at all,
+         * so the hub starves and the bridge's console shows a hole. Two runs
+         * were read that way before this existed, and neither could separate a
+         * phone that stopped sending from a bridge that failed to forward.
+         *
+         * A diagnostic that disappears when someone does not wire an LED is
+         * useless on exactly the rig that needs it, so only the gpio_set_level()
+         * below is conditional.
+         */
+        const int64_t now_us = esp_timer_get_time();
         const bool streaming =
-            s_last_audio_us != 0 &&
-            (esp_timer_get_time() - s_last_audio_us) < SILENCE_US;
+            s_last_audio_us != 0 && (now_us - s_last_audio_us) < SILENCE_US;
+
+        /* Edges only. The steady states are the LED's business, and a line per
+         * tick would bury the two transitions that matter. */
+        if (streaming != was_streaming && s_last_audio_us != 0) {
+            const int64_t held = edge_us ? now_us - edge_us : 0;
+            if (streaming) {
+                ESP_LOGW(TAG, "audio resumed after %lld ms of silence",
+                         held / 1000);
+            } else {
+                /* Dated from the last packet, not from this tick: the silence
+                 * began when the audio did, and SILENCE_US plus up to a tick of
+                 * latency is this task noticing, not the gap itself. */
+                ESP_LOGW(TAG, "audio stopped, last packet %lld ms ago",
+                         (now_us - s_last_audio_us) / 1000);
+            }
+            edge_us = now_us;
+        }
 
         if (!streaming) {
             /* Settle dark rather than freezing wherever the last edge left it:
@@ -126,16 +153,18 @@ static void led_task(void *arg)
         }
         was_streaming = streaming;
 
+#if HAVE_STREAMING
         gpio_set_level(PIN_STREAMING, blink ? LED_ON : LED_OFF);
 #endif
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
     }
 }
-#endif
 
 void status_led_start(void)
 {
 #if HAVE_CONNECTED || HAVE_STREAMING
+    /* Pins only. The task below starts either way -- it carries the audio-gap
+     * diagnostic now, which a board with no LEDs still wants. */
     const gpio_config_t cfg = {
         .pin_bit_mask =
 #if HAVE_CONNECTED
@@ -161,6 +190,7 @@ void status_led_start(void)
 #if HAVE_STREAMING
     gpio_set_level(PIN_STREAMING, LED_OFF);
 #endif
+#endif
 
     /* Lowest priority in the system: a missed tick shows as a slightly uneven
      * blink and nothing else, which is the right thing to give up first. */
@@ -173,7 +203,6 @@ void status_led_start(void)
     }
 
     ESP_LOGI(TAG, "status LEDs: connected on %d, streaming on %d (-1 = none), "
-                  "active %s",
+                  "active %s; audio gaps logged either way",
              PIN_CONNECTED, PIN_STREAMING, LED_ON == 0 ? "low" : "high");
-#endif
 }

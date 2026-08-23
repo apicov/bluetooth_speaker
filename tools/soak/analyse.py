@@ -741,13 +741,47 @@ def main():
                 print(f"     worst {weak['value'].min():.0f} Hz"
                       f" ({100 * weak['value'].min() / nominal:.0f}%)"
                       f" at +{weak.loc[weak['value'].idxmin(), 'wall_s'] - t0:.0f}s")
-                print(f"     when: " + ", ".join(
-                    f"+{w - t0:.0f}s" for w in weak["wall_s"].head(8)))
+                # Which of the three links dropped it. The hub can only say
+                # that audio stopped arriving; bt_bridge is the only witness to
+                # whether it ever left the phone, which is why capture.py now
+                # asks for that board. A gap logged there and no drops means the
+                # source stopped and nothing here is at fault; a hub-side
+                # shortfall with the bridge silent means it went missing between
+                # them.
+                gap = met[met["metric"] == "audio-gap-ms"]
+                drops = met[met["metric"] == "bridge-dropped"]
+                # A boundary is not the cause -- roughly 1% of them see one --
+                # but both dropouts on record sat within seconds of one, so it
+                # is worth naming when it is there.
+                # The hub's own boundary, not the satellites' echo of the same
+                # track: they re-log it a few seconds later and would name that
+                # instead, which reads as a closer boundary than there was.
+                bounds = ev[(ev["kind"] == "boundary") & (ev["unit"] == "hub")] \
+                    if not ev.empty and "kind" in ev.columns else pd.DataFrame()
+                print("     window     fed   nearest track boundary   what bt_bridge saw")
+                for w, v in zip(weak["wall_s"], weak["value"]):
+                    near = "     --"
+                    if not bounds.empty:
+                        dt = (bounds["wall_s"] - w)
+                        i = dt.abs().values.argmin()
+                        near = f"{dt.iloc[i]:+.0f}s"
+                    if gap.empty and drops.empty:
+                        saw = "not captured -- add it as a --unit"
+                    else:
+                        near_gap = gap[(gap["wall_s"] > w - 30) & (gap["wall_s"] < w + 30)]
+                        nd = drops[(drops["wall_s"] > w - 30) & (drops["wall_s"] < w + 30)]
+                        saw = (f"audio gap {near_gap['value'].max():.0f} ms"
+                               if not near_gap.empty else "no audio gap")
+                        saw += (f", {nd['value'].max():.0f} dropped"
+                                if not nd.empty else ", no drops")
+                    print(f"     +{w - t0:7.0f}s  {100 * v / nominal:3.0f}%"
+                          f"   {near:>10s}             {saw}")
                 print("     A source that halves starves the hub's own ring, and the"
                       " timeline jump that")
-                print("     follows re-anchors every satellite. It is not a radio"
-                      " fault; check the phone,")
-                print("     the A2DP link and bt_bridge before anything on this side.")
+                print("     follows re-anchors every satellite. Gap logged on the"
+                      " bridge with no drops")
+                print("     = the phone stopped; no gap but the hub short = it went"
+                      " missing after the bridge.")
         if not len(stalls) and (eff.empty or not len(weak)):
             print("  No stalls: the source never stopped, and never slowed.")
         g = met[(met["kind"] == "sbc_in") & (met["metric"] == "gap")]

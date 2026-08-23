@@ -113,6 +113,15 @@ KINDS = [
     ("output clock retuned", "retune"),
     ("CRIPPLED:", "crippled"),
     ("ALLOCATION FAILED", "alloc_fail"),
+    # bt_bridge. The A2DP source is the one link a soak could never see: when
+    # the phone stops feeding, the hub starves and the bridge said nothing at
+    # all until status_led.c was taught to log the gap it already measures.
+    ("audio stopped", "audio_gap"),
+    ("audio resumed", "audio_gap"),
+    ("queue full:", "bridge_drop"),
+    ("payload past the link ceiling:", "bridge_drop"),
+    ("hub never raised the handshake:", "bridge_drop"),
+    ("track change (#", "bridge_track"),
 ]
 
 # Numbers the generic scan cannot see, because the figure comes before the word.
@@ -141,6 +150,20 @@ EXTRA = {
     "health":     [(re.compile(r"\((\d+) refused\)"), "retunes_refused")],
     "divergence": [(re.compile(r"->\s*([+-]?\d+) ms apart"), "apart_ms")],
     "servo":      [(re.compile(r"\((\d+) frames/s\)"), "frames_per_s")],
+
+    # bt_bridge's lines all put the number where the generic scan cannot reach
+    # it: behind a colon, or before the noun it counts. That is the case this
+    # table exists for.
+    #
+    # `audio-gap-ms` is the one that matters. It is the length of a silence the
+    # bridge saw on its own A2DP input, so a hub-side under-delivery with a gap
+    # here is the phone, and one without is this side of the radio.
+    "audio_gap":    [(re.compile(r"resumed after (\d+) ms"), "audio-gap-ms"),
+                     (re.compile(r"last packet (\d+) ms ago"), "audio-stopped-ms")],
+    # "queue full: 12 dropped (+3)" -- the total, not the delta, so it stays a
+    # counter across a run rather than a series of increments.
+    "bridge_drop":  [(re.compile(r":\s*(\d+) dropped"), "bridge-dropped")],
+    "bridge_track": [(re.compile(r"#(\d+)"), "bridge-track-id")],
 }
 
 # Lines that mark a moment rather than measure one. Kept whole in events.csv.
@@ -490,10 +513,21 @@ def main():
     ap = argparse.ArgumentParser(
         description="Capture every unit's console to CSV for a soak run.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="example:\n"
-               "  %(prog)s --unit hub=/dev/ttyUSB0:921600 --unit sat=/dev/ttyUSB1\n\n"
+        epilog="example, all four boards:\n"
+               "  %(prog)s \\\n"
+               "    --unit hub=/dev/serial/by-id/usb-FTDI_...-if00-port0:921600 \\\n"
+               "    --unit bt_bridge=/dev/serial/by-id/usb-Silicon_Labs_... \\\n"
+               "    --unit sat_classic=/dev/ttyUSB0 --unit sat_s3=/dev/ttyACM0\n\n"
+               "CAPTURE bt_bridge. It is the A2DP source's only witness, and two\n"
+               "soaks were read without it: the hub starved, the timeline jumped,\n"
+               "and nothing could say whether the phone had stopped sending or the\n"
+               "bridge had failed to forward. status_led.c logs the audio gap and\n"
+               "sbc_spi.c the drops, but only onto that board's own console.\n\n"
+               "by-id paths, not /dev/ttyUSB0: the hub and one satellite are both\n"
+               "USB-serial and swap numbers between plugs, which relabels a whole\n"
+               "run silently.\n\n"
                "The hub's console is 921600 in this repo's sdkconfig.defaults, on a\n"
-               "custom UART; the satellite and bridge are the IDF default 115200.\n"
+               "custom UART; the satellites and bridge are the IDF default 115200.\n"
                "Reading a board at the wrong baud prints garbage, not an error.")
     ap.add_argument("--unit", action="append", metavar="NAME=PORT[:BAUD]",
                     help="repeatable, one per board: hub=/dev/ttyUSB0:921600")
