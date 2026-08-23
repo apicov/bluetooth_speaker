@@ -33,9 +33,19 @@
  *        each assertion, so nothing accumulates across frames -- the worst a
  *        clock difference can cost is one frame, and the CRC catches that one.
  *
- * That is an argument, not a measurement. `crc` in the sbc_in stats line is
- * what tests it, and it is expected to sit at 0. If it does not, this paragraph
- * is what was wrong.
+ * That was an argument, not a measurement, and it said so: `crc` in the sbc_in
+ * stats line was what would test it.
+ *
+ * IT HAS NOW BEEN MEASURED, and the argument holds. Across nine soak sessions
+ * on 2026-08-22 and 23, roughly 25 hours and some three million packets, the
+ * hub reported `hdr 0 crc 0 short 0` in every window of every run -- not one
+ * bad header, not one CRC failure, not one CS-split transfer. The transactional
+ * framing does what this paragraph claimed it would.
+ *
+ * What that does NOT cover is packets that never arrive at all: `gaps` is
+ * non-zero in every one of those runs, and the frames it is missing were lost
+ * before the wire, not on it. See sbc_in.c's `lost` counter, which says how
+ * many, and the three counters in bt_bridge/main/sbc_spi.c, which say whose.
  */
 #pragma once
 

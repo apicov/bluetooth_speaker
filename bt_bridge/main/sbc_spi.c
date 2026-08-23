@@ -1,6 +1,7 @@
 #include "sbc_spi.h"
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -59,9 +60,30 @@
  */
 #define HANDSHAKE_TIMEOUT_MS 100
 
-/* ~10 A2DP packets. Dropping here is better than stalling Bluetooth, and the
- * seq field means the hub can see it happened. */
-#define QUEUE_BYTES (SBC_LINK_MAX_PAYLOAD * 10)
+/*
+ * Dropping here is better than stalling Bluetooth, and the seq field means the
+ * hub can see it happened.
+ *
+ * Sized in units of the CEILING (2048) rather than of a real packet, so the
+ * name understates it: a phone sends ~833 bytes at 50 packets/s, and with the
+ * ring item overhead that is ~24 packets per 10 units, about 480 ms of audio.
+ * Raised from 10 to 20, so ~1 s.
+ *
+ * WHAT IT DOES AND DOES NOT BUY, because the arithmetic is not obvious. The
+ * ring does not simply fill when the hub goes away: wait_for_handshake() gives
+ * up after HANDSHAKE_TIMEOUT_MS and DISCARDS the head packet, so during a stall
+ * the ring drains at ~10/s while A2DP fills at ~50/s. It therefore only
+ * overflows after ~600 ms of continuous hub unavailability -- 1.2 s now -- and
+ * by then s_stalled has already counted several drops. Deeper helps a burst;
+ * it does not help a hub that is not listening.
+ *
+ * RAISED BEFORE THE MEASUREMENT THAT WOULD JUSTIFY IT, deliberately and at the
+ * cost of one confounded run. The hub reports "gaps N (lost M)" and this board
+ * now reports which of its counters moved, but no soak has yet been read with
+ * both. So if the next quiet run is taken as proof this was the fault, it is
+ * not: s_dropped moving is the only thing that would say so.
+ */
+#define QUEUE_BYTES (SBC_LINK_MAX_PAYLOAD * 20)
 
 static const char *TAG = "sbc_spi";
 
@@ -81,10 +103,25 @@ static struct {
     uint8_t payload[SBC_LINK_MAX_PAYLOAD];
 } s_pkt;
 
-static uint32_t s_seq;
+/*
+ * Atomic because it is incremented from TWO task contexts, which is easy to
+ * miss: the Bluetooth stack's, through sbc_link_send() and
+ * sbc_link_send_meta(), and the esp_timer task's, through sbc_link_send_vol()
+ * from vol_heartbeat_cb() in avrcp_meta.c. On a dual-core part those genuinely
+ * interleave, and a lost increment hands two frames the same number.
+ *
+ * LATENT, NOT OBSERVED, and worth saying so plainly: the collision window is a
+ * few instructions against a 5 s heartbeat, order 1e-4 per hour. It is NOT the
+ * cause of the ~3-per-window sequence gaps this link has always shown, and
+ * anyone reading this while chasing those should keep looking. The hub survives
+ * it either way -- it resyncs expect_seq, and its `lost` counter takes only
+ * forward jumps -- so this is correctness, not a repair.
+ */
+static _Atomic uint32_t s_seq;
 static uint32_t s_dropped;
 static uint32_t s_oversize;
 static uint32_t s_stalled;
+static uint32_t s_txerr;
 
 void sbc_link_send(const uint8_t *sbc, uint16_t len)
 {
@@ -230,42 +267,69 @@ static void report_when_moved(const char *what, uint32_t count,
     }
 }
 
+/*
+ * How long to park waiting for a packet before going round anyway.
+ *
+ * NOT idleness, and not a poll: it is what keeps the reports at the bottom of
+ * the loop running when the source has stopped. They used to sit behind a
+ * portMAX_DELAY receive, so drops went unprinted for as long as the phone
+ * stayed quiet -- which is exactly the window an A2DP dropout is investigated
+ * in. sbc_in.c on the hub solved the same problem the same way and says so.
+ */
+#define TX_IDLE_TICK_MS 500
+
 static void tx_task(void *arg)
 {
-    static uint32_t last_dropped, last_oversize, last_stalled;
-    static int64_t dropped_at, oversize_at, stalled_at;
+    static uint32_t last_dropped, last_oversize, last_stalled, last_txerr;
+    static int64_t dropped_at, oversize_at, stalled_at, txerr_at;
 
     while (1) {
         size_t len = 0;
-        uint8_t *item = (uint8_t *)xRingbufferReceive(s_ring, &len, portMAX_DELAY);
-        if (!item) {
-            continue;
+        uint8_t *item = (uint8_t *)xRingbufferReceive(s_ring, &len,
+                                                      pdMS_TO_TICKS(TX_IDLE_TICK_MS));
+        if (item) {
+            /*
+             * Already framed by sbc_link_send(); pad it out to the fixed size
+             * the hub has armed a buffer for. The pad carries nothing --
+             * hdr.len says where the real bytes stop and the CRC covers only
+             * those -- it exists so that neither end has to learn the other's
+             * intentions before the transfer starts.
+             */
+            memcpy(s_frame, item, len);
+            memset(s_frame + len, 0, SBC_LINK_FRAME_BYTES - len);
+            vRingbufferReturnItem(s_ring, item);
+
+            if (wait_for_handshake()) {
+                spi_transaction_t t = {
+                    .length = SBC_LINK_FRAME_BYTES * 8,
+                    .tx_buffer = s_frame,
+                };
+                /*
+                 * COUNTED, not ESP_ERROR_CHECK. This used to abort, which took
+                 * the whole bridge down and silenced every speaker in the room
+                 * for a transient on one transfer -- the harshest response on a
+                 * link where every other failure is counted and survived
+                 * (oversize, queue full, a hub that never raises the
+                 * handshake). One lost frame is a hole the hub already sees as
+                 * a sequence gap; a reboot is a hole plus a reconnect.
+                 */
+                const esp_err_t err = spi_device_transmit(s_spi, &t);
+                if (err != ESP_OK) {
+                    s_txerr++;
+                }
+            }
         }
 
         /*
-         * Already framed by sbc_link_send(); pad it out to the fixed size the
-         * hub has armed a buffer for. The pad carries nothing -- hdr.len says
-         * where the real bytes stop and the CRC covers only those -- it exists
-         * so that neither end has to learn the other's intentions before the
-         * transfer starts.
+         * Outside the `if`, so they still print when nothing is arriving. The
+         * receive above times out for this reason.
          */
-        memcpy(s_frame, item, len);
-        memset(s_frame + len, 0, SBC_LINK_FRAME_BYTES - len);
-        vRingbufferReturnItem(s_ring, item);
-
-        if (wait_for_handshake()) {
-            spi_transaction_t t = {
-                .length = SBC_LINK_FRAME_BYTES * 8,
-                .tx_buffer = s_frame,
-            };
-            ESP_ERROR_CHECK(spi_device_transmit(s_spi, &t));
-        }
-
         report_when_moved("queue full", s_dropped, &last_dropped, &dropped_at);
         report_when_moved("payload past the link ceiling", s_oversize,
                           &last_oversize, &oversize_at);
         report_when_moved("hub never raised the handshake", s_stalled,
                           &last_stalled, &stalled_at);
+        report_when_moved("SPI transmit failed", s_txerr, &last_txerr, &txerr_at);
     }
 }
 

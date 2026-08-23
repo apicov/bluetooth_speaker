@@ -68,6 +68,22 @@ static spi_slave_transaction_t s_trans[NFRAMES];
  * that audio_in.c needed -- with no shared clock there is no rate to measure,
  * so what matters now is whether packets arrive intact. */
 static uint32_t s_packets, s_bad_hdr, s_bad_crc, s_short, s_gaps, s_decode_err, s_dec_crc;
+/*
+ * How many packets the gaps above actually cost.
+ *
+ * `s_gaps` counts EVENTS: expect_seq resyncs to whatever arrived, so one lost
+ * packet and a thousand lost packets both read as 1. That hid the shape of the
+ * only fault this link has ever shown. Across nine soaks and ~25 hours the
+ * distribution of per-window gap counts was
+ *
+ *     {1:1, 2:1, 3:708, 5:1, 6:1, 8:1, 23:1, 24:1, 25:1}
+ *
+ * -- 708 windows of EXACTLY three, in every run, on both A-MPDU settings, not
+ * periodic and not track-driven. Systematic, and unattributable, because
+ * "gaps 3" is the same line whether three packets went missing or three bursts
+ * of hundreds did. This is the number that tells those apart.
+ */
+static uint32_t s_lost;
 /* Volume frames taken, REPEATS INCLUDED -- the bridge re-states the level on a
  * timer, so a link that is dropping them reads as this sitting still while the
  * phone is plainly being used. Here rather than in hub.h with the streamer's
@@ -87,13 +103,25 @@ static uint64_t s_pcm_samples;
  * -126734 us, and drift accounted for 7% of it. The remaining ~118 ms was a
  * pause in delivery, and no instrument on this board could see one.
  *
- * A2DP packets arrive ~23/s, so ~43 ms apart -- but that is the AVERAGE, and
+ * A2DP packets arrive ~50/s, so ~20 ms apart -- but that is the AVERAGE, and
  * the first run with this counter showed the truth: every 5 s window contains a
  * gap of 79 to 112 ms, median 100. The source has always delivered in bursts,
  * and nothing here could see it.
  *
- * GAP_ALARM_US therefore sits above that, not at it. 100 ms was the first guess
- * and it alarmed on every window, which is no alarm at all.
+ * THIS LINE READ "~23/s, so ~43 ms apart" and the rate was wrong, which matters
+ * because GAP_ALARM_US is argued from it. s_packets counts audio frames only --
+ * META and VOL branch away above it -- and the window below is a fixed 5 s, so
+ * the ~250 every capture shows is ~50/s. It cross-checks against the codec:
+ * 44100 Hz over 128 samples per SBC frame is ~345 frames/s, and a phone packing
+ * ~7 frames per packet gives ~49/s.
+ *
+ * GAP_ALARM_US is unaffected and stays at 150 ms. It was chosen against the
+ * MEASURED spread -- 79 to 112 ms, median 100 -- and not against the mean
+ * spacing, so correcting the mean does not move it. If anything the correction
+ * strengthens it: at 20 ms nominal, a 100 ms burst gap is five packets' worth
+ * of clumping rather than two, so the alarm sits further above the noise than
+ * the old number implied. 100 ms was the first guess and it alarmed on every
+ * window, which is no alarm at all.
  */
 static int64_t s_last_pkt_us;
 static uint32_t s_max_gap_us;
@@ -195,6 +223,18 @@ static void rx_task(void *arg)
 
             if (have_seq && hdr.seq != expect_seq) {
                 s_gaps++;
+                /*
+                 * SIGNED, and that is the whole subtlety. A seq that went
+                 * BACKWARDS -- repeated or reordered -- is a negative step, and
+                 * on unsigned arithmetic it would read as four billion lost and
+                 * swamp the counter for the rest of the window. The bridge can
+                 * produce one: its s_seq++ is reachable from two tasks. Only a
+                 * forward jump is loss.
+                 */
+                const int32_t ahead = (int32_t)(hdr.seq - expect_seq);
+                if (ahead > 0) {
+                    s_lost += (uint32_t)ahead;
+                }
             }
             expect_seq = hdr.seq + 1;
             have_seq = true;
@@ -407,12 +447,13 @@ rearm:
                 }
                 ESP_LOGI(TAG, "pkts %" PRIu32 " | %" PRIu32 " Hz x%u | eff %" PRIu32 " Hz | "
                               "hdr %" PRIu32 " crc %" PRIu32 " short %" PRIu32
-                              " gaps %" PRIu32 " dec %" PRIu32 " dcrc %" PRIu32
+                              " gaps %" PRIu32 " lost %" PRIu32
+                              " dec %" PRIu32 " dcrc %" PRIu32
                               " | vol %" PRIu32
                               " | fed-drop %" PRIu32 " B | max gap %" PRIu32 " us",
                          s_packets, info.sample_rate, info.channels, eff,
-                         s_bad_hdr, s_bad_crc, s_short, s_gaps, s_decode_err,
-                         s_dec_crc, s_vol, dropped, s_max_gap_us);
+                         s_bad_hdr, s_bad_crc, s_short, s_gaps, s_lost,
+                         s_decode_err, s_dec_crc, s_vol, dropped, s_max_gap_us);
             }
             s_pcm_samples = 0;
             /*
@@ -441,6 +482,7 @@ rearm:
             /* Per-window, not cumulative: a rising total tells you far less than
              * a rate, and cumulative counters made 500 k look worse than it was. */
             s_packets = s_bad_hdr = s_bad_crc = s_short = s_gaps = s_decode_err = s_dec_crc = 0;
+            s_lost = 0;
             s_vol = 0;
             s_max_gap_us = 0;
             next_report = now + 5000000;
