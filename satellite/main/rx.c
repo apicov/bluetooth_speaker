@@ -909,8 +909,35 @@ static void fec_hold_abandon(void)
     }
 }
 
-/* Everything the FEC layer knows, thrown away. Called when the stream resyncs:
- * the group it was accumulating belongs to a timeline that no longer exists. */
+/*
+ * Whether a packet may be held or delivered at all.
+ *
+ * BOTH HALVES, and they are not the same condition. have_seq says this receiver
+ * knows where it is in the sequence; stream_start_local says there is a timeline
+ * to play against. Only rx.c clears the first, but play.c zeroes the second on
+ * its own -- on an underrun and on a resync -- without touching have_seq at all.
+ *
+ * A hold that outlived that would resolve into a stream that no longer exists:
+ * fec_hold_abandon() would write concealment and flush its held packets into a
+ * ring the anchor path is about to reset, and if anchor_stream() then REFUSED
+ * the packet -- which it does while resync_request is set, while the estimator
+ * settles, and through an ANCHOR_MIN_LEAD_US refusal streak -- into a ring
+ * nothing resets at all. The stale audio would be discarded soon enough; the
+ * phase points pushed beside it carry a play_at from before the stall, and the
+ * playback task measures against those.
+ *
+ * So the hold's lifetime is exactly the anchor gate's, and this is the one place
+ * that says so. It is deliberately the same test handle_audio() applies two
+ * lines further down before calling anchor_stream().
+ */
+static bool fec_stream_ready(void)
+{
+    return have_seq && stream_start_local != 0;
+}
+
+/* Everything the FEC layer knows, thrown away. Called when the stream is not in
+ * a state a hold can resolve into: the group it was accumulating belongs to a
+ * timeline that no longer exists. */
 static void fec_reset(void)
 {
     if (s_hold.active) {
@@ -1035,6 +1062,18 @@ static void fec_parity_rx(const audio_fec_msg_t *fm, int n)
     n_fec_parity_rx++;
 
     /*
+     * The second gate, and it is not reachable from the first: a parity can
+     * repair a loss and deliver a packet without any audio datagram passing
+     * through handle_audio() in between, so the check there does not cover this
+     * path. Same condition, same reason -- fec_repair() ends in audio_deliver(),
+     * and that must not write into a stream that is not there.
+     */
+    if (!fec_stream_ready()) {
+        fec_reset();
+        return;
+    }
+
+    /*
      * Trusted only if all of it agrees: the sender's K, a span that covers at
      * least a bare header and no more than a codeword, a datagram long enough to
      * hold what it claims, and the group this receiver actually accumulated.
@@ -1047,7 +1086,7 @@ static void fec_parity_rx(const audio_fec_msg_t *fm, int n)
         fm->span <= (uint16_t)AUDIO_FEC_CODEWORD_MAX &&
         fm->span >= s_fec_span &&
         n >= (int)AUDIO_FEC_MSG_BYTES(fm->span) &&
-        have_seq && s_fec_open && s_fec_ok && fm->base_seq == s_fec_base;
+        s_fec_open && s_fec_ok && fm->base_seq == s_fec_base;
 
     if (usable) {
         const uint8_t full = (uint8_t)((1u << FEC_K) - 1u);
@@ -1153,9 +1192,12 @@ static void handle_audio(const audio_msg_t *msg, int64_t arrived_at)
      * leaves have_seq in its final state before anchor_stream() reads it, so
      * the packet lands in exactly one of the two paths rather than being
      * sequenced against a stream that is about to be rebuilt.
+     *
+     * The test is fec_stream_ready() rather than have_seq alone, and it must
+     * stay the same test the anchor gate below applies -- see the note on it.
      */
-    if (!have_seq) {
-        fec_reset();          /* a resync: the open group is a dead timeline's */
+    if (!fec_stream_ready()) {
+        fec_reset();          /* nothing a hold could resolve into */
     }
     if (s_hold.active) {
         if (fec_hold_offer(msg)) {
