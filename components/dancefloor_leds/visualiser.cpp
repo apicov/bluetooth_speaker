@@ -1348,6 +1348,43 @@ void render_task(void *arg)
             s_latch.flush();
             std::memset(pixels, 0, sizeof(pixels));
             show(pixels);
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+            /*
+             * ... and the second this pin last fired on, for the same reason.
+             *
+             * last_flash_sec is a MASTER second, and the arming test below only
+             * arms a second LATER than it. A flush says the timeline those
+             * seconds were counted on has been replaced -- and when the
+             * replacement is a hub that has just rebooted, the new timeline
+             * starts near zero, so every second the frames name is smaller than
+             * this and NOTHING is ever armed again. The strip recovers with the
+             * queue above; the marker stayed dark until the satellite itself was
+             * rebooted.
+             *
+             * This is the reset the declaration warns off -- "resetting it on
+             * idle would re-open exactly that hole" -- and the warning is about
+             * IDLE, which is a stream that stopped on a timeline still running.
+             * A flush is the other thing: the timeline is gone, so the late
+             * frame this guard exists to refuse cannot arrive, and the value
+             * guarding against it is meaningless.
+             *
+             * Any armed edge goes with it, for the reason the idle path drops
+             * one: it names a local instant computed through an offset that is
+             * being re-seeded, and firing it would pulse the pin against the
+             * old clock. The pin is then written rather than left, because
+             * dropping lower_at is dropping the only thing that would have
+             * ended a flash in progress -- the strip would go dark under a
+             * marker stuck on.
+             *
+             * Dark on a unit that was drawing, which is where the flashes
+             * resume from; the link level on one already idle, which is what
+             * the idle path below would re-assert anyway.
+             */
+            last_flash_sec = -1;
+            flash_at = 0;
+            lower_at = 0;
+            marker_write(marker_idle ? marker_idle_level() : LED_MARKER_OFF);
+#endif
         }
 
 #if !DF_ANALYSES_AUDIO

@@ -110,7 +110,28 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
     if (flux <= threshold) {
         return false;
     }
-    if (now_us - d->last_onset_us < d->refractory_us) {
+    /*
+     * The refractory window, and the one case where it must not apply.
+     *
+     * now_us is MASTER time -- the hub's esp_timer, which counts from the hub's
+     * boot. Reset the hub and it restarts near zero, so every frame that
+     * follows names an instant hours BEFORE the last onset this detector fired
+     * on. The subtraction then goes large and negative, which is smaller than
+     * any refractory, and the gate below swallows every onset for as long as it
+     * takes master time to climb back past the old value: the strip stops
+     * following the music until the satellite itself is rebooted, which is
+     * exactly the fault this handles.
+     *
+     * A negative interval is not a short one. It says the timeline restarted
+     * under us, so the stored instant belongs to a clock that no longer exists
+     * and is dropped rather than compared against. Not init(): the flux history
+     * is still about the same audio and still valid -- see the class comment on
+     * RemoteDetect for why the reset points matter.
+     */
+    const int64_t since_onset = now_us - d->last_onset_us;
+    if (since_onset < 0) {
+        d->last_onset_us = INT64_MIN / 2;   /* as init() leaves it */
+    } else if (since_onset < d->refractory_us) {
         return false;
     }
 

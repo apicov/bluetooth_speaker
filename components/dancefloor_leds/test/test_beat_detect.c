@@ -246,6 +246,91 @@ int main(void)
         check("a raised floor still finds large rises", hits >= strokes - 2, d);
     }
 
+    /*
+     * The hub reboots and master time restarts near zero.
+     *
+     * now_us is the hub's clock, so every frame after such a reset names an
+     * instant far BEFORE the last onset this detector fired on. A refractory
+     * gate that only asks "is the interval smaller than the window" reads that
+     * negative interval as too soon and swallows every onset until master time
+     * climbs back past the old value -- an hour of dark strips on a satellite
+     * that is otherwise playing audio perfectly, ended only by rebooting the
+     * satellite. That was the fault; this is the test that says it is gone.
+     */
+    {
+        beat_det_t d; beat_det_init(&d);
+        float band[BEAT_BANDS] = {0};
+        int before = 0, after = 0;
+
+        /* An hour into the hub's uptime, kicks at 120 BPM. */
+        const int64_t hub_up_us = 3600LL * 1000000LL;
+        for (int i = 0; i < 400; i++) {
+            const int since = i % FRAMES_PER_BEAT_120;
+            kick_frame(band, since, 0.6f);
+            float s;
+            if (beat_det_update(&d, band, hub_up_us + (int64_t)i * HOP_US, &s)) {
+                before++;
+            }
+        }
+
+        /* The hub reboots. Same audio, same detector, timeline back at zero. */
+        for (int i = 0; i < 400; i++) {
+            const int since = i % FRAMES_PER_BEAT_120;
+            kick_frame(band, since, 0.6f);
+            float s;
+            if (beat_det_update(&d, band, (int64_t)i * HOP_US, &s)) {
+                after++;
+            }
+        }
+
+        char det[80];
+        snprintf(det, sizeof det, "%d onsets before the reset, %d after",
+                 before, after);
+        check("a timeline restart does not deafen the detector",
+              before > 5 && after >= before - 1, det);
+    }
+    {
+        /* ... and the window is not simply disarmed by it: once the new
+         * timeline is running, two kicks inside the refractory period are still
+         * one onset. A backwards jump is a discontinuity to absorb, not a
+         * licence to fire twice. */
+        beat_det_t d; beat_det_init(&d);
+        float band[BEAT_BANDS] = {0};
+        for (int i = 0; i < 200; i++) {
+            kick_frame(band, i % FRAMES_PER_BEAT_120, 0.6f);
+            float s;
+            beat_det_update(&d, band, 3600LL * 1000000LL + (int64_t)i * HOP_US, &s);
+        }
+        int hits = 0;
+        int64_t prev = 0, closest = -1;
+        for (int i = 0; i < 200; i++) {
+            /* A rise every other frame -- 23 ms apart, so five times faster
+             * than BEAT_REFRACTORY_US allows. Alternating rather than held,
+             * because flux is a RISE: a band pinned high produces none, and a
+             * gate that had stopped working would still read as quiet. */
+            kick_frame(band, (i % 2) ? -1 : 0, 0.6f);
+            const int64_t t = (int64_t)i * HOP_US;
+            float s;
+            if (!beat_det_update(&d, band, t, &s)) {
+                continue;
+            }
+            /* The SPACING, not the count. A count is the wrong instrument here:
+             * the adaptive threshold rejects most of these rises on its own, so
+             * a detector with no refractory at all still comes in under any
+             * count this could plausibly allow. What only the gate can promise
+             * is that no two onsets land closer together than the window. */
+            if (hits++ && (closest < 0 || t - prev < closest)) {
+                closest = t - prev;
+            }
+            prev = t;
+        }
+        char det[96];
+        snprintf(det, sizeof det, "%d onsets, closest pair %lld us, window %d us",
+                 hits, (long long)closest, BEAT_REFRACTORY_US);
+        check("the refractory window survives the restart",
+              hits > 1 && closest >= BEAT_REFRACTORY_US, det);
+    }
+
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");
     return failures != 0;
 }
