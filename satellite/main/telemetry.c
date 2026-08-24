@@ -278,12 +278,42 @@ void telemetry_tick(void)
      * classifies on a literal prefix. The two windows are the same window and
      * are labelled the same way.
      */
+    /*
+     * THE DOWNLINK, WHICH NOTHING MEASURED UNTIL NOW.
+     *
+     * The hub prints `rssi-min`, and that is esp_wifi_ap_get_sta_list() -- the
+     * signal it HEARS FROM us. It says nothing about the signal we hear from
+     * IT, and the two are only equal if both ends are healthy. Every soak on
+     * file has therefore measured one direction and assumed the other.
+     *
+     * It matters because of what the 2026-08-24 run could not decide. Frames
+     * are held and released in bursts with ZERO final ack failures across
+     * 3,003,948 of them, and a chain of retries that all SUCCEED looks exactly
+     * like that while holding a transmit buffer the whole time. A weak or
+     * mismatched antenna on the hub would do it, and the hub's own -37 dBm
+     * cannot rule it out -- that is the uplink.
+     *
+     * Read as a PAIR against the hub's rssi-min for the same minute. Antenna
+     * gain is reciprocal, so a healthy link reads roughly symmetric; a
+     * persistent gap between the two is a fault in one end's transmit chain
+     * rather than in the air between them.
+     *
+     * Text, not a number, so a failed read cannot be mistaken for 0 dBm --
+     * the same rule lead-min and ring-low on this line already follow.
+     */
+    wifi_ap_record_t ap;
+    char rssi_s[16];
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        snprintf(rssi_s, sizeof(rssi_s), "%d dBm", (int)ap.rssi);
+    } else {
+        snprintf(rssi_s, sizeof(rssi_s), "none");
+    }
     ESP_LOGW(TAG, "ARRIVAL 5s: pkts %" PRIu32 " | gap-max %ld ms | "
                   "burst-max %" PRIu32 " | lead-min %s | lead-drop %" PRIu32
-                  " | ring-low %s | starved %" PRIu32 " ms",
+                  " | ring-low %s | starved %" PRIu32 " ms | hub-rssi %s",
              audio_rx_now - audio_rx_told,
              (long)(gap_max / 1000), burst_max, lead_s,
-             lead_insane_now - lead_insane_told, ring_s, starved_ms);
+             lead_insane_now - lead_insane_told, ring_s, starved_ms, rssi_s);
     audio_rx_told = audio_rx_now;
     starve_told = starve_now;
     lead_insane_told = lead_insane_now;

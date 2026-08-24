@@ -582,6 +582,48 @@ def main():
                   " failure. Both look like this.")
         print()
 
+    # ------------------------------------------------------------------------
+    # THE LINK, IN BOTH DIRECTIONS.
+    #
+    # The hub's rssi-min is what it HEARS FROM the satellites (uplink); the
+    # satellites' hub-rssi is what they hear from IT (downlink). Antenna gain
+    # is reciprocal, so on a healthy pair of radios these read roughly
+    # symmetric. A persistent gap is a transmit-chain fault at the weaker end,
+    # and it is the one thing txdone-fail cannot see: a chain of retries that
+    # all SUCCEED holds a buffer for its whole length and never counts.
+    # ------------------------------------------------------------------------
+    up = gauge(met, "hub", "status", "rssi-min")
+    downs = {u: gauge(met, u, "arrival", "hub-rssi") for u in units if u != "hub"}
+    downs = {u: d for u, d in downs.items() if d is not None and not d.empty}
+    if up is not None and not up.empty and downs:
+        head("LINK  (uplink vs downlink -- a gap is one end's transmit chain)")
+        u_med = up["value"].median()
+        print(f"  uplink   hub hears satellites   median {u_med:6.0f} dBm"
+              f"   min {up['value'].min():.0f}")
+        worst = 0.0
+        for u, d in sorted(downs.items()):
+            d_med = d["value"].median()
+            worst = max(worst, u_med - d_med)
+            print(f"  downlink {u:12s} hears hub  median {d_med:6.0f} dBm"
+                  f"   min {d['value'].min():.0f}   asymmetry {u_med - d_med:+.0f} dB")
+        print()
+        if worst >= 10:
+            print(f"  ** {worst:.0f} dB ASYMMETRIC -- the satellites hear the hub much more"
+                  f" faintly than it hears them.")
+            print("     Reciprocity says a shared path cannot do that, so it is the HUB'S"
+                  " TRANSMIT chain:")
+            print("     antenna mismatch/VSWR, a bad u.FL seat, or the wrong"
+                  " antenna-select resistor.")
+        elif worst >= 5:
+            print(f"  {worst:.0f} dB of asymmetry -- suggestive but within what different"
+                  " radios and placements give.")
+            print("  Worth a second run before reading anything into it.")
+        else:
+            print("  Symmetric within a few dB: both transmit chains look healthy, and a"
+                  " hub antenna fault")
+            print("  is NOT the explanation for held frames. Look past the radio.")
+        print()
+
     # ---- 7. the hub's refused sends -----------------------------------------
     #
     # DELIVERY above says a hole was held AFTER sendto. This says whether the
