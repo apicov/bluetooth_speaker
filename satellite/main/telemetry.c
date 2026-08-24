@@ -338,7 +338,7 @@ void telemetry_tick(void)
                       " anchors %" PRIu32 " splices %" PRIu32 " retunes %" PRIu32
                       " (%" PRIu32 " refused) | gaps %" PRIu32 " (%" PRIu32
                       " short, %" PRIu32 " too big) ring-full %" PRIu32 " upgrades %" PRIu32 " anchors-refused %" PRIu32
-                      " | wifi-drops %" PRIu32
+                      " | wifi-drops %" PRIu32 " (no-lease %" PRIu32 ")"
                       " | alloc-fail %" PRIu32
                       " | clock %s (tsf %" PRIu32 "/probe %" PRIu32
                       ", wide-span %" PRIu32 ")"
@@ -355,7 +355,8 @@ void telemetry_tick(void)
                  hw_play, hw_drift, n_underruns, n_reanchors, n_splices,
                  n_retunes, n_retunes_bad, n_gaps, n_gap_short, n_gap_resyncs, n_ring_full,
                  n_anchor_upgrades,
-                 n_anchor_late + n_anchor_soon, n_wifi_drops, n_alloc_fail,
+                 n_anchor_late + n_anchor_soon, n_wifi_drops, n_wifi_lease_fail,
+                 n_alloc_fail,
                  tsf_fresh(esp_timer_get_time(), NULL) ? "TSF" : "probe",
                  n_tsf_used, n_tsf_fallback, n_tsf_wide,
                  n_phase_drop, n_short_reads, n_short_frames,

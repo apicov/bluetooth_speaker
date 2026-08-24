@@ -24,7 +24,9 @@
  *   drift_task  writes the servo's own state, rate_trim_hz, the retune_* set
  *               and the windowed heap figures, and READS everything else in
  *               order to report it.
- *   wifi_event  writes n_wifi_drops, wifi_down_at, rejoined_at.
+ *   wifi_event  writes n_wifi_drops, wifi_down_at, rejoined_at and net.c's
+ *               own reconnect state, which probe_task reads through
+ *               wifi_retry_tick() -- and which writes n_wifi_lease_fail.
  *
  * `volatile` here means "another task writes this", not "this is atomic". A
  * 64-bit load is two instructions on this CPU, so a reader can catch half of a
@@ -514,6 +516,20 @@ extern volatile uint32_t n_seq_dropped;
 extern volatile uint32_t n_decode_err;
 extern volatile uint32_t n_recv_err;
 extern volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
+/*
+ * Associations that never produced a DHCP lease, and were torn down for it.
+ *
+ * Separate from n_wifi_drops because the two say opposite things about where to
+ * look. A drop is the radio losing a link it had; this is the radio perfectly
+ * happy with a link that is useless -- associated, no address, probes going
+ * nowhere. It is the fault WIFI_LEASE_TIMEOUT_US exists to end, and if it ever
+ * climbs the question is the hub's DHCP server, not the air.
+ *
+ * Each one is followed by a disconnect this unit asked for, so n_wifi_drops
+ * counts it too. Reading them together is the point: drops well above lease
+ * failures is an ordinary flaky link, drops tracking them one for one is this.
+ */
+extern volatile uint32_t n_wifi_lease_fail;
 /*
  * The receive path's own instruments, counted here rather than logged there.
  *
@@ -1062,6 +1078,11 @@ extern volatile bool playing;
 /* net.c -- joining the AP, and the socket everything rides on */
 void wifi_start_sta(void);
 void socket_start(void);
+/* Re-ask for the association when the backoff since the last drop is up. Must
+ * be called periodically or a disconnected unit never comes back; the probe
+ * task carries it. See wifi_retry_tick() for why it is not a task of its own
+ * and not the vTaskDelay in the event handler it replaced. */
+void wifi_retry_tick(void);
 
 /* out.c -- the I2S channel, the write path, and retuning its clock */
 void i2s_start(uint32_t rate);

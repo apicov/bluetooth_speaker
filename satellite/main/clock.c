@@ -49,6 +49,20 @@ void probe_task(void *arg)
     uint32_t seq = 0;
 
     while (1) {
+        /*
+         * The reconnect, riding this loop's period.
+         *
+         * First, before the probe: while the unit is off the air the sendto
+         * below goes nowhere, so getting the association back is the only thing
+         * this task can usefully do with the tick. It is a compare and a return
+         * on a unit that is joined, which is every tick but the ones that matter.
+         *
+         * net.c owns the policy -- when to try and what to wait -- and this only
+         * supplies the heartbeat. See wifi_retry_tick() for why the wait is no
+         * longer taken on the event loop's task.
+         */
+        wifi_retry_tick();
+
         time_msg_t msg = { .type = MSG_TIME_REQ, .seq = seq++, .t1 = esp_timer_get_time() };
         sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&dest, sizeof(dest));
 

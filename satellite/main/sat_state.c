@@ -70,6 +70,7 @@ volatile uint32_t n_seq_dropped;  /* packets older than expected, dropped */
 volatile uint32_t n_decode_err;  /* live-stream SBC frames that would not decode */
 volatile uint32_t n_recv_err;  /* recvfrom() errors */
 volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
+volatile uint32_t n_wifi_lease_fail;  /* associations that never got an address */
 volatile uint32_t n_gap_frames;  /* silence inserted for lost packets */
 volatile uint32_t n_gap_short;  /* gap fills the ring could not take */
 volatile uint32_t n_gap_short_frames;
