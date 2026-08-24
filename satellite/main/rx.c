@@ -802,6 +802,7 @@ static struct {
     uint32_t seq;                    /* the single seq that did not arrive */
     uint32_t frames;                 /* what it was worth, for the fallback fill */
     uint32_t last_seq;               /* newest seq held, for contiguity */
+    int64_t  began_at;               /* local us, for fec_hold_max_us */
     int      n;
     uint16_t len[FEC_HOLD_MAX];
     uint8_t  buf[FEC_HOLD_MAX][AUDIO_FEC_CODEWORD_MAX];
@@ -871,6 +872,23 @@ static bool fec_hold_push(const audio_msg_t *m)
     return true;
 }
 
+/*
+ * How long the hold lasted, folded into the window's maximum.
+ *
+ * Called at BOTH resolutions, because a hold that ends in silence costs the ring
+ * exactly what one that ends in a repair does -- the packets were not written
+ * either way. Measuring only the successful ones would report the cost of the
+ * cases that worked and hide the cases that waited just as long for nothing.
+ */
+static void fec_hold_note_duration(void)
+{
+    const int64_t held = esp_timer_get_time() - s_hold.began_at;
+
+    if (held > 0 && held < INT32_MAX && (int32_t)held > fec_hold_max_us) {
+        fec_hold_max_us = (int32_t)held;
+    }
+}
+
 /* Deliver what was held, in the order it arrived. The repaired packet (or the
  * silence that stood in for it) has already gone in ahead of them. */
 static void fec_hold_flush(void)
@@ -895,6 +913,7 @@ static void fec_hold_abandon(void)
         return;
     }
     n_fec_lost++;
+    fec_hold_note_duration();
     s_hold.active = false;
     fec_group_close();
 
@@ -942,6 +961,7 @@ static void fec_reset(void)
 {
     if (s_hold.active) {
         n_fec_lost++;
+        fec_hold_note_duration();
         s_hold.active = false;
         s_hold.n = 0;
     }
@@ -989,6 +1009,7 @@ static bool fec_hold_begin(const audio_msg_t *msg, uint32_t missing)
     s_hold.active = true;
     s_hold.seq = want;
     s_hold.frames = msg->frames;
+    s_hold.began_at = esp_timer_get_time();
     n_fec_holds++;
     return true;
 }
@@ -1045,7 +1066,10 @@ static bool fec_repair(const audio_fec_msg_t *fm, uint32_t want_seq)
         n_gaps++;
     }
     n_fec_recovered++;
-    s_hold.active = false;
+    if (s_hold.active) {
+        fec_hold_note_duration();
+        s_hold.active = false;
+    }
     fec_group_close();
     audio_deliver((const audio_msg_t *)s_fec_rec);
     fec_hold_flush();

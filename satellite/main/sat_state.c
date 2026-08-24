@@ -92,6 +92,7 @@ volatile uint32_t rx_burst_max;
 volatile int32_t  rx_lead_min_us = ARRIVAL_UNSEEN;
 volatile uint32_t n_lead_insane;
 volatile int32_t  ring_low_ms    = ARRIVAL_UNSEEN;
+volatile int32_t  fec_hold_max_us;
 volatile uint32_t n_trim_drops;
 volatile uint32_t n_trim_dups;
 volatile int32_t  catchup_frames;

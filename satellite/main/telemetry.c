@@ -241,10 +241,12 @@ void telemetry_tick(void)
     const uint32_t burst_max = rx_burst_max;
     const int32_t lead_min = rx_lead_min_us;
     const int32_t ring_low = ring_low_ms;
+    const int32_t hold_max = fec_hold_max_us;
     rx_gap_max_us = 0;
     rx_burst_max = 0;
     rx_lead_min_us = ARRIVAL_UNSEEN;
     ring_low_ms = ARRIVAL_UNSEEN;
+    fec_hold_max_us = 0;
     /*
      * Each starve callback is one DMA descriptor's worth of digital zero, and
      * i2s_start() sets dma_frame_num to AUDIO_FRAMES -- so the count converts
@@ -323,13 +325,22 @@ void telemetry_tick(void)
      */
     static uint32_t fec_parity_told;
     const uint32_t fec_parity_now = n_fec_parity_rx;
+    /*
+     * fec-hold-max sits beside ring-low deliberately. The hold is the only
+     * mechanism in this path that stops writing to the ring on purpose, so if
+     * ring-low has moved since parity was switched on, these two adjacent
+     * figures are what say whether the hold is why. Expect 0 in a window with no
+     * losses, and at most (K-2) packet times -- ~40 ms at K=4 -- in one with.
+     */
     ESP_LOGW(TAG, "ARRIVAL 5s: pkts %" PRIu32 " | fec-parity %" PRIu32
                   " | gap-max %ld ms | "
                   "burst-max %" PRIu32 " | lead-min %s | lead-drop %" PRIu32
-                  " | ring-low %s | starved %" PRIu32 " ms | hub-rssi %s",
+                  " | ring-low %s | fec-hold-max %ld ms"
+                  " | starved %" PRIu32 " ms | hub-rssi %s",
              audio_rx_now - audio_rx_told, fec_parity_now - fec_parity_told,
              (long)(gap_max / 1000), burst_max, lead_s,
-             lead_insane_now - lead_insane_told, ring_s, starved_ms, rssi_s);
+             lead_insane_now - lead_insane_told, ring_s,
+             (long)(hold_max / 1000), starved_ms, rssi_s);
     audio_rx_told = audio_rx_now;
     fec_parity_told = fec_parity_now;
     starve_told = starve_now;

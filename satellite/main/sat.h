@@ -710,6 +710,25 @@ extern volatile uint32_t rx_burst_max;    /* longest run arriving < RX_BURST_US 
 extern volatile int32_t  rx_lead_min_us;  /* least of play_at - arrival, in master us */
 extern volatile uint32_t n_lead_insane;   /* ...and readings refused as not-a-lead */
 extern volatile int32_t  ring_low_ms;     /* shallowest the play task found the ring */
+/*
+ * Longest a packet waited behind a hole for its parity, this window.
+ *
+ * THE ONE NUMBER THE PARITY DESIGN RESTS ON. A loss can only be repaired once
+ * the group's parity arrives, so the receiver holds the packets behind the hole
+ * until it does -- and every claim about whether that is affordable is a claim
+ * about this figure. The arithmetic says (K-2) packet times: ~40 ms at K=4,
+ * against a 350 ms LEAD_US and a 350 ms RING_TARGET_MS.
+ *
+ * A gauge rather than an assertion because the arithmetic assumes the hub sends
+ * parity promptly after the group's last packet, and nothing on this end can
+ * know that it did. Read beside ring-low on the same line: the hold is the one
+ * mechanism in the receive path that deliberately stops writing to the ring, so
+ * if ring-low has moved since parity was switched on, this says whether the hold
+ * is why.
+ *
+ * Zero is the normal reading. A hold only starts when a packet is lost.
+ */
+extern volatile int32_t  fec_hold_max_us;
 
 /*
  * Close enough together to be one release rather than two arrivals.

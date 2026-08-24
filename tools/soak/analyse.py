@@ -638,8 +638,23 @@ def main():
             pct = 100.0 * rec / gaps
             print(f"  {u}: {gaps:,} lost on the air -> {rec:,} rebuilt whole"
                   f" ({pct:.0f}%), {lost:,} left as silence")
+            hm = gauge(met, u, "arrival", "fec-hold-max")
+            hold_s = ""
+            if hm is not None and not hm.empty:
+                # The design's one load-bearing number. (K-2) packet times at
+                # ~20 ms each is what the arithmetic promises; anything far past
+                # it means the hub is not sending parity promptly after the
+                # group's last packet, and the ring depth beside it is paying
+                # for the difference.
+                worst = hm["value"].max()
+                budget = (k_val - 2) * 20 if k_val else None
+                flag = ("   ** past the (K-2) x 20 ms budget **"
+                        if budget and worst > budget * 1.5 else "")
+                hold_s = (f"   longest hold {worst:.0f} ms"
+                          + (f" of ~{budget} ms expected" if budget else "")
+                          + flag)
             print(f"       held {held:,} times   parity received {par_n:,}"
-                  f"   bad {bad}")
+                  f"   bad {bad}{hold_s}")
             if bad:
                 print("       ** fec-bad is not a radio fault. The hub and this"
                       " satellite disagree about the wire or about K;")
