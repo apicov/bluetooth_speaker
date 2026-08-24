@@ -451,6 +451,7 @@ you looked.
 
 | | |
 |---|---|
+| [`docs/wifi.md`](docs/wifi.md) | WiFi from the band up: 802.11 fundamentals, the ESP32 driver and every configuration option, then this link read as a worked example. The only one of these that currently exists. |
 | [`docs/architecture.md`](docs/architecture.md) | The way in. Concepts first, then the system, then the decisions. |
 | [`docs/clock-sync.md`](docs/clock-sync.md) | The sync maths, the phase servo, TSF, measured results. |
 | [`docs/sync-reference.md`](docs/sync-reference.md) | The sync system's functions, messages and every parameter, as tables. Start here to look something up; `clock-sync.md` for why it is that value. |
