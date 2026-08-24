@@ -819,46 +819,76 @@ def main():
     chose = gauge(met, "hub", "other", "chose")
     if chose is not None and not chose.empty:
         head("CHANNEL CHOICE  (the hub's survey against capture.py's sweep)")
-        ch = int(chose["value"].iloc[0])
         cands = [1, 6, 11]
 
-        def rd(unit, name):
+        def near(unit, name, when, tol=5.0):
+            """The value of `name` recorded closest to `when`, within tol seconds.
+
+            PER SURVEY, not per run. A capture can span several boots -- the
+            2026-08-24 13:33 one had two, 57 s apart, that chose DIFFERENT
+            channels -- and a median across them mixes readings from separate
+            measurements of a band that moved in between. That is a wrong
+            answer rather than an imprecise one.
+            """
             g = gauge(met, unit, "other", name)
-            return None if g is None or g.empty else g["value"].median()
+            if g is None or g.empty:
+                return None
+            d = (g["wall_s"] - when).abs()
+            return None if d.min() > tol else g.loc[d.idxmin(), "value"]
 
-        # The hub's own occupancy dwell, when the build that ran had one.
-        busy = {c: rd("hub", f"ch{c}-busy") for c in cands}
-        if any(v is not None for v in busy.values()):
-            print("  hub occupancy dwell (busy = permille of dwell, what decides):")
+        surveys = chose.reset_index(drop=True)
+        for i, row in surveys.iterrows():
+            ch, when = int(row["value"]), row["wall_s"]
+            label = (f"  survey {i + 1} of {len(surveys)}  (+{when - t0:.0f}s)"
+                     if len(surveys) > 1 else "  survey")
+            print(f"{label}   chose ch{ch}")
+            busy = {c: near("hub", f"ch{c}-busy", when) for c in cands}
             for c in cands:
-                f, n = rd("hub", f"ch{c}-frames"), rd("hub", f"ch{c}-noise")
-                mark = "  <- chose" if c == ch else ""
-                print(f"    ch{c:<3} busy {fmt_or(busy[c], '4.0f')}"
-                      f"   frames {fmt_or(f, '5.0f')}"
-                      f"   noise {fmt_or(n, '4.0f')} dBm{mark}")
-        else:
-            print(f"  hub chose ch{ch}  (this build's survey ranked on beacon"
-                  " power only -- no occupancy dwell)")
+                n = near("hub", f"ch{c}-nets", when)
+                mark = "  <-" if c == ch else ""
+                if busy[c] is not None:
+                    f = near("hub", f"ch{c}-frames", when)
+                    print(f"      ch{c:<3} busy {fmt_or(busy[c], '4.0f')}"
+                          f"   frames {fmt_or(f, '5.0f')}"
+                          f"   nets {fmt_or(n, '3.0f')}{mark}")
+                else:
+                    print(f"      ch{c:<3} nets {fmt_or(n, '3.0f')}"
+                          f"   (no occupancy dwell in this build){mark}")
+        if len(surveys) > 1:
+            picks = sorted({int(v) for v in surveys["value"]})
+            if len(picks) > 1:
+                print(f"\n  ** {len(surveys)} surveys in this capture chose DIFFERENT"
+                      f" channels {picks}. **")
+                print("     The band moved between them, or the survey is not"
+                      " reproducible. Either way this")
+                print("     run is not on one channel throughout -- read it per boot"
+                      " segment, not whole.")
 
-        sweep = {c: (rd("air", f"ch{c}-nets"), rd("air", f"ch{c}-dbm")) for c in cands}
+        ran_on = int(surveys["value"].iloc[-1])
+        sweep = {}
+        for c in cands:
+            g = gauge(met, AIR_UNIT, "other", f"ch{c}-nets")
+            gd = gauge(met, AIR_UNIT, "other", f"ch{c}-dbm")
+            sweep[c] = (None if g is None or g.empty else g["value"].median(),
+                        None if gd is None or gd.empty else gd["value"].median())
         if any(n is not None for n, _ in sweep.values()):
             print("\n  capture.py sweep, the receiver that does NOT change between runs:")
             for c in cands:
                 n, d = sweep[c]
-                mark = "  <- hub chose this" if c == ch else ""
+                mark = "  <- ran on this" if c == ran_on else ""
                 print(f"    ch{c:<3} nets {fmt_or(n, '4.0f')}"
                       f"   {fmt_or(d, '5.0f')} dBm{mark}")
-            rank = sorted((n for n, _ in sweep.values() if n is not None))
-            mine = sweep.get(ch, (None, None))[0]
-            if mine is not None and rank and mine == max(rank) and len(rank) > 1:
-                print(f"\n  ** THE HUB CHOSE THE BUSIEST CHANNEL THE SWEEP CAN SEE"
-                      f" (ch{ch}, {mine:.0f} nets). **")
+            counts = [n for n, _ in sweep.values() if n is not None]
+            mine = sweep.get(ran_on, (None, None))[0]
+            if mine is not None and len(counts) > 1 and mine == max(counts):
+                print(f"\n  ** THE HUB RAN ON THE BUSIEST CHANNEL THE SWEEP CAN SEE"
+                      f" (ch{ran_on}, {mine:.0f} nets). **")
                 print("     The two receivers disagree, and the sweep is the one that"
                       " did not change.")
                 print("     Expect contention: frames LOST (txdone-fail) rather than"
                       " held (air-gap-max).")
-            elif mine is not None and rank and mine == min(rank):
-                print(f"\n  Agrees: ch{ch} is also the quietest the sweep can see.")
+            elif mine is not None and counts and mine == min(counts):
+                print(f"\n  Agrees: ch{ran_on} is also the quietest the sweep can see.")
         print()
 
     # ---- 7b. the air ---------------------------------------------------------
