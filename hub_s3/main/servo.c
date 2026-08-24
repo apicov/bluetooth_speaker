@@ -142,7 +142,17 @@ void servo_tick(void)
         ticks = 0;
         /* Empty unless something failed, so a clean line is unchanged from
          * every log captured before this instrument existed. */
-        char why[128];
+        /*
+         * SIZED FOR THE WHOLE LINE, for the reason burst[] below is: 128 was a
+         * typical-case number, not a worst-case one. tx_fail_summary() renders
+         * up to TX_ERR_SLOTS (4) distinct errno names plus "other", and
+         * strerror() strings run to ~32 characters -- " -- Software caused
+         * connection abort 4294967295" is 47 bytes on its own, so four of them
+         * and a tail is ~200. Worse, it CLEARS each slot as it renders it, so a
+         * truncated tally is lost rather than deferred: the window would under-
+         * report and no later window would make it up.
+         */
+        char why[224];
         tx_fail_summary(why, sizeof(why));
         /* Which lanes were refused, and -- only when something was -- whether
          * the refusals were beacon-spaced or one unbroken stall. See net.c. */
@@ -158,6 +168,14 @@ void servo_tick(void)
          */
         char burst[224];
         tx_burst_summary(burst, sizeof(burst));
+        /*
+         * What the RADIO did, as opposed to what sendto() accepted. Always
+         * non-empty -- see tx_air_summary() in net.c for why a clean window
+         * still has to print here. Worst case is a 10-digit ms figure and two
+         * UINT32s, ~64 bytes; 96 leaves room for the labels.
+         */
+        char air[96];
+        tx_air_summary(air, sizeof(air));
         /*
          * The station census, taken here rather than kept as a counter because
          * association is a fact the driver already holds and a counter would
@@ -207,7 +225,7 @@ void servo_tick(void)
          * gone somewhere else and this filter is not earning its place. */
         ESP_LOGI(TAG, "local ring %u bytes (%lu ms) | phase %+ld us "
                       "(median %+ld%s, smoothed %+ld us) | "
-                      "tx-fail %" PRIu32 " (%s)%s%s"
+                      "tx-fail %" PRIu32 " (%s)%s%s%s"
                       " | cong-skip %" PRIu32
                       " | stale-skip %" PRIu32
                       " | %lu pkts/s | fanout-gap-max %ld ms | lead-min %s"
@@ -218,7 +236,7 @@ void servo_tick(void)
                  (long)s_phase_err_us,
                  (long)(s_phase_med_valid ? s_phase_med_us : 0),
                  s_phase_med_valid ? "" : " n/a",
-                 (long)err_ema, s_tx_fail, lanes, why, burst,
+                 (long)err_ema, s_tx_fail, lanes, why, burst, air,
                  n_tx_cong_skip, n_tx_pace_skip,
                  (unsigned long)(s_audio_pkts / window_s),
                  (long)(n_fanout_gap_max_us / 1000), lead_s,

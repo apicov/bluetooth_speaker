@@ -167,6 +167,10 @@ static int survey_channel(void)
 }
 #endif /* CONFIG_DANCEFLOOR_WIFI_CHANNEL == 0 */
 
+/* Defined beside the counters it feeds, far below; declared here because
+ * wifi_start_ap() registers it. See tx_done_cb() for what it measures. */
+static void tx_done_cb(uint8_t ifidx, uint8_t *data, uint16_t *data_len, bool txStatus);
+
 void wifi_start_ap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -366,6 +370,15 @@ void wifi_start_ap(void)
      * the packets whose timing we depend on. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
+    /* Must follow esp_wifi_start(): the driver rejects it before that. Not
+     * fatal if it fails -- the hub still plays, it just loses the one stall
+     * signal a cache queue cannot hide. See tx_done_cb() above. */
+    const esp_err_t td = esp_wifi_set_tx_done_cb(tx_done_cb);
+    if (td != ESP_OK) {
+        ESP_LOGW(TAG, "no tx-done callback: %s -- air-gap-max will read 0",
+                 esp_err_to_name(td));
+    }
+
     /*
      * TX power is left at the driver default (full). It was once capped at
      * 13 dBm to stop this radio swamping the Bluetooth receiver when both shared
@@ -564,6 +577,84 @@ static void enomem_note_shape(int64_t now)
 }
 
 /*
+ * WHAT THE RADIO ACTUALLY DID, which is a different question from what sendto()
+ * accepted and is the only one a cache queue cannot answer for.
+ *
+ * WHY THIS EXISTS. Every hub-side stall signal on this line is stamped at
+ * sendto() RETURN: tx-fail counts a refusal, fanout-gap-max measures the gap
+ * between accepted sends, lead-min is computed as the packet is built. Turn
+ * ESP_WIFI_CACHE_TX_BUFFER_NUM on and the driver stops refusing -- it queues in
+ * PSRAM instead -- so all three go quiet whether or not the air improved. The
+ * 2026-08-23 15:56 soak measured stalls of 355 ms to 1.24 s behind those
+ * refusals, and a run that cannot see them is not a quieter run, it is a blind
+ * one.
+ *
+ * esp_wifi_set_tx_done_cb() fires when a frame leaves the radio, so the gap
+ * between callbacks is the stall itself, measured past every queue in front of
+ * it. THAT IS THE POINT: it stays honest with the cache queue on.
+ *
+ * AND IT SEPARATES THE TWO CAUSES the refusals could not. txStatus is false
+ * when the frame was transmitted and never acknowledged -- retries exhausted,
+ * i.e. the air. So:
+ *
+ *   air-gap large, txdone-fail rising ... the medium. Frames went and died.
+ *   air-gap large, txdone-fail flat .... frames are not being LOST. That rules
+ *                                        out retry-exhaustion, and it is the
+ *                                        half of the question this answers.
+ *
+ * IT DOES NOT FINISH THE JOB, and an earlier version of this comment claimed it
+ * did. A flat txdone-fail is equally consistent with the driver never dequeuing
+ * AND with a busy medium deferring us in CCA -- a frame that waits for the air
+ * and then succeeds is not an ack failure. Separating those two needs something
+ * this callback cannot see. What it does establish is that the frames which go
+ * are getting through, which the 2026-08-24 00:04 soak showed at 0 failures in
+ * 135,099 frames outside the startup transient.
+ *
+ * Kept to three counters and no allocation: this runs in the WiFi task's
+ * context on every transmitted frame, and deliberately carries no IRAM_ATTR --
+ * the hub has ~12 kB of internal DRAM free and IRAM is the wrong pool to spend
+ * for a counter bump.
+ */
+static volatile uint32_t n_txdone;            /* frames the radio reported done */
+static volatile uint32_t n_txdone_fail;       /* ...of which the air never acked */
+static volatile int32_t  n_air_gap_max_us;    /* widest silence between two of them */
+static int64_t s_txdone_prev_at;
+
+static void tx_done_cb(uint8_t ifidx, uint8_t *data, uint16_t *data_len, bool txStatus)
+{
+    (void)ifidx; (void)data; (void)data_len;
+    const int64_t now = esp_timer_get_time();
+    n_txdone++;
+    if (!txStatus) {
+        n_txdone_fail++;
+    }
+    if (s_txdone_prev_at) {
+        const int64_t gap = now - s_txdone_prev_at;
+        if (gap > n_air_gap_max_us) {
+            n_air_gap_max_us = (int32_t)(gap > INT32_MAX ? INT32_MAX : gap);
+        }
+    }
+    s_txdone_prev_at = now;
+}
+
+/*
+ * Render the air's own three numbers and clear them. ALWAYS PRINTS, unlike the
+ * refusal instruments beside it: a clean window here is a positive measurement
+ * -- the radio kept emitting -- and that is exactly the reading the cache-queue
+ * experiment needs to be able to trust. An empty string would be silence about
+ * silence.
+ */
+void tx_air_summary(char *buf, size_t len)
+{
+    snprintf(buf, len, " | air-gap-max %ld ms | txdone %" PRIu32
+                       " | txdone-fail %" PRIu32,
+             (long)(n_air_gap_max_us / 1000), n_txdone, n_txdone_fail);
+    n_air_gap_max_us = 0;
+    n_txdone = 0;
+    n_txdone_fail = 0;
+}
+
+/*
  * An audio packet reached the transmit path, so the pool has a buffer again.
  * Called from fan_out() on FANOUT_SENT -- see the note above for why audio and
  * not any other lane is what closes a stretch.
@@ -582,6 +673,24 @@ void tx_burst_summary(char *buf, size_t len)
 {
     if (!n_enomem_refusals) {
         buf[0] = '\0';
+        /*
+         * THE COUNTERS STILL HAVE TO BE CLEARED ON THIS PATH, and not doing so
+         * was a bug. A retry that SUCCEEDS never reaches tx_fail_note(), so it
+         * bumps n_audio_retry without bumping n_enomem_refusals: a window where
+         * every ENOMEM was rescued takes this early return, prints nothing, and
+         * used to carry those retries forward to be printed beside a LATER
+         * window's refusals. That is the same "a counter that outlived its
+         * window would be attributed to the next one's refusals" failure the
+         * clear below the snprintf exists to prevent, on the one path that
+         * skipped it.
+         *
+         * It matters more from here on, not less: with ESP_WIFI_CACHE_TX_BUFFER_NUM
+         * on, refusals are exactly what stops happening, so this is the path
+         * most windows will take.
+         */
+        n_refuse_near_frame = 0;
+        n_audio_retry = 0;
+        n_audio_retry_ok = 0;
         /* Nothing was refused, so nothing is claimed -- but whether a stretch
          * is open still has to reach the next window, or a stall that goes
          * quiet for one window and resumes would read as two. */

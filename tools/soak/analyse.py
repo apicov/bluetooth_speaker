@@ -167,8 +167,25 @@ def counter_total(df, unit, metric):
            & df["kind"].isin(["health", "trim"])]
     if s.empty:
         return None
-    per_boot = s.groupby("boot")["value"]
-    return int((per_boot.max() - per_boot.first()).sum())
+    #
+    # PER KIND, THEN THE LARGER -- not one pooled series. HEALTH and TRIM are
+    # two different lines and a name can appear on both meaning two different
+    # things: on the 2026-08-23 15:56 soak the hub published `dropped` on both,
+    # the health one reaching 2 and the trim one 1,976. Pooling them takes
+    # max() from whichever series happens to be higher and first() from
+    # whichever sample happens to be earliest, so the answer is a difference
+    # between two unrelated counters. It read correctly there only because the
+    # health series started at 0 and stayed small.
+    #
+    # Taking the larger of the two independently-computed totals keeps the real
+    # counter and cannot double-count the impostor. A name carried by only one
+    # kind -- which is nearly all of them -- is unaffected.
+    #
+    totals = []
+    for _, part in s.groupby("kind"):
+        per_boot = part.groupby("boot")["value"]
+        totals.append(int((per_boot.max() - per_boot.first()).sum()))
+    return max(totals)
 
 
 def gauge(df, unit, kind, metric):
@@ -528,6 +545,43 @@ def main():
             print("        delivery fault at all -- it was half the starvation"
                   " on the 2026-08-19 20:04 soak.")
 
+    # ------------------------------------------------------------------------
+    # THE AIR'S OWN READING, printed BEFORE the refusals and not after.
+    #
+    # Every other hub-side stall number is stamped at sendto() return, so
+    # ESP_WIFI_CACHE_TX_BUFFER_NUM silences all of them at once by queueing in
+    # PSRAM instead of refusing. air-gap-max comes from the driver's tx-done
+    # callback -- the radio finishing a frame -- so it is the one that stays
+    # honest with a queue in front of it. Read it first, or a quiet tx-fail
+    # reads as a fixed hub when it may only be a hidden one.
+    # See tx_done_cb() in hub_s3/main/net.c.
+    # ------------------------------------------------------------------------
+    air_gap = gauge(met, "hub", "status", "air-gap-max")
+    if air_gap is not None and not air_gap.empty:
+        head("AIR GAP  (what the RADIO did -- a cache queue cannot hide this)")
+        g = air_gap["value"]
+        done = window_sum(met, "hub", "txdone")
+        fail = window_sum(met, "hub", "txdone-fail")
+        print(f"  widest silence between two transmitted frames, per window:")
+        print(f"    median {g.median():.0f} ms   p90 {g.quantile(0.9):.0f} ms"
+              f"   p99 {g.quantile(0.99):.0f} ms   max {g.max():.0f} ms")
+        over = int((g >= 350).sum())
+        print(f"    {over} of {len(g)} windows ({over / max(len(g), 1) * 100:.1f}%)"
+              f" had a silence >= LEAD_US (350 ms) -- long enough that anything"
+              f" queued through it plays late or not at all")
+        if done:
+            print(f"  frames done {done:,}   never acked {fail:,}"
+                  f"  ({fail / max(done, 1) * 100:.2f}%)")
+            print("    a large air-gap WITH acks failing is the medium -- frames went"
+                  " and died on the air.")
+            print("    a large air-gap with acks CLEAN means frames are not being LOST;"
+                  " retry-exhaustion is ruled out.")
+            print("    it does NOT separate a driver that never dequeued from a busy"
+                  " medium deferring us in CCA --")
+            print("    a frame that waits for the air and then succeeds is not an ack"
+                  " failure. Both look like this.")
+        print()
+
     # ---- 7. the hub's refused sends -----------------------------------------
     #
     # DELIVERY above says a hole was held AFTER sendto. This says whether the
@@ -540,6 +594,11 @@ def main():
     # stretches far apart are four different faults with four different fixes.
     # The buckets are documented where they are measured, in hub_s3/main/net.c.
     head("HUB TX  (a refused send is a hole in the sound, not a hub-local event)")
+    if air_gap is not None and not air_gap.empty:
+        print("  NOTE: read AIR GAP above first. With ESP_WIFI_CACHE_TX_BUFFER_NUM"
+              " non-zero the driver")
+        print("  queues instead of refusing, so a LOW number here is not by itself"
+              " an improvement.")
     tx_any = False
     for u in units:
         tf = gauge(met, u, "status", "tx-fail")

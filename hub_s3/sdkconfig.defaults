@@ -846,38 +846,48 @@ CONFIG_ESP_WIFI_RX_BA_WIN=6
 # 32. It queues upper-layer packets in PSRAM when no static TX buffer is free,
 # instead of rejecting them.
 #
-# WAS 0 DELIBERATELY, on two objections. "Worth trying on its own once the
-# fan-out work needs it" is what the note said, and the fan-out work needs it.
+# 16, 2026-08-23, AS A MEASUREMENT AND NOT AS A FIX. Read the whole of this
+# before reading the next soak, because the expected result is NOT "tx-fail
+# goes to zero" and a run that produces it has not succeeded.
 #
-# The first objection does not survive being checked. "A late audio packet is
-# refused at anchor time anyway (ANCHOR_MIN_LEAD_US)" -- but that gate applies
-# at STREAM START, not to packets inside a running stream, and the hub stamps
-# play_at 200 ms ahead. A packet held a few ms in this queue still arrives with
-# ~195 ms of lead and plays normally. The alternative is not a late packet, it
-# is no packet: a hole in the sound on every satellite at once, recoverable from
-# the FEC only if the NEXT packet gets through, which under a burst of ENOMEM is
-# exactly what does not happen.
+# WHAT THE 15:56 SOAK ESTABLISHED. 1,180 audio refusals in 7.19 h, every one of
+# them ENOMEM. Nothing on the hub predicted them: pivoting all 7,696 status
+# windows, ring depth, lead-min, phase, rssi-min and churn are the same in a
+# refusing window as in a clean one. Only the consequences move. 33 of 55
+# starvation bins hit BOTH satellites at once, which is the medium or this
+# radio rather than either station. The frame lane was in flight for 1% of
+# refusals, so the pace gate is already doing its job.
 #
-# The second objection stands, and is why this is BACK AT 0 after one run with
-# it on: it converts tx-fail into silence, and tx-fail is the counter this whole
-# file is written around.
+# WHY A DEEPER QUEUE IS NOT EXPECTED TO HELP, stated so the run can falsify it.
+# The pool is 38 buffers against ~130 datagrams/s, i.e. ~292 ms deep, so a
+# refusal means the medium was gone for 292 ms PLUS the refusal stretch. Those
+# stretches ran p50 63 ms, p90 288 ms, p99 926 ms -- so the shortest stall that
+# refuses anything is already ~355 ms, against a LEAD_US of 350 ms. A packet
+# this queue holds through one of them arrives with no lead left and is
+# unplayable when it emerges. The queue converts a refused packet into a late
+# one, and both are silence.
 #
-# The run with it on (17:52) is the useful negative result. tx-fail did NOT go
-# away -- 10 to 58 audio rejections per 20 s window with 32 cache buffers in
-# front of them -- which says the constraint is AIRTIME, not buffer count. A
-# queue cannot make a stream fit that does not fit; it only delays the moment it
-# does not. So the queue was never going to be the fix, and leaving it on now
-# would confound the thing that might be: with FEC at 0 an audio packet drops
-# from the 1472-byte MTU back to ~851 B, and the question is whether tx-fail
-# goes to zero because of that. It cannot be answered through a queue that
-# absorbs the evidence either way.
+# SO WHAT IS BEING TESTED IS THAT SENTENCE, not the queue. Read in this order:
+#   1. air-gap-max / txdone-fail (new this change, see tx_done_cb() in net.c) --
+#      these are stamped when the RADIO finishes a frame, so unlike tx-fail,
+#      fanout-gap-max and lead-min they cannot be hidden by this queue. If
+#      air-gap-max still shows 355 ms-1.2 s silences, the stall is real and the
+#      queue only moved where it is counted.
+#   2. the SATELLITES' gap-max, lead-min and starved ms. These are the room's
+#      own reading and this queue cannot touch them either. If starved does not
+#      fall, the queue bought nothing however quiet tx-fail went.
+#   3. tx-fail LAST, and only to confirm it fell. On its own it now means
+#      nothing: absorbing the evidence is exactly what the queue does.
 #
-# Turn it back on once tx-fail is genuinely 0 and the reason is understood. It
-# is free in the pool that matters -- these live in PSRAM, of which the hub has
-# 8 MB, while the static buffers are internal SRAM with ~6.7 kB free and a
-# largest block of 3584, room for two more of those at most -- so it is worth
-# having as burst insurance. It is not worth having as a blindfold.
-CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=0
+# 16 rather than the default 32 because 16/130 s is ~123 ms of added delay,
+# inside what a 350 ms lead can absorb; 32 is ~246 ms and would spend most of
+# the lead on its own. A previous run at 32 is on record as not removing
+# tx-fail, which is consistent with all of the above.
+#
+# If air-gap-max confirms the stalls, the next question is upstream of this
+# file -- the interferer on the chosen channel, or the driver's own dequeue --
+# and this goes back to 0 rather than staying on as a blindfold.
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
 
 # Forward this unit's logs and HEALTH snapshots over the sync socket to a
 # laptop collector (see CONFIG_DANCEFLOOR_WIFI_LOGS). Bench only, and now OFF by

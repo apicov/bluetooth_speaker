@@ -1048,6 +1048,11 @@ void tx_fail_lanes(char *buf, size_t len);
  * beacon-spaced clusters (the queue is deep) or one unbroken stall (the release
  * has stopped). Writes an empty string when nothing was refused. See net.c. */
 void tx_burst_summary(char *buf, size_t len);
+
+/* The air's own reading, which survives a cache queue in front of the driver
+ * when every other stall signal on the line does not. See tx_done_cb() in
+ * net.c. Always writes a non-empty string. */
+void tx_air_summary(char *buf, size_t len);
 /* Closes an open refusal stretch: an audio packet got through, so the pool
  * freed a buffer. Called from fan_out() on FANOUT_SENT. See net.c for why
  * audio, and only audio, is what may close one. */
