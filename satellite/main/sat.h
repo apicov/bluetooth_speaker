@@ -124,9 +124,15 @@ extern const char *TAG;
  *
  * Set through DANCEFLOOR_RING_KB now rather than fixed here, because with a
  * second target the "117 kB free" above stops being the only answer -- an S3
- * satellite has 512 kB of internal SRAM. The default is unchanged at 80 on both
- * targets; the Kconfig help says why raising it on the S3 is a measurement
- * nobody has taken rather than a free win.
+ * satellite has 512 kB of internal SRAM. The Kconfig help says why raising it on
+ * the S3 beyond the shared default is a measurement nobody has taken rather than
+ * a free win.
+ *
+ * THE DEFAULT IS 96 kB (557 ms), not the 80 the arithmetic above works in. It
+ * went 80 -> 96 when LEAD_US went 250 -> 350, because the depth net's +-120 ms
+ * excursion then reached 470 ms and 80 kB holds 464 -- see RING_TARGET_MS below,
+ * which is where that change is recorded. The 64 -> 80 paragraphs above are kept
+ * as the history of the constant and are read at the numbers they name.
  */
 #define RING_BYTES  (CONFIG_DANCEFLOOR_RING_KB * 1024)
 
@@ -245,12 +251,14 @@ extern volatile bool phase_stepped;
 /*
  * What an anchorable packet looks like. See the refusals in handle_audio().
  *
- * The hub stamps every chunk LEAD_US = 250 ms ahead, so a healthy packet
+ * The hub stamps every chunk LEAD_US = 350 ms ahead, so a healthy packet
  * arrives with most of that still in front of it -- a good anchor was measured
- * at "in 154 ms", back when the lead was 200. This is half of that lead, and
- * the number is not arbitrary caution: the scheduled wait below is the ONLY
- * thing that prefills the ring, so whatever lead survives to here is the
- * prefill, and half the design depth is the least worth starting on.
+ * at "in 154 ms", back when the lead was 200. The number is not arbitrary
+ * caution: the scheduled wait below is the ONLY thing that prefills the ring,
+ * so whatever lead survives to here is the prefill, and some fraction of the
+ * design depth is the least worth starting on. WHAT fraction is the note below
+ * this one -- it stopped being "half" when the lead moved to 350 and this
+ * constant did not follow.
  *
  * It was 20 ms, chosen as "the floor below which prefill is not worth having",
  * and that was the wrong test. A run cleared it by four milliseconds: 144
@@ -280,16 +288,28 @@ extern volatile bool phase_stepped;
  * lead/path mismatch does not leave a speaker silent for a whole track.
  */
 /*
- * 125000 SINCE LEAD_US BECAME 250 ms. This is "half the hub's lead" and has been
- * since it was written; the number moved because the lead did, not because the
- * reasoning changed. Leaving it at 100 ms would have quietly loosened the guard
- * from half a lead to two fifths.
+ * 125000 WAS "half the hub's lead", set when LEAD_US became 250 ms. It went
+ * 100 -> 125 because the lead did, not because the reasoning changed; leaving it
+ * at 100 would have quietly loosened the guard from half a lead to two fifths.
+ *
+ * IT IS NO LONGER HALF. The lead then went 250 -> 350 and this did not follow,
+ * so the guard is 125 of 350 -- between a third and a half, and loosened by
+ * exactly the drift the paragraph above was written to prevent. That is a
+ * SIDE EFFECT, not a decision: no run re-derived the ratio at the longer lead,
+ * and nothing here argues a third is the right number. hub.h's RESYNC_HARD_US
+ * note reads the guard at 125 ms and is consistent with this value, so the two
+ * headers agree on what the constant IS; what is open is what it should be.
+ *
+ * Raising it to 175 (half of 350) is the obvious candidate and is deliberately
+ * NOT done here, because it tightens a guard whose whole tension is that
+ * tightening it refuses healthy packets -- see the trough paragraph above.
+ * That is a measurement, not an edit.
  *
  * The tension the paragraph above describes is what raising the lead was partly
  * for. 251 anchors were refused in three hours against a measured mean lead of
  * 146 ms: RESYNC_US lets the hub's timeline sit 150 ms below target, so a
  * perfectly healthy packet in a trough showed under this floor and was refused,
- * exactly as predicted. Both ends of that moved -- the centre is 250 now -- so
+ * exactly as predicted. Both ends of that moved -- the centre is 350 now -- so
  * the distribution should clear this by more than it did, not less.
  */
 #define ANCHOR_MIN_LEAD_US     125000
@@ -626,9 +646,9 @@ extern volatile uint32_t n_short_frames;
  *     lead = play_at - (arrival converted to master)
  *
  * is how much of the hub's LEAD_US survived the trip. In steady state it is
- * ~250 ms. If a gap in arrivals comes with a COLLAPSED lead, the hub stamped
+ * ~350 ms. If a gap in arrivals comes with a COLLAPSED lead, the hub stamped
  * those packets on time and the transport held them. If the gap comes with the
- * lead still near 250 ms, they were stamped late and the fault is upstream of
+ * lead still near 350 ms, they were stamped late and the fault is upstream of
  * the air. The hub's own fan-out interval (hub.h, n_fanout_gap_max_us) is the
  * other half of that comparison.
  *
