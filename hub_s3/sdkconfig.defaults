@@ -214,6 +214,17 @@ CONFIG_ESP_PHY_ENABLE_USB=n
 # air, which tools/soak/capture.py now records.
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
 
+# BACK AT 6, AND PARKED -- not withdrawn. The antenna was changed on
+# 2026-08-24 before this had been soaked, and two variables in one run answer
+# neither. It returns to 6 so the antenna is the only thing that moved against
+# the 00:04 soak; the case for 2 is below and stands until a run refutes it.
+#
+# Read the LINK section first when that soak lands. If the satellites now hear
+# the hub materially louder than they did, the held frames had a physical
+# cause and the retry chain this window bounds was only carrying it. If the
+# link reads the same and the frames are still held, come back and set this
+# to 2.
+#
 # 2, down from 6, 2026-08-24. THE SURGICAL VERSION of the experiment above,
 # and the reason the gate on it is being answered rather than ignored.
 #
@@ -258,7 +269,7 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
 # Unchanged on the satellite deliberately: RX_BA_WIN there stays 6 and the two
 # ends negotiate the minimum, so this sets the window from the transmitting
 # side, which is the side that is holding.
-CONFIG_ESP_WIFI_TX_BA_WIN=2
+CONFIG_ESP_WIFI_TX_BA_WIN=6
 
 # The rate axis. All four points were measured on this hardware and 6 Mbps was
 # the one that held, 0.33 gaps/min; "do not re-open without a new reason" was
