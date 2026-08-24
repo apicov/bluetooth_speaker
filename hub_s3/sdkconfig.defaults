@@ -213,7 +213,52 @@ CONFIG_ESP_PHY_ENABLE_USB=n
 # nothing on this board moves when an episode starts. It is what else is on the
 # air, which tools/soak/capture.py now records.
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
-CONFIG_ESP_WIFI_TX_BA_WIN=6
+
+# 2, down from 6, 2026-08-24. THE SURGICAL VERSION of the experiment above,
+# and the reason the gate on it is being answered rather than ignored.
+#
+# THE NEW REASON the block above asks for. When it was written, "nothing on
+# this board moves when an episode starts" was literally true -- every gauge
+# was stamped at sendto() return. air-gap-max and txdone (tx_done_cb() in
+# net.c) are stamped when the RADIO finishes a frame, and they move:
+#
+#   air-gap-max, refusing windows ....... 505 ms median
+#   air-gap-max, clean windows .......... 141 ms median
+#   satellite burst-max near a >=350 ms air-gap ... 2 -> 5 packets
+#   txdone-fail ......................... 0 in 3,003,948 frames
+#
+# Read together those say the frames are NOT being lost and NOT failing on the
+# air -- they are HELD, and then RELEASED IN A BURST. That is the drain the
+# block above inferred from an absence of evidence, now measured directly, and
+# it is the same sentence that block already wrote: "TX_BA_WIN 6 holds up to
+# six MPDUs' buffers through one block-ack retry chain, and that is what a
+# drain looks like."
+#
+# WHY NOT SIMPLY TURN AGGREGATION OFF: because that was tried and the record
+# above says why it failed. It DID do what it was aimed at -- worst stretch
+# 1313 -> 486 ms, satellite underruns roughly halved -- but block-ack is also
+# selective retransmission, and without it `gaps` more than tripled (38/38 ->
+# 167/112) and the project logged its first hub-side underrun. The mechanism
+# was right and the instrument was too blunt: it removed the holding and the
+# loss recovery together.
+#
+# The window is the knob that separates them. IDF's range is 2-32, so 2 keeps
+# block-ack -- and its selective retransmission -- while cutting the buffers
+# one retry chain can hold from six to two. If the drain is the chain, this is
+# a third of it; if it is not, this run says so cheaply and the answer is off
+# this board.
+#
+# THE BAR, and it is `gaps`, not tx-fail. Aggregation-off already showed you
+# can buy a shorter stretch with lost packets; that trade is refused. Read, in
+# order: satellite `gaps` must NOT rise materially against this run's 28/29 in
+# 4.41 h -- if it triples, this failed the same way and goes back to 6. Then
+# air-gap-max p90 (280 ms here) and p99 (~500 ms), which is what should fall.
+# Then starvation ms/h and underruns/h.
+#
+# Unchanged on the satellite deliberately: RX_BA_WIN there stays 6 and the two
+# ends negotiate the minimum, so this sets the window from the transmitting
+# side, which is the side that is holding.
+CONFIG_ESP_WIFI_TX_BA_WIN=2
 
 # The rate axis. All four points were measured on this hardware and 6 Mbps was
 # the one that held, 0.33 gaps/min; "do not re-open without a new reason" was
