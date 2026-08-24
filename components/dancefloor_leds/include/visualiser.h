@@ -135,6 +135,29 @@ int visualiser_hop(void);
  */
 void visualiser_marker_set_link(bool up);
 
+/*
+ * Blink the marker fast while the boot channel survey is sampling the band,
+ * and stop when it is done.
+ *
+ * WHAT IT IS FOR. The survey is ~7.4 s of scanning and dwelling before the AP
+ * exists, and from outside the board that is indistinguishable from a hang.
+ * This makes the wait legible without a console: fast blink means "sampling",
+ * and the blink STOPPING is the ready signal.
+ *
+ * IT DOES NOT JOIN THE THREE-STATE SCHEME, deliberately. dark/solid/flash all
+ * mean something about a running floor, and this happens before there is one.
+ * It runs off its own esp_timer, touches the pin directly, and on stop leaves
+ * it dark -- which is exactly the state visualiser_start() drives it to anyway,
+ * so nothing downstream can tell this ran. marker_write()'s `shown` cache is
+ * untouched and stays at -1, so the render task's first write still reaches the
+ * pin whatever it asks for.
+ *
+ * Safe to call before visualiser_start(); it configures the pin itself. Calling
+ * it twice the same way is a no-op. A no-op entirely unless
+ * CONFIG_DANCEFLOOR_ENABLE_LED_MARKER is set, so callers need no #ifdef.
+ */
+void visualiser_marker_busy(bool on);
+
 /* Brings up the strip and starts the analysis and render tasks. Call once. */
 void visualiser_start(void);
 

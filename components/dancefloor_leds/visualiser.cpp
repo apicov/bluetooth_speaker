@@ -301,6 +301,32 @@ void marker_write(int level)
     gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), level);
 }
 
+/*
+ * The boot-survey blink, which is the one thing on this pin that is NOT part
+ * of the dark/solid/flash scheme -- see visualiser_marker_busy() in the header
+ * for why it stands apart.
+ *
+ * 80 ms a toggle: fast enough to read as "working" rather than as the
+ * once-a-second flash the same LED does later, and slow enough to be a blink
+ * and not a dim glow.
+ *
+ * Its own esp_timer because the survey blocks. esp_wifi_scan_start() is called
+ * synchronously and does not return for ~4.7 s, so anything driven from the
+ * calling task would sit still for exactly the stretch this exists to cover.
+ */
+constexpr int64_t MARKER_BUSY_TOGGLE_US = 80 * 1000;
+
+static esp_timer_handle_t s_marker_busy_timer;
+static int s_marker_busy_level = LED_MARKER_OFF;
+
+static void marker_busy_cb(void *)
+{
+    s_marker_busy_level = (s_marker_busy_level == LED_MARKER_ON) ? LED_MARKER_OFF
+                                                                 : LED_MARKER_ON;
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
+                   s_marker_busy_level);
+}
+
 /* What the marker holds when no audio is being drawn: lit if this unit is on
  * the floor, dark if it is not. The flash is drawn on top of this. */
 int marker_idle_level()
@@ -1577,6 +1603,54 @@ void render_task(void *arg)
 }
 
 }  // namespace
+
+/*
+ * Start or stop the survey blink. See visualiser.h for what it means and why it
+ * is kept out of the three-state scheme.
+ *
+ * Failure is silent and harmless: this is an indicator, and a board that cannot
+ * create a timer still has a floor to run. It must never be the reason a hub
+ * does not come up.
+ */
+void visualiser_marker_busy(bool on)
+{
+#if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
+    if (on) {
+        if (s_marker_busy_timer) {
+            return;                       /* already blinking */
+        }
+        gpio_config_t m = {};
+        m.pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_LED_MARKER_GPIO;
+        m.mode = GPIO_MODE_OUTPUT;
+        if (gpio_config(&m) != ESP_OK) {
+            return;
+        }
+        esp_timer_create_args_t a = {};
+        a.callback = marker_busy_cb;
+        a.name = "marker-busy";
+        if (esp_timer_create(&a, &s_marker_busy_timer) != ESP_OK) {
+            s_marker_busy_timer = nullptr;
+            return;
+        }
+        s_marker_busy_level = LED_MARKER_OFF;
+        esp_timer_start_periodic(s_marker_busy_timer, MARKER_BUSY_TOGGLE_US);
+    } else {
+        if (!s_marker_busy_timer) {
+            return;
+        }
+        esp_timer_stop(s_marker_busy_timer);
+        esp_timer_delete(s_marker_busy_timer);
+        s_marker_busy_timer = nullptr;
+        /* Dark, which is both "the survey is done" and the state
+         * visualiser_start() drives this pin to when it takes over. */
+        s_marker_busy_level = LED_MARKER_OFF;
+        gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
+                       LED_MARKER_OFF);
+    }
+#else
+    (void)on;
+#endif
+}
 
 void visualiser_marker_set_link(bool up)
 {

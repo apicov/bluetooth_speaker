@@ -13,6 +13,7 @@
 
 #include "esp_private/wifi.h"
 #include "nvs_flash.h"
+#include "visualiser.h"
 
 /*
  * Count them, and stop sending to them.
@@ -245,6 +246,15 @@ static int survey_channel(void)
 {
     static const int cand[3] = {1, 6, 11};
 
+    /*
+     * Say so on the LED, because from outside the board this is ~7.4 s of
+     * looking exactly like a hang: no AP yet, no audio, nothing on the pin.
+     * The blink stopping is the ready signal. A no-op on a build without the
+     * marker, and it leaves the pin dark -- which is where visualiser_start()
+     * puts it anyway -- so nothing after this point can tell it ran.
+     */
+    visualiser_marker_busy(true);
+
     /* Scanning needs STA mode and a started radio. No STA netif is created for
      * it: a scan wants no IP stack, and the AP netif made above is untouched. */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -305,6 +315,7 @@ static int survey_channel(void)
         ESP_LOGE(TAG, "channel survey FAILED (%s) -- using ch %d unmeasured; "
                       "the band was never looked at",
                  esp_err_to_name(err), CHANNEL_FALLBACK);
+        visualiser_marker_busy(false);
         return CHANNEL_FALLBACK;
     }
 
@@ -376,6 +387,7 @@ static int survey_channel(void)
              busy[1], frames[1],
              busy[2], frames[2],
              cand[best], OCCUPANCY_VETO_PERMILLE);
+    visualiser_marker_busy(false);
     return cand[best];
 }
 #endif /* CONFIG_DANCEFLOOR_WIFI_CHANNEL == 0 */
