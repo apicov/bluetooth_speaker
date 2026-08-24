@@ -188,6 +188,15 @@ def counter_total(df, unit, metric):
     return max(totals)
 
 
+def fmt_or(v, spec, dash="   --"):
+    """A number, or a dash when the run never recorded it.
+
+    Same rule the satellite's lead-min follows on the wire: a value that was
+    not measured must not render as a plausible zero.
+    """
+    return dash if v is None else format(v, spec)
+
+
 def gauge(df, unit, kind, metric):
     s = df[(df["unit"] == unit) & (df["kind"] == kind) & (df["metric"] == metric)]
     return s[["wall_s", "value"]].reset_index(drop=True) if not s.empty else None
@@ -793,6 +802,65 @@ def main():
         print("  No tx-fail gauge -- the hub predates this instrument.")
 
     # ---- 8. heap ------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # DID THE HUB PICK THE RIGHT CHANNEL?
+    #
+    # Two independent receivers see this band: the hub's own boot survey, and
+    # capture.py's sweep. Only the sweep is constant across soaks -- the hub's
+    # reading moves with whatever antenna is fitted -- so when they disagree,
+    # the sweep is the control.
+    #
+    # This check exists because they DID disagree and nothing noticed. On
+    # 2026-08-24 the hub chose ch6, a channel its own scan counted ten networks
+    # on, while the sweep read ch6 at 6 nets against ch11's ONE. The channel
+    # had also been changing silently between soaks, which quietly made every
+    # cross-run comparison on file part channel comparison.
+    # ------------------------------------------------------------------------
+    chose = gauge(met, "hub", "other", "chose")
+    if chose is not None and not chose.empty:
+        head("CHANNEL CHOICE  (the hub's survey against capture.py's sweep)")
+        ch = int(chose["value"].iloc[0])
+        cands = [1, 6, 11]
+
+        def rd(unit, name):
+            g = gauge(met, unit, "other", name)
+            return None if g is None or g.empty else g["value"].median()
+
+        # The hub's own occupancy dwell, when the build that ran had one.
+        busy = {c: rd("hub", f"ch{c}-busy") for c in cands}
+        if any(v is not None for v in busy.values()):
+            print("  hub occupancy dwell (busy = permille of dwell, what decides):")
+            for c in cands:
+                f, n = rd("hub", f"ch{c}-frames"), rd("hub", f"ch{c}-noise")
+                mark = "  <- chose" if c == ch else ""
+                print(f"    ch{c:<3} busy {fmt_or(busy[c], '4.0f')}"
+                      f"   frames {fmt_or(f, '5.0f')}"
+                      f"   noise {fmt_or(n, '4.0f')} dBm{mark}")
+        else:
+            print(f"  hub chose ch{ch}  (this build's survey ranked on beacon"
+                  " power only -- no occupancy dwell)")
+
+        sweep = {c: (rd("air", f"ch{c}-nets"), rd("air", f"ch{c}-dbm")) for c in cands}
+        if any(n is not None for n, _ in sweep.values()):
+            print("\n  capture.py sweep, the receiver that does NOT change between runs:")
+            for c in cands:
+                n, d = sweep[c]
+                mark = "  <- hub chose this" if c == ch else ""
+                print(f"    ch{c:<3} nets {fmt_or(n, '4.0f')}"
+                      f"   {fmt_or(d, '5.0f')} dBm{mark}")
+            rank = sorted((n for n, _ in sweep.values() if n is not None))
+            mine = sweep.get(ch, (None, None))[0]
+            if mine is not None and rank and mine == max(rank) and len(rank) > 1:
+                print(f"\n  ** THE HUB CHOSE THE BUSIEST CHANNEL THE SWEEP CAN SEE"
+                      f" (ch{ch}, {mine:.0f} nets). **")
+                print("     The two receivers disagree, and the sweep is the one that"
+                      " did not change.")
+                print("     Expect contention: frames LOST (txdone-fail) rather than"
+                      " held (air-gap-max).")
+            elif mine is not None and rank and mine == min(rank):
+                print(f"\n  Agrees: ch{ch} is also the quietest the sweep can see.")
+        print()
+
     # ---- 7b. the air ---------------------------------------------------------
     #
     # The variable no soak before 2026-08-23 recorded, and the reason three of

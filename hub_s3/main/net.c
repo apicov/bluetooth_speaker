@@ -94,6 +94,120 @@ static int occupancy_dbm(float mw)
     return mw > 0.0f ? (int)lroundf(10.0f * log10f(mw)) : -100;
 }
 
+/*
+ * HOW BUSY A CHANNEL ACTUALLY IS, which the beacon scan below cannot answer.
+ *
+ * WHY THIS EXISTS. survey_channel() ranked by summed beacon POWER, and the
+ * comment above it always conceded the gap: a beacon says a network is
+ * present, not that it is busy. Ten idle neighbours outrank one saturated one
+ * on that metric. On 2026-08-24 it picked ch6 -- a channel its own scan
+ * counted TEN networks on -- while capture.py's sweep, on a receiver that had
+ * not changed, read ch6 at 6 nets and ch11 at ONE. The run that followed
+ * changed failure mode to match: frames LOST at 27 ack failures/hour where
+ * every previous run had held frames at zero. That is contention.
+ *
+ * WHAT IT MEASURES. A promiscuous dwell counts EVERY frame on the air, not
+ * just beacons, and rx_ctrl carries what each one cost: sig_len, and either a
+ * legacy rate or an MCS. Summed over the dwell that is airtime -- occupancy,
+ * in the unit that matters.
+ *
+ * IT ALSO SUBSUMES THE OVERLAP PROBLEM the 13-channel scan exists for. The
+ * radio's receive bandwidth is ~20 MHz, so a dwell on ch1 hears ch5's traffic
+ * natively. This measures what THIS radio receives on that channel, adjacent
+ * energy included, rather than modelling it from a channel-number distance.
+ *
+ * FCSFAIL IS ON DELIBERATELY, against IDF's "do not open it in general". A
+ * frame that failed FCS still occupied the air, and collisions and marginal
+ * interferers are precisely what a beacon scan cannot see. The callback is a
+ * few adds, so the flood is affordable for half a second.
+ */
+#define OCCUPANCY_DWELL_MS 500
+#define OCCUPANCY_OVERHEAD_US 50   /* preamble + IFS + ACK, flat per frame */
+
+static volatile uint32_t s_occ_busy_us;
+static volatile uint32_t s_occ_frames;
+static volatile int32_t  s_occ_noise_sum;
+static volatile int32_t  s_occ_noise_min;
+
+/*
+ * Tenths of a Mbit/s, so the whole table is integers and the division below
+ * cannot land on a float in a callback. Index is the 5-bit rx_ctrl.rate for
+ * non-HT frames: WIFI_PHY_RATE_1M_L is 0x00 and _9M is 0x0F, and the order in
+ * between is the enum's, not ascending -- see esp_wifi_types_generic.h.
+ */
+static const uint16_t legacy_rate_tenths[16] = {
+     10,  20,  55, 110,      /* 1, 2, 5.5, 11 long preamble          */
+     10,  20,  55, 110,      /* 0x04 unused; 2, 5.5, 11 short        */
+    480, 240, 120,  60,      /* 48, 24, 12, 6                        */
+    540, 360, 180,  90,      /* 54, 36, 18, 9                        */
+};
+
+/* MCS0..7 at 20 MHz, long GI, tenths of a Mbit/s. */
+static const uint16_t ht_mcs_tenths[8] = { 65, 130, 195, 260, 390, 520, 585, 650 };
+
+static void occupancy_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    (void)type;
+    const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+    const wifi_pkt_rx_ctrl_t *c = &p->rx_ctrl;
+
+    uint32_t tenths;
+    if (c->sig_mode == 1) {                       /* HT */
+        tenths = ht_mcs_tenths[c->mcs & 7];
+        if (c->cwb) {
+            tenths *= 2;                          /* 40 MHz */
+        }
+        if (c->sgi) {
+            tenths = tenths * 10 / 9;             /* short guard interval */
+        }
+    } else {
+        tenths = legacy_rate_tenths[c->rate & 15];
+    }
+    if (!tenths) {
+        tenths = 10;                              /* never divide by zero */
+    }
+    /* bits * 10 / tenths-of-Mbit = microseconds. */
+    s_occ_busy_us += (uint32_t)c->sig_len * 8u * 10u / tenths + OCCUPANCY_OVERHEAD_US;
+    s_occ_frames++;
+    s_occ_noise_sum += c->noise_floor;
+    if (c->noise_floor < s_occ_noise_min) {
+        s_occ_noise_min = c->noise_floor;
+    }
+}
+
+/*
+ * Dwell on one channel and report what crossed it. `busy_permille` is the
+ * fraction of the dwell the air was occupied, in parts per thousand, which
+ * keeps the log line integer like every other figure on it.
+ */
+static void occupancy_measure(int channel, uint32_t *busy_permille,
+                              uint32_t *frames, int *noise_med, int *noise_min)
+{
+    s_occ_busy_us = 0;
+    s_occ_frames = 0;
+    s_occ_noise_sum = 0;
+    s_occ_noise_min = 0;
+
+    const wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_CTRL
+                     | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_MISC
+                     | WIFI_PROMIS_FILTER_MASK_FCSFAIL,
+    };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(occupancy_cb);
+    esp_wifi_set_channel((uint8_t)channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(true);
+    vTaskDelay(pdMS_TO_TICKS(OCCUPANCY_DWELL_MS));
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+
+    const uint32_t n = s_occ_frames;
+    *frames = n;
+    *busy_permille = s_occ_busy_us / OCCUPANCY_DWELL_MS;   /* us / ms = permille */
+    *noise_med = n ? (int)(s_occ_noise_sum / (int32_t)n) : 0;
+    *noise_min = n ? s_occ_noise_min : 0;
+}
+
 static int survey_channel(void)
 {
     static const int cand[3] = {1, 6, 11};
@@ -104,13 +218,19 @@ static int survey_channel(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     /* PASSIVE. This unit has no business transmitting probe requests into a
-     * room it is about to be the AP of, and a beacon interval is ~102 ms, so
-     * 120 ms a channel catches at least one from everything that is there.
-     * Thirteen channels at 120 ms is ~1.6 s, spent once. */
+     * room it is about to be the AP of.
+     *
+     * 360 ms, WHICH IS IDF'S OWN DEFAULT (WIFI_PASSIVE_SCAN_DEFAULT_TIME), up
+     * from the 120 that used to be here. A beacon interval is ~102 ms, so 120
+     * gives roughly ONE chance per AP -- the old comment read that as "catches
+     * at least one from everything that is there", and it is nearer a coin
+     * toss per network. Both the count and the power sum were under-sampled,
+     * and this survey has now been caught getting the answer wrong. Thirteen
+     * channels at 360 ms is ~4.7 s, spent once at boot. */
     const wifi_scan_config_t sc = {
         .show_hidden = true,
         .scan_type = WIFI_SCAN_TYPE_PASSIVE,
-        .scan_time = { .passive = 120 },
+        .scan_time = { .passive = WIFI_PASSIVE_SCAN_DEFAULT_TIME },
     };
     esp_err_t err = esp_wifi_scan_start(&sc, true);
 
@@ -135,6 +255,18 @@ static int survey_channel(void)
         }
     }
 
+    /* Occupancy, per candidate, while the radio is still up. See
+     * occupancy_measure() above for why beacon power was not enough. Skipped
+     * entirely if the scan failed -- there is nothing to rank. */
+    uint32_t busy[3] = {0}, frames[3] = {0};
+    int noise_med[3] = {0}, noise_min[3] = {0};
+    if (err == ESP_OK) {
+        for (int k = 0; k < 3; k++) {
+            occupancy_measure(cand[k], &busy[k], &frames[k],
+                              &noise_med[k], &noise_min[k]);
+        }
+    }
+
     ESP_ERROR_CHECK(esp_wifi_stop());
 
     if (err != ESP_OK) {
@@ -146,10 +278,51 @@ static int survey_channel(void)
         return CHANNEL_FALLBACK;
     }
 
+    /*
+     * RANKED ON MEASURED AIRTIME, with beacon power demoted to the log line.
+     *
+     * The tie-break is the fix for the case that prompted this. When two
+     * candidates are within a quarter of each other the occupancy measurement
+     * is not separating them, and then the NETWORK COUNT is the better bet: a
+     * channel with one neighbour is less likely to acquire a burst later than
+     * one with ten, even if they read equally quiet in half a second. Where
+     * occupancy does separate them it decides alone.
+     */
     int best = 0;
     for (int k = 1; k < 3; k++) {
-        if (power[k] < power[best]) {
+        if (busy[k] < busy[best]) {
             best = k;
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        const uint32_t margin = busy[best] + busy[best] / 4 + 2;
+        if (k != best && busy[k] <= margin && nets[k] < nets[best]) {
+            best = k;
+        }
+    }
+
+    /*
+     * NOISE FLOOR IS MEASURED, LOGGED, AND DOES NOT VOTE.
+     *
+     * It is the one reading here that can see a non-WiFi interferer -- a
+     * microwave or a video sender raises it while decoding nothing -- and that
+     * is exactly the blind spot every soak on file has had. It still stays out
+     * of the ranking, because it is new and has no baseline on this hardware,
+     * and ranking on an uncalibrated number is how the fault above happened.
+     * Warn instead, and give it a vote once a few soaks say what normal is.
+     */
+    int quietest_noise = 0;
+    for (int k = 0; k < 3; k++) {
+        if (frames[k] && (!quietest_noise || noise_med[k] < quietest_noise)) {
+            quietest_noise = noise_med[k];
+        }
+    }
+    for (int k = 0; k < 3; k++) {
+        if (frames[k] && quietest_noise && noise_med[k] - quietest_noise >= 6) {
+            ESP_LOGW(TAG, "ch%d noise floor %d dBm is %d dB above the quietest"
+                          " candidate -- possible non-WiFi interferer; this does"
+                          " NOT affect the choice",
+                     cand[k], noise_med[k], noise_med[k] - quietest_noise);
         }
     }
 
@@ -162,6 +335,19 @@ static int survey_channel(void)
              occupancy_dbm(power[0]), nets[0],
              occupancy_dbm(power[1]), nets[1],
              occupancy_dbm(power[2]), nets[2],
+             cand[best]);
+    /* Second line rather than a longer first one: the line above is the wire
+     * format three soaks of logs already parse, and appending to it would put
+     * the figure that DECIDES the choice after the one that no longer does. */
+    ESP_LOGW(TAG, "channel occupancy: dwell %d ms | "
+                  "ch1-busy %" PRIu32 " ch1-frames %" PRIu32 " ch1-noise %d | "
+                  "ch6-busy %" PRIu32 " ch6-frames %" PRIu32 " ch6-noise %d | "
+                  "ch11-busy %" PRIu32 " ch11-frames %" PRIu32 " ch11-noise %d"
+                  " -- busy is permille of dwell, and is what chose ch%d",
+             OCCUPANCY_DWELL_MS,
+             busy[0], frames[0], noise_med[0],
+             busy[1], frames[1], noise_med[1],
+             busy[2], frames[2], noise_med[2],
              cand[best]);
     return cand[best];
 }
