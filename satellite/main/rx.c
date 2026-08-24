@@ -295,84 +295,30 @@ static bool upgrade_provisional_anchor(const audio_msg_t *msg, int64_t offset)
 }
 
 /*
- * Fill one missing packet's worth (up to want_frames) into the ring: a recovered
- * payload first, if a trailing FEC block carried one, then silence for whatever
- * it did not yield. Advances samples_in by exactly the frames the ring accepted
- * -- the same accounting as decode_into_ring() and the fill below, because every
- * marker and phase point is recorded against samples_in and an undercount would
- * slide the whole stream.
+ * Fill one missing packet's worth (want_frames) into the ring as concealment.
+ * Advances samples_in by exactly the frames the ring accepted -- the same
+ * accounting as decode_into_ring(), because every marker and phase point is
+ * recorded against samples_in and an undercount would slide the whole stream.
  *
- * Whole SBC frames are decoded until want_frames would be overshot; the rest is
- * silence, so the fill is length-exact. red == NULL means no redundancy covered
- * this packet, so the whole fill is silence -- the behaviour this path always had.
- *
- * Any shortfall is counted in n_fec_short_frames rather than quietly padded. It
- * is ~1/4 of every recovery whenever redundancy is on -- a copy of an ~825-byte
- * payload does not fit beside it -- and nothing used to say so.
+ * THIS IS THE FALLBACK NOW, NOT THE REPAIR. It used to take a recovered payload
+ * and decode as much of it as had arrived, then pad the remainder -- which was
+ * ~1/4 of every recovery, because a whole copy never fitted beside the packet
+ * that carried it. XOR parity recovers a packet WHOLE or not at all, so a
+ * repaired packet goes through decode_into_ring() like any other and this is
+ * reached only when nothing could repair the loss: two losses in one group, a
+ * parity that never arrived, or parity switched off.
  */
-static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
-                                            uint32_t want_frames)
+static uint32_t fill_gap_silence(uint32_t want_frames)
 {
-    static int16_t pcm[SBC_MAX_PCM_SAMPLES];
     static const int16_t silence[128 * AUDIO_CHANNELS] = {0};
     uint32_t filled = 0;
 
-    if (red && red_len) {
-        size_t off = 0;
-        while (filled < want_frames && off < red_len) {
-            size_t consumed = 0, samples = 0;
-            if (!sbc_decode_frame(red + off, red_len - off, &consumed, pcm, &samples)
-                || consumed == 0) {
-                /*
-                 * Stop, but DO NOT reinitialise the decoder.
-                 *
-                 * This used to call sbc_decoder_init() here, and because the
-                 * copy was cut mid-frame by the hub's MTU guard it fired on
-                 * essentially every recovery. The decoder is one global context
-                 * shared with the live stream, and what init() throws away is
-                 * the synthesis filterbank history -- so each recovery also put
-                 * a transient into the frames that followed it, on top of the
-                 * silence the truncation had already caused. Two artefacts from
-                 * one cause, and the second one looked like a decoder problem.
-                 *
-                 * A failure here says the COPY is short or corrupt. It says
-                 * nothing about the live stream, whose own decode path resets on
-                 * its own errors (decode_into_ring). SBC frames are
-                 * independently decodable, so leaving the state alone costs
-                 * nothing and keeps the history the next real frame needs.
-                 */
-                n_fec_decode_err++;
-                break;
-            }
-            off += consumed;
-            uint32_t f = (uint32_t)(samples / AUDIO_CHANNELS);
-            if (filled + f > want_frames) {
-                break;                       /* next frame would overshoot; silence the rest */
-            }
-            size_t want = samples * sizeof(int16_t);
-            size_t sent = xStreamBufferSend(ring, pcm, want, 0);
-            uint32_t got = (uint32_t)(sent / (AUDIO_CHANNELS * sizeof(int16_t)));
-            filled += got;
-            samples_in += (int32_t)got;
-            if (sent < want) {
-                return filled;               /* ring filled mid-packet */
-            }
-        }
-    }
-
-    /* Whatever the copy did not supply. Counted before the loop so a ring that
-     * fills mid-pad does not hide the shortfall behind a second cause -- these
-     * frames were owed by the recovery either way. */
-    if (red && filled < want_frames) {
-        n_fec_short_frames += want_frames - filled;
-    }
-
     /*
-     * The rest is concealed rather than silenced: the last audio that really
-     * played, faded to zero over PLC_FADE_FRAMES, then zeros for however much
-     * gap is left. Same LENGTH as the silence it replaces -- every frame is
-     * still counted into samples_in below, so the timeline is untouched and this
-     * cannot slide the stream. Only the content differs.
+     * Concealed rather than silenced: the last audio that really played, faded
+     * to zero over PLC_FADE_FRAMES, then zeros for however much gap is left.
+     * Same LENGTH as the silence it replaces -- every frame is still counted
+     * into samples_in below, so the timeline is untouched and this cannot slide
+     * the stream. Only the content differs.
      *
      * Before the first decode there is nothing to fade from, so it degrades to
      * exactly the old behaviour.
@@ -420,45 +366,41 @@ static uint32_t fill_recovered_then_silence(const uint8_t *red, size_t red_len,
 }
 
 /*
- * A lost packet must become silence of exactly the right length. Skipping it
- * would pull every later frame earlier and slide the whole stream against
- * the master -- a permanent error, not a momentary glitch. `frames` tells us
- * how much audio a packet was worth, so a gap can be filled accurately even
- * though SBC packets vary in size.
+ * Conceal `missing` lost packets of `per_frames` each, in sequence order.
+ *
+ * SPLIT OUT OF absorb_sequence_gap() so the two callers can differ on WHEN.
+ * A gap used to be filled the instant the packet after it arrived, which is the
+ * only thing that can be done with a FIFO ring -- and it is also what makes
+ * parity impossible, because the parity for a group cannot have arrived yet.
+ * The FEC layer below defers the decision by holding the packets behind the
+ * hole; this is what it calls when the hole turns out to be unrepairable after
+ * all, and what absorb_sequence_gap() calls directly when it always was.
+ *
+ * Counting the gap is NOT here, deliberately: n_gaps is incremented at
+ * detection, once, before anything tries to repair it. That is what makes
+ * `gaps` a measure of what the air lost rather than of what reached the
+ * speaker, which is how the 2026-08-24 A/B proved the channel and not the FEC
+ * was what fixed the run. n_fec_recovered is the other half of the pair.
  */
-static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
+static bool fill_gap(uint32_t missing, uint32_t per_frames)
 {
-    if (have_seq && msg->seq > expect_seq) {
-        uint32_t missing = msg->seq - expect_seq;
-        uint32_t frames_missing = missing * msg->frames;
-        n_gaps++;
-        n_gap_frames += frames_missing;
+    const uint32_t frames_missing = missing * per_frames;
 
-        /*
-         * Trailing FEC redundancy, if the hub attached any: parse every block the
-         * recv carried, so a missing packet can be decoded from the copy a later
-         * packet piggybacked instead of becoming silence. Found by length, not a
-         * flag, so this recovers from any sender that attached blocks and is a
-         * no-op for one that did not.
-         */
-        struct { uint8_t ofs; const uint8_t *p; uint16_t len; } reds[8];
-        int n_reds = 0;
-        for (size_t off = AUDIO_MSG_BYTES(msg->payload_len);
-             n_reds < (int)(sizeof(reds) / sizeof(reds[0])) &&
-             off + AUDIO_RED_HDR_BYTES <= (size_t)n; ) {
-            const audio_red_hdr_t *rh =
-                (const audio_red_hdr_t *)((const uint8_t *)msg + off);
-            if (rh->red_len == 0 ||
-                off + AUDIO_RED_HDR_BYTES + rh->red_len > (size_t)n) {
-                break;
-            }
-            reds[n_reds].ofs = rh->red_seq_ofs;
-            reds[n_reds].p = (const uint8_t *)msg + off + AUDIO_RED_HDR_BYTES;
-            reds[n_reds].len = rh->red_len;
-            n_reds++;
-            off += AUDIO_RED_HDR_BYTES + rh->red_len;
-        }
-
+    /*
+     * HERE, NOT AT DETECTION, and the two are no longer the same place.
+     *
+     * n_gaps counts what the air lost; this counts what the room heard, and
+     * parity is what drove them apart -- a repaired gap never reaches this
+     * function, so it contributes nothing to the silence total. Counted at
+     * detection, as it used to be, `gaps 40 (800 ms silence)` would claim 800 ms
+     * of holes on a run where 38 of the 40 came back whole.
+     *
+     * Above the resync guards below, exactly where it was relative to them, so
+     * every path that reached the old counter still reaches this one and no
+     * window's figure changes meaning for a reason other than the repair.
+     */
+    n_gap_frames += frames_missing;
+    {
         /*
          * Past a point, filling the gap is the wrong answer.
          *
@@ -563,32 +505,16 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
             return false;
         }
         /*
-         * Fill in sequence order. For each missing packet, decode the recovered
-         * SBC a trailing FEC block carried for it -- if one did -- then pad with
-         * silence so the timeline length stays exact. Partial recovery (the
-         * hub's MTU guard truncated the copy) decodes to fewer frames; the
-         * silence pad in fill_recovered_then_silence() makes up the difference.
+         * Fill in sequence order, one packet's worth at a time, so the timeline
+         * length stays exact whatever the ring does mid-fill.
          */
         uint32_t filled = 0;
         for (uint32_t i = 0; i < missing && filled < frames_missing; i++) {
             uint32_t per = frames_missing - filled;
-            if (per > msg->frames) {
-                per = msg->frames;
+            if (per > per_frames) {
+                per = per_frames;
             }
-            uint8_t want_ofs = (uint8_t)(msg->seq - (expect_seq + i));
-            const uint8_t *red = NULL;
-            uint16_t rlen = 0;
-            for (int k = 0; k < n_reds; k++) {
-                if (reds[k].ofs == want_ofs) {
-                    red = reds[k].p;
-                    rlen = reds[k].len;
-                    break;
-                }
-            }
-            if (red) {
-                n_fec_recovered++;
-            }
-            uint32_t got = fill_recovered_then_silence(red, rlen, per);
+            uint32_t got = fill_gap_silence(per);
             filled += got;
             if (got < per) {
                 /*
@@ -607,6 +533,57 @@ static bool absorb_sequence_gap(const audio_msg_t *msg, int n)
                 return false;
             }
         }
+    }
+    return true;
+}
+
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+/* Started below; declared here because the gap path is what arms it. */
+static bool fec_hold_begin(const audio_msg_t *msg, uint32_t missing);
+#endif
+
+/*
+ * A lost packet must become silence of exactly the right length -- or, if parity
+ * can still repair it, the packet itself a little later. Skipping it would pull
+ * every later frame earlier and slide the whole stream against the master: a
+ * permanent error, not a momentary glitch.
+ *
+ * Returns false when this packet must not be delivered: it was filled for, it
+ * was a duplicate, or it has been taken into the FEC hold and will be delivered
+ * when the group resolves.
+ */
+static bool absorb_sequence_gap(const audio_msg_t *msg)
+{
+    if (have_seq && msg->seq > expect_seq) {
+        const uint32_t missing = msg->seq - expect_seq;
+        n_gaps++;
+
+        /*
+         * Offered to parity FIRST, and the gap is already counted, so a repaired
+         * loss still reads as a loss on the air. If the hold takes it, this
+         * packet is not delivered now -- it is delivered in seq order behind the
+         * repaired one when the parity lands, a few tens of milliseconds from
+         * here and still ~310 ms ahead of when it plays.
+         */
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+        if (fec_hold_begin(msg, missing)) {
+            return false;
+        }
+        /*
+         * Parity would not even take it on -- most often because the gap is
+         * more than one packet, which one parity per group cannot cover by
+         * construction. Counted here so that, per window,
+         *
+         *     gaps == fec + fec-lost
+         *
+         * holds exactly: every gap the air made either came back whole or did
+         * not, and there is no third bucket for a loss nothing tried to repair.
+         * Without this line a burst loss would vanish from both columns and the
+         * repair rate would read better than it was.
+         */
+        n_fec_lost++;
+#endif
+        return fill_gap(missing, msg->frames);
     } else if (have_seq && msg->seq < expect_seq) {
         /*
          * A duplicate or a reorder, dropped -- its audio slot has already been
@@ -752,6 +729,380 @@ static void decode_into_ring(const audio_msg_t *msg)
     }
 }
 
+
+/* Defined below the FEC layer, which calls it to release a repaired or held
+ * packet. One definition, three callers -- see the note on it. */
+static void audio_deliver(const audio_msg_t *msg);
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+/*
+ * XOR parity, receiving end.
+ *
+ * THE PROBLEM THIS SOLVES IS NOT ARITHMETIC, IT IS ORDER. A loss is discovered
+ * when the packet AFTER it arrives, and the parity that could repair it is not
+ * sent until the group's last packet -- so at the moment the old code filled the
+ * hole with silence, the repair had not been transmitted yet. The ring is a FIFO
+ * and a hole cannot be back-filled once audio has been written past it.
+ *
+ * So the packets behind an unrepaired hole are HELD, not decoded, until the
+ * group resolves one way or the other. The hold is bounded by the group: at
+ * worst the loss is member 0 and the parity arrives after member K-1, which is
+ * (K-2) packet times -- 40 ms at K=4, against a 350 ms hub lead and a 350 ms
+ * target ring depth. The audio still reaches the ring with ~310 ms in hand, far
+ * above the 125 ms ANCHOR_MIN_LEAD_US floor, and the ring dips by 40 ms out of
+ * 557. That budget is why K is 4 and the ceiling is 8; see the Kconfig help.
+ *
+ * IT DEGRADES TO EXACTLY THE OLD BEHAVIOUR. Two losses in one group, a parity
+ * that never arrives, a hub built with a different K, a payload too long to
+ * cover -- every one of them ends in fill_gap(), which is the silence fill that
+ * would have happened anyway, just up to (K-2) packet times later. Nothing here
+ * can put wrong audio into the ring: audio_fec_extract() refuses any recovery
+ * whose rebuilt header is not exactly the packet that went missing.
+ */
+_Static_assert(CONFIG_DANCEFLOOR_AUDIO_FEC_K >= 2 &&
+               CONFIG_DANCEFLOOR_AUDIO_FEC_K <= AUDIO_FEC_K_MAX,
+               "DANCEFLOOR_AUDIO_FEC_K must be 0 (off) or 2..AUDIO_FEC_K_MAX");
+#define FEC_K        CONFIG_DANCEFLOOR_AUDIO_FEC_K
+#define FEC_HOLD_MAX (FEC_K - 1)      /* a loss at member 0 holds the rest of the group */
+
+/*
+ * The group's running XOR, and the packet a repair rebuilds into.
+ *
+ * ONE ACCUMULATOR, NOT A WINDOW OF K PACKETS. Recovering member i needs every
+ * other member of the group, and the ones before the hole have already been
+ * decoded and thrown away -- but XOR does not need them individually. Folding
+ * each arrival into a single buffer as it passes, then folding the parity in on
+ * top, leaves exactly the codeword of whatever never came. That is the whole
+ * repair, in AUDIO_FEC_CODEWORD_MAX bytes instead of K times that.
+ *
+ * s_fec_rec is a byte array cast to audio_msg_t rather than an audio_msg_t: the
+ * struct is packed, so there is nothing to align, and its payload[] ceiling is
+ * AUDIO_MAX_PAYLOAD (2048) where parity can only ever cover
+ * AUDIO_FEC_PAYLOAD_MAX (1438). The same cast rx_task makes on its receive
+ * buffer, for the same reason.
+ */
+static uint8_t  s_fec_acc[AUDIO_FEC_CODEWORD_MAX];
+static uint8_t  s_fec_rec[AUDIO_FEC_CODEWORD_MAX];
+static uint16_t s_fec_span;          /* bytes of s_fec_acc[] in use */
+static uint32_t s_fec_base;          /* seq of member 0 of the open group */
+static uint8_t  s_fec_seen;          /* bit per member index that arrived */
+static bool     s_fec_open;          /* a group is being accumulated */
+static bool     s_fec_ok;            /* ...and it can still produce a repair */
+static uint32_t s_fec_closed_base;   /* the last group whose parity was handled */
+static bool     s_fec_closed;
+
+/*
+ * The packets waiting behind an unrepaired hole.
+ *
+ * Stored on the wire as they arrived -- AUDIO_MSG_BYTES(payload_len) bytes, not
+ * decoded PCM, which would be four times the size and would have to be undone
+ * if the repair succeeded.
+ */
+static struct {
+    bool     active;
+    uint32_t seq;                    /* the single seq that did not arrive */
+    uint32_t frames;                 /* what it was worth, for the fallback fill */
+    uint32_t last_seq;               /* newest seq held, for contiguity */
+    int      n;
+    uint16_t len[FEC_HOLD_MAX];
+    uint8_t  buf[FEC_HOLD_MAX][AUDIO_FEC_CODEWORD_MAX];
+} s_hold;
+
+static void fec_group_reset(uint32_t base)
+{
+    /* Only what the last group used. At ~851-byte payloads that is ~877 bytes
+     * rather than the full 1464 ceiling, twelve times a second. */
+    memset(s_fec_acc, 0, s_fec_span);
+    s_fec_span = 0;
+    s_fec_base = base;
+    s_fec_seen = 0;
+    s_fec_open = true;
+    s_fec_ok = true;
+}
+
+/* A group is finished with -- repaired, given up on, or clean. Marked rather
+ * than merely forgotten, so the packets delivered out of the hold afterwards do
+ * not fold themselves into a fresh accumulator for a group that is over. */
+static void fec_group_close(void)
+{
+    if (s_fec_open) {
+        s_fec_closed_base = s_fec_base;
+        s_fec_closed = true;
+    }
+    s_fec_open = false;
+}
+
+/*
+ * Fold one delivered packet into its group's running XOR.
+ *
+ * Called for every packet that reaches the ring, in the one place that puts
+ * them there -- so a held packet is folded in when it is HELD (the parity may
+ * arrive before it is flushed, and the XOR has to be complete by then) and the
+ * closed-group guard above is what stops it being folded in twice.
+ */
+static void fec_note_arrival(const audio_msg_t *m)
+{
+    const uint32_t base = m->seq - (m->seq % FEC_K);
+
+    if (s_fec_closed && base == s_fec_closed_base) {
+        return;                      /* already accounted for; group is over */
+    }
+    if (!s_fec_open || base != s_fec_base) {
+        fec_group_reset(base);
+    }
+    if (!audio_fec_xor_in(s_fec_acc, &s_fec_span, m)) {
+        s_fec_ok = false;            /* payload longer than parity can cover */
+        return;
+    }
+    s_fec_seen |= (uint8_t)(1u << (m->seq % FEC_K));
+}
+
+static bool fec_hold_push(const audio_msg_t *m)
+{
+    const uint16_t len = (uint16_t)AUDIO_MSG_BYTES(m->payload_len);
+
+    if (s_hold.n >= FEC_HOLD_MAX || len > (uint16_t)AUDIO_FEC_CODEWORD_MAX) {
+        return false;
+    }
+    memcpy(s_hold.buf[s_hold.n], m, len);
+    s_hold.len[s_hold.n] = len;
+    s_hold.n++;
+    s_hold.last_seq = m->seq;
+    fec_note_arrival(m);
+    return true;
+}
+
+/* Deliver what was held, in the order it arrived. The repaired packet (or the
+ * silence that stood in for it) has already gone in ahead of them. */
+static void fec_hold_flush(void)
+{
+    for (int i = 0; i < s_hold.n; i++) {
+        audio_deliver((const audio_msg_t *)s_hold.buf[i]);
+    }
+    s_hold.n = 0;
+}
+
+/*
+ * The hole is not going to be repaired: fill it and release what was waiting.
+ *
+ * This is the path every failure ends on, and it lands in exactly the place the
+ * receiver would have been without parity at all -- the same fill_gap(), of the
+ * same length, counted the same way. The only difference is that it happened up
+ * to (K-2) packet times later, which the lead absorbs.
+ */
+static void fec_hold_abandon(void)
+{
+    if (!s_hold.active) {
+        return;
+    }
+    n_fec_lost++;
+    s_hold.active = false;
+    fec_group_close();
+
+    if (fill_gap(1, s_hold.frames)) {
+        fec_hold_flush();
+    } else {
+        /* fill_gap asked for a re-anchor: the ring is about to be reset under
+         * us and these packets have nowhere to go. Dropping them is not a loss
+         * of position -- have_seq is already false, so the next packet re-enters
+         * the anchor path and the timeline is rebuilt from it. */
+        s_hold.n = 0;
+    }
+}
+
+/* Everything the FEC layer knows, thrown away. Called when the stream resyncs:
+ * the group it was accumulating belongs to a timeline that no longer exists. */
+static void fec_reset(void)
+{
+    if (s_hold.active) {
+        n_fec_lost++;
+        s_hold.active = false;
+        s_hold.n = 0;
+    }
+    s_fec_open = false;
+    s_fec_closed = false;
+    memset(s_fec_acc, 0, s_fec_span);
+    s_fec_span = 0;
+}
+
+/*
+ * A gap has just been detected. Hold behind it instead of filling it, if parity
+ * could still repair it.
+ *
+ * Every one of these refusals means "the silence fill is the right answer now",
+ * and they are the whole of the latency argument: the hold may only last until
+ * the parity for the group the hole is in, which has not been sent yet.
+ */
+static bool fec_hold_begin(const audio_msg_t *msg, uint32_t missing)
+{
+    const uint32_t want = expect_seq;      /* the seq that did not arrive */
+
+    if (missing != 1) {
+        return false;                      /* parity repairs one loss, not two */
+    }
+    if (anchor_provisional) {
+        /* Holding would defer upgrade_provisional_anchor() past the packets it
+         * is waiting for, and an anchor known to be bad is worth more than one
+         * repaired packet. */
+        return false;
+    }
+    if (msg->payload_len > AUDIO_FEC_PAYLOAD_MAX) {
+        return false;                      /* this group will get no parity */
+    }
+    if (want / FEC_K != msg->seq / FEC_K) {
+        return false;                      /* the group's parity is already past */
+    }
+    if (!s_fec_open || !s_fec_ok || s_fec_base != want - (want % FEC_K)) {
+        return false;                      /* nothing accumulated to repair from */
+    }
+
+    s_hold.n = 0;
+    if (!fec_hold_push(msg)) {
+        return false;
+    }
+    s_hold.active = true;
+    s_hold.seq = want;
+    s_hold.frames = msg->frames;
+    n_fec_holds++;
+    return true;
+}
+
+/*
+ * A packet arrived while a hold is in flight. Take it if it belongs behind the
+ * same hole; otherwise say so and let the caller give up.
+ */
+static bool fec_hold_offer(const audio_msg_t *m)
+{
+    if (m->seq != s_hold.last_seq + 1) {
+        return false;                      /* a second loss in the same group */
+    }
+    if (m->seq / FEC_K != s_hold.seq / FEC_K) {
+        return false;                      /* group over, parity did not come */
+    }
+    if (m->payload_len > AUDIO_FEC_PAYLOAD_MAX) {
+        return false;
+    }
+    return fec_hold_push(m);
+}
+
+/* Rebuild the one missing member and deliver it, then everything behind it. */
+static bool fec_repair(const audio_fec_msg_t *fm, uint32_t want_seq)
+{
+    for (uint16_t i = 0; i < fm->span; i++) {
+        s_fec_acc[i] ^= fm->parity[i];
+    }
+    /* The parity is at least as long as the longest member, so the codeword now
+     * extends to its span -- and the next group's reset must clear that far. */
+    s_fec_span = fm->span;
+
+    if (!audio_fec_extract(s_fec_acc, fm->span, want_seq,
+                           (audio_msg_t *)s_fec_rec)) {
+        n_fec_bad++;
+        return false;
+    }
+
+    /*
+     * COUNT THE LOSS IF NOTHING ELSE DID.
+     *
+     * When the member that went missing was the group's LAST one, the parity
+     * arrives before any audio packet behind it, so absorb_sequence_gap() never
+     * sees a seq jump and never counts the gap. Repairing it silently would make
+     * `gaps` a count of losses the repair happened to be too slow for -- which
+     * is the opposite of what it is for. It has to mean what the air lost,
+     * before and independently of what was done about it, or a comparison
+     * between a parity run and a bare one measures the parity twice.
+     *
+     * s_hold.active is the test because it is exactly the record of whether a
+     * gap was already counted: a hold only ever starts from a detected gap.
+     */
+    if (!s_hold.active) {
+        n_gaps++;
+    }
+    n_fec_recovered++;
+    s_hold.active = false;
+    fec_group_close();
+    audio_deliver((const audio_msg_t *)s_fec_rec);
+    fec_hold_flush();
+    return true;
+}
+
+/*
+ * One parity datagram. This is where a repair happens -- including for a loss
+ * nothing has noticed yet, when the member that went missing was the group's
+ * last and no audio packet has arrived behind it to reveal the gap.
+ */
+static void fec_parity_rx(const audio_fec_msg_t *fm, int n)
+{
+    n_fec_parity_rx++;
+
+    /*
+     * Trusted only if all of it agrees: the sender's K, a span that covers at
+     * least a bare header and no more than a codeword, a datagram long enough to
+     * hold what it claims, and the group this receiver actually accumulated.
+     * A hub and a satellite built with different K fail the count or the base
+     * and are counted, rather than combining unrelated packets.
+     */
+    const bool usable =
+        fm->count == FEC_K &&
+        fm->span >= (uint16_t)AUDIO_MSG_BYTES(0) &&
+        fm->span <= (uint16_t)AUDIO_FEC_CODEWORD_MAX &&
+        fm->span >= s_fec_span &&
+        n >= (int)AUDIO_FEC_MSG_BYTES(fm->span) &&
+        have_seq && s_fec_open && s_fec_ok && fm->base_seq == s_fec_base;
+
+    if (usable) {
+        const uint8_t full = (uint8_t)((1u << FEC_K) - 1u);
+        const uint8_t lost = (uint8_t)(full & ~s_fec_seen);
+
+        if (lost == 0) {
+            fec_group_close();       /* a clean group: nothing to repair */
+            return;
+        }
+        /* Exactly one bit set. Two losses XOR to something that is not a packet,
+         * and audio_fec_extract() would refuse it anyway -- but there is no
+         * point building it to find out, and n_fec_lost is the honest counter
+         * for a group parity cannot help with. */
+        if ((lost & (uint8_t)(lost - 1u)) == 0) {
+            const uint32_t want = s_fec_base + (uint32_t)__builtin_ctz(lost);
+            if (want == expect_seq && fec_repair(fm, want)) {
+                return;
+            }
+        }
+    } else if (fm->count != FEC_K) {
+        n_fec_bad++;                 /* the two ends disagree about K */
+    }
+
+    fec_hold_abandon();
+    fec_group_close();
+}
+#endif  /* CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0 */
+
+/*
+ * Everything a packet does once the sequencing has accepted it.
+ *
+ * Pulled out of handle_audio() because there are three callers now, not one: a
+ * packet that arrived in order, a packet the parity rebuilt, and a packet that
+ * was held behind a hole while the parity was on its way. All three must land
+ * identically -- same marker handling, same phase point, same samples_in
+ * accounting -- and the surest way to guarantee that is for there to be one
+ * copy of it.
+ *
+ * That is the deeper reason parity recovers the audio_msg_t HEADER as well as
+ * the payload. The scheme it replaces produced a bare buffer of SBC, which had
+ * to be fed through a separate fill routine that reimplemented a subset of this
+ * and got the accounting subtly different. A recovered packet here is a packet.
+ */
+static void audio_deliver(const audio_msg_t *msg)
+{
+    expect_seq = msg->seq + 1;
+    have_seq = true;
+
+    record_packet_positions(msg);
+    decode_into_ring(msg);
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+    fec_note_arrival(msg);
+#endif
+}
+
 /*
  * One audio packet, in the order the decisions have to be taken.
  *
@@ -760,7 +1111,7 @@ static void decode_into_ring(const audio_msg_t *msg)
  * between four screens of commentary, so the order could not be read without
  * reading all of it.
  */
-static void handle_audio(const audio_msg_t *msg, int n, int64_t arrived_at)
+static void handle_audio(const audio_msg_t *msg, int64_t arrived_at)
 {
     int64_t offset;
     bool by_tsf = false;
@@ -793,6 +1144,27 @@ static void handle_audio(const audio_msg_t *msg, int n, int64_t arrived_at)
         return;
     }
 
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+    /*
+     * Before the anchor, not after, and that ordering is load-bearing.
+     *
+     * A hold that gives up may ask for a re-anchor (fill_gap can), and this
+     * packet is then the one that has to carry it. Deciding the hold first
+     * leaves have_seq in its final state before anchor_stream() reads it, so
+     * the packet lands in exactly one of the two paths rather than being
+     * sequenced against a stream that is about to be rebuilt.
+     */
+    if (!have_seq) {
+        fec_reset();          /* a resync: the open group is a dead timeline's */
+    }
+    if (s_hold.active) {
+        if (fec_hold_offer(msg)) {
+            return;           /* held; delivered when the group resolves */
+        }
+        fec_hold_abandon();   /* it belongs to a later group: the hole is real */
+    }
+#endif
+
     if ((!have_seq || stream_start_local == 0) &&
         !anchor_stream(msg, offset, by_tsf)) {
         return;
@@ -800,23 +1172,21 @@ static void handle_audio(const audio_msg_t *msg, int n, int64_t arrived_at)
     if (upgrade_provisional_anchor(msg, offset)) {
         return;
     }
-    if (!absorb_sequence_gap(msg, n)) {
+    if (!absorb_sequence_gap(msg)) {
         return;
     }
 
-    expect_seq = msg->seq + 1;
-    have_seq = true;
-
-    record_packet_positions(msg);
-    decode_into_ring(msg);
+    audio_deliver(msg);
 }
 
 
 void rx_task(void *arg)
 {
     (void)arg;
-    /* Sized for the largest message we can receive, which is audio. */
+    /* Sized for the largest message we can receive, which is audio -- a parity
+     * datagram is capped at the MTU and so is comfortably smaller. */
     static uint8_t buf[sizeof(audio_msg_t)];
+    _Static_assert(sizeof(buf) >= AUDIO_UDP_MTU, "a full datagram would not fit");
 
     while (1) {
         int n = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
@@ -1082,7 +1452,19 @@ void rx_task(void *arg)
                 rx_burst_max = s_burst_run;
             }
             s_prev_audio_at = t4;
-            handle_audio((const audio_msg_t *)buf, n, t4);
+            handle_audio((const audio_msg_t *)buf, t4);
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+        } else if (buf[0] == MSG_AUDIO_FEC &&
+                   n >= (int)AUDIO_FEC_MSG_BYTES(0)) {
+            /*
+             * NOT counted into the arrival cadence above. rx_gap_max_us and
+             * burst-max are about the AUDIO stream's evenness, and folding a
+             * parity datagram into them would close a real gap with a packet
+             * that carries no audio -- the instrument would report a delivery
+             * that did not happen.
+             */
+            fec_parity_rx((const audio_fec_msg_t *)buf, n);
+#endif
         }
     }
 }

@@ -45,7 +45,11 @@ COUNTERS = {
     "underruns", "restarts", "reanchors", "anchors", "splices", "retunes",
     "retunes_refused", "gaps", "ring-full", "dma-starve", "short-reads",
     "short-resync", "wifi-drops", "alloc-fail", "phase-drop", "seq-drop",
-    "decode-err", "recv-err", "sta-left", "wifi-over", "fec-trunc",
+    "decode-err", "recv-err", "sta-left", "wifi-over",
+    # fec-trunc was the piggyback scheme's truncation count on HEALTH. The
+    # scheme is gone and so is the counter; kept here so a capture taken before
+    # XOR parity still totals correctly rather than being read as a gauge.
+    "fec-trunc",
     "refill-withheld", "anchors-refused", "upgrades", "dropped", "dup",
     "wide-span", "sta-timeout",
     # The faded catch-up's own pair, apart from the trim's dropped/dup because
@@ -553,6 +557,98 @@ def main():
                   " first: a source stall makes both collapse and is not a")
             print("        delivery fault at all -- it was half the starvation"
                   " on the 2026-08-19 20:04 soak.")
+
+    # ---- 6b. XOR parity ----------------------------------------------------
+    #
+    # WHAT THIS SECTION IS FOR, AND THE MISTAKE IT EXISTS TO PREVENT.
+    #
+    # The 2026-08-24 A/B ran the old piggyback FEC against no FEC over matched
+    # 46-minute windows and both were flawless -- zero gaps either way. That is
+    # not evidence that redundancy works; it is evidence that the channel was
+    # quiet. Redundancy can only be judged where losses happen, so the first
+    # thing printed here is whether the run had any, and a run with none says
+    # nothing about parity at all however good the other numbers look.
+    #
+    # The pairing that matters is `gaps` against `fec` on the same unit:
+    #
+    #   gaps       what the AIR lost -- counted at detection, before any repair
+    #   fec        of those, how many came back WHOLE
+    #   fec-lost   ...and how many did not (two in a group, or no parity)
+    #   fec-held   how often packets waited behind a hole for a parity
+    #   fec-bad    parity that arrived and could not be trusted -- must be 0
+    #
+    # gaps is deliberately pre-repair, which is what let the earlier soaks prove
+    # the channel and not the FEC had fixed a run. So `gaps 40, fec 38` is the
+    # scheme working, not forty holes in the sound.
+    fec_units = sorted({u for u in met[met["kind"] == "rx5s"]["unit"].unique()})
+    fec_rows = []
+    for u in fec_units:
+        g = gauge(met, u, "rx5s", "gaps")
+        f = gauge(met, u, "rx5s", "fec")
+        if g is None or f is None or g.empty:
+            continue
+        def total(name):
+            x = gauge(met, u, "rx5s", name)
+            return 0 if x is None or x.empty else int(x["value"].sum())
+        fec_rows.append((u, int(g["value"].sum()), total("fec"),
+                         total("fec-lost"), total("fec-held"), total("fec-bad")))
+    if fec_rows:
+        head("XOR PARITY  (of what the air lost, how much came back whole)")
+        # Parity arriving at all, from the satellite's ARRIVAL line: it should
+        # read the audio packet rate divided by K. A zero here with audio
+        # flowing is the one failure no other counter on the floor can see --
+        # the hub not sending parity looks exactly like a channel that never
+        # lost anything.
+        k = gauge(met, "hub", "status", "fec-k")
+        k_val = int(k["value"].iloc[-1]) if k is not None and not k.empty else None
+        tx = window_sum(met, "hub", "fec-tx")
+        cong = window_sum(met, "hub", "fec-cong")
+        skip = window_sum(met, "hub", "fec-skip")
+        print(f"  hub: K={k_val if k_val is not None else '--'}"
+              f"   parity sent {tx:,}   withheld under backoff {cong:,}"
+              f"   ungroupable {skip:,}")
+        if k_val == 0:
+            print("       ** parity is switched OFF in this build "
+                  "(DANCEFLOOR_AUDIO_FEC_K=0) -- the rows below are the "
+                  "unprotected baseline **")
+        elif tx == 0:
+            print("       ** no parity was sent all run -- check the build and "
+                  "the hub's own status line before reading anything below **")
+        if cong:
+            print(f"       {cong:,} groups stood down for the transmit pool. That is"
+                  " the design working: read it beside tx-fail (audio),")
+            print("       which must NOT have risen with it -- if both moved, parity"
+                  " is not what is holding the pool.")
+        for u, gaps, rec, lost, held, bad in fec_rows:
+            if gaps == 0:
+                print(f"  {u}: no losses this run -- parity had nothing to repair,"
+                      " and this run cannot judge it.")
+                print("       Re-run under contention: a large download on a nearby"
+                      " machine, not associated to the hub's AP.")
+                continue
+            par = gauge(met, u, "arrival", "fec-parity")
+            par_n = int(par["value"].sum()) if par is not None and not par.empty else 0
+            if tx == 0 and par_n == 0:
+                # A capture from before parity existed, or a run with it off.
+                # Printing a 0% repair rate here would read as a failure of the
+                # scheme rather than its absence, so say what this actually is.
+                print(f"  {u}: {gaps:,} lost on the air, all of them silence --"
+                      " this run had no parity to repair them.")
+                continue
+            pct = 100.0 * rec / gaps
+            print(f"  {u}: {gaps:,} lost on the air -> {rec:,} rebuilt whole"
+                  f" ({pct:.0f}%), {lost:,} left as silence")
+            print(f"       held {held:,} times   parity received {par_n:,}"
+                  f"   bad {bad}")
+            if bad:
+                print("       ** fec-bad is not a radio fault. The hub and this"
+                      " satellite disagree about the wire or about K;")
+                print("          reflash both from the same tree. **")
+            if lost > rec and gaps > 10:
+                print("       More losses went unrepaired than repaired, which"
+                      " means they are arriving in bursts rather than singly.")
+                print("       Parity covers one loss per group of K; a burst"
+                      " inside one group is out of its reach by construction.")
 
     # ------------------------------------------------------------------------
     # THE AIR'S OWN READING, printed BEFORE the refusals and not after.

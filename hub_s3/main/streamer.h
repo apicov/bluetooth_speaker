@@ -35,6 +35,11 @@
 
 void streamer_start(void);
 
+/* Claim the XOR parity buffer from PSRAM. Called by streamer_start(); separate
+ * because the buffer belongs to timeline.c, which is where the send path that
+ * fills it lives. */
+void streamer_fec_start(void);
+
 /*
  * xTaskCreate with the return value actually read. Defined in streamer.c.
  *

@@ -810,8 +810,9 @@ extern volatile uint32_t s_audio_pkts;
  *
  * Ordered audible-first, which is also roughly worst-first: a refused audio
  * packet is a hole in the sound on every satellite at once, a refused frame is
- * one repaint, a refused level is covered by the 1 Hz repeat, and a refused
- * probe reply is one clock sample out of four a second.
+ * one repaint, a refused level is covered by the 1 Hz repeat, a refused probe
+ * reply is one clock sample out of four a second, and a refused parity packet
+ * costs nothing at all unless the group it covered also lost a member.
  *
  * Racy exactly as s_tx_fail is, and for the same reason -- see net.c.
  */
@@ -821,6 +822,7 @@ typedef enum {
     TX_LANE_VOL,         /* streamer_send_vol() */
     TX_LANE_META,        /* streamer_send_meta(): track metadata */
     TX_LANE_PROBE,       /* probe_task(): time and TSF replies */
+    TX_LANE_FEC,         /* send_fec_to_clients(): XOR parity for a group */
     TX_LANE_N,
 } tx_lane_t;
 
@@ -1372,21 +1374,32 @@ extern volatile uint32_t n_sta_timeout;
 extern uint32_t n_wifi_oversize;
 
 /*
- * Redundant copies the MTU forced short.
+ * XOR parity, from the sending end. All three are per-window and cleared by the
+ * status line that prints them.
  *
- * Zero while DANCEFLOOR_AUDIO_FEC_DEPTH is 0, which is the default and why this
- * is quiet today. With redundancy on it counts almost every packet, and that is
- * the honest reading rather than a fault: an ~825-byte payload leaves ~618 bytes
- * for a copy, so ~1/4 of each one is missing and the satellite pads it with
- * silence -- about 6 ms per "recovered" packet. The satellite's
- * n_fec_short_frames is the same fact seen from the receiving end.
+ * n_fec_sent is groups whose parity reached at least one satellite. At K it
+ * should be the audio packet rate divided by K and nothing else -- ~12 a second
+ * against ~50 at K=4 -- so a figure below that is the two counters beside it,
+ * and a figure at zero with audio flowing means the scheme is not running at
+ * all.
  *
- * A cap that made copies fit whole was tried and reverted; see
- * DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help. So this counter is what any future
- * attempt at redundancy has to drive to zero, and what says immediately whether
- * a given payload size and depth actually fit each other.
+ * n_fec_cong_skip is the one worth watching, and the one the last FEC scheme had
+ * no equivalent of. It counts parity WITHHELD because the transmit pool was in
+ * ENOMEM backoff -- redundancy standing down so it does not displace the audio
+ * it exists to protect. Read it beside tx-fail: a busy channel should show this
+ * rising while tx-fail stays flat, which is the trade working. This rising
+ * TOGETHER with tx-fail (audio) means parity is not the thing holding the pool
+ * and something else is.
+ *
+ * n_fec_skipped is a group that could not produce parity at all: a payload
+ * longer than AUDIO_FEC_PAYLOAD_MAX, or a seq run that was not contiguous.
+ * Expected to be flat at zero forever on this hardware -- payloads are ~851 B
+ * against a 1438 B ceiling -- so any movement here is a wire-format question,
+ * not a radio one.
  */
-extern uint32_t n_fec_truncated;
+extern volatile uint32_t n_fec_sent;
+extern volatile uint32_t n_fec_skipped;
+extern volatile uint32_t n_fec_cong_skip;
 
 /* Ring position and scheduled instant of the last packet sent, so the analysis
  * -- fed on arrival, before this packet's stamp exists -- can date what it is

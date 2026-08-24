@@ -166,3 +166,94 @@ uint16_t sbc_link_crc16(const void *hdr, const void *payload, uint16_t len)
     crc = crc16_bytes(crc, (const uint8_t *)payload, len);
     return crc;
 }
+
+/*
+ * XOR parity for the audio downlink. The wire format and the reasoning behind
+ * it are at audio_fec_msg_t in sync_proto.h; this is the arithmetic, kept here
+ * so both firmwares run one implementation and the host test can exercise it.
+ */
+
+/*
+ * Bytewise, deliberately.
+ *
+ * A word-at-a-time loop would need both operands at the same alignment, and the
+ * codeword straddles a 26-byte header -- so the payload half starts on an odd
+ * boundary in acc[] and there is nothing to align to without changing the wire
+ * format. The cost of not bothering is ~877 bytes per packet at ~50 packets a
+ * second: under 44 kB/s of XOR on each end, which is noise beside the SBC decode
+ * on the same core. The CRC above spends thirty times that.
+ */
+static void xor_bytes(uint8_t *dst, const uint8_t *src, uint16_t n)
+{
+    for (uint16_t i = 0; i < n; i++) {
+        dst[i] ^= src[i];
+    }
+}
+
+bool audio_fec_xor_in(uint8_t *acc, uint16_t *span, const audio_msg_t *m)
+{
+    if (m->payload_len > AUDIO_FEC_PAYLOAD_MAX) {
+        return false;
+    }
+    const uint16_t len = (uint16_t)AUDIO_MSG_BYTES(m->payload_len);
+
+    /*
+     * Only the bytes this member actually has. Everything past them is the
+     * implicit zero padding, and XOR-ing zeros is a no-op -- which is exactly
+     * why unequal SBC lengths need no length table on the wire.
+     */
+    xor_bytes(acc, (const uint8_t *)m, len);
+    if (len > *span) {
+        *span = len;
+    }
+    return true;
+}
+
+bool audio_fec_extract(const uint8_t *acc, uint16_t span, uint32_t want_seq,
+                       audio_msg_t *out)
+{
+    /*
+     * A codeword shorter than a bare header cannot be a packet, and reading a
+     * payload_len out of it would be reading past the parity the sender sent.
+     */
+    if (span < AUDIO_MSG_BYTES(0) || span > AUDIO_FEC_CODEWORD_MAX) {
+        return false;
+    }
+
+    /*
+     * Copied out before anything is trusted, so the checks below read from a
+     * properly typed object rather than reaching into acc[] at hand-computed
+     * offsets. out is the caller's, and is only meaningful when this returns
+     * true -- a refused recovery may leave it holding whatever the XOR produced.
+     */
+    memcpy(out, acc, span);
+
+    /*
+     * THE THREE CHECKS ARE THE TWO-LOSS DEFENCE. With one member missing the
+     * XOR reproduces it exactly, so all three pass by construction. With two
+     * missing it produces the XOR of both, which is not a packet: the type and
+     * format bytes are the two headers' bytes XOR-ed together and the seq is the
+     * two seqs XOR-ed together. Any of those matching by accident is possible;
+     * all three at once is not, and a wrong seq alone would put the audio in the
+     * wrong slot, which is worse than the silence a loss already costs.
+     *
+     * The same three catch a hub and a satellite built with different K, where
+     * the receiver folds a genuinely different set of packets than the sender.
+     */
+    if (out->type != MSG_AUDIO || out->format != AUDIO_FMT_SBC ||
+        out->seq != want_seq) {
+        return false;
+    }
+
+    /*
+     * And the length has to be consistent with the parity that carried it. A
+     * recovered payload_len longer than the span means the decoder would read
+     * bytes the sender never covered -- past the end of the recovered packet and
+     * into whatever the caller's buffer held before.
+     */
+    if (out->payload_len > AUDIO_FEC_PAYLOAD_MAX ||
+        AUDIO_MSG_BYTES(out->payload_len) > span) {
+        return false;
+    }
+    return true;
+}

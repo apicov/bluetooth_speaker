@@ -53,19 +53,42 @@ static int64_t s_wait_since;
  * See TIMELINE_HOLD_STARVE_MS. */
 static int64_t s_hold_since;
 
-#if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+_Static_assert(CONFIG_DANCEFLOOR_AUDIO_FEC_K >= 2 &&
+               CONFIG_DANCEFLOOR_AUDIO_FEC_K <= AUDIO_FEC_K_MAX,
+               "DANCEFLOOR_AUDIO_FEC_K must be 0 (off) or 2..AUDIO_FEC_K_MAX");
+#define FEC_K CONFIG_DANCEFLOOR_AUDIO_FEC_K
+
 /*
- * The last FEC_DEPTH payloads, kept so each outgoing packet can piggyback them
- * as trailing redundancy for the satellite to recover a loss from. [0] is the
- * packet immediately before this one, [1] the one before that. Single-writer
- * like everything else in this file: sbc_in's rx_task is the only caller.
+ * The parity datagram for the group being sent, accumulated IN PLACE and held IN
+ * PSRAM.
+ *
+ * ONE BUFFER, NOT TWO: audio_fec_xor_in() folds each packet straight into the
+ * message that will carry it, so the group's running XOR and the datagram are
+ * the same 1472 bytes rather than an accumulator plus a copy of it.
+ *
+ * AND NOT IN INTERNAL DRAM, which is the constraint this whole scheme had to be
+ * designed around. The hub runs with ~10-12 kB of internal DRAM free and a
+ * largest free block of ~7.7 kB, because the WiFi driver's 38 static TX buffers
+ * are DMA-capable internal SRAM and cannot move anywhere else. Spending 1.5 kB
+ * of that on redundancy would be taking it from the pool that refuses audio
+ * sends with ENOMEM -- the exact failure this replaces. PSRAM has 8 MB and this
+ * buffer never touches DMA: sendto() copies it into a pbuf, so the slow read is
+ * ~1.5 kB at 12 datagrams a second and nothing measures it.
+ *
+ * It is allocated once, in streamer_fec_start(), and parity is simply off if the
+ * board has no PSRAM to give -- refusing loudly rather than falling back to
+ * internal, because the fallback would silently spend the one thing that has
+ * none to spare.
+ *
+ * Single-writer like everything else in this file: sbc_in's rx_task is the only
+ * caller of the path that touches it.
  */
-static struct {
-    uint8_t  payload[AUDIO_MAX_PAYLOAD];
-    uint16_t len;
-    uint32_t seq;
-    bool     valid;
-} fec_prev[CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH];
+static audio_fec_msg_t *s_fec;
+static uint16_t s_fec_span;      /* bytes of s_fec->parity[] in use this group */
+static uint32_t s_fec_base;      /* seq of member 0 of the group */
+static uint32_t s_fec_have;      /* members folded in so far */
+static bool     s_fec_ok;        /* false once this group cannot produce parity */
 #endif
 
 uint32_t streamer_take_dropped(void)
@@ -641,6 +664,144 @@ static void fan_out(size_t bytes, int64_t now)
     s_fanout_prev_at = now;
 }
 
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+/*
+ * The parity datagram for one completed group, to the same client list the
+ * audio went to.
+ *
+ * ITS OWN LANE, AND IT YIELDS. fan_out() ignores the ENOMEM backoff because
+ * audio always sends -- a refused audio packet is a hole in the sound. Parity is
+ * the opposite: it exists to repair holes, and a parity datagram that takes the
+ * last TX buffer MAKES one. So it stands down while the pool is in backoff,
+ * exactly as the frame and volume lanes do.
+ *
+ * That is not a corner case, it is the whole failure the last FEC scheme died
+ * of: redundancy is wanted precisely when the channel is busy, which is
+ * precisely when the transmit pool has nothing to spare. Yielding here means the
+ * cost of parity under contention is that it stops, not that it starts
+ * displacing the audio it was meant to protect.
+ */
+static void send_fec_to_clients(size_t bytes)
+{
+    if (esp_timer_get_time() < s_tx_congested_until) {
+        n_fec_cong_skip++;
+        return;
+    }
+
+    client_t snapshot[MAX_CLIENTS];
+    clients_snapshot(snapshot);
+
+    bool any = false;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!snapshot[i].last_seen) {
+            continue;
+        }
+        /*
+         * No ENOMEM retry, unlike the audio lane. A retry costs a syscall in the
+         * audio path's own task, and what it would buy is a repair rather than
+         * the sound itself. If the pool is that tight the backoff above is about
+         * to fire anyway.
+         */
+        if (sendto(sock, s_fec, bytes, 0,
+                   (struct sockaddr *)&snapshot[i].addr,
+                   sizeof(snapshot[i].addr)) < 0) {
+            tx_fail_note(TX_LANE_FEC, errno);
+        } else {
+            any = true;
+        }
+    }
+    if (any) {
+        n_fec_sent++;
+    }
+}
+
+/*
+ * Fold one sent packet into its group's parity, and publish the parity when the
+ * group closes.
+ *
+ * GROUPS ARE ALIGNED ON seq -- member index is seq % FEC_K -- so the satellite
+ * derives the same grouping from arithmetic and nothing has to be negotiated or
+ * carried on the audio packets. audio_msg_t is untouched by this whole scheme,
+ * which is what keeps a satellite that predates it reading the stream unchanged.
+ */
+static void fec_note_sent(const audio_msg_t *m, int64_t now)
+{
+    (void)now;
+    if (!s_fec) {
+        return;              /* no PSRAM for the buffer; parity is off */
+    }
+    const uint32_t idx = m->seq % FEC_K;
+
+    if (idx == 0) {
+        /* Clear only what the last group used, not the full ceiling: at ~851 B
+         * payloads that is ~877 bytes rather than 1464, twelve times a second. */
+        memset(s_fec->parity, 0, s_fec_span);
+        s_fec_span = 0;
+        s_fec_base = m->seq;
+        s_fec_have = 0;
+        s_fec_ok = true;
+    }
+
+    /*
+     * A group whose members are not the contiguous run this one claims cannot
+     * produce parity that means anything, so it produces none.
+     *
+     * seq is assigned as `seq++` on the one path that reaches fan_out(), and
+     * never reset, so today the run is always contiguous and this never fires.
+     * It is here because that is a property of code above, not of this function,
+     * and the failure it would otherwise cause is silent: a parity built over
+     * the wrong set still passes its own length checks at the far end and is
+     * caught only by audio_fec_extract()'s seq test, one recovery at a time.
+     */
+    if (idx != s_fec_have) {
+        s_fec_ok = false;
+    }
+    if (s_fec_ok && !audio_fec_xor_in(s_fec->parity, &s_fec_span, m)) {
+        s_fec_ok = false;      /* payload longer than a parity datagram can cover */
+    }
+    s_fec_have = idx + 1;
+
+    if (idx + 1 < FEC_K) {
+        return;                /* group still open */
+    }
+    if (!s_fec_ok) {
+        n_fec_skipped++;
+        return;
+    }
+
+    s_fec->type = MSG_AUDIO_FEC;
+    s_fec->count = FEC_K;
+    s_fec->span = s_fec_span;
+    s_fec->base_seq = s_fec_base;
+    send_fec_to_clients(AUDIO_FEC_MSG_BYTES(s_fec_span));
+}
+#endif
+
+
+/*
+ * Claim the parity buffer. Called once at startup, before any audio flows.
+ *
+ * A no-op when parity is configured off, and a warning -- not a fallback -- when
+ * PSRAM refuses. See s_fec for why internal DRAM is not an acceptable second
+ * choice here: taking 1.5 kB of it to protect the audio would be taking it from
+ * the pool whose exhaustion is what drops the audio.
+ */
+void streamer_fec_start(void)
+{
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+    s_fec = heap_caps_malloc(sizeof(*s_fec), MALLOC_CAP_SPIRAM);
+    if (!s_fec) {
+        ESP_LOGW(TAG, "XOR parity disabled: PSRAM refused %u bytes. Audio is "
+                      "unaffected; a lost packet is a gap again, as it was "
+                      "before DANCEFLOOR_AUDIO_FEC_K existed.",
+                 (unsigned)sizeof(*s_fec));
+        return;
+    }
+    memset(s_fec, 0, sizeof(*s_fec));
+    ESP_LOGI(TAG, "XOR parity: K=%d, one %u-byte parity per group, %u%% overhead",
+             FEC_K, (unsigned)sizeof(*s_fec), 100 / FEC_K);
+#endif
+}
 
 void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool marker)
 {
@@ -712,9 +873,9 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
      *
      * Here, at the stamp, and against the `now` read at the top of this call:
      * that is the same instant the satellite's arrival lead is measured from at
-     * the other end, so the two subtract to a transit time. Everything between
-     * this line and the sendto is microseconds of FEC assembly, so it does not
-     * matter which side of it this sits.
+     * the other end, so the two subtract to a transit time. Nothing but a memcpy
+     * stands between this line and the sendto now that parity is assembled after
+     * it, so it does not matter which side of it this sits.
      */
     {
         const int64_t lead = next_play_at - now;
@@ -731,65 +892,19 @@ void streamer_send_sbc(const uint8_t *sbc, uint16_t len, uint32_t frames, bool m
     }
     memcpy(msg.payload, sbc, len);
 
-    size_t bytes = AUDIO_MSG_BYTES(len);
-#if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
-    /*
-     * Piggyback up to FEC_DEPTH previous payloads after this one, as far as the
-     * UDP MTU allows. Each block is an audio_red_hdr_t plus its SBC; red_seq_ofs
-     * is how many packets back it recovers (1, 2, ...). Attached only while the
-     * stored chain is contiguous -- if a packet was skipped here (an early
-     * return above left a hole in seq), the deeper slots no longer describe a
-     * run and are left off. The blocks are written into the unused tail of
-     * msg.payload[], which is AUDIO_MAX_PAYLOAD bytes and so always holds a
-     * packet that itself fits the MTU.
-     *
-     * COPIES ARE TRUNCATED, and n_fec_truncated counts it. An ~825-byte payload
-     * leaves ~618 bytes of room, so about a quarter of each copy is missing and
-     * the satellite pads that much silence -- which is why the depth defaults to
-     * 0 and this loop does not run. Sizing the payload so a copy fits whole was
-     * tried and reverted; DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help has the
-     * measurement.
-     */
-    {
-        size_t off = AUDIO_MSG_BYTES(len);          /* where the next block goes */
-        for (int d = 0; d < CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH; d++) {
-            if (!fec_prev[d].valid) {
-                break;
-            }
-            if (fec_prev[d].seq + (uint32_t)(d + 1) != msg.seq) {
-                break;                              /* chain broken by a skip */
-            }
-            if (off + AUDIO_RED_HDR_BYTES > AUDIO_UDP_MTU) {
-                break;
-            }
-            size_t room = AUDIO_UDP_MTU - off - AUDIO_RED_HDR_BYTES;
-            uint16_t take = fec_prev[d].len;
-            if (take > room) {
-                take = (uint16_t)room;
-                n_fec_truncated++;
-            }
-            audio_red_hdr_t rh = { .red_len = take, .red_seq_ofs = (uint8_t)(d + 1) };
-            uint8_t *dst = (uint8_t *)&msg + off;
-            memcpy(dst, &rh, AUDIO_RED_HDR_BYTES);
-            memcpy(dst + AUDIO_RED_HDR_BYTES, fec_prev[d].payload, take);
-            off += AUDIO_RED_HDR_BYTES + take;
-        }
-        bytes = off;
-    }
-#endif
+    const size_t bytes = AUDIO_MSG_BYTES(len);
     fan_out(bytes, now);
 
-#if CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH > 0
-    /* Shift the ring: this packet becomes [0], older ones move down. After the
-     * send so an early return (which never reached here) does not poison the
-     * chain with a packet that was not transmitted. */
-    for (int d = CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH - 1; d > 0; d--) {
-        fec_prev[d] = fec_prev[d - 1];
-    }
-    memcpy(fec_prev[0].payload, sbc, len);
-    fec_prev[0].len = len;
-    fec_prev[0].seq = msg.seq;
-    fec_prev[0].valid = true;
+#if CONFIG_DANCEFLOOR_AUDIO_FEC_K > 0
+    /*
+     * Fold this packet into its group's parity, and send the parity if it
+     * completed one. After fan_out(), so a packet that never reached the send
+     * cannot be covered by a parity that was already on the air -- and so that
+     * a packet the TX pool REFUSED still is: the satellite lost it either way,
+     * and parity repairs a hole made at this end exactly as it repairs one made
+     * on the air.
+     */
+    fec_note_sent(&msg, now);
 #endif
 
     /*

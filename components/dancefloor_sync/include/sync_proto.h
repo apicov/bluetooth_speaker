@@ -47,6 +47,15 @@ typedef enum {
      * hub runs no analysers at all now. Not reused, for the same reason as 3
      * above. */
     MSG_VOL      = 13,  /* master -> listeners, playback volume (see vol_msg_t) */
+    /*
+     * master -> listeners, one XOR parity packet per group of audio packets.
+     * See audio_fec_msg_t. Its own type rather than a field on audio_msg_t
+     * because a satellite that predates it must go on reading the audio
+     * unchanged, and an unknown type is already ignored by rx_task's dispatch
+     * -- which is exactly the compatibility the trailing-redundancy scheme it
+     * replaces had, kept for the same reason.
+     */
+    MSG_AUDIO_FEC = 14,
 } msg_type_t;
 
 /*
@@ -565,42 +574,6 @@ typedef struct __attribute__((packed)) {
 #define AUDIO_MSG_BYTES(n) (sizeof(audio_msg_t) - AUDIO_MAX_PAYLOAD + (n))
 
 /*
- * Optional trailing forward-error-correction redundancy.
- *
- * audio_msg_t itself is UNCHANGED: when no redundancy is attached this is the
- * same wire format every log was captured against, and an older receiver reads
- * payload_len bytes and ignores anything after. Redundancy is appended AFTER the
- * first payload_len bytes as one or more self-describing blocks, found by length
- * rather than by a version byte -- so a receiver from this branch recovers from
- * any sender that attached it, and a sender that did not is read unchanged.
- *
- * Each block is a packed header (red_len, red_seq_ofs) followed by red_len bytes
- * of a previous packet's SBC. red_seq_ofs says which previous packet it recovers
- * (1 = the packet immediately before this one). A block lives in the unused tail
- * of payload[] on the wire; the attach path is MTU-guarded so a packet carries as
- * many whole blocks as fit and never fragments.
- *
- * Decoded audio is ~1.4 Mbps in 172 packets/s; the SBC sent over the air is
- * ~330 kbps in ~50 packets/s of ~825-byte payloads. A copy is attached only as
- * far as the MTU allows, so at those payload sizes it is TRUNCATED to about
- * three quarters and the satellite pads the rest with silence -- roughly 6 ms
- * per "recovered" packet, which the log still reports as a clean recovery.
- *
- * That is why the depth defaults to 0. A whole copy needs 2 x 825 + 29 bytes
- * against a 1472-byte MTU and cannot fit, and making it fit by shrinking the
- * payload doubles the packet rate, which this hub cannot afford. The full
- * measurement is in DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig help; it is kept there
- * rather than here because it is a decision about a setting, not about the wire
- * format, and the wire format is what this header is for.
- */
-#define AUDIO_RED_HDR_BYTES   3                     /* u16 red_len + u8 red_seq_ofs */
-#define AUDIO_RED_BYTES(r)    (AUDIO_RED_HDR_BYTES + (r))
-
-/* On-wire bytes for an audio message of n payload bytes followed by r bytes of
- * trailing redundancy. AUDIO_MSG_BYTES(n) is the r == 0 case. */
-#define AUDIO_MSG_RED_BYTES(n, r) (AUDIO_MSG_BYTES(n) + AUDIO_RED_BYTES(r))
-
-/*
  * What one UDP datagram may carry: 1500-byte Ethernet-equivalent MTU less 20
  * bytes of IP and 8 of UDP. On-link under the SoftAP, so nothing fragments this
  * further and nothing routes it.
@@ -621,11 +594,151 @@ typedef struct __attribute__((packed)) {
  * A cap that DID bind -- one sized so a whole redundant copy fits beside the
  * payload -- was tried and reverted: it splits every packet in two, and the
  * doubled packet rate both exhausts the transmit buffers and doubles the
- * timeline slew, which is per packet. See DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig
+ * timeline slew, which is per AUDIO packet. See DANCEFLOOR_AUDIO_FEC_K's Kconfig
  * help for the measurement. Anything that reintroduces such a cap has to make
- * TIMELINE_SLEW_US per unit of audio first.
+ * TIMELINE_SLEW_US per unit of audio first -- which is exactly why the parity
+ * below is a datagram of its own rather than something attached here: it raises
+ * the datagram rate without touching the audio packet rate, and so costs no slew
+ * at all.
  */
 #define AUDIO_TX_PAYLOAD_MTU_MAX (AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0))
+
+/*
+ * XOR PARITY: one extra datagram per group of K audio packets, which recovers
+ * any ONE of them whole.
+ *
+ * WHY THIS SHAPE, AND WHAT IT REPLACES. Until now redundancy was piggybacked:
+ * each audio packet carried copies of previous payloads in its own tail. That
+ * pinned every packet at the 1472-byte MTU instead of its natural ~851 B -- 73%
+ * more airtime, permanently, on a link whose 6 Mbps group rate has no
+ * aggregation -- and a whole copy still did not fit beside the payload, so every
+ * recovery came back about three quarters complete with a decode error on the
+ * end of it. Over a five-hour soak the truncation counter reached 889,439
+ * against ~890,000 packets: not "sometimes", every single one. The measurement
+ * history is in DANCEFLOOR_AUDIO_FEC_K's Kconfig help.
+ *
+ * Parity inverts the economics. The redundancy is its own datagram, so the audio
+ * packets go back to their natural size and nothing is truncated; the cost is
+ * 1/K of the audio bytes and 1/K of the datagram rate instead of 1x of both.
+ *
+ * IT COSTS NO TIMELINE SLEW, which is the objection that killed the last
+ * attempt. TIMELINE_SLEW_US is applied once per call to streamer_send_sbc(), so
+ * it is per AUDIO packet, not per datagram. Shrinking payloads to make copies
+ * fit doubled the audio packet rate and so doubled the slew -- phase ran to
+ * +271 ms. A parity datagram never enters that path: it carries no play_at, does
+ * not advance the timeline, and is not counted in the packet rate the servo
+ * steers on. It buys airtime and TX buffers, and nothing else.
+ *
+ * THE CODEWORD IS THE WHOLE MESSAGE, HEADER INCLUDED. Each member contributes
+ *
+ *     [ AUDIO_MSG_BYTES(0) bytes of audio_msg_t header ][ payload, zero-padded ]
+ *
+ * and the parity is the XOR of all K of them. Padding is implicit: a shorter
+ * payload simply stops contributing, which is identical to XOR-ing zeros, so the
+ * unequal SBC lengths this stream produces need no length table on the wire.
+ *
+ * Recovering the header along with the payload is what makes the repair WHOLE
+ * rather than approximate. seq, frames, play_at, marker and restart all come
+ * back, so a recovered packet is fed through the ordinary receive path and is
+ * indistinguishable from one that arrived -- no length guessing, no silence pad,
+ * no separate fill routine that has to reproduce the real path's accounting.
+ *
+ * It is also the integrity check. After the XOR the recovered header must read
+ * type MSG_AUDIO, format AUDIO_FMT_SBC and exactly the seq that was missing.
+ * Two losses in one group, or a parity built over a different set than the
+ * receiver believes, cannot pass all three -- so the failure mode is the silence
+ * fill that a loss would have caused anyway, never corrupted audio pushed into
+ * the ring. audio_fec_extract() is where that is enforced.
+ *
+ * GROUPS ARE ALIGNED ON seq, so both ends derive membership from arithmetic and
+ * nothing has to be negotiated: member index is seq % K, base is seq - (seq % K).
+ * base_seq and count travel on the parity anyway, so a hub and a satellite built
+ * with different K disagree loudly (the parity is refused and counted) instead of
+ * combining the wrong packets.
+ */
+#define AUDIO_FEC_HDR_BYTES 8       /* type + count + span + base_seq */
+
+/*
+ * The longest audio payload parity can cover: what is left of one datagram after
+ * the parity header and the audio header the codeword carries.
+ *
+ * 1438 bytes, against the ~851 a phone actually produces, so it does not bind --
+ * and it is only 8 bytes below AUDIO_TX_PAYLOAD_MTU_MAX, so the only payloads it
+ * excludes are ones already within 8 bytes of fragmenting. A group containing one
+ * is sent without parity and counted (n_fec_skipped), rather than sending a
+ * parity that would fragment or one that silently covers less than it claims.
+ */
+#define AUDIO_FEC_PAYLOAD_MAX (AUDIO_UDP_MTU - AUDIO_FEC_HDR_BYTES - AUDIO_MSG_BYTES(0))
+#define AUDIO_FEC_CODEWORD_MAX AUDIO_MSG_BYTES(AUDIO_FEC_PAYLOAD_MAX)
+
+/*
+ * The ceiling on K, not the value of it -- DANCEFLOOR_AUDIO_FEC_K picks that.
+ *
+ * 8 because the receiver tracks which members it has seen in one byte, and
+ * because the latency argument runs out well before the bitmask does: a loss can
+ * only be repaired once the parity arrives, so the receiver must HOLD the packets
+ * behind the hole until then, and that hold is (K-2) packet times in the worst
+ * case -- 120 ms at K=8 against a 350 ms lead and a 350 ms target ring depth.
+ * K=4's 40 ms is the default for that reason.
+ */
+#define AUDIO_FEC_K_MAX 8
+
+/*
+ * One group's parity.
+ *
+ * `span` is bytes of parity[] in use: the longest codeword in the group, so a
+ * group of ~851-byte payloads sends ~877 bytes rather than the full ceiling.
+ * Carried explicitly rather than derived from the datagram length so a truncated
+ * receive is refused instead of silently XOR-ing short.
+ *
+ * `count` is how many members were folded in, and `base_seq` the first of them.
+ * The pair is what lets a receiver check the group it reconstructed against the
+ * group the sender actually built, which is the whole of the two-loss and
+ * mismatched-K defence.
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t  type;        /* MSG_AUDIO_FEC */
+    uint8_t  count;       /* members XORed into parity[], 2..AUDIO_FEC_K_MAX */
+    uint16_t span;        /* bytes of parity[] that follow */
+    uint32_t base_seq;    /* seq of member 0 of the group */
+    uint8_t  parity[AUDIO_FEC_CODEWORD_MAX];
+} audio_fec_msg_t;
+
+/* Bytes to send for a parity of `n` span. */
+#define AUDIO_FEC_MSG_BYTES(n) (sizeof(audio_fec_msg_t) - AUDIO_FEC_CODEWORD_MAX + (n))
+
+_Static_assert(AUDIO_FEC_MSG_BYTES(0) == AUDIO_FEC_HDR_BYTES,
+               "AUDIO_FEC_HDR_BYTES and audio_fec_msg_t's header disagree -- "
+               "AUDIO_FEC_PAYLOAD_MAX is computed from the former");
+_Static_assert(AUDIO_FEC_MSG_BYTES(AUDIO_FEC_CODEWORD_MAX) == AUDIO_UDP_MTU,
+               "a full parity datagram would fragment");
+_Static_assert(AUDIO_FEC_K_MAX <= 8, "the receiver's seen-mask is one byte");
+
+/*
+ * XOR one member's codeword into acc[], growing *span to cover it.
+ *
+ * acc must be AUDIO_FEC_CODEWORD_MAX bytes and both must be zeroed at the start
+ * of a group. Adding is the same operation at both ends: the hub folds in every
+ * packet it sends, the satellite folds in every packet that arrives, and the
+ * satellite then folds in the parity itself -- leaving exactly the codeword of
+ * whatever did not arrive.
+ *
+ * Returns false and leaves acc untouched if the payload is longer than parity
+ * can cover, which means the group gets no parity at all.
+ */
+bool audio_fec_xor_in(uint8_t *acc, uint16_t *span, const audio_msg_t *m);
+
+/*
+ * The reverse: acc[] holds parity XOR every member that DID arrive, so it is the
+ * missing member's codeword. Validate it and copy it out as a whole message.
+ *
+ * `want_seq` is the seq the caller believes is missing; a recovered header that
+ * says anything else means the group was not what the receiver thought it was,
+ * and the recovery is refused. Same for a type or format that is not audio, and
+ * for a payload_len that does not fit inside the span the parity claimed.
+ */
+bool audio_fec_extract(const uint8_t *acc, uint16_t span, uint32_t want_seq,
+                       audio_msg_t *out);
 
 /* The frame lane against the same MTU. Here rather than beside frame_msg_t
  * because that is where the MTU is defined; a full batch is 387 bytes. */
@@ -640,14 +753,9 @@ _Static_assert(FRAME_MSG_BYTES(FRAME_PAYLOAD_MAX) <= AUDIO_UDP_MTU,
  *
  * There is one build now. Every lane is unicast to the hub's client list, so a
  * field that always reads "unicast" tells a reader nothing they could not get
- * from the source. FEC depth stayed on those lines: it is a real Kconfig knob
- * that changes between bench phases.
+ * from the source. The FEC group size stayed on those lines: it is a real
+ * Kconfig knob that changes between bench phases.
  */
-
-typedef struct __attribute__((packed)) {
-    uint16_t red_len;        /* bytes of red_payload that follow; 0 == none */
-    uint8_t  red_seq_ofs;    /* this recovers the packet (seq - red_seq_ofs) */
-} audio_red_hdr_t;
 
 typedef struct {
     int64_t offset[SYNC_WINDOW];

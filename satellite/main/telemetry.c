@@ -147,8 +147,8 @@ void telemetry_tick(void)
     static uint32_t gaps_told, gap_frames_told, gap_short_told,
                     gap_short_frames_told, ring_full_told,
                     anchor_late_told, anchor_soon_told, gap_resyncs_told,
-                    upgrades_told, fec_told, fec_short_told, fec_err_told,
-                    short_frames_told;
+                    upgrades_told, fec_told, fec_lost_told, fec_holds_told,
+                    fec_bad_told, short_frames_told;
     const uint32_t short_frames_now = n_short_frames;
     const uint32_t gaps_now = n_gaps, gap_frames_now = n_gap_frames,
                    gap_short_now = n_gap_short,
@@ -159,19 +159,22 @@ void telemetry_tick(void)
                    gap_resyncs_now = n_gap_resyncs,
                    upgrades_now = n_anchor_upgrades,
                    fec_now = n_fec_recovered,
-                   fec_short_now = n_fec_short_frames,
-                   fec_err_now = n_fec_decode_err;
+                   fec_lost_now = n_fec_lost,
+                   fec_holds_now = n_fec_holds,
+                   fec_bad_now = n_fec_bad;
     if (gaps_now != gaps_told || ring_full_now != ring_full_told ||
         anchor_late_now != anchor_late_told || anchor_soon_now != anchor_soon_told ||
         gap_resyncs_now != gap_resyncs_told || upgrades_now != upgrades_told ||
-        fec_now != fec_told || fec_short_now != fec_short_told ||
-        fec_err_now != fec_err_told || short_frames_now != short_frames_told) {
+        fec_now != fec_told || fec_lost_now != fec_lost_told ||
+        fec_holds_now != fec_holds_told || fec_bad_now != fec_bad_told ||
+        short_frames_now != short_frames_told) {
         ESP_LOGW(TAG, "RX 5s: gaps %" PRIu32 " (%" PRIu32 " ms silence, %"
                       PRIu32 " short by %" PRIu32 " ms) | ring-full %" PRIu32
                       " | pad %" PRIu32 " ms"
                       " | too big to fill %" PRIu32 " | upgrades %" PRIu32
                       " | anchors refused %" PRIu32 " late, %" PRIu32 " too soon"
-                      " | fec %" PRIu32 " (%" PRIu32 " ms short, %" PRIu32 " err)",
+                      " | fec %" PRIu32 " (fec-lost %" PRIu32 ", fec-held %"
+                      PRIu32 ", fec-bad %" PRIu32 ")",
                  gaps_now - gaps_told,
                  (gap_frames_now - gap_frames_told) * 1000 / stream_rate,
                  gap_short_now - gap_short_told,
@@ -183,8 +186,9 @@ void telemetry_tick(void)
                  anchor_late_now - anchor_late_told,
                  anchor_soon_now - anchor_soon_told,
                  fec_now - fec_told,
-                 (fec_short_now - fec_short_told) * 1000 / stream_rate,
-                 fec_err_now - fec_err_told);
+                 fec_lost_now - fec_lost_told,
+                 fec_holds_now - fec_holds_told,
+                 fec_bad_now - fec_bad_told);
     }
     gaps_told = gaps_now;
     gap_frames_told = gap_frames_now;
@@ -196,8 +200,9 @@ void telemetry_tick(void)
     gap_resyncs_told = gap_resyncs_now;
     upgrades_told = upgrades_now;
     fec_told = fec_now;
-    fec_short_told = fec_short_now;
-    fec_err_told = fec_err_now;
+    fec_lost_told = fec_lost_now;
+    fec_holds_told = fec_holds_now;
+    fec_bad_told = fec_bad_now;
     short_frames_told = short_frames_now;
 
     /*
@@ -308,13 +313,25 @@ void telemetry_tick(void)
     } else {
         snprintf(rssi_s, sizeof(rssi_s), "none");
     }
-    ESP_LOGW(TAG, "ARRIVAL 5s: pkts %" PRIu32 " | gap-max %ld ms | "
+    /*
+     * fec-parity rides HERE rather than on the RX line above, and beside `pkts`
+     * on purpose: it should read pkts/K and nothing else, so the pair is a
+     * one-glance check that the parity lane is alive. On the RX line it would
+     * be invisible in exactly the windows that matter, because that line prints
+     * only when a fault counter moved -- and "the hub stopped sending parity"
+     * moves no fault counter on this unit at all.
+     */
+    static uint32_t fec_parity_told;
+    const uint32_t fec_parity_now = n_fec_parity_rx;
+    ESP_LOGW(TAG, "ARRIVAL 5s: pkts %" PRIu32 " | fec-parity %" PRIu32
+                  " | gap-max %ld ms | "
                   "burst-max %" PRIu32 " | lead-min %s | lead-drop %" PRIu32
                   " | ring-low %s | starved %" PRIu32 " ms | hub-rssi %s",
-             audio_rx_now - audio_rx_told,
+             audio_rx_now - audio_rx_told, fec_parity_now - fec_parity_told,
              (long)(gap_max / 1000), burst_max, lead_s,
              lead_insane_now - lead_insane_told, ring_s, starved_ms, rssi_s);
     audio_rx_told = audio_rx_now;
+    fec_parity_told = fec_parity_now;
     starve_told = starve_now;
     lead_insane_told = lead_insane_now;
 

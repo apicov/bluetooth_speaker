@@ -230,7 +230,8 @@ void servo_tick(void)
                       " | stale-skip %" PRIu32
                       " | %lu pkts/s | fanout-gap-max %ld ms | lead-min %s"
                       " | stations %d | rssi-min %d | phy-11n %d | churn %" PRIu32
-                      " | fec %d",
+                      " | fec-k %d fec-tx %" PRIu32 " fec-cong %" PRIu32
+                      " fec-skip %" PRIu32,
                  (unsigned)filled,
                  (unsigned long)(filled * 1000 / (sample_rate * AUDIO_CHANNELS * 2)),
                  (long)s_phase_err_us,
@@ -241,7 +242,8 @@ void servo_tick(void)
                  (unsigned long)(s_audio_pkts / window_s),
                  (long)(n_fanout_gap_max_us / 1000), lead_s,
                  (int)sta.num, (int)rssi_min, n_11n, n_join_churn,
-                 (int)CONFIG_DANCEFLOOR_AUDIO_FEC_DEPTH);
+                 (int)CONFIG_DANCEFLOOR_AUDIO_FEC_K,
+                 n_fec_sent, n_fec_cong_skip, n_fec_skipped);
         s_tx_fail = 0;
         /* The lane counters are cleared inside tx_fail_lanes(), on the same
          * pass that rendered them, for the reason tx_fail_summary() is: the
@@ -259,6 +261,12 @@ void servo_tick(void)
         n_lead_min_us = LEAD_UNSEEN;
         /* Same window as the refusals it is there to be correlated with. */
         n_join_churn = 0;
+        /* The parity trio, cleared with the tx-fail they are read against: a
+         * window where cong-skip rose and tx-fail did not is the trade working,
+         * and that comparison only holds while both describe the same 5 s. */
+        n_fec_sent = 0;
+        n_fec_cong_skip = 0;
+        n_fec_skipped = 0;
     }
 
     const int32_t target = (int32_t)(LEAD_US / 1000) *

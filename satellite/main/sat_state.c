@@ -62,16 +62,18 @@ volatile uint32_t n_splices;  /* track-boundary corrections applied */
 volatile uint32_t n_retunes;
 volatile uint32_t n_retunes_bad;
 volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
-volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
-volatile uint32_t n_fec_short_frames;  /* frames a recovery was short by, silenced */
-volatile uint32_t n_fec_decode_err;  /* a redundant copy failed to decode part-way */
+volatile uint32_t n_fec_recovered;  /* lost packets rebuilt whole from parity */
+volatile uint32_t n_fec_lost;  /* holes parity could not close */
+volatile uint32_t n_fec_holds;  /* times packets were held waiting for a parity */
+volatile uint32_t n_fec_parity_rx;  /* parity datagrams received */
+volatile uint32_t n_fec_bad;  /* parity that arrived and could not be trusted */
 volatile uint32_t n_gap_short_resyncs;  /* re-anchors forced by a fill that did not fit */
 volatile uint32_t n_seq_dropped;  /* packets older than expected, dropped */
 volatile uint32_t n_decode_err;  /* live-stream SBC frames that would not decode */
 volatile uint32_t n_recv_err;  /* recvfrom() errors */
 volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
 volatile uint32_t n_wifi_lease_fail;  /* associations that never got an address */
-volatile uint32_t n_gap_frames;  /* silence inserted for lost packets */
+volatile uint32_t n_gap_frames;  /* silence actually inserted; a repaired gap adds none */
 volatile uint32_t n_gap_short;  /* gap fills the ring could not take */
 volatile uint32_t n_gap_short_frames;
 volatile uint32_t n_ring_full;  /* decoded blocks dropped, ring full */

@@ -122,58 +122,80 @@ menu "Dancefloor audio transport (FEC)"
 
     comment "Audio, the volume level and the analysis frames all go to the hub's"
     comment "client list, one sendto per satellite -- ACKed and retried by the link"
-    comment "layer, and airtime scales with speaker count. Piggyback redundancy (FEC)"
-    comment "is available below and is off by default; see its help for why."
+    comment "layer, and airtime scales with speaker count. Loss recovery is XOR"
+    comment "parity across a group of packets; see the help below for the two"
+    comment "schemes that came before it and what each one measured."
 
-    config DANCEFLOOR_AUDIO_FEC_DEPTH
-        int "Piggyback redundancy depth (previous packets carried)"
-        default 0
-        range 0 4
+    config DANCEFLOOR_AUDIO_FEC_K
+        int "XOR parity group size K (0 disables)"
+        default 4
+        range 0 8
         help
-          How many previous audio payloads each packet piggybacks as trailing
-          redundancy, so a lost datagram is decoded from the next one instead of
-          becoming a silence gap.
+          One parity datagram per K audio packets, which recovers any single
+          packet lost out of that group -- whole, header included. 0 turns it
+          off; 2..8 are the valid group sizes and anything else is refused by a
+          build assertion rather than half-configured.
 
-          DEFAULT 0, AND THAT IS A MEASURED RESULT, NOT CAUTION. Depth 1 was the
-          default for one afternoon and cost more audio than it saved:
+          THE COST IS 1/K, AND THAT IS THE ENTIRE POINT. K=4 is 25% more audio
+          bytes and 25% more audio datagrams; K=8 is 12.5% of each. Read those
+          against the 73% the scheme this replaces cost permanently, and against
+          the ~0.2-0.3% on-air loss any of it exists to repair.
+
+          WHY NOT PIGGYBACKED, WHICH IS WHAT WAS HERE BEFORE. This setting used
+          to be DANCEFLOOR_AUDIO_FEC_DEPTH: 0-4 copies of previous payloads
+          attached to each packet's tail. It was correct code and it lost:
 
             mcast fec 0 (13:02, 13:30)   hub tx-fail 0
             mcast fec 1 (14:23)          hub tx-fail 92 / 365 s
             mcast fec 1 (17:52)          hub tx-fail 10-58 AUDIO per 20 s
 
-          The mechanism is airtime, not the MTU. A depth-1 packet is pinned at
-          the full 1472-byte MTU instead of ~851 B -- 73% more airtime for audio,
-          at the fixed 6 Mbps group rate with no aggregation -- and the hub's
-          26 static TX buffers cannot absorb it. That is 4-6% of the audio
-          discarded at the socket, against an on-air loss of 0.2-0.3% that the
-          redundancy exists to repair. It also cannot repair it fully: a whole
-          copy of an ~825-byte payload does not fit beside it, so what arrives is
-          ~75% and the satellite pads the rest, logged as
-          `fec 5 (29 ms short, 5 err)` -- about 5.8 ms of silence per recovery
-          and a decode error on every one.
+          The mechanism was airtime. A depth-1 packet is pinned at the full
+          1472-byte MTU instead of ~851 B -- 73% more airtime for audio, at the
+          fixed 6 Mbps group rate with no aggregation -- and the hub's static TX
+          buffers could not absorb it: 4-6% of the audio discarded at the socket
+          to repair 0.2-0.3% lost on the air. It could not even repair that
+          fully. A whole copy of an ~825-byte payload does not fit beside it, so
+          what arrived was ~75% and the satellite padded the rest, logged as
+          `fec 5 (29 ms short, 5 err)` -- ~5.8 ms of silence per recovery and a
+          decode error on every one. Over a five-hour soak fec-trunc reached
+          889,439 against ~890,000 packets: every copy, always.
 
-          So depth 1 spent ~5% of the stream to recover ~70% of 0.3%. Turning it
-          off is not giving up on loss recovery; it is declining to pay for a
-          version of it that costs more than the loss.
+          CAPPING THE PAYLOAD SO A COPY FITS WAS TRIED ON 2026-08-13 AND TOOK
+          THE FLOOR DOWN. It binds on every packet, so each payload becomes two
+          datagrams, and the doubled AUDIO packet rate both exhausted the
+          transmit buffers (`tx-fail 370 (312 audio)` in one 20 s window) and
+          doubled the timeline slew, which is TIMELINE_SLEW_US per audio packet.
+          Phase ran to +271 ms and the satellites re-anchored every few seconds.
 
-          What would work needs the packets to get smaller, which needs the
-          packet rate to rise, which needs transmit capacity this hub does not
-          have. Capping the payload so a copy fits was tried on 2026-08-13 and
-          took the floor down: it binds on every packet, so each payload becomes
-          two datagrams, and the doubled rate both exhausts the transmit buffers
-          (`tx-fail 370 (312 audio)` in one 20 s window) and doubles the timeline
-          slew, which is 20 us PER PACKET -- phase ran to +271 ms and the
-          satellites re-anchored every few seconds. Anything that reintroduces
-          such a cap must make TIMELINE_SLEW_US per unit of audio first. XOR
-          parity across a group of packets is the design that fits: one parity
-          packet per K recovers any single loss for 1/K overhead instead of 1x,
-          and leaves packets at ~851 B.
+          Parity is not that. The parity datagram carries no play_at, never
+          enters streamer_send_sbc(), and does not advance the timeline -- so it
+          raises the datagram rate by 1/K and the slew by nothing at all. The
+          audio packets keep their natural ~851 B and nothing is truncated, so a
+          recovery is whole rather than three-quarters of one.
 
-          A receiver parses trailing redundancy by length, so it recovers from
-          any sender that attached it, and an older sender that did not is read
-          unchanged. Nothing about it is tied to how the packet was addressed --
-          the measurements below were taken while audio went to a multicast
-          group, and the airtime argument is what carried over, not the group.
+          A/B ON 2026-08-24, matched 46-minute windows on the same channel: the
+          old FEC 1 and FEC 0 were both flawless -- zero gaps, zero refusals,
+          zero starvation either way, and the old scheme fired 9 times in 5
+          hours. A CLEAN CHANNEL CANNOT TELL THESE APART. Test under contention
+          or do not bother: a large download on a nearby machine, not associated
+          to the hub's AP, degrades playback audibly within seconds and is the
+          only condition in which any of this earns its overhead.
+
+          WHY K DEFAULTS TO 4 RATHER THAN 8. Parity for a group can only be sent
+          after the group's last packet, so a receiver that wants to use it must
+          hold the packets behind a hole until the parity lands -- worst case
+          (K-2) packet times, ~20 ms each. At K=4 that is 40 ms against a 350 ms
+          hub lead (LEAD_US), a 350 ms target ring depth (RING_TARGET_MS) and a
+          125 ms anchor floor (ANCHOR_MIN_LEAD_US), so a repaired packet still
+          reaches the ring with ~310 ms of lead in hand. K=8 halves the overhead
+          but holds 120 ms, which eats a third of the ring and starts showing up
+          in ring-low. The hold also costs the satellite (K-1) packet buffers of
+          RAM, which is why the ceiling is 8 and not more.
+
+          Both ends must agree on K: group membership is seq % K, derived rather
+          than negotiated. They cannot disagree silently -- the parity carries
+          its own base_seq and count, and a receiver that reconstructed a
+          different group refuses the recovery and counts fec-bad.
 
 endmenu
 

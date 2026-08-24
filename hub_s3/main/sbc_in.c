@@ -317,8 +317,9 @@ static void rx_task(void *arg)
              * and that binds on every payload, so every one became two datagrams
              * and the audio packet rate doubled: 15% of the hub's own audio
              * discarded at the socket, and a timeline slewing at twice the rate
-             * the satellites could follow. DANCEFLOOR_AUDIO_FEC_DEPTH's Kconfig
-             * help has the run. The threshold is the whole difference between
+             * the satellites could follow. DANCEFLOOR_AUDIO_FEC_K's Kconfig help
+             * has the run; XOR parity replaced the scheme that wanted the cap,
+             * and needs no cap at all. The threshold is the whole difference between
              * the two behaviours, which is why it is named for what it protects
              * rather than for a number.
              *
@@ -352,8 +353,9 @@ static void rx_task(void *arg)
                 /*
                  * Flush before taking this frame if it would push the span past
                  * the cap. Never flushes an empty span: a single SBC frame
-                 * larger than the cap cannot be cut, so it goes on its own and
-                 * the attach path truncates its copy and counts n_fec_truncated.
+                 * larger than the cap cannot be cut, so it goes on its own --
+                 * and if it is longer than AUDIO_FEC_PAYLOAD_MAX, its group is
+                 * sent without parity and counted in n_fec_skipped.
                  *
                  * streamer_begin_packet() again for the new span -- it snapshots
                  * the ring position this packet's audio starts at, which is the

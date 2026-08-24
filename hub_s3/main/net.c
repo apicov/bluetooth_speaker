@@ -978,7 +978,7 @@ void tx_burst_summary(char *buf, size_t len)
 void tx_fail_lanes(char *buf, size_t len)
 {
     static const char *const name[TX_LANE_N] = {
-        "audio", "frame", "vol", "meta", "probe",
+        "audio", "frame", "vol", "meta", "probe", "fec",
     };
     size_t off = 0;
     buf[0] = '\0';

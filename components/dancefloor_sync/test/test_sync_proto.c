@@ -784,6 +784,188 @@ int main(void)
               "somebody who muted the room from the phone has not said nothing");
     }
 
+
+    /*
+     * 29. XOR parity: the round trip.
+     *
+     * A group of packets with DELIBERATELY UNEQUAL payloads, because that is the
+     * case the wire format leans on -- the padding to the longest member is
+     * implicit, and the only thing that makes it safe is that XOR-ing zeros is a
+     * no-op. Equal-length members would pass whatever the implementation did.
+     *
+     * Every member is dropped in turn and rebuilt, and the rebuilt packet is
+     * compared BYTE FOR BYTE against the original over its whole on-wire length.
+     * The point of parity over the header as well as the payload is that a
+     * recovery is a packet, not a buffer of SBC, and a test that only checked
+     * the payload would not notice play_at coming back wrong.
+     */
+    {
+        enum { K = 4 };
+        static audio_msg_t grp[K];
+        static uint8_t acc[AUDIO_FEC_CODEWORD_MAX];
+        static uint8_t rec[AUDIO_FEC_CODEWORD_MAX];
+        const uint16_t lens[K] = { 851, 823, 877, 12 };
+        uint16_t span = 0;
+        bool built = true;
+
+        for (int i = 0; i < K; i++) {
+            memset(&grp[i], 0, sizeof(grp[i]));
+            grp[i].type = MSG_AUDIO;
+            grp[i].format = AUDIO_FMT_SBC;
+            grp[i].marker = (i == 2);
+            grp[i].restart = (i == 3);
+            grp[i].payload_len = lens[i];
+            grp[i].seq = 1000 + (uint32_t)i;
+            grp[i].sample_rate = 44100;
+            grp[i].frames = 882;
+            grp[i].play_at = 5000000LL + i * 20000LL;
+            for (uint16_t b = 0; b < lens[i]; b++) {
+                grp[i].payload[b] = (uint8_t)(b * 7 + i * 31 + 1);
+            }
+            built = built && audio_fec_xor_in(acc, &span, &grp[i]);
+        }
+        check("parity spans the longest member's codeword",
+              built && span == AUDIO_MSG_BYTES(877), NULL);
+
+        /* The parity as it would go on the wire, kept aside: recovery consumes
+         * the accumulator, so each drop has to start from a clean copy. */
+        static uint8_t parity[AUDIO_FEC_CODEWORD_MAX];
+        memcpy(parity, acc, span);
+
+        int recovered = 0, exact = 0;
+        for (int drop = 0; drop < K; drop++) {
+            uint16_t s2 = 0;
+            memset(acc, 0, sizeof(acc));
+            for (int i = 0; i < K; i++) {
+                if (i != drop) {
+                    audio_fec_xor_in(acc, &s2, &grp[i]);
+                }
+            }
+            for (uint16_t b = 0; b < span; b++) {
+                acc[b] ^= parity[b];
+            }
+            if (audio_fec_extract(acc, span, grp[drop].seq, (audio_msg_t *)rec)) {
+                recovered++;
+                if (memcmp(rec, &grp[drop],
+                           AUDIO_MSG_BYTES(grp[drop].payload_len)) == 0) {
+                    exact++;
+                }
+            }
+        }
+        char d[64];
+        snprintf(d, sizeof d, "recovered=%d exact=%d of %d", recovered, exact, K);
+        check("any single member is rebuilt byte for byte", recovered == K &&
+              exact == K, d);
+    }
+
+    /*
+     * 30. XOR parity: what it must REFUSE.
+     *
+     * This is the half that keeps a failed repair harmless. Silence of the right
+     * length is a known cost; wrong audio in the ring is a stream that slides,
+     * and every one of these would produce exactly that if it were let through.
+     */
+    {
+        enum { K = 4 };
+        static audio_msg_t grp[K];
+        static uint8_t acc[AUDIO_FEC_CODEWORD_MAX];
+        static uint8_t parity[AUDIO_FEC_CODEWORD_MAX];
+        static uint8_t rec[AUDIO_FEC_CODEWORD_MAX];
+        uint16_t span = 0;
+
+        for (int i = 0; i < K; i++) {
+            memset(&grp[i], 0, sizeof(grp[i]));
+            grp[i].type = MSG_AUDIO;
+            grp[i].format = AUDIO_FMT_SBC;
+            grp[i].payload_len = (uint16_t)(800 + i);
+            grp[i].seq = 2000 + (uint32_t)i;
+            grp[i].frames = 882;
+            grp[i].play_at = 90000LL + i;
+            for (uint16_t b = 0; b < grp[i].payload_len; b++) {
+                grp[i].payload[b] = (uint8_t)(b + i);
+            }
+            audio_fec_xor_in(acc, &span, &grp[i]);
+        }
+        memcpy(parity, acc, span);
+
+        /* TWO losses. The XOR of two codewords is not a packet, and the seq it
+         * carries is the two seqs XOR-ed -- which for 2000 and 2001 is 1, a
+         * number that would put 20 ms of audio a thousand packets out of place. */
+        uint16_t s2 = 0;
+        memset(acc, 0, sizeof(acc));
+        audio_fec_xor_in(acc, &s2, &grp[2]);
+        audio_fec_xor_in(acc, &s2, &grp[3]);
+        for (uint16_t b = 0; b < span; b++) {
+            acc[b] ^= parity[b];
+        }
+        check("two losses in one group are refused",
+              !audio_fec_extract(acc, span, grp[0].seq, (audio_msg_t *)rec) &&
+              !audio_fec_extract(acc, span, grp[1].seq, (audio_msg_t *)rec),
+              "the rebuilt header is both packets at once, and is neither");
+
+        /* One loss, but the caller asks for the wrong seq -- which is what a
+         * receiver that mis-derived the group would do. */
+        s2 = 0;
+        memset(acc, 0, sizeof(acc));
+        for (int i = 1; i < K; i++) {
+            audio_fec_xor_in(acc, &s2, &grp[i]);
+        }
+        for (uint16_t b = 0; b < span; b++) {
+            acc[b] ^= parity[b];
+        }
+        check("a recovery for the wrong seq is refused",
+              !audio_fec_extract(acc, span, grp[0].seq + 1, (audio_msg_t *)rec) &&
+              audio_fec_extract(acc, span, grp[0].seq, (audio_msg_t *)rec),
+              "same codeword, and only the seq the group actually lost passes");
+
+        /* A span shorter than a bare header, and one past the codeword ceiling. */
+        check("an impossible span is refused",
+              !audio_fec_extract(acc, (uint16_t)(AUDIO_MSG_BYTES(0) - 1),
+                                 grp[0].seq, (audio_msg_t *)rec) &&
+              !audio_fec_extract(acc, (uint16_t)(AUDIO_FEC_CODEWORD_MAX + 1),
+                                 grp[0].seq, (audio_msg_t *)rec),
+              "a truncated parity must not be read as a short packet");
+    }
+
+    /*
+     * 31. XOR parity: the sizes that decide whether any of it fits.
+     *
+     * AUDIO_FEC_PAYLOAD_MAX is what a payload may be for its group to get parity
+     * at all, and the arithmetic behind it is the whole reason this scheme is
+     * affordable where the last one was not: a parity datagram is ONE header plus
+     * ONE codeword, not a payload with a copy of another payload after it.
+     */
+    {
+        char d[96];
+        snprintf(d, sizeof d, "payload-max=%zu codeword=%zu datagram=%zu",
+                 (size_t)AUDIO_FEC_PAYLOAD_MAX, (size_t)AUDIO_FEC_CODEWORD_MAX,
+                 (size_t)AUDIO_FEC_MSG_BYTES(AUDIO_FEC_CODEWORD_MAX));
+        check("a full parity datagram is exactly one MTU",
+              AUDIO_FEC_MSG_BYTES(AUDIO_FEC_CODEWORD_MAX) == AUDIO_UDP_MTU &&
+              AUDIO_FEC_CODEWORD_MAX == AUDIO_MSG_BYTES(AUDIO_FEC_PAYLOAD_MAX), d);
+
+        /* The measured payload size, which is what actually decides the cost. */
+        snprintf(d, sizeof d, "851 B payload -> %zu B parity vs %zu B audio",
+                 (size_t)AUDIO_FEC_MSG_BYTES(AUDIO_MSG_BYTES(851)),
+                 (size_t)AUDIO_MSG_BYTES(851));
+        check("parity for a typical group is one typical packet",
+              AUDIO_FEC_MSG_BYTES(AUDIO_MSG_BYTES(851)) < AUDIO_UDP_MTU &&
+              AUDIO_FEC_MSG_BYTES(AUDIO_MSG_BYTES(851)) <
+                  AUDIO_MSG_BYTES(851) + AUDIO_FEC_HDR_BYTES + 1, d);
+
+        /* And the packets it covers keep their natural size: nothing here pins
+         * an audio packet to the MTU, which is the fault this scheme exists to
+         * undo. */
+        static audio_msg_t big;
+        static uint8_t acc[AUDIO_FEC_CODEWORD_MAX];
+        uint16_t span = 0;
+        memset(&big, 0, sizeof(big));
+        big.payload_len = AUDIO_FEC_PAYLOAD_MAX + 1;
+        check("a payload parity cannot cover is refused, not truncated",
+              !audio_fec_xor_in(acc, &span, &big) && span == 0,
+              "truncation is what made every recovery of the old scheme partial");
+    }
+
     printf("\n%s\n", failures ? "FAILURES PRESENT" : "all tests passed");
     return failures != 0;
 }

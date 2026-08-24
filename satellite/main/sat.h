@@ -477,35 +477,71 @@ extern volatile uint32_t n_reanchors;  /* streams anchored, first included */
 extern volatile uint32_t n_splices;  /* track-boundary corrections applied */
 extern volatile uint32_t n_retunes;
 extern volatile uint32_t n_retunes_bad;
-extern volatile uint32_t n_gaps;  /* lost-packet gaps filled with silence */
-extern volatile uint32_t n_fec_recovered;  /* lost packets decoded from FEC redundancy */
 /*
- * Frames a recovery was SHORT by, padded with silence -- the honest half of
- * n_fec_recovered.
+ * Gaps the air made, counted at DETECTION and before anything tries to repair
+ * them -- so this is a measure of the link, not of the concealment.
  *
- * These two together are the instrument that was missing. n_fec_recovered
- * counts packets a redundant copy covered; it said nothing about how MUCH of
- * each one the copy actually carried, and the copy is truncated to ~3/4 by the
- * hub's MTU guard. So the log read `gaps 1 (20 ms silence) | fec 1` -- a gap,
- * and a recovery, and the reader is left to assume they cancel. They did not:
- * ~6 ms of that 20 was still silence, every time, once every ~2.7 s.
+ * Kept that way deliberately. On the 2026-08-24 A/B it is what proved the clean
+ * channel and not the FEC was carrying the run: had it counted only the losses
+ * the repair missed, "FEC 1 and FEC 0 both flawless" would have been unreadable.
+ * A parity build and a bare build must be comparable on this number.
  *
- * Now the shortfall is its own number, and it reads 0 only because redundancy
- * is off by default. Turn DANCEFLOOR_AUDIO_FEC_DEPTH up and it will be roughly a
- * quarter of every recovery; n_fec_truncated at the hub end is the same fact
- * seen from the sender. Between them they are what any future attempt at
- * redundancy has to drive to zero before it can claim to have recovered
+ * n_gap_frames is deliberately NOT its partner any more. That counts silence
+ * actually written, so a repaired gap adds to this and not to that, and the
+ * printed line says both: how much was lost, and how much of it was heard.
+ */
+extern volatile uint32_t n_gaps;
+/*
+ * XOR parity, receiving end. n_gaps is what the air lost; these say what the
+ * speaker got back.
+ *
+ * n_fec_recovered is packets rebuilt WHOLE. That word is the difference between
+ * this scheme and the one it replaced: a recovery used to be about three
+ * quarters of a payload plus a silence pad plus a decode error, so `gaps 1 |
+ * fec 1` read as though the two cancelled when ~6 ms of the 20 was still
+ * silence. There is no partial recovery now -- audio_fec_extract() either
+ * returns the packet that went missing or refuses -- so gaps minus recovered is
+ * exactly the silence that reached the room, and the two counters this replaces
+ * (a short-frames tally and a copy-decode error count) have nothing left to
+ * measure.
+ *
+ * n_fec_lost is the other outcome: a hole parity could not close. Two losses in
+ * one group, a gap of more than one packet, a parity that never arrived, or a
+ * resync that threw the group away. It ends in the same fill_gap() the receiver
+ * would have done without parity at all, so this is not a fault -- it is the
+ * fraction of losses the scheme does not cover.
+ *
+ * The two are exhaustive by construction: every gap detected is offered to
+ * parity exactly once and lands in one column or the other, so
+ *
+ *     n_gaps == n_fec_recovered + n_fec_lost
+ *
+ * across any window. That identity is the point. A burst loss that parity
+ * cannot touch would otherwise appear in neither column and the repair rate
+ * would read better than it was.
+ *
+ * n_fec_holds is how often packets were held behind a hole waiting for a
+ * parity. Read against n_fec_recovered: holds that did not become recoveries
+ * are n_fec_lost, and a hold costs up to (K-2) packet times of ring depth
+ * whichever way it ends. A rate here far above the loss rate means groups are
+ * being opened and abandoned, not that anything was repaired.
+ *
+ * n_fec_parity_rx is arrival proof for the parity lane itself. It should sit at
+ * the audio packet rate divided by K -- ~12/s at K=4 -- and a zero here with
+ * audio flowing says the hub is not sending parity at all, which no other
+ * counter on this unit would distinguish from a channel that simply never lost
  * anything.
- */
-extern volatile uint32_t n_fec_short_frames;
-/*
- * Decodes of a redundant copy that failed part-way.
  *
- * Distinct from a live-stream decode error because the response differs: this
- * path deliberately does NOT reinitialise the decoder. See the note in
- * fill_recovered_then_silence().
+ * n_fec_bad must stay at zero. It counts a parity that arrived and could not be
+ * trusted: a count field that disagrees with this build's K, or a rebuilt header
+ * that is not the packet that went missing. Both mean the two firmwares
+ * disagree about the wire, and neither is a radio problem.
  */
-extern volatile uint32_t n_fec_decode_err;
+extern volatile uint32_t n_fec_recovered;
+extern volatile uint32_t n_fec_lost;
+extern volatile uint32_t n_fec_holds;
+extern volatile uint32_t n_fec_parity_rx;
+extern volatile uint32_t n_fec_bad;
 /*
  * Three faults that used to happen silently. Each was a `continue`, a `break` or
  * a bare `return false` with nothing recorded, so a run in which any of them
@@ -567,7 +603,7 @@ extern volatile uint32_t n_wifi_lease_fail;
  * that can afford to wait on a UART. Cumulative, like every other counter here;
  * the narration below prints the window by subtracting what it said last time.
  */
-extern volatile uint32_t n_gap_frames;  /* silence inserted for lost packets */
+extern volatile uint32_t n_gap_frames;  /* silence actually inserted; a repaired gap adds none */
 extern volatile uint32_t n_gap_short;  /* gap fills the ring could not take */
 extern volatile uint32_t n_gap_short_frames;
 extern volatile uint32_t n_ring_full;  /* decoded blocks dropped, ring full */

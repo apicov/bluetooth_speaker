@@ -66,6 +66,11 @@ void streamer_start(void)
     local_ring = xStreamBufferCreate(LOCAL_RING_BYTES, AUDIO_CHUNK_BYTES);
     assert(local_ring);
 
+    /* Before wifi_start_ap(), so the PSRAM request is made while the heap is
+     * least fragmented -- and so the "parity disabled" warning, if it comes,
+     * prints ahead of the WiFi banner rather than buried in it. */
+    streamer_fec_start();
+
     wifi_start_ap();
     socket_start();
     /* Mirror this hub's own logs and relay every satellite's to a collector.
