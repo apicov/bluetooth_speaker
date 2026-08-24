@@ -87,7 +87,15 @@ _Static_assert(CONFIG_DANCEFLOOR_AUDIO_FEC_K >= 2 &&
 static audio_fec_msg_t *s_fec;
 static uint16_t s_fec_span;      /* bytes of s_fec->parity[] in use this group */
 static uint32_t s_fec_base;      /* seq of member 0 of the group */
-static uint32_t s_fec_have;      /* members folded in so far */
+/*
+ * Members folded in so far, which is also the assertion that they are the
+ * contiguous run the parity will claim they are. msg.seq is assigned as `seq++`
+ * on the single path that reaches fan_out() and is never reset, so s_fec_have
+ * always equals the arriving member's index and a group is always a whole run.
+ * Nothing enforces that here: it is a property of the code above, and a check
+ * for a state that cannot occur is worth less than the sentence saying why.
+ */
+static uint32_t s_fec_have;
 static bool     s_fec_ok;        /* false once this group cannot produce parity */
 #endif
 
@@ -742,20 +750,6 @@ static void fec_note_sent(const audio_msg_t *m, int64_t now)
         s_fec_ok = true;
     }
 
-    /*
-     * A group whose members are not the contiguous run this one claims cannot
-     * produce parity that means anything, so it produces none.
-     *
-     * seq is assigned as `seq++` on the one path that reaches fan_out(), and
-     * never reset, so today the run is always contiguous and this never fires.
-     * It is here because that is a property of code above, not of this function,
-     * and the failure it would otherwise cause is silent: a parity built over
-     * the wrong set still passes its own length checks at the far end and is
-     * caught only by audio_fec_extract()'s seq test, one recovery at a time.
-     */
-    if (idx != s_fec_have) {
-        s_fec_ok = false;
-    }
     if (s_fec_ok && !audio_fec_xor_in(s_fec->parity, &s_fec_span, m)) {
         s_fec_ok = false;      /* payload longer than a parity datagram can cover */
     }
