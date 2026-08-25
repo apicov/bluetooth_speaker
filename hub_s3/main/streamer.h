@@ -6,7 +6,7 @@
  * time probes, and sends undecoded SBC tagged with the master-clock instant
  * each packet should be played at. UNICAST to each registered listener, not
  * multicast: group-addressed frames get no link ACK and no retry, and
- * unicast is the transport the floor measured stable on. The price is that
+ * unicast is the transport that proved stable in use. The price is that
  * airtime scales with speaker count -- the hub's packet rate is 50 + 96xN;
  * sync_proto.h carries the figures.
  *

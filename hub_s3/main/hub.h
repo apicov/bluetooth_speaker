@@ -100,11 +100,10 @@
 /**
  * @brief How far ahead of playback each chunk is stamped.
  *
- * The margin must clear three numbers, all measured: the satellite's anchor
- * minimum (ANCHOR_MIN_LEAD_US in satellite/main/sat.h, 125 ms), a group frame
- * held a whole DTIM period (102 ms, beacon read-back in net.c), and the worst
- * transit seen on a loss-free packet (153 ms, measured 2026-08-20). LEAD_US
- * minus RESYNC_US is the worst lead a healthy packet can carry; it must stay
+ * The margin must clear three things: the satellite's anchor minimum
+ * (ANCHOR_MIN_LEAD_US in satellite/main/sat.h), a frame held a whole DTIM
+ * period, and the worst transit a loss-free packet can take. LEAD_US minus
+ * RESYNC_US is the worst lead a healthy packet can carry, and it must stay
  * above all three.
  *
  * The ceiling is the satellite's ring, a classic ESP32 with no PSRAM: 96 kB
@@ -214,10 +213,9 @@
  *        instead of the analysis rate of 86/s. Airtime scales with speaker
  *        count, so this is what keeps the hub's transmit rate near flat.
  *
- * Revisit only with a soak: batching latency and lane rate trade against
- * each other, and this lane has been retuned on arithmetic alone twice and
- * paid for it twice. tools/satsim loads the fan-out, because the cost of an
- * unpaced lane is per satellite.
+ * Batching latency and lane rate trade against each other, so neither can be
+ * changed on arithmetic alone -- the cost of an unpaced lane is per
+ * satellite, and tools/satsim is what loads the fan-out to show it.
  */
 #define TX_FRAME_PACE_US       DTIM_HOLD_US
 
@@ -243,9 +241,9 @@
  *        exactly like a satellite; playing at the lead is what keeps it in
  *        time with every other speaker.
  *
- * 80 kB is 464 ms. The lead occupies ~61.7 kB of it (350 ms at 44.1 kHz
- * stereo), leaving ~114 ms of headroom; the worst gap measured on the input
- * is ~95 ms, so the headroom clears it twice over. xStreamBufferCreate
+ * 80 kB is 464 ms. The lead occupies most of it, and what is left is the
+ * headroom that has to absorb a gap on the input -- it must stay comfortably
+ * wider than the worst gap the source can produce. xStreamBufferCreate
  * allocates from internal SRAM, which is why the ring cannot follow the
  * PCM buffers into PSRAM. fed-drop non-zero means the source stalled longer
  * than the ring holds, and memory is not the answer.
@@ -620,8 +618,8 @@ extern int32_t s_refill_frames;  /**< Frames written during that window. */
  *         wifi_config.ap.max_connection in net.c, and
  *         CONFIG_LWIP_DHCPS_MAX_STATION_NUM: a satellite refused by the
  *         third associates and then has no address, which reports as a unit
- *         that joined and never probed. Measured at two satellites; the
- *         number says what the design intends to carry. */
+ *         that joined and never probed. The number says what the design
+ *         intends to carry, not what has been exercised. */
 #define MAX_CLIENTS 15
 
 /** @brief How long a satellite that stops probing stays on the send list:

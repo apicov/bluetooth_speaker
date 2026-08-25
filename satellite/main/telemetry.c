@@ -13,8 +13,8 @@
  * `TRIM:`, `MEM:`, `RX 5s:`, `ARRIVAL 5s:` — and then turns it into metrics
  * columns with one regex over `key then number` pairs. So a key must be a
  * single hyphenated word immediately followed by its value, and renaming or
- * reordering one silently drops a column from every soak. Tidying these
- * strings breaks a tool.
+ * reordering one silently drops a column from the captured metrics. Tidying
+ * these strings breaks a tool.
  *
  * @section cadence What prints when
  *

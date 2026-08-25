@@ -109,11 +109,10 @@ static int64_t s_last_pkt_us;
  * source that simply stops sending produces no bad header, no CRC failure, no
  * sequence gap and no decode error, and is invisible to all of them.
  *
- * Delivery is bursty by construction, so an ordinary window still contains a
- * gap of around a hundred milliseconds against a ~50 packets/s average.
- * @ref GAP_ALARM_US therefore sits above that spread rather than above the
- * mean spacing: set near the spread itself it alarms on every window, which
- * is no alarm at all.
+ * Delivery is bursty by construction, so an ordinary window contains a gap
+ * far wider than the mean packet spacing. @ref GAP_ALARM_US therefore sits
+ * above that spread rather than above the spacing: set near the spread
+ * itself it alarms on every window, which is no alarm at all.
  */
 static uint32_t s_max_gap_us;
 
