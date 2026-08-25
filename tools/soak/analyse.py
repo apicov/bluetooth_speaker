@@ -212,19 +212,66 @@ def gauge(df, unit, kind, metric):
 
 
 def window_sum(df, unit, metric):
-    """Total of a per-window `status` gauge over the run.
+    """Sum of a per-window `status` gauge over the windows THAT WERE CAPTURED.
 
     tx-fail and the ENOMEM shape beside it are CLEARED by the window that
     prints them -- see tx_fail_summary() and tx_burst_summary() in
-    hub_s3/main/net.c -- so the run total is a plain sum over windows.
+    hub_s3/main/net.c -- so summing windows is the right shape of arithmetic.
 
     counter_total() is the wrong helper for them twice over: it baselines each
     boot segment against its first value, which is meaningless for a series
     that returns to zero every window, and it reads only health and trim lines
     while these live on the hub's `status` line.
+
+    A LOWER BOUND, NOT A TOTAL, and callers must say so. The hub's log lines do
+    not all reach the capture: on the 2026-08-25 soak its HEALTH lines arrived
+    60, 120, 180, 240, 300, 361, 420, 540 and 780 s apart -- exact multiples of
+    their 60 s period, so whole lines are dropped rather than emitted late --
+    while both satellites' arrived 60 s apart 104 times out of 104. Two thirds
+    of the hub's windows were missing, and every sum over them was short by
+    about that factor: `frames done 185,916` for a run that transmitted ~150/s
+    for an hour.
+
+    RATIOS BETWEEN TWO OF THESE ARE STILL SOUND -- both terms are undercounted
+    by the same sampling, so txdone-fail/txdone survives it. Absolute totals and
+    anything divided by wall-clock time do not. window_cover() gives callers
+    what they need to qualify the difference.
     """
     s = gauge(df, unit, "status", metric)
     return 0 if s is None or s.empty else int(s["value"].sum())
+
+
+def window_cover(df, unit, metric="txdone"):
+    """(windows captured, window seconds, seconds those windows cover).
+
+    The window length is the median of the SHORTEST intervals between captured
+    lines: dropped lines only ever create multiples of the real period, so the
+    short end of the distribution is the period itself. The median of the short
+    ones rather than the outright minimum, since the minimum is one line's
+    arrival jitter -- it read 19 s for a 20 s period on the 2026-08-25 soak.
+
+    Returns (0, None, 0.0) when the series is too short to say anything.
+    """
+    s = gauge(df, unit, "status", metric)
+    if s is None or len(s) < 3:
+        return (0 if s is None else len(s)), None, 0.0
+    d = s["wall_s"].diff().dropna()
+    d = d[d > 0]
+    if d.empty:
+        return len(s), None, 0.0
+    win_s = round(d[d <= d.min() * 1.5].median())
+    return len(s), win_s, float(len(s) * win_s)
+
+
+def cover_note(n, win_s, covered_s, span_s):
+    """One line saying how much of the run a window sum actually saw."""
+    if not n or not win_s or span_s <= 0:
+        return ""
+    pct = 100.0 * covered_s / span_s
+    if pct >= 95.0:
+        return ""
+    return (f"    (over {n} captured {win_s:.0f} s windows = {pct:.0f}% of the run"
+            f" -- the hub drops log lines, so counts here are LOWER BOUNDS)")
 
 
 def tx_faults(df, unit):
@@ -246,7 +293,7 @@ def tx_faults(df, unit):
     if not total:
         return []
     out = [f"      {'tx-fail':18s} {total:>8,}   "
-           f"sendto() refused -- see HUB TX below"]
+           f"sendto() refused (lower bound) -- see HUB TX below"]
     # Absent from sessions captured before the lane split was extracted;
     # `capture.py --replay <dir>` rebuilds those from their raw.log.
     audio = window_sum(df, unit, "tx_fail_audio")
@@ -738,8 +785,16 @@ def main():
               f" had a silence >= LEAD_US (350 ms) -- long enough that anything"
               f" queued through it plays late or not at all")
         if done:
-            print(f"  frames done {done:,}   never acked {fail:,}"
-                  f"  ({fail / max(done, 1) * 100:.2f}%)")
+            n_w, win_s, cov = window_cover(met, "hub", "txdone")
+            rate = f"  = {done / cov:.0f}/s" if cov else ""
+            # The RATIO is sound where the total is not: both terms are sampled
+            # by the same dropped lines, so the percentage survives it.
+            print(f"  frames done {done:,}{rate}   never acked {fail:,}"
+                  f"  ({fail / max(done, 1) * 100:.2f}% -- a ratio, so the"
+                  f" sampling below does not affect it)")
+            note = cover_note(n_w, win_s, cov, t1 - t0)
+            if note:
+                print(note)
             print("    a large air-gap WITH acks failing is the medium -- frames went"
                   " and died on the air.")
             print("    a large air-gap with acks CLEAN means frames are not being LOST;"
@@ -822,7 +877,16 @@ def main():
             continue
         audio = window_sum(met, u, "tx_fail_audio")
         enomem = window_sum(met, u, "space")
-        print(f"  {u}: {total:,} refused over the run ({total / span_h:.0f}/hour)")
+        n_w, win_s, cov = window_cover(met, u, "tx-fail")
+        # Per hour OF WHAT WAS CAPTURED, not of the run: dividing a sampled sum
+        # by wall-clock time understates the rate by the sampling factor on top
+        # of the sum already being short.
+        per_h = total / (cov / 3600.0) if cov else total / span_h
+        print(f"  {u}: {total:,} refused in the captured windows"
+              f" ({per_h:.0f}/hour while observed)")
+        note = cover_note(n_w, win_s, cov, t1 - t0)
+        if note:
+            print(note)
         if audio:
             print(f"      {audio:,} of them audio  -> ~{audio * 12 / 1000.0:.1f} s of"
                   f" starvation expected at the measured ~12 ms each")
