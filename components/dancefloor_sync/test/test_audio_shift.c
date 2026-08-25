@@ -1,18 +1,4 @@
-/*
- * Host-side tests for the catch-up crossfade.
- *   cc -std=c11 -Wall -Wextra -I../include test_audio_shift.c ../audio_shift.c -o t && ./t
- *
- * The claims under test are the ones audio_shift.h makes: the output is
- * exactly `frames` long, continuous at both joints, free of amplitude dips
- * (a crossfade of a signal with itself at a small offset sums to roughly the
- * signal), and it consumes exactly frames+shift input frames -- the count the
- * caller puts in samples_played, so a mistake here is a phase error the servo
- * would have to walk off.
- *
- * The ramp is the workhorse: a shift on a ramp is still a ramp, so any
- * discontinuity or dip anywhere in the output is arithmetically visible as a
- * step in the frame-to-frame difference.
- */
+
 #include "audio_shift.h"
 
 #include <stdio.h>
@@ -22,7 +8,6 @@
 #include <inttypes.h>
 #include <math.h>
 
-/* -std=c11 has no M_PI, and the exact value does not matter to a sine. */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -40,8 +25,6 @@ static void check(const char *name, bool cond, const char *detail)
 #define CHANS  2
 #define INMAX  (FRAMES + CATCHUP_SHIFT_MAX + 1)
 
-/* L carries the ramp, R carries the ramp plus a large constant, so a test
- * that mixes channels (or drops one) fails loudly rather than subtly. */
 static void ramp(int16_t *buf, unsigned n, int base)
 {
     for (unsigned i = 0; i < n; i++) {
@@ -52,8 +35,7 @@ static void ramp(int16_t *buf, unsigned n, int base)
 
 static void test_strands(void)
 {
-    /* For every shift the play path can produce, plain regions must be the
-     * un-mixed strands and the fade must be monotone between them. */
+
     static int16_t in[INMAX * CHANS];
     static int16_t out[FRAMES * CHANS];
 
@@ -73,8 +55,8 @@ static void test_strands(void)
             bool ok = true;
 
             for (unsigned i = 0; i < FRAMES && ok; i++) {
-                int want_a = (int)i;                 /* this strand   */
-                int want_b = (int)i + shift;         /* the other     */
+                int want_a = (int)i;
+                int want_b = (int)i + shift;
                 for (unsigned c = 0; c < CHANS; c++) {
                     int16_t v = out[i * CHANS + c];
                     int16_t lo = (int16_t)(want_a < want_b ? want_a : want_b);
@@ -93,12 +75,7 @@ static void test_strands(void)
 
 static void test_continuity(void)
 {
-    /* On a ramp every output frame must advance monotonically: by exactly 1
-     * across the plain regions, and by 0..2 inside the fade. There the shift
-     * itself is being spread -- a drop of 8 over a 64-frame fade advances
-     * 8/63 of a frame extra per frame, which truncates to steps of 1 and 2
-     * (an insert leaves steps of 0 and 1). What must never happen anywhere
-     * is a step backwards (a level dip) or a jump of 3+: either is a tick. */
+
     static int16_t in[INMAX * CHANS];
     static int16_t out[FRAMES * CHANS];
     char name[64];
@@ -129,9 +106,7 @@ static void test_continuity(void)
 
 static void test_level(void)
 {
-    /* A crossfade must never exceed the material: equal-ramp weights sum to
-     * 1, so on a sine the output's peak sits inside the input's. Clipping or
-     * a dip here would make the catch-up audible as a level puff. */
+
     static int16_t in[INMAX * CHANS];
     static int16_t out[FRAMES * CHANS];
 
@@ -154,17 +129,14 @@ static void test_level(void)
         char name[64];
         snprintf(name, sizeof name, "sine shift %+d: level held (%d of %d)",
                  shift, peak_out, peak_in);
-        /* One count of integer-rounding slack per mix. */
+
         check(name, peak_out <= peak_in + 1, NULL);
     }
 }
 
 static void test_chunk_seam(void)
 {
-    /* The next chunk the caller reads starts at input frame FRAMES+shift, so
-     * the last output frame must be adjacent to it on a ramp: the shift must
-     * not leave the stream ahead or behind by an extra frame. This is the
-     * samples_played arithmetic -- off by one is off by 23 us of phase. */
+
     static int16_t in[INMAX * CHANS];
     static int16_t out[FRAMES * CHANS];
 
@@ -175,7 +147,7 @@ static void test_chunk_seam(void)
         audio_shift_chunk(out, in, FRAMES, shift, CATCHUP_FADE_FRAMES, CHANS);
 
         int16_t last = out[(FRAMES - 1) * CHANS];
-        int16_t next = (int16_t)((int)(FRAMES + shift));  /* frame nin */
+        int16_t next = (int16_t)((int)(FRAMES + shift));
         char name[64];
         snprintf(name, sizeof name, "shift %+d: seam adjacent to next chunk", shift);
         check(name, (int16_t)(last + 1) == next, NULL);
@@ -184,17 +156,12 @@ static void test_chunk_seam(void)
 
 static void test_fade_bounds(void)
 {
-    /* A fade of 1 would divide by zero; the header forbids fades too short
-     * to be a fade. Only the guard value 2 is exercised here -- the function
-     * trusts its caller, and these tests document the contract. */
+
     static int16_t in[INMAX * CHANS];
     static int16_t out[FRAMES * CHANS];
     ramp(in, FRAMES + 2, 0);
     audio_shift_chunk(out, in, FRAMES, 2, 2, CHANS);
-    /* q = 254, f0 = 252. j=0 is pure A (src[252] = 252), j=1 is pure B
-     * (src[255] = 255 -- degenerate: no intermediate point), then the tail
-     * reads src[i+2]: 256, 257. The exactness is the contract, not the
-     * smoothness; that is why real fades are 64 frames. */
+
     bool ok = out[0] == 0 && out[251 * CHANS] == 251
            && out[252 * CHANS] == 252 && out[253 * CHANS] == 255
            && out[254 * CHANS] == 256 && out[255 * CHANS] == 257;

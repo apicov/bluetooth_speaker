@@ -1,10 +1,4 @@
-/*
- * Clock synchronisation between dancefloor units.
- *
- * Deliberately free of ESP-IDF dependencies so the estimator can be unit-tested
- * on the host -- this is the part of the system most likely to be subtly wrong,
- * and hardware bring-up is a bad place to discover that.
- */
+
 #pragma once
 
 #include <stdbool.h>
@@ -14,474 +8,104 @@
 
 #define SYNC_PORT        5001
 
-#define SYNC_WINDOW      10      /* probes retained for the median */
-#define SYNC_MIN_SAMPLES 3       /* below this the estimate is not trusted */
+#define SYNC_WINDOW      10
+#define SYNC_MIN_SAMPLES 3
 
-/*
- * Offset step between consecutive probes that means the master's clock changed
- * origin rather than drifted -- see sync_est_add(). Drift moves it by a few
- * microseconds per probe and asymmetry by a few milliseconds; a second is
- * neither.
- */
 #define SYNC_STEP_US     1000000
 
 typedef enum {
-    MSG_TIME_REQ = 1,   /* satellite -> master */
-    MSG_TIME_RSP = 2,   /* master -> satellite, unicast */
-    /* 3 was MSG_BLINK, for the M4 blink harness. The number is deliberately
-     * not reused: an old board still flashed with that firmware would be
-     * talking a protocol this one no longer speaks, and a silently
-     * reinterpreted type is worse than an unknown one. */
-    MSG_AUDIO    = 4,   /* master -> listeners */
-    MSG_META     = 5,   /* master -> listeners, track metadata */
-    MSG_SPLICE   = 6,   /* satellite -> master, what it corrected at a boundary */
-    MSG_TSF      = 7,   /* master -> satellite, measurement only, see tsf_msg_t */
-    MSG_FRAME    = 8,   /* master -> listeners, a batch of analysis frames */
-    MSG_LOG      = 9,   /* any wifi unit -> collector, one formatted log line */
-    MSG_HEALTH   = 10,  /* any wifi unit -> collector, the structured HEALTH snapshot */
-    MSG_LOG_SUB  = 11,  /* collector -> hub: "send logs here" (see log_sub_msg_t) */
-    /* 12 was MSG_ML, one pluggable analyser's result sent to a unit that was
-     * given them rather than computing them. Removed when the analysers became
-     * spectrum-fed: a unit that receives MSG_FRAME already has the spectrum, so
-     * it can run the model itself and there is nothing left to distribute. The
-     * hub runs no analysers at all now. Not reused, for the same reason as 3
-     * above. */
-    MSG_VOL      = 13,  /* master -> listeners, playback volume (see vol_msg_t) */
-    /*
-     * master -> listeners, one XOR parity packet per group of audio packets.
-     * See audio_fec_msg_t. Its own type rather than a field on audio_msg_t
-     * because a satellite that predates it must go on reading the audio
-     * unchanged, and an unknown type is already ignored by rx_task's dispatch
-     * -- which is exactly the compatibility the trailing-redundancy scheme it
-     * replaces had, kept for the same reason.
-     */
+    MSG_TIME_REQ = 1,
+    MSG_TIME_RSP = 2,
+
+    MSG_AUDIO    = 4,
+    MSG_META     = 5,
+    MSG_SPLICE   = 6,
+    MSG_TSF      = 7,
+    MSG_FRAME    = 8,
+    MSG_LOG      = 9,
+    MSG_HEALTH   = 10,
+    MSG_LOG_SUB  = 11,
+
+    MSG_VOL      = 13,
+
     MSG_AUDIO_FEC = 14,
 } msg_type_t;
 
-/*
- * Audio chunking.
- *
- * 256 frames is 5.8 ms at 44.1 kHz and puts the packet at 1041 bytes, safely
- * under a 1500-byte MTU so nothing fragments. Larger chunks would fragment;
- * smaller ones spend more of the link on headers.
- */
 #define AUDIO_FRAMES    256
 #define AUDIO_CHANNELS  2
 #define AUDIO_CHUNK_BYTES (AUDIO_FRAMES * AUDIO_CHANNELS * (int)sizeof(int16_t))
 
-/* Wire format. Fixed-width and packed: both ends are xtensa here, but the host
- * test builds this too, and an accidental layout change would be invisible. */
 typedef struct __attribute__((packed)) {
     uint8_t type;
     uint32_t seq;
-    int64_t t1;   /* satellite transmit, satellite clock */
-    int64_t t2;   /* master receive,    master clock    */
-    int64_t t3;   /* master transmit,   master clock    */
+    int64_t t1;
+    int64_t t2;
+    int64_t t3;
 } time_msg_t;
 
-/*
- * The master's 802.11 TSF against its own clock. MEASUREMENT ONLY -- nothing
- * reads it but a log line, and the probe estimator continues to drive every
- * anchor, offset and splice.
- *
- * TSF is the WiFi MAC's own microsecond counter. The AP maintains it, every
- * beacon carries it, and each associated station's MAC hardware timestamps the
- * beacon on arrival and slaves its local copy to it. That hardware timestamp is
- * what real PTP relies on and what a software stamp either side of a sendto()
- * cannot provide -- everything between "read the clock" and "the frame left"
- * lands in the error budget, and that path asymmetry is the estimator's floor
- * (see docs/clock-sync.md §2).
- *
- * With TSF there is no round trip to be asymmetric. Each unit relates its OWN
- * TSF to its OWN esp_timer, and since both TSFs track the same AP counter:
- *
- *     offset = (master_local - master_tsf) - (sat_local - sat_tsf)
- *
- * The two reads on each side are not atomic, so a few microseconds of skew is
- * inherent. That is far below what this is trying to distinguish.
- *
- * Zero means the interface is not associated or has not yet seen a beacon; the
- * sender skips it and the receiver ignores it.
- */
 typedef struct __attribute__((packed)) {
-    uint8_t type;      /* MSG_TSF */
-    int64_t tsf;       /* esp_wifi_get_tsf_time(WIFI_IF_AP) */
-    int64_t local;     /* esp_timer_get_time(), read adjacently */
+    uint8_t type;
+    int64_t tsf;
+    int64_t local;
 } tsf_msg_t;
 
-/*
- * What a satellite corrected at a track boundary, reported so the master can
- * print how far apart the units had drifted.
- *
- * Every unit splices by its OWN phase error against the same published
- * timeline, so the difference between two units' corrections is how far apart
- * they had come to be. Both are measured at the boundary, which is the one
- * instant that recurs identically in every track -- unlike a reading taken
- * wherever a log window happened to fall, which depends on how long since the
- * last boundary reset it.
- *
- * The marker GPIO answers the same question physically, and better, because it
- * sees things no software reading can. It is a bench instrument: two boards, a
- * wire and a common ground. This works over the WiFi that is there anyway, for
- * every satellite rather than the one that happens to be wired.
- *
- * Sent from the probe task, not from playback: a sendto() in the audio path is
- * exactly the kind of thing that costs a buffer. Up to PROBE_PERIOD_MS late,
- * which against track-length intervals is nothing.
- */
 typedef struct __attribute__((packed)) {
-    uint8_t type;         /* MSG_SPLICE */
-    int32_t applied_us;   /* + = skipped content (was late), - = inserted silence */
-    int32_t phase_us;     /* the phase error it was correcting */
-    /*
-     * The correction this unit WOULD have applied on the OTHER estimator. Same
-     * units and same clamp as applied_us, so the two subtract meaningfully --
-     * that is the whole reason it is the correction rather than a phase value.
-     *
-     * The roles have swapped, and the field was renamed when they did. It used to
-     * be `applied_med_us`: the splice ran on the newest raw reading and this
-     * carried what the median would have asked for. The median won -- the raw
-     * reading carries ~15.7 ms of scatter, and two units splicing on independent
-     * noisy samples land in different places, which is why a track change
-     * sometimes improved cross-unit sync and sometimes degraded it. Both units
-     * now splice on sync_phase_median() and this carries the RAW counterfactual.
-     *
-     * Kept rather than deleted so the comparison that justified the change
-     * survives it, and so a revert has something to check itself against.
-     *
-     * WIRE COMPATIBILITY: the layout is unchanged -- same offset, same width,
-     * same clamp -- so a unit on either build parses the other's message. Only
-     * the meaning of the number flips, and both firmwares must be reflashed
-     * together for the printed comparison to mean anything.
-     */
+    uint8_t type;
+    int32_t applied_us;
+    int32_t phase_us;
+
     int32_t applied_alt_us;
 } splice_msg_t;
 
-/*
- * Audio alignment measurement.
- *
- * Every unit pulses a GPIO at the moment it plays the sample whose *master-clock*
- * time crosses a multiple of MARKER_PERIOD_US. If two units are in sync their
- * pulses coincide; the gap between them is the sync error, measured on the audio
- * itself rather than inferred from clock estimates.
- *
- * Master-clock time is used rather than a sample count from each unit's own
- * start, so a satellite that joins late still marks the same instants.
- *
- * The pulse fires when a chunk is written to the output, not when it reaches the
- * DAC, so it sits ahead of the sound by the DMA depth. That offset is identical
- * on every unit and cancels in the comparison.
- */
-/*
- * Marked by CONTENT, not by time: every unit pulses when the audio from a
- * tagged packet reaches its output, so both are marking the same sample.
- *
- * The first attempt derived the instant from samples_played / sample_rate using
- * the nominal 44100. Each unit actually plays at whatever its drift servo last
- * set, so a 0.4% difference accumulated ~8 ms between markers and the two units'
- * pulses slid apart independently -- the measurement reported servo divergence
- * rather than audio misalignment.
- *
- * Tying the marker to a packet removes rate from the question entirely: if two
- * units emit the same sample at the same instant they are in sync, whatever
- * their clocks are doing.
- *
- * Packets arrive ~50/s, so every 100th is about 2 s.
- */
 #define MARKER_EVERY_PKTS 100
 #define MARKER_PULSE_US   200
 
-/*
- * Smoothed phase error each unit tolerates before correcting its output rate.
- *
- * Shared, because it is not a per-unit preference: every unit deadbands around
- * its own reading of the same timeline, so the worst case between any two of
- * them is twice this, whatever the servos report individually.
- *
- * It used to be bounded below by what a RETUNE costs, measured rather than
- * guessed. On the bench, forcing same-rate retunes and reading the phase either
- * side: the channel is down 1.8 to 5.8 ms and the phase step is 1.1 to 6.9 ms,
- * mean 3.3 ms against a mean outage of 3.1 ms. The step IS the outage, to
- * within the several ms the phase wanders on its own.
- *
- * This was briefly raised to 20000 on the theory that frequent retunes were
- * what made the strips drift. They were not. A retune used to cost up to 50 ms
- * because the satellite's playback task ran flat out while the channel was down
- * -- see the `retuning` guard in satellite/main/out.c -- and once that was
- * fixed the cost fell to the outage. 7000 is what the build that measured well
- * actually had.
- *
- * NEITHER BOUND STILL BINDS, as of 2026-08-14. Corrections this size are made
- * in software now, by dropping or duplicating one frame at a time (see
- * rate_trim_hz on either unit), so a correction costs no outage at all and the
- * whole-Hz floor -- 22.7 ppm at 44.1 kHz, ~2.3 ms of phase, the smallest step a
- * clock retune could express -- is a property of an actuator that is no longer
- * used here. Only a coarse rate MATCH still retunes the clock.
- *
- * 7000 is kept unchanged all the same, and deliberately: the point of that
- * change was to remove an interruption without moving the sync behaviour, and
- * every cross-unit figure this project has recorded was measured at this value.
- * Tightening it is now affordable in a way it was not, and it is the obvious
- * next experiment -- but it is a separate one, with its own flash and its own
- * TRACK DIVERGENCE reading. See docs/clock-sync.md.
- */
 #define PHASE_DEADBAND_US 7000
 
-
 typedef enum {
-    /*
-     * 0 was AUDIO_FMT_PCM, interleaved 16-bit stereo, from when the master
-     * decoded for everyone and sent samples. Satellites decode their own SBC
-     * now -- it costs a quarter of the airtime -- so nothing produces this
-     * format and satellite rejects any packet not marked SBC.
-     *
-     * Kept as a burned number for the same reason as MSG_BLINK above: a board
-     * still running the old firmware would put a 0 here and mean PCM by it, and
-     * a format byte silently reinterpreted as something else is worse than one
-     * that is simply unknown.
-     */
-    AUDIO_FMT_SBC = 1,   /* one or more back-to-back SBC frames */
+
+    AUDIO_FMT_SBC = 1,
 } audio_fmt_t;
 
-/*
- * Sized to match SBC_LINK_MAX_PAYLOAD (sbc_link.h): the same max SBC payload, on
- * the WiFi hop to satellites instead of the SPI hop from the bridge. It must
- * stay >= SBC_LINK_MAX_PAYLOAD or the forwarder refuses what the link delivered
- * -- test_sync_proto.c asserts it does not drift below. Only the first
- * payload_len bytes go on the wire (AUDIO_MSG_BYTES), so the array is a ceiling,
- * not a per-packet cost.
- */
 #define AUDIO_MAX_PAYLOAD 2048
 
-/*
- * One chunk of audio. `play_at` is the master-clock instant the *first* sample
- * should hit the DAC; the satellite converts it with sync_to_local().
- *
- * Carries SBC rather than PCM. Decoded audio is 1.4 Mbps in 172 packets/s;
- * the SBC it was decoded from is ~330 kbps in 50 packets/s. Measured on this
- * hardware, PCM cost ~7% of packets rejected by a full WiFi TX queue plus ~13%
- * lost on the air at 24% duty cycle. Quartering both fixes both, and costs
- * nothing in quality -- it is the same SBC, decoded at the far end instead.
- *
- * `seq` matters as much as the timestamp: UDP loses packets, and a gap must be
- * filled with the right amount of silence or every later sample plays early and
- * the whole stream slides.
- *
- * Only the first `payload_len` bytes are transmitted, so packets are as small as
- * the audio allows.
- */
 typedef struct __attribute__((packed)) {
     uint8_t  type;
-    uint8_t  format;        /* audio_fmt_t */
-    uint8_t  marker;        /* 1 = pulse the sync GPIO when this audio plays */
-    /*
-     * 1 = a track boundary starts here. When playback reaches this audio, snap
-     * the accumulated phase error to zero by skipping or inserting samples.
-     *
-     * The splice must happen HERE, not when the track-change notification
-     * arrives: at that moment the buffer still holds ~200 ms of the previous
-     * track, and correcting immediately would cut its ending. Waiting until
-     * playback arrives puts the splice exactly at the boundary, where a track
-     * change makes it inaudible.
-     */
+    uint8_t  format;
+    uint8_t  marker;
+
     uint8_t  restart;
     uint16_t payload_len;
     uint32_t seq;
     uint32_t sample_rate;
-    uint32_t frames;        /* PCM frames this payload decodes to */
+    uint32_t frames;
     int64_t  play_at;
     uint8_t  payload[AUDIO_MAX_PAYLOAD];
 } audio_msg_t;
 
-/* Track metadata forwarded from the bridge. Carries link_meta_t verbatim, so
- * there is exactly one definition of the fields (see sbc_link.h). */
-/*
- * Analysis frames, for units that draw what another unit decided.
- *
- * The payload is one or more vis_frame_t from components/dancefloor_leds --
- * copied in as bytes rather than declared here, because that component does not
- * depend on this one and must stay buildable alone. `len` is the size of ONE
- * frame, carried so the two ends can disagree about it and say so instead of
- * reading past it: a hub and a satellite on different builds is the failure this
- * protocol is most likely to meet, and a silently reinterpreted frame would be
- * worse than a refused one. `count` is how many of them follow, back to back.
- *
- * A BATCH, NOT A FRAME, and the reason is the pace rather than the analysis.
- * The hub computes 86 frames a second at hop 512 and draws every one of them;
- * the satellites were receiving 9.8, because TX_FRAME_PACE_US gates this lane
- * to one send per 102.4 ms and everything offered in between was dropped. That is a
- * detector running at a ninth of the rate its thresholds were tuned at -- see
- * BEAT_HIST, which is a frame COUNT, so the satellites' adaptive window was 4.4
- * seconds against the hub's 0.5 -- and it is visible from across the field as a
- * hub whose strip follows the music and satellites whose strips lurch.
- *
- * The pace is not the fault and stays: a group-addressed frame is held until the
- * beacon whatever the sender does, so sending faster only occupies transmit
- * buffers the audio needs. What changes is how much rides in the one datagram
- * the beacon releases. One packet per beacon, every frame since the last one,
- * and the burst the pace was introduced to prevent still does not form.
- *
- * WHAT IT COSTS is loss granularity: a lost packet is now ~9 consecutive frames
- * (~102 ms) rather than one. At the 0.2-0.3% group loss measured below that is a
- * hole every 30-50 s, and df::RemoteDetect converges back within its history
- * length because the history it lost is the only state it has. If that ever
- * reads as a stutter, the fix is to split the batch into a FIXED two or three
- * sub-packets per beacon -- still deterministic, still nothing like the ~26
- * packets a beacon the unpaced lane produced. TX_FRAME_BATCH in hub.h is the
- * one knob.
- *
- * UNICAST, to each satellite on the hub's client list, like every other lane.
- * The batch is byte-identical for all of them, so this is N copies of one
- * datagram and the cost scales with the floor: ~2.8 kB/s per listener at 86 Hz,
- * against the 30-40 the audio already costs that same listener.
- *
- * IT WAS MULTICAST FOR A WHILE, and the argument was scaling rather than loss:
- * one transmission feeds every listener, so the hub's packet rate would be flat
- * in speaker count -- ~146/s whatever N is, against 50 + 96xN. At fifteen
- * satellites that is ~316 against ~1490 packets a second. It worked, at 6 Mbps
- * OFDM with 11b dropped and 32 transmit buffers, and measured 0.2-0.3% loss.
- *
- * It was removed anyway, because the floor is run on unicast and unicast is
- * what proved stable in use. Nothing about the batch or the frame format came
- * from the group; the scaling claim above is what was given up, and it has not
- * been paid for again -- the hub's transmit rate is 50 + 96xN once more, and
- * nothing has measured past two satellites.
- *
- * It was ~8.3 kB/s until vis_frame_t lost spec[]; see FRAME_PAYLOAD_MAX for
- * what came off and why. Neither the batch nor that shrink changes the PACKET
- * rate -- the batch took it from 86/s offered and 9.8/s sent to 9.8/s sent
- * whole, and the smaller frame makes each of those 9.8 datagrams a quarter the
- * size without making them fewer.
- *
- * The cost is real and is paid elsewhere: a group-addressed frame is held by
- * the SoftAP until the DTIM beacon releases it, occupying one static TX buffer
- * the whole time. At 86 packets a second that was most of the pool, which is
- * what the pace and now the batch exist to prevent -- one buffer per beacon,
- * held for one beacon. That is what beacon_interval in the hub's
- * wifi_start_ap() is set explicitly against, and it is why raising
- * ESP_WIFI_STATIC_TX_BUFFER_NUM far past 36 makes things WORSE rather than
- * better -- a deeper queue does not drain faster. 48 was the count that proved
- * it, on anchors-refused.
- *
- * THE SHIPPED COUNT IS 38, since 2026-08-17, and that is not a walk back toward
- * 48. The crowding was fixed at the source instead -- TX_FRAME_PACE_US in hub.h
- * paces this lane so the burst does not form -- and the +2 is margin for the
- * moment one begins anyway, cheap once the burst-former is gated and far enough
- * below 48 that the bufferbloat finding is not in play. sdkconfig.defaults has
- * the table, and says to come back to 36 if 38 ever reads like 48 did.
- */
-/*
- * Room for a whole beacon's worth of frames: 12 x 32 bytes.
- *
- * The 32 is sizeof(vis_frame_t), which this header deliberately cannot see --
- * the LED component does not depend on the protocol and must stay buildable on
- * its own, so the number is written out here and checked where the two do meet
- * (clients.c static-asserts TX_FRAME_BATCH frames against this cap).
- *
- * IT WAS 96, and the difference is the whole point of this change. Two thirds
- * of a frame was spec[], the quantised spectrum, which only the pluggable
- * analysers read -- so every satellite with DANCEFLOOR_ML off took 64 bytes 86
- * times a second and threw them away. A frame now carries the timeline labels
- * and the four detector bands, which is what the receiver actually consumes.
- *
- * WHAT IT BUYS IS AIRTIME, NOT BUFFERS, and the distinction matters because the
- * buffers are what this lane has historically cost. A full batch goes from 1155
- * bytes to 387 -- the lane from ~8.3 kB/s to ~2.8 -- but a static TX buffer
- * holds one datagram whatever its size, so the ~9.8 datagrams a second and the
- * DTIM window each one occupies are exactly as before. The knob for THAT is
- * TX_FRAME_BATCH: at 32 bytes a frame, two beacons' worth is ~566 bytes and
- * would halve the datagram rate, at the cost of up to ~205 ms against a 350 ms
- * lead. Not taken here; it wants its own measurement.
- *
- * 12 rather than the 9 a beacon actually holds at hop 512: the analysis task
- * does not run at a metronomic 86/s, and a decoder lump hands it several frames
- * at once. The spare three absorb that without the batch overflowing and cutting
- * itself short. It was 160 -- one frame and change -- while the lane sent one
- * frame per datagram.
- */
 #define FRAME_PAYLOAD_MAX 384
 
 typedef struct __attribute__((packed)) {
-    uint8_t type;           /* MSG_FRAME */
-    uint8_t len;            /* bytes per frame; every frame in the batch is this size */
-    uint8_t count;          /* frames that follow, back to back; >= 1 */
+    uint8_t type;
+    uint8_t len;
+    uint8_t count;
     uint8_t payload[FRAME_PAYLOAD_MAX];
 } frame_msg_t;
 
-/* On-wire bytes for n TOTAL payload bytes -- len * count, not one frame. */
 #define FRAME_MSG_BYTES(n) (sizeof(frame_msg_t) - FRAME_PAYLOAD_MAX + (n))
 
-/*
- * ml_msg_t was here, carrying one pluggable analyser's result to a unit that was
- * given them rather than computing them. It was a separate message from
- * MSG_FRAME because of cadence: frames go out at the analysis rate, an analyser
- * with a second of context reports once a second, and carrying a result in every
- * frame would have multiplied its cost by eighty.
- *
- * It is gone because the question it answered stopped existing. Analysers now
- * read the quantised spectrum, which every unit taking MSG_FRAME already has --
- * so a unit that wants a model's answer runs the model, and there is nothing to
- * ship. The hub runs no analysers at all. See the note on 12 in msg_type_t.
- */
-
 typedef struct __attribute__((packed)) {
-    uint8_t type;           /* MSG_META */
-    uint8_t payload[196];   /* sizeof(link_meta_t) */
+    uint8_t type;
+    uint8_t payload[196];
 } meta_msg_t;
 
-/* The two definitions must not drift apart; sbc_link.h owns the fields. */
 _Static_assert(sizeof(link_meta_t) <= 196, "link_meta_t outgrew meta_msg_t.payload");
 
-/*
- * Playback volume, hub -> listeners. Applied at each unit's output by
- * audio_volume_write_i32(); see that for the taper and why it lives there.
- *
- * ADDRESSED LIKE THE AUDIO -- the client list, which is what the audio walks.
- * That is the requirement, not an implementation detail: a unit must hear the
- * level exactly when it hears the stream. It was briefly broken, while the
- * audio went to a multicast group and this still went to the list, and
- * streamer_send_vol() has the full argument.
- *
- * Sent three times when the phone changes it, pushed once when a satellite is
- * given an address, and repeated once a second regardless. The repeats predate
- * unicast -- they replaced the link-layer ACK a group frame never got -- and
- * they still earn their place: a level is state rather than a stream, so a unit
- * that missed the one packet carrying it stays wrong until something says so
- * again, and this bounds how long a unit that was never told stays silent.
- */
 typedef struct __attribute__((packed)) {
-    uint8_t type;           /* MSG_VOL */
-    uint8_t volume;         /* 0-127, 127 = unity */
+    uint8_t type;
+    uint8_t volume;
 } vol_msg_t;
 
-/*
- * One formatted log line, shipped off-board for centralised analysis.
- *
- * The bench runs several boards at once and the interesting events -- a
- * retune on one unit against a clean window on another, a heap dip that
- * precedes an alloc-fail, two units' phase lines side by side -- only read
- * across consoles. This carries each ESP_LOG line to a laptop collector so
- * they land in one merged stream. The receive path never sends it: a blocking
- * send there would close the same loss -> log -> mailbox-overflow -> loss loop
- * that took the per-event ESP_LOGW calls out of handle_audio()
- * (satellite/main/main.c:286). The hook that fills this runs in whichever
- * task logged, but only enqueues (non-blocking, drop-on-full); a separate
- * low-priority task drains the queue and does the sendto().
- *
- * Variable-length, like the audio and frame messages: only the first msg_len
- * bytes of `msg` go on the wire (LOG_MSG_BYTES), so the 192-byte array is a
- * ceiling, not a per-packet cost. The whole ceiling stays under a 1500-byte
- * MTU so nothing fragments.
- *
- * The collector is the hub's funnel: every unit sends to the hub, and the hub
- * forwards to whichever laptop registered with MSG_LOG_SUB. Every packet the
- * collector receives therefore comes from the hub's 192.168.4.1, so the UDP
- * source address is useless for telling units apart. `role` and `src_ip` are
- * what split them: role distinguishes hub from satellite, and src_ip (in
- * network byte order) is the satellite's own address, stamped by the hub on
- * relay because the satellite does not know its DHCP lease. 0 means "the hub
- * itself" on a hub-originated packet.
- */
 #define LOG_ROLE_HUB 0
 #define LOG_ROLE_SAT 1
 
@@ -489,222 +113,82 @@ typedef struct __attribute__((packed)) {
 #define LOG_MSG_MAX   192
 
 typedef struct __attribute__((packed)) {
-    uint8_t  type;        /* MSG_LOG */
-    uint8_t  level;       /* the level char as printed: 'E','W','I','D' */
-    uint8_t  role;        /* LOG_ROLE_HUB / LOG_ROLE_SAT */
+    uint8_t  type;
+    uint8_t  level;
+    uint8_t  role;
     uint8_t  tag_len;
     uint16_t msg_len;
     uint32_t seq;
-    uint32_t src_ip;      /* network order; hub stamps on relay, 0 = self */
+    uint32_t src_ip;
     char     tag[LOG_TAG_MAX];
     char     msg[LOG_MSG_MAX];
 } log_msg_t;
 
-/* Bytes to send for a message of m payload bytes. */
 #define LOG_MSG_BYTES(m) (sizeof(log_msg_t) - LOG_MSG_MAX + (size_t)(m))
 
 _Static_assert(sizeof(log_msg_t) <= 1500, "log_msg_t ceiling exceeds the MTU");
 
-/*
- * The structured counterpart to the HEALTH line, shipped every ~60 s beside
- * the ring_monitor_task (hub) / drift_task (satellite) narration that already
- * holds every field in scope. A fixed layout, not a formatted string, so the
- * collector writes one CSV row per snapshot and the numbers plot directly.
- *
- * The two units log different counters, so the fields past the common heap and
- * stack set are a union: the name is the satellite's and the hub alias is in
- * the comment. Both units fill every field -- a counter that does not exist on
- * one role is left 0 -- so the collector unpacks one layout regardless of role.
- * role/src_ip are as for log_msg_t: the hub stamps src_ip on relay.
- */
 typedef struct __attribute__((packed)) {
-    uint8_t  type;          /* MSG_HEALTH */
-    uint8_t  role;          /* LOG_ROLE_HUB / LOG_ROLE_SAT */
-    uint8_t  clock_src;     /* satellite: 0 = probe estimator, 1 = TSF; hub: 0 */
+    uint8_t  type;
+    uint8_t  role;
+    uint8_t  clock_src;
     uint8_t  _rsv;
     uint32_t seq;
-    uint32_t src_ip;        /* network order; hub stamps on relay, 0 = self */
+    uint32_t src_ip;
     uint64_t uptime_s;
     uint32_t heap_cur;
-    uint32_t heap_min;      /* since boot */
-    uint32_t heap_win;      /* lowest this minute, taken and cleared */
-    uint32_t heap_largest;  /* largest free block */
-    uint32_t hw_play;       /* stack headroom, play task */
-    uint32_t hw_mon;        /* hub: ring_monitor; satellite: drift task */
-    /* counters common to both roles, then the role-specific tail. */
+    uint32_t heap_min;
+    uint32_t heap_win;
+    uint32_t heap_largest;
+    uint32_t hw_play;
+    uint32_t hw_mon;
+
     uint32_t underruns;
-    uint32_t reanchors_or_restarts;        /* sat: reanchors, hub: restarts */
+    uint32_t reanchors_or_restarts;
     uint32_t splices;
     uint32_t retunes;
-    uint32_t retunes_refused;              /* both: n_retunes_bad */
-    uint32_t gaps_or_sta_left;             /* sat: gaps, hub: sta-left */
-    uint32_t wifi_drops_or_oversize;       /* sat: wifi-drops, hub: wifi-over */
+    uint32_t retunes_refused;
+    uint32_t gaps_or_sta_left;
+    uint32_t wifi_drops_or_oversize;
     uint32_t alloc_fail;
     uint32_t phase_drop;
     uint32_t short_reads;
     uint32_t short_frames;
-    uint32_t ring_full_or_sta_dropped;     /* sat: ring-full, hub: sta-dropped */
-    uint32_t upgrades_or_sta_nolease;      /* sat: anchor upgrades, hub: sta-nolease */
-    uint32_t anchors_refused_or_timeout;   /* sat: anchors-refused, hub: sta-timeout */
-    /*
-     * How faithful the capture itself is, from wifi_log. dropped counts lines
-     * the hook could not queue or the non-blocking send could not hand to the
-     * driver; no_dest counts those with no collector registered. Nonzero
-     * dropped means the merged stream has holes -- read it before concluding
-     * anything from a gap between two lines.
-     */
+    uint32_t ring_full_or_sta_dropped;
+    uint32_t upgrades_or_sta_nolease;
+    uint32_t anchors_refused_or_timeout;
+
     uint32_t log_dropped;
     uint32_t log_no_dest;
 } health_msg_t;
 
-/*
- * The collector's registration. Sent to the hub every few seconds; the hub
- * forwards logs to the most recent sender for ~30 s after the last one. The
- * magic stops a stray two-byte packet (an unknown type, or a truncated probe)
- * from being read as a subscribe and pulling audio-bound traffic onto the
- * laptop. "LOG1" in ASCII.
- */
 #define LOG_SUB_MAGIC 0x4C4F4731u
 typedef struct __attribute__((packed)) {
-    uint8_t  type;        /* MSG_LOG_SUB */
-    uint32_t magic;       /* LOG_SUB_MAGIC */
+    uint8_t  type;
+    uint32_t magic;
 } log_sub_msg_t;
 
-/* Bytes to send for a payload of `n`. */
 #define AUDIO_MSG_BYTES(n) (sizeof(audio_msg_t) - AUDIO_MAX_PAYLOAD + (n))
 
-/*
- * What one UDP datagram may carry: 1500-byte Ethernet-equivalent MTU less 20
- * bytes of IP and 8 of UDP. On-link under the SoftAP, so nothing fragments this
- * further and nothing routes it.
- */
 #define AUDIO_UDP_MTU 1472
 
-/*
- * The largest payload a sender may put in one datagram: header plus payload
- * against the MTU, 1446 bytes.
- *
- * At the ~825-byte payloads a phone produces it never binds, so the packet rate
- * is unchanged from every log ever captured. It exists for the case that always
- * could have fragmented and never had a guard: a 1500-byte A2DP payload becoming
- * a 1526-byte datagram, since the only ceiling checked was AUDIO_MAX_PAYLOAD at
- * 2048. The FEC attach path clamps its own copies to whatever is left, so it
- * cannot push a packet over on its own.
- *
- * A cap that DID bind -- one sized so a whole redundant copy fits beside the
- * payload -- was tried and reverted: it splits every packet in two, and the
- * doubled packet rate both exhausts the transmit buffers and doubles the
- * timeline slew, which is per AUDIO packet. See DANCEFLOOR_AUDIO_FEC_K's Kconfig
- * help for the measurement. Anything that reintroduces such a cap has to make
- * TIMELINE_SLEW_US per unit of audio first -- which is exactly why the parity
- * below is a datagram of its own rather than something attached here: it raises
- * the datagram rate without touching the audio packet rate, and so costs no slew
- * at all.
- */
 #define AUDIO_TX_PAYLOAD_MTU_MAX (AUDIO_UDP_MTU - AUDIO_MSG_BYTES(0))
 
-/*
- * XOR PARITY: one extra datagram per group of K audio packets, which recovers
- * any ONE of them whole.
- *
- * WHY THIS SHAPE, AND WHAT IT REPLACES. Until now redundancy was piggybacked:
- * each audio packet carried copies of previous payloads in its own tail. That
- * pinned every packet at the 1472-byte MTU instead of its natural ~851 B -- 73%
- * more airtime, permanently, on a link whose 6 Mbps group rate has no
- * aggregation -- and a whole copy still did not fit beside the payload, so every
- * recovery came back about three quarters complete with a decode error on the
- * end of it. Over a five-hour soak the truncation counter reached 889,439
- * against ~890,000 packets: not "sometimes", every single one. The measurement
- * history is in DANCEFLOOR_AUDIO_FEC_K's Kconfig help.
- *
- * Parity inverts the economics. The redundancy is its own datagram, so the audio
- * packets go back to their natural size and nothing is truncated; the cost is
- * 1/K of the audio bytes and 1/K of the datagram rate instead of 1x of both.
- *
- * IT COSTS NO TIMELINE SLEW, which is the objection that killed the last
- * attempt. TIMELINE_SLEW_US is applied once per call to streamer_send_sbc(), so
- * it is per AUDIO packet, not per datagram. Shrinking payloads to make copies
- * fit doubled the audio packet rate and so doubled the slew -- phase ran to
- * +271 ms. A parity datagram never enters that path: it carries no play_at, does
- * not advance the timeline, and is not counted in the packet rate the servo
- * steers on. It buys airtime and TX buffers, and nothing else.
- *
- * THE CODEWORD IS THE WHOLE MESSAGE, HEADER INCLUDED. Each member contributes
- *
- *     [ AUDIO_MSG_BYTES(0) bytes of audio_msg_t header ][ payload, zero-padded ]
- *
- * and the parity is the XOR of all K of them. Padding is implicit: a shorter
- * payload simply stops contributing, which is identical to XOR-ing zeros, so the
- * unequal SBC lengths this stream produces need no length table on the wire.
- *
- * Recovering the header along with the payload is what makes the repair WHOLE
- * rather than approximate. seq, frames, play_at, marker and restart all come
- * back, so a recovered packet is fed through the ordinary receive path and is
- * indistinguishable from one that arrived -- no length guessing, no silence pad,
- * no separate fill routine that has to reproduce the real path's accounting.
- *
- * It is also the integrity check. After the XOR the recovered header must read
- * type MSG_AUDIO, format AUDIO_FMT_SBC and exactly the seq that was missing.
- * Two losses in one group, or a parity built over a different set than the
- * receiver believes, cannot pass all three -- so the failure mode is the silence
- * fill that a loss would have caused anyway, never corrupted audio pushed into
- * the ring. audio_fec_extract() is where that is enforced.
- *
- * GROUPS ARE ALIGNED ON seq, so both ends derive membership from arithmetic and
- * nothing has to be negotiated: member index is seq % K, base is seq - (seq % K).
- * base_seq and count travel on the parity anyway, so a hub and a satellite built
- * with different K disagree loudly (the parity is refused and counted) instead of
- * combining the wrong packets.
- */
-#define AUDIO_FEC_HDR_BYTES 8       /* type + count + span + base_seq */
+#define AUDIO_FEC_HDR_BYTES 8
 
-/*
- * The longest audio payload parity can cover: what is left of one datagram after
- * the parity header and the audio header the codeword carries.
- *
- * 1438 bytes, against the ~851 a phone actually produces, so it does not bind --
- * and it is only 8 bytes below AUDIO_TX_PAYLOAD_MTU_MAX, so the only payloads it
- * excludes are ones already within 8 bytes of fragmenting. A group containing one
- * is sent without parity and counted (n_fec_skipped), rather than sending a
- * parity that would fragment or one that silently covers less than it claims.
- */
 #define AUDIO_FEC_PAYLOAD_MAX (AUDIO_UDP_MTU - AUDIO_FEC_HDR_BYTES - AUDIO_MSG_BYTES(0))
 #define AUDIO_FEC_CODEWORD_MAX AUDIO_MSG_BYTES(AUDIO_FEC_PAYLOAD_MAX)
 
-/*
- * The ceiling on K, not the value of it -- DANCEFLOOR_AUDIO_FEC_K picks that.
- *
- * 8 because the receiver tracks which members it has seen in one byte, and
- * because the latency argument runs out well before the bitmask does: a loss can
- * only be repaired once the parity arrives, so the receiver must HOLD the packets
- * behind the hole until then, and that hold is (K-2) packet times in the worst
- * case -- 120 ms at K=8 against a 350 ms lead and a 350 ms target ring depth.
- * K=4's 40 ms is the default for that reason.
- */
 #define AUDIO_FEC_K_MAX 8
 
-/*
- * One group's parity.
- *
- * `span` is bytes of parity[] in use: the longest codeword in the group, so a
- * group of ~851-byte payloads sends ~877 bytes rather than the full ceiling.
- * Carried explicitly rather than derived from the datagram length so a truncated
- * receive is refused instead of silently XOR-ing short.
- *
- * `count` is how many members were folded in, and `base_seq` the first of them.
- * The pair is what lets a receiver check the group it reconstructed against the
- * group the sender actually built, which is the whole of the two-loss and
- * mismatched-K defence.
- */
 typedef struct __attribute__((packed)) {
-    uint8_t  type;        /* MSG_AUDIO_FEC */
-    uint8_t  count;       /* members XORed into parity[], 2..AUDIO_FEC_K_MAX */
-    uint16_t span;        /* bytes of parity[] that follow */
-    uint32_t base_seq;    /* seq of member 0 of the group */
+    uint8_t  type;
+    uint8_t  count;
+    uint16_t span;
+    uint32_t base_seq;
     uint8_t  parity[AUDIO_FEC_CODEWORD_MAX];
 } audio_fec_msg_t;
 
-/* Bytes to send for a parity of `n` span. */
 #define AUDIO_FEC_MSG_BYTES(n) (sizeof(audio_fec_msg_t) - AUDIO_FEC_CODEWORD_MAX + (n))
 
 _Static_assert(AUDIO_FEC_MSG_BYTES(0) == AUDIO_FEC_HDR_BYTES,
@@ -714,134 +198,39 @@ _Static_assert(AUDIO_FEC_MSG_BYTES(AUDIO_FEC_CODEWORD_MAX) == AUDIO_UDP_MTU,
                "a full parity datagram would fragment");
 _Static_assert(AUDIO_FEC_K_MAX <= 8, "the receiver's seen-mask is one byte");
 
-/*
- * XOR one member's codeword into acc[], growing *span to cover it.
- *
- * acc must be AUDIO_FEC_CODEWORD_MAX bytes and both must be zeroed at the start
- * of a group. Adding is the same operation at both ends: the hub folds in every
- * packet it sends, the satellite folds in every packet that arrives, and the
- * satellite then folds in the parity itself -- leaving exactly the codeword of
- * whatever did not arrive.
- *
- * Returns false and leaves acc untouched if the payload is longer than parity
- * can cover, which means the group gets no parity at all.
- */
 bool audio_fec_xor_in(uint8_t *acc, uint16_t *span, const audio_msg_t *m);
 
-/*
- * The reverse: acc[] holds parity XOR every member that DID arrive, so it is the
- * missing member's codeword. Validate it and copy it out as a whole message.
- *
- * `want_seq` is the seq the caller believes is missing; a recovered header that
- * says anything else means the group was not what the receiver thought it was,
- * and the recovery is refused. Same for a type or format that is not audio, and
- * for a payload_len that does not fit inside the span the parity claimed.
- */
 bool audio_fec_extract(const uint8_t *acc, uint16_t span, uint32_t want_seq,
                        audio_msg_t *out);
 
-/* The frame lane against the same MTU. Here rather than beside frame_msg_t
- * because that is where the MTU is defined; a full batch is 387 bytes. */
 _Static_assert(FRAME_MSG_BYTES(FRAME_PAYLOAD_MAX) <= AUDIO_UDP_MTU,
                "a full frame batch would fragment");
 
-/*
- * AUDIO_TRANSPORT_TAG and FRAMES_TRANSPORT_TAG were here, printing "mcast" or
- * "unicast" on the periodic status lines. They existed because two builds were
- * otherwise indistinguishable in any log window -- the only tell was a one-time
- * boot line that scrolls out of a capture the moment a run starts.
- *
- * There is one build now. Every lane is unicast to the hub's client list, so a
- * field that always reads "unicast" tells a reader nothing they could not get
- * from the source. The FEC group size stayed on those lines: it is a real
- * Kconfig knob that changes between bench phases.
- */
-
 typedef struct {
     int64_t offset[SYNC_WINDOW];
-    int64_t delay[SYNC_WINDOW];   /* round-trip time, for minimum-delay selection */
+    int64_t delay[SYNC_WINDOW];
     int count;
     int next;
 } sync_est_t;
 
 void sync_est_init(sync_est_t *e);
 
-/*
- * Fold one completed probe exchange into the estimate.
- * t4 is the satellite receive time on the satellite clock.
- *
- * offset = ((t2 - t1) + (t3 - t4)) / 2, the standard NTP estimator. It assumes
- * the two path delays are equal; they are not, and that asymmetry is the error
- * floor. The median across probes is what keeps WiFi retries from wrecking it.
- */
 void sync_est_add(sync_est_t *e, int64_t t1, int64_t t2, int64_t t3, int64_t t4);
 
-/*
- * Best offset estimate, in microseconds, such that master_time = local_time + offset.
- * False until SYNC_MIN_SAMPLES probes have landed.
- *
- * Selects the offset from the probe with the *lowest* round-trip time rather
- * than taking a median. A fast round trip had little queuing in either
- * direction, so its paths were closer to symmetric -- and asymmetry is the only
- * error the estimator cannot see. Measured RTT on a SoftAP link swings between
- * about 5 ms and 14 ms, so the choice of sample matters more than averaging
- * across all of them. This is what PTP does.
- *
- * Ties favour the newer sample, since an old one has had time to drift.
- */
 bool sync_est_offset(const sync_est_t *e, int64_t *offset_out);
 
-/*
- * True once a full window of probes has landed, i.e. the estimate has had a
- * chance to find a genuinely low-RTT sample rather than the best of three.
- *
- * Matters for anchoring playback: `play_at` is consulted once, at stream start,
- * so an offset error at that instant is permanent. Waiting the extra couple of
- * seconds costs nothing and removes a whole class of "one speaker is slightly
- * out" that would be untraceable afterwards.
- */
 static inline bool sync_est_settled(const sync_est_t *e)
 {
     return e->count >= SYNC_WINDOW;
 }
 
-/* Master clock -> local clock. */
 static inline int64_t sync_to_local(int64_t master_us, int64_t offset)
 {
     return master_us - offset;
 }
 
-/*
- * A short history of raw phase readings, for the track-boundary splice.
- *
- * The servo has smoothed its input since it was measured triggering on noise;
- * the splice never did. It snaps this unit's position using the single most
- * recent reading, and on the hub that reading is not trustworthy on its own:
- * two reads of it a millisecond apart differed by 15.7 ms, and
- * docs/architecture.md §16 lists "the hub's absolute phase reading wanders" as
- * a wart with the cause unfound. So at every boundary the hub jumps to a
- * position several milliseconds wrong in a direction nothing predicts, while
- * the satellite -- quieter by a factor of three, its load being a fraction of
- * the hub's -- lands closer. The two splice to different places, which is why a
- * track change sometimes improves cross-unit sync and sometimes degrades it.
- *
- * The EMA the servo uses cannot serve here: it is updated once per 5 s window,
- * so at a boundary it is up to 20 s stale. This is a separate, short filter
- * over the raw readings themselves.
- *
- * MEDIAN, not mean. What is left after the overshoot and wrote_at corrections
- * (see either unit's crossing loop) is preemption latency on a board also
- * running a SoftAP, SBC decode and the bridge SPI link: bounded below, long-tailed
- * to the right. There is a minimum latency and no mechanism that makes a
- * reading early. The mean is dragged by that tail; the median sits on the mode.
- * If the noise is symmetric after all, the median merely costs ~1.25x in
- * standard error at this window length, which is nothing against a 15.7 ms
- * swing -- so it is the right answer under both models and the mean under only
- * one. It is the same shape as the offset estimator's minimum-RTT selection,
- * which beat a median 117 us to 1080 us on hardware for the same reason.
- */
-#define SYNC_PHASE_HIST 9   /* odd, so the median is an element and not an average */
-#define SYNC_PHASE_MIN  5   /* below this no median is offered */
+#define SYNC_PHASE_HIST 9
+#define SYNC_PHASE_MIN  5
 
 typedef struct {
     int32_t v[SYNC_PHASE_HIST];
@@ -851,16 +240,6 @@ typedef struct {
 
 void sync_phase_reset(sync_phase_hist_t *h);
 
-/* One accepted phase reading, in microseconds, + = playing late. */
 void sync_phase_push(sync_phase_hist_t *h, int32_t us);
 
-/*
- * The median of what is held. False below SYNC_PHASE_MIN readings, which is the
- * guard against splicing on one or two samples taken just after a re-anchor.
- *
- * Nine readings arrive in about 180 ms at ~50 packets/s. Over that span drift
- * contributes 5 us, the hub's timeline slew 0.4 ms and the satellite's offset
- * slew 78 us -- all far below the millisecond scatter being removed, and all
- * common-mode across units, so nothing here separates them.
- */
 bool sync_phase_median(const sync_phase_hist_t *h, int32_t *out);

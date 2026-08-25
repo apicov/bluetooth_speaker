@@ -1,14 +1,4 @@
-/*
- * Host-side tests for the clock offset estimator.
- *   cc -std=c11 -Wall -Wextra -I../main test_sync_proto.c ../main/sync_proto.c -o test && ./test
- *
- * Simulation model, where master_clock = local_clock + TRUE_OFFSET:
- *   t1 = satellite send        (local clock)
- *   t2 = t1 + up   + offset    (master clock)
- *   t3 = t2 + service          (master clock)
- *   t4 = t3 - offset + down    (local clock)
- * which makes the estimator's error exactly (up - down) / 2.
- */
+
 #include "sync_proto.h"
 #include "audio_out.h"
 
@@ -19,9 +9,6 @@
 #include <limits.h>
 #include <math.h>
 
-/* An independent CRC-16/CCITT-FALSE, so the link's CRC is checked against
- * another implementation rather than against itself. Pinned on the published
- * "123456789" -> 0x29B1 vector before it certifies anything. */
 static uint16_t ref_crc16(const uint8_t *p, size_t n)
 {
     uint16_t crc = 0xFFFF;
@@ -43,7 +30,6 @@ static void check(const char *name, bool cond, const char *detail)
     if (!cond) failures++;
 }
 
-/* Deterministic PRNG - a flaky test here would be worse than no test. */
 static uint32_t rng_state = 0x1234567u;
 static int32_t rnd(int32_t lo, int32_t hi)
 {
@@ -62,10 +48,9 @@ static void probe(sync_est_t *e, int64_t t1, int64_t offset, int64_t up,
 
 int main(void)
 {
-    const int64_t TRUE_OFFSET = 1234567;  /* us */
+    const int64_t TRUE_OFFSET = 1234567;
     int64_t est;
 
-    /* 1. Not enough samples yet. */
     {
         sync_est_t e; sync_est_init(&e);
         probe(&e, 1000, TRUE_OFFSET, 500, 100, 500);
@@ -73,7 +58,6 @@ int main(void)
         check("rejects estimate below SYNC_MIN_SAMPLES", !sync_est_offset(&e, &est), NULL);
     }
 
-    /* 2. Symmetric, noiseless: must be exact. */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < 5; i++)
@@ -83,7 +67,6 @@ int main(void)
         check("symmetric noiseless path is exact", ok && est == TRUE_OFFSET, d);
     }
 
-    /* 3. Symmetric with jitter: well inside the 1 ms budget. */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < SYNC_WINDOW; i++)
@@ -94,21 +77,17 @@ int main(void)
         check("jittered symmetric path within 1 ms", err < 1000, d);
     }
 
-    /* 4. One WiFi retry inflating a single probe by 80 ms. A mean would be
-     *    dragged ~8 ms off; minimum-delay selection never even considers it. */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < 9; i++)
             probe(&e, 1000 * (i + 1), TRUE_OFFSET, 500, 100, 500);
-        probe(&e, 10000, TRUE_OFFSET, 80000, 100, 500);   /* the outlier */
+        probe(&e, 10000, TRUE_OFFSET, 80000, 100, 500);
         sync_est_offset(&e, &est);
         int64_t err = llabs(est - TRUE_OFFSET);
         char d[64]; snprintf(d, sizeof d, "err=%" PRId64 " us", err);
         check("min-RTT ignores an 80 ms retry outlier", err < 1000, d);
     }
 
-    /* 5. Sustained asymmetry is the error floor, not something the median fixes.
-     *    2 ms up against 200 us down must show up as ~900 us of error. */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < SYNC_WINDOW; i++)
@@ -119,8 +98,6 @@ int main(void)
         check("asymmetric path errs by half the asymmetry", err == 900, d);
     }
 
-    /* 6. Ring buffer must retain only the most recent SYNC_WINDOW probes, so a
-     *    clock that steps is eventually forgotten rather than averaged forever. */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < SYNC_WINDOW; i++)
@@ -133,53 +110,32 @@ int main(void)
         check("window forgets superseded offsets", est == NEW_OFFSET, d);
     }
 
-    /* 7. The reason for selecting on delay rather than taking a median.
-     *    Nine slow, badly asymmetric probes (5 ms up, 0.5 ms down -> +2250 us of
-     *    error each) and one fast symmetric probe. A median would return roughly
-     *    2250 us of error; picking the lowest-RTT sample returns the clean one.
-     *    This mirrors the measured 5-14 ms RTT spread on a real SoftAP link. */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < 9; i++)
             probe(&e, 1000 * (i + 1), TRUE_OFFSET, 5000, 100, 500);
-        probe(&e, 10000, TRUE_OFFSET, 600, 100, 600);     /* the clean one */
+        probe(&e, 10000, TRUE_OFFSET, 600, 100, 600);
         sync_est_offset(&e, &est);
         int64_t err = llabs(est - TRUE_OFFSET);
         char d[72]; snprintf(d, sizeof d, "err=%" PRId64 " us (median would be ~2250)", err);
         check("min-RTT picks the symmetric probe", err < 100, d);
     }
 
-    /*
-     * 8. The master rebooting is not drift.
-     *
-     * Its clock then counts from a new origin, and every sample already in the
-     * window is wrong by its entire previous uptime. The window spans 2.5 s and
-     * minimum-RTT selection may pick any sample in it, so without this a
-     * satellite anchors on an offset that is an hour stale, schedules playback
-     * for a time that never arrives, and hands the phase servo a number no
-     * correction can fix. Observed on hardware as a satellite reporting -699
-     * seconds of phase and then aborting on the sample rate that produced.
-     */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < SYNC_WINDOW; i++)
             probe(&e, 1000 * (i + 1), TRUE_OFFSET, 1000, 100, 1000);
         check("a full window is settled", sync_est_settled(&e), NULL);
 
-        /* Master reboots: its clock restarts, so the offset drops by its uptime. */
         const int64_t after = TRUE_OFFSET - 3595000000LL;
         probe(&e, 20000, after, 1000, 100, 1000);
 
         check("a clock-origin step is not trusted as an estimate",
               !sync_est_settled(&e), "window discarded, playback holds");
 
-        /* One surviving sample is not an estimate, and the caller is told so
-         * rather than handed it. */
         check("no estimate is offered from the remains",
               !sync_est_offset(&e, &est), "count fell below SYNC_MIN_SAMPLES");
 
-        /* Once enough probes on the new clock have landed, it is the new offset
-         * that comes out. The stale one is gone entirely, not merely outvoted. */
         for (int i = 0; i < SYNC_MIN_SAMPLES; i++)
             probe(&e, 21000 + 1000 * i, after, 1000, 100, 1000);
         char d[80];
@@ -187,7 +143,6 @@ int main(void)
                  sync_est_offset(&e, &est) ? est : 0, TRUE_OFFSET);
         check("the stale window cannot be selected from", llabs(est - after) < 100, d);
 
-        /* And it settles again on the new clock rather than wedging. */
         for (int i = 0; i < SYNC_WINDOW; i++)
             probe(&e, 30000 + 1000 * i, after, 1000, 100, 1000);
         sync_est_offset(&e, &est);
@@ -195,16 +150,11 @@ int main(void)
               sync_est_settled(&e) && llabs(est - after) < 100, NULL);
     }
 
-    /*
-     * 9. A single corrupt probe must cost two samples, not the whole session:
-     *    the garbage becomes the baseline, the next good sample steps away from
-     *    it and resets again, seeded correctly that time.
-     */
     {
         sync_est_t e; sync_est_init(&e);
         for (int i = 0; i < 5; i++)
             probe(&e, 1000 * (i + 1), TRUE_OFFSET, 1000, 100, 1000);
-        probe(&e, 6000, TRUE_OFFSET + 9000000000LL, 1000, 100, 1000);   /* garbage */
+        probe(&e, 6000, TRUE_OFFSET + 9000000000LL, 1000, 100, 1000);
         for (int i = 0; i < SYNC_WINDOW; i++)
             probe(&e, 10000 + 1000 * i, TRUE_OFFSET, 1000, 100, 1000);
         sync_est_offset(&e, &est);
@@ -213,17 +163,12 @@ int main(void)
               sync_est_settled(&e) && llabs(est - TRUE_OFFSET) < 100, d);
     }
 
-    /* 10. Round-trip conversion is what actually schedules playback. */
     {
         int64_t master_now = 9000000;
         int64_t local = sync_to_local(master_now, TRUE_OFFSET);
         check("sync_to_local inverts the offset", local + TRUE_OFFSET == master_now, NULL);
     }
 
-    /* ------------------------------------------------ the splice phase filter */
-
-    /* 11. Too few readings is not an estimate. The caller splices on nothing
-     *     rather than on one sample taken just after a re-anchor. */
     {
         sync_phase_hist_t h; sync_phase_reset(&h);
         int32_t med;
@@ -236,8 +181,6 @@ int main(void)
         check("a median appears at SYNC_PHASE_MIN", sync_phase_median(&h, &med), NULL);
     }
 
-    /* 12. A steady reading must survive the filter unchanged. If the phase
-     *     really is +8 ms the splice must still correct +8 ms. */
     {
         sync_phase_hist_t h; sync_phase_reset(&h);
         for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, 8231);
@@ -246,17 +189,6 @@ int main(void)
         check("constant input passes through unchanged", ok && med == 8231, d);
     }
 
-    /*
-     * 13. The whole reason this exists.
-     *
-     * Eight readings agreeing on +2 ms and one at +50 ms -- the shape the hub
-     * actually produces, where two reads a millisecond apart differed by 15.7 ms.
-     * The mean moves by 5.3 ms and the splice cuts that much real audio for an
-     * error that is not there; the median does not move at all.
-     *
-     * The comparison is computed here rather than asserted in a comment, so the
-     * test is what documents the choice.
-     */
     {
         static const int32_t reading[SYNC_PHASE_HIST] =
             { 2000, 2100, 1900, 2000, 50000, 2050, 1950, 2000, 2100 };
@@ -276,11 +208,6 @@ int main(void)
               med == 2000 && mean - med > 5000, d);
     }
 
-    /*
-     * 14. It must forget. The history spans ~180 ms of playback and a splice or
-     *     a re-anchor resets it, but nothing else bounds how long a unit runs --
-     *     a reading from an earlier position must not still be voting.
-     */
     {
         sync_phase_hist_t h; sync_phase_reset(&h);
         for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, -30000);
@@ -290,14 +217,6 @@ int main(void)
         check("the ring keeps only the newest window", med == 4000, d);
     }
 
-    /*
-     * 15. A partly-filled history must not count the slots it has not written.
-     *
-     * Five readings of +9 ms with four zeroed slots left over: a median taken
-     * over all nine slots returns 0 and the boundary passes with no correction
-     * at all. Run this against a version that sorts SYNC_PHASE_HIST instead of
-     * count -- it fails, which is the point of writing it.
-     */
     {
         sync_phase_hist_t h; sync_phase_reset(&h);
         for (int i = 0; i < 5; i++) sync_phase_push(&h, 9000);
@@ -306,8 +225,6 @@ int main(void)
         check("unwritten slots do not vote", ok && med == 9000, d);
     }
 
-    /* 16. Reset must actually clear, not just rewind -- a splice calls it and
-     *     the next boundary must not see anything from before the correction. */
     {
         sync_phase_hist_t h; sync_phase_reset(&h);
         for (int i = 0; i < SYNC_PHASE_HIST; i++) sync_phase_push(&h, 12000);
@@ -316,13 +233,6 @@ int main(void)
         check("reset drops the whole history", !sync_phase_median(&h, &med), NULL);
     }
 
-    /*
-     * 17. The SPI link's frame must satisfy the SPI slave's DMA rule in the
-     *     TYPE, not at the allocation. The driver needs a 4-byte-aligned buffer
-     *     whose length is a multiple of 4, and sbc_link.h claims the 12-byte
-     *     header is sized to deliver that. Nothing else checks the claim, and a
-     *     field added to the header later would break it silently on hardware.
-     */
     {
         char d[80];
         snprintf(d, sizeof d, "hdr=%zu frame=%zu", sizeof(spi_link_hdr_t),
@@ -331,12 +241,6 @@ int main(void)
               sizeof(spi_link_hdr_t) == 12 && SBC_LINK_FRAME_BYTES % 4 == 0, d);
     }
 
-    /*
-     * The WiFi hop must accept at least what the SPI hop delivers. The two
-     * ceilings are independent literals that have to move together; if the WiFi
-     * one fell below the SPI one, the hub forwarder would refuse what the link
-     * just carried -- a silent drop on a different layer than the one above.
-     */
     {
         char d[80];
         snprintf(d, sizeof d, "spi=%zu wifi=%zu",
@@ -345,22 +249,6 @@ int main(void)
               AUDIO_MAX_PAYLOAD >= SBC_LINK_MAX_PAYLOAD, d);
     }
 
-
-    /*
-     * THE APPLIED THRESHOLD MUST NOT BIND AT REAL PAYLOAD SIZES.
-     *
-     * This is the test that was missing. Everything above checks the FEC
-     * arithmetic and all of it passed while the hub was splitting every payload
-     * in two, doubling the audio packet rate, discarding 15% of its own audio at
-     * the socket and slewing the timeline at twice the rate the satellites could
-     * follow. Not one assertion here noticed, because none of them asked the
-     * question that mattered: how many datagrams does one A2DP payload become?
-     *
-     * A phone at bitpool 53, 44.1 kHz joint stereo sends ~119-byte SBC frames,
-     * ~7 to a payload, ~825 bytes -- and up to 1024 has been seen. If the
-     * threshold sbc_in.c cuts on is below that, the rate doubles and both
-     * TIMELINE_SLEW_US and the TX buffer pool are silently resized with it.
-     */
     {
         char d[96];
         snprintf(d, sizeof d, "mtu-cap=%zu", (size_t)AUDIO_TX_PAYLOAD_MTU_MAX);
@@ -368,7 +256,6 @@ int main(void)
               AUDIO_TX_PAYLOAD_MTU_MAX == 1446 &&
               AUDIO_MSG_BYTES(AUDIO_TX_PAYLOAD_MTU_MAX) == AUDIO_UDP_MTU, d);
 
-        /* One datagram per payload at every size this source produces. */
         static const size_t seen[] = { 512, 700, 825, 1024, 1200, 1446 };
         bool one_each = true;
         for (size_t i = 0; i < sizeof seen / sizeof seen[0]; i++) {
@@ -381,14 +268,6 @@ int main(void)
         check("a real A2DP payload is not split", one_each, d);
     }
 
-    /*
-     * 18. The CRC is CRC-16/CCITT-FALSE, checked against an independent
-     *     implementation rather than against a number this file copied from
-     *     the one under test.
-     *
-     * ref_crc16() is pinned first on the published check value for "123456789",
-     * 0x29B1, so a wrong reference cannot certify a wrong production function.
-     */
     {
         check("the reference CRC matches the published vector",
               ref_crc16((const uint8_t *)"123456789", 9) == 0x29B1, NULL);
@@ -408,15 +287,6 @@ int main(void)
               got == ref_crc16(flat, sizeof flat), d);
     }
 
-    /*
-     * 19. Whatever is already in the crc field must not change the answer.
-     *
-     * That convention is what lets the sender compute over a header it has
-     * filled in and the receiver over a header carrying the sender's value,
-     * neither one copying the struct to blank a field. If it ever stops
-     * holding, every frame fails its check on hardware and nothing here says
-     * why.
-     */
     {
         const uint8_t payload[32] = { 1, 2, 3 };
         spi_link_hdr_t a = { .kind = LINK_KIND_SBC, .len = 32, .seq = 7, .crc = 0 };
@@ -426,20 +296,6 @@ int main(void)
               sbc_link_crc16(&a, payload, 32) == sbc_link_crc16(&b, payload, 32), NULL);
     }
 
-    /*
-     * 20. The error the XOR byte could not see.
-     *
-     * Flip the same bit in two payload bytes and the XOR is unchanged -- it is
-     * a parity per bit position, so any even number of flips in one column is
-     * invisible to it. The first half passes, which is the point of writing it:
-     * the UART link would have accepted this frame, and on a wire running 20x
-     * faster there is no resync scan behind it to notice.
-     *
-     * The XOR is reproduced here rather than called. sbc_link_checksum() went
-     * with the UART declarations when the classic hub was retired, and this test
-     * is the reason the byte is still worth describing -- it says what the CRC
-     * was chosen over, so it has to keep computing the thing it argues against.
-     */
     {
         uint8_t good[64], bad[64];
         for (int i = 0; i < 64; i++) good[i] = (uint8_t)(i * 7 + 3);
@@ -460,15 +316,6 @@ int main(void)
               sbc_link_crc16(&h, good, 64) != sbc_link_crc16(&h, bad, 64), NULL);
     }
 
-    /*
-     * 21. The log/health messages are the collector's wire format, unpacked in
-     *     Python against this packed C layout. A field added, removed or
-     *     reordered here shifts every offset after it silently and the
-     *     collector reads garbage, so the sizes are pinned the way the SPI
-     *     frame is above. log_msg_t is variable-length (only the first msg_len
-     *     bytes of its 192-byte array go on the wire); health_msg_t and
-     *     log_sub_msg_t are fixed.
-     */
     {
         char d[96];
         snprintf(d, sizeof d, "log=%zu health=%zu sub=%zu",
@@ -478,12 +325,6 @@ int main(void)
               sizeof(log_sub_msg_t) == 5, d);
     }
 
-    /*
-     * 22. LOG_MSG_BYTES is bytes-on-the-wire for a given message length -- the
-     *     fixed header plus the payload, never the whole 222-byte ceiling -- and
-     *     the ceiling itself must stay clear of the MTU so a longest line never
-     *     fragments. The receiver sizes its buffer off this relationship.
-     */
     {
         char d[96];
         const size_t hdr = sizeof(log_msg_t) - LOG_MSG_MAX;
@@ -495,15 +336,6 @@ int main(void)
               LOG_MSG_BYTES(LOG_MSG_MAX) <= 1500, d);
     }
 
-    /*
-     * 23. The volume taper.
-     *
-     * It runs on both units against the same number and must produce the same
-     * samples: the hub is an LX7 and the satellite an LX6, and two speakers
-     * disagreeing about level is the same class of fault as them disagreeing
-     * about rate. Integer throughout is what guarantees it, and these pin the
-     * properties that make the integer version usable.
-     */
     {
         check("full volume is exactly unity",
               audio_volume_q15(AUDIO_VOL_MAX) == 32768, "no rounding loss at the top");
@@ -518,9 +350,6 @@ int main(void)
         check("the taper never goes backwards", monotonic,
               "a slider that drops in level as it is raised");
 
-        /* Full scale must be a no-op on the samples, not merely close to one:
-         * the default build never attenuates and must be bit-identical to one
-         * compiled before this existed. */
         int16_t a[8], b[8];
         for (int i = 0; i < 8; i++) {
             a[i] = b[i] = (int16_t)(i * 4000 - 16000);
@@ -529,8 +358,6 @@ int main(void)
         check("full volume does not touch the samples",
               memcmp(a, b, sizeof a) == 0, NULL);
 
-        /* Silence in, silence out -- the property that lets the splice's const
-         * quiet buffer skip this entirely. */
         int16_t q[8] = { 0 };
         audio_apply_volume(q, 4, 40);
         bool quiet_stays = true;
@@ -541,7 +368,6 @@ int main(void)
         }
         check("silence maps to silence at any volume", quiet_stays, NULL);
 
-        /* Attenuation actually attenuates, and never inverts or overflows. */
         int16_t s[8];
         for (int i = 0; i < 8; i++) {
             s[i] = (int16_t)(i * 4000 - 16000);
@@ -563,26 +389,11 @@ int main(void)
               "type + level, and nothing a padding byte could hide in");
     }
 
-    /*
-     * 24. The taper is a RELATIONSHIP, not a table of digits.
-     *
-     * The table in audio_out.h is generated by tools/gen_vol_table.py, and the
-     * thing worth protecting is the property it was generated from: every step
-     * of the slider is the same number of decibels. A hand-edited entry, or a
-     * regenerated table with a different floor, breaks that and nothing else
-     * would notice -- the endpoints would still be exact and it would still be
-     * monotonic.
-     *
-     * Floating point is used HERE and deliberately never in the firmware, which
-     * is the whole point: the test re-derives what the image only looks up.
-     */
     {
         check("q16 endpoints are exact",
               audio_volume_q16(0) == 0 && audio_volume_q16(AUDIO_VOL_MAX) == 65536,
               "unity is a shift of 16, silence is silence");
 
-        /* Stronger than the non-decreasing check above: two slider positions
-         * that produce the same level are a slider with a dead spot. */
         bool strict = true;
         for (int v = 2; v <= AUDIO_VOL_MAX; v++) {
             if (audio_volume_q16(v) <= audio_volume_q16(v - 1)) {
@@ -591,8 +402,6 @@ int main(void)
         }
         check("the taper strictly increases", strict, "no two positions alike");
 
-        /* And the halved table inherits it, which is what lets the 16-bit path
-         * be a shift of the 32-bit one rather than a second table. */
         bool strict15 = true;
         for (int v = 2; v <= AUDIO_VOL_MAX; v++) {
             if (audio_volume_q15(v) <= audio_volume_q15(v - 1)) {
@@ -602,22 +411,7 @@ int main(void)
         check("halving it keeps that", strict15,
               "q15 is q16 >> 1, and a shift must not flatten a step");
 
-        /*
-         * Two bounds, not one, because the error is not uniform and saying so
-         * is the point.
-         *
-         * The table is integers, and at the bottom of a -60 dB curve those
-         * integers are small -- 66, 69, 73 -- so half a count of rounding is
-         * ~0.065 dB and a ratio of two of them can be 0.09 dB off nominal. That
-         * is real and it is confined: from 16 up, where the entries are large
-         * enough for rounding not to matter, it is inside 0.05 dB.
-         *
-         * A single loose bound would have hidden which half was which, and a
-         * single tight one would have failed for a reason that is inaudible at
-         * -55 dB. Both are checked so a regenerated table that goes wrong in the
-         * MIDDLE cannot hide behind the bottom's tolerance.
-         */
-        const double nominal = 60.0 / (AUDIO_VOL_MAX - 1);   /* dB per step */
+        const double nominal = 60.0 / (AUDIO_VOL_MAX - 1);
         double worst = 0.0, worst_up = 0.0;
         int worst_at = 0, worst_up_at = 0;
         for (int v = 2; v <= AUDIO_VOL_MAX; v++) {
@@ -648,17 +442,6 @@ int main(void)
               fabs(floor_db + 60.0) < 0.1, d);
     }
 
-    /*
-     * 25. The widening multiply is exact and cannot overflow. EXHAUSTIVELY.
-     *
-     * All 128 levels against all 65536 int16 inputs, which is 8.4 M iterations
-     * and finishes in well under a second here. It is exhaustive because that is
-     * what justifies audio_volume_write_i32() having no saturation branch: the
-     * claim is not "we did not find an overflow", it is "there is not one".
-     *
-     * The extremes are where it would be: -32768 at unity is exactly INT32_MIN,
-     * which is representable, and one more count of gain would not be.
-     */
     {
         bool ok = true, unity_exact = true;
         long long worst_lo = 0, worst_hi = 0;
@@ -671,7 +454,7 @@ int main(void)
                 }
                 if (y < worst_lo) worst_lo = y;
                 if (y > worst_hi) worst_hi = y;
-                /* Never inverts, never grows. */
+
                 if ((x > 0 && y < 0) || (x < 0 && y > 0) ||
                     llabs(y) > llabs(x) * 65536) {
                     ok = false;
@@ -689,15 +472,6 @@ int main(void)
               "so a full-scale build is bit-identical through the conversion");
     }
 
-    /*
-     * 26. The two byte domains are two, and stay two.
-     *
-     * AUDIO_CHUNK_BYTES is the ring; AUDIO_OUT_CHUNK_BYTES is the DAC. The
-     * splice inserts silence by writing a buffer straight at the DAC, so a
-     * length computed in the wrong domain would halve every insert -- and an
-     * insert is a TIMING correction, so it would sound exactly right while being
-     * exactly wrong. This is the assertion that catches it.
-     */
     {
         char d[96];
         snprintf(d, sizeof d, "ring %d B, out %d B, frame %d B",
@@ -708,13 +482,6 @@ int main(void)
               AUDIO_OUT_FRAME_BYTES == AUDIO_CHANNELS * (int)sizeof(int32_t), d);
     }
 
-    /*
-     * 27. The ramp.
-     *
-     * It exists so the 0 -> level step a silent-until-told unit makes is not a
-     * click, so what matters is that it always arrives, never overshoots, and
-     * leaves silence alone on the way.
-     */
     {
         audio_ramp_t r = { 0 };
         int16_t in[AUDIO_FRAMES * AUDIO_CHANNELS];
@@ -734,8 +501,6 @@ int main(void)
         check("and stops there", r.cur == audio_volume_q16(AUDIO_VOL_MAX),
               "no overshoot past the level it was asked for");
 
-        /* Settled at unity it is the bit-exact widening, so a full-volume build
-         * is unchanged by the ramp existing. */
         audio_volume_write_i32(out, in, AUDIO_FRAMES, AUDIO_VOL_MAX, &r);
         bool exact = true;
         for (int i = 0; i < AUDIO_FRAMES * AUDIO_CHANNELS; i++) {
@@ -745,8 +510,6 @@ int main(void)
         }
         check("a settled ramp at full volume is the plain widening", exact, NULL);
 
-        /* Mid-ramp, silence must still be silence -- the property the splice's
-         * const quiet buffer goes through this path on. */
         audio_ramp_t mid = { audio_volume_q16(40) };
         int16_t quiet[AUDIO_FRAMES * AUDIO_CHANNELS] = { 0 };
         audio_volume_write_i32(out, quiet, AUDIO_FRAMES, AUDIO_VOL_MAX, &mid);
@@ -759,15 +522,6 @@ int main(void)
         check("silence stays silence at any point in a ramp", silent, NULL);
     }
 
-    /*
-     * 28. The silent-until-told policy.
-     *
-     * Three states and they must not blur: nothing has been said (silence),
-     * nothing has been said for too long (fall back to full scale), and
-     * something has been said (do that). The fourth case is the one worth
-     * naming: told-and-zero is a deliberate mute and must not be read as
-     * ignorance.
-     */
     {
         check("an untold unit plays silence",
               audio_vol_effective(99, false, false) == 0,
@@ -784,21 +538,6 @@ int main(void)
               "somebody who muted the room from the phone has not said nothing");
     }
 
-
-    /*
-     * 29. XOR parity: the round trip.
-     *
-     * A group of packets with DELIBERATELY UNEQUAL payloads, because that is the
-     * case the wire format leans on -- the padding to the longest member is
-     * implicit, and the only thing that makes it safe is that XOR-ing zeros is a
-     * no-op. Equal-length members would pass whatever the implementation did.
-     *
-     * Every member is dropped in turn and rebuilt, and the rebuilt packet is
-     * compared BYTE FOR BYTE against the original over its whole on-wire length.
-     * The point of parity over the header as well as the payload is that a
-     * recovery is a packet, not a buffer of SBC, and a test that only checked
-     * the payload would not notice play_at coming back wrong.
-     */
     {
         enum { K = 4 };
         static audio_msg_t grp[K];
@@ -827,8 +566,6 @@ int main(void)
         check("parity spans the longest member's codeword",
               built && span == AUDIO_MSG_BYTES(877), NULL);
 
-        /* The parity as it would go on the wire, kept aside: recovery consumes
-         * the accumulator, so each drop has to start from a clean copy. */
         static uint8_t parity[AUDIO_FEC_CODEWORD_MAX];
         memcpy(parity, acc, span);
 
@@ -858,13 +595,6 @@ int main(void)
               exact == K, d);
     }
 
-    /*
-     * 30. XOR parity: what it must REFUSE.
-     *
-     * This is the half that keeps a failed repair harmless. Silence of the right
-     * length is a known cost; wrong audio in the ring is a stream that slides,
-     * and every one of these would produce exactly that if it were let through.
-     */
     {
         enum { K = 4 };
         static audio_msg_t grp[K];
@@ -888,9 +618,6 @@ int main(void)
         }
         memcpy(parity, acc, span);
 
-        /* TWO losses. The XOR of two codewords is not a packet, and the seq it
-         * carries is the two seqs XOR-ed -- which for 2000 and 2001 is 1, a
-         * number that would put 20 ms of audio a thousand packets out of place. */
         uint16_t s2 = 0;
         memset(acc, 0, sizeof(acc));
         audio_fec_xor_in(acc, &s2, &grp[2]);
@@ -903,8 +630,6 @@ int main(void)
               !audio_fec_extract(acc, span, grp[1].seq, (audio_msg_t *)rec),
               "the rebuilt header is both packets at once, and is neither");
 
-        /* One loss, but the caller asks for the wrong seq -- which is what a
-         * receiver that mis-derived the group would do. */
         s2 = 0;
         memset(acc, 0, sizeof(acc));
         for (int i = 1; i < K; i++) {
@@ -918,7 +643,6 @@ int main(void)
               audio_fec_extract(acc, span, grp[0].seq, (audio_msg_t *)rec),
               "same codeword, and only the seq the group actually lost passes");
 
-        /* A span shorter than a bare header, and one past the codeword ceiling. */
         check("an impossible span is refused",
               !audio_fec_extract(acc, (uint16_t)(AUDIO_MSG_BYTES(0) - 1),
                                  grp[0].seq, (audio_msg_t *)rec) &&
@@ -927,14 +651,6 @@ int main(void)
               "a truncated parity must not be read as a short packet");
     }
 
-    /*
-     * 31. XOR parity: the sizes that decide whether any of it fits.
-     *
-     * AUDIO_FEC_PAYLOAD_MAX is what a payload may be for its group to get parity
-     * at all, and the arithmetic behind it is the whole reason this scheme is
-     * affordable where the last one was not: a parity datagram is ONE header plus
-     * ONE codeword, not a payload with a copy of another payload after it.
-     */
     {
         char d[96];
         snprintf(d, sizeof d, "payload-max=%zu codeword=%zu datagram=%zu",
@@ -944,7 +660,6 @@ int main(void)
               AUDIO_FEC_MSG_BYTES(AUDIO_FEC_CODEWORD_MAX) == AUDIO_UDP_MTU &&
               AUDIO_FEC_CODEWORD_MAX == AUDIO_MSG_BYTES(AUDIO_FEC_PAYLOAD_MAX), d);
 
-        /* The measured payload size, which is what actually decides the cost. */
         snprintf(d, sizeof d, "851 B payload -> %zu B parity vs %zu B audio",
                  (size_t)AUDIO_FEC_MSG_BYTES(AUDIO_MSG_BYTES(851)),
                  (size_t)AUDIO_MSG_BYTES(851));
@@ -953,9 +668,6 @@ int main(void)
               AUDIO_FEC_MSG_BYTES(AUDIO_MSG_BYTES(851)) <
                   AUDIO_MSG_BYTES(851) + AUDIO_FEC_HDR_BYTES + 1, d);
 
-        /* And the packets it covers keep their natural size: nothing here pins
-         * an audio packet to the MTU, which is the fault this scheme exists to
-         * undo. */
         static audio_msg_t big;
         static uint8_t acc[AUDIO_FEC_CODEWORD_MAX];
         uint16_t span = 0;
