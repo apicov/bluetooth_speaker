@@ -125,6 +125,24 @@ class Sat:
         self.ip = ip
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # ASK FOR A BIG RECEIVE BUFFER, because the default one makes this
+        # script invent packet loss that never happened.
+        #
+        # N fake satellites are N unicast streams to ONE laptop radio and one IP
+        # stack -- eight of them is ~340 kB/s of audio plus parity arriving at a
+        # single station. A first run at n=8 reported 5,613 packets "lost" while
+        # the two REAL satellites in the same minutes read pkts 250, fec-parity
+        # 62, starved 0: the floor was perfect and the drops were all on this
+        # side of the air.
+        #
+        # Parity suffered worst -- 0.8-7.6/s against an expected 12.5 -- and the
+        # shape says why. Parity is the FIFTH datagram of a burst of five, so it
+        # arrives when the socket buffer is at its fullest and is the first thing
+        # the kernel discards. A load generator whose own receive path is the
+        # bottleneck reports the hub as broken when it is fine, which is worse
+        # than not measuring at all.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        self.rcvbuf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         self.sock.bind((ip, SYNC_PORT))
         self.sock.setblocking(False)
         self.probe_seq = 0
@@ -435,6 +453,14 @@ def main():
     socks = [s.sock for s in sats]
     print(f"{args.n} fake satellites on {ips[0]}..{ips[-1]}, probing {args.hub} "
           f"every {PROBE_PERIOD * 1000:.0f} ms. Ctrl-C to stop.")
+    # The kernel silently caps SO_RCVBUF at net.core.rmem_max, so say what was
+    # actually granted rather than what was asked for: a small buffer here is
+    # the difference between measuring the hub and measuring this laptop.
+    got = min(s.rcvbuf for s in sats)
+    print(f"receive buffer {got // 1024} kB per socket"
+          + ("" if got >= (1 << 20) else
+             "  -- LOW. Loss reported below may be this machine, not the air."
+             " Raise it with: sudo sysctl -w net.core.rmem_max=8388608"))
 
     if args.verify:
         print(f"parity verification on {min(args.verify, args.n)} of them: every"
