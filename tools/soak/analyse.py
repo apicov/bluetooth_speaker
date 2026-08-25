@@ -546,10 +546,13 @@ def main():
     # does not give back, which arms the catch-up drain the room hears as a
     # semitone of pitch on one speaker and not the other.
     #
-    # Nothing was LOST: seq-drop, decode-err, recv-err, wifi-drops and fec-err
-    # all read zero, and the ring went from empty to 425 of its 464 ms inside one
-    # window. So packets were held and released in a lump, and the only open
-    # question was where the lump formed. These four numbers answer it:
+    # Nothing was LOST: seq-drop, decode-err, recv-err and wifi-drops all read
+    # zero, and the ring went from empty to 425 of its 464 ms inside one window.
+    # (That soak predates XOR parity, and its loss counter was the `err` field
+    # inside the piggyback scheme's `fec N (M ms short, K err)` line -- never a
+    # metric of its own. Today the equivalent is fec-lost, in section 6b.)
+    # So packets were held and released in a lump, and the only open question
+    # was where the lump formed. These four numbers answer it:
     #
     #   gap-max   longest silence between two arrivals   steady ~20 ms
     #   lead-min  least of play_at minus arrival         steady ~LEAD_US (250 ms)
