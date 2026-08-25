@@ -1,3 +1,18 @@
+/**
+ * @file sat_state.c
+ * @brief The definitions for everything sat.h declares, and nothing else.
+ *
+ * Deliberately just the storage. Each field's meaning, its owner and what a
+ * torn read costs are documented once, beside its `extern` in sat.h, so a
+ * field that changes hands is changed in one place rather than two.
+ *
+ * The only thing that lives here and nowhere else is the initialisers, and
+ * only a handful are non-zero: @ref stream_rate and @ref tx_rate start at
+ * 44100, @ref marker_sample and @ref restart_pos at -1 for "none",
+ * @ref rx_lead_min_us and @ref ring_low_ms at @ref ARRIVAL_UNSEEN so the very
+ * first window can say "nothing measured" rather than print a zero, and the
+ * two heap minima at `UINT32_MAX` so the first sample wins.
+ */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

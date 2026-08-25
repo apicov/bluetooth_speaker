@@ -1,3 +1,30 @@
+/**
+ * @file telemetry.c
+ * @brief One 5 s window of reporting, and the allocator failure hook.
+ *
+ * The audio path counts and this file talks. Every counter here is incremented
+ * somewhere that must not touch a UART: rx_task is the only thing draining the
+ * UDP mailbox, and play_task is the audio path, so a log line from either
+ * costs buffer. This task can afford to wait on a 115200-baud console.
+ *
+ * @section format The lines are a wire format, not decoration
+ *
+ * tools/soak/capture.py classifies a line by its literal prefix — `HEALTH:`,
+ * `TRIM:`, `MEM:`, `RX 5s:`, `ARRIVAL 5s:` — and then turns it into metrics
+ * columns with one regex over `key then number` pairs. So a key must be a
+ * single hyphenated word immediately followed by its value, and renaming or
+ * reordering one silently drops a column from every soak. Tidying these
+ * strings breaks a tool.
+ *
+ * @section cadence What prints when
+ *
+ * - `ARRIVAL 5s:` every window, unconditionally. It is the line that says the
+ *   unit is alive and how audio is reaching it, and a fault that stops audio
+ *   arriving would also stop a conditional line from printing.
+ * - `RX 5s:` only when a fault counter moved, differenced against what it last
+ *   said.
+ * - `HEALTH:`, `TRIM:` and `MEM:` once a minute.
+ */
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -28,6 +55,15 @@
 
 #include "sat.h"
 
+/* on_alloc_failed() is documented at its declaration in sat.h.
+ *
+ * Records and does not log, for two reasons. It runs INSIDE the allocator, and
+ * ESP_LOGx allocates. And IDF marks the heap's failure path IRAM-resident
+ * because the heap stays usable with the flash cache disabled -- so a hook in
+ * flash would fault when reached from an ISR or during a flash write, which is
+ * a diagnostic for running out of memory that crashes under the one condition
+ * it exists to observe.
+ */
 IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *function_name)
 {
     (void)function_name;
@@ -38,6 +74,7 @@ IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *function_
     }
 }
 
+/* telemetry_tick() is documented at its declaration in sat.h. */
 void telemetry_tick(void)
 {
     const uint32_t heap_now = esp_get_free_heap_size();
@@ -49,6 +86,9 @@ void telemetry_tick(void)
         heap_int_window = heap_int_now;
     }
 
+    /* Said as soon as it happens rather than waiting for the minute line: an
+     * allocation failure is the kind of fault whose next consequence is a task
+     * that does not start. */
     static uint32_t alloc_fail_told;
     if (n_alloc_fail != alloc_fail_told) {
         alloc_fail_told = n_alloc_fail;
@@ -68,6 +108,9 @@ void telemetry_tick(void)
     if (step_report_pending) {
         step_report_pending = false;
         static uint32_t step_pad_told;
+        /* Read once: the play task is still writing it. Printed as a delta
+         * against the last step, because the running total accumulates across
+         * hours and says nothing about the step being reported. */
         const uint32_t pad_total = step_report_pad;
         ESP_LOGW(TAG, "PHASE STEP: %+ld -> %+ld us (%+ld) | buffer %ld ms | "
                       "pad %" PRIu32 " frames | trim %+ld Hz",
@@ -80,6 +123,9 @@ void telemetry_tick(void)
         step_report_mag = 0;
     }
 
+    /* Snapshot every counter, print the window's differences only if one
+     * moved, then update all of them regardless -- so a window that printed
+     * nothing does not fold its silence into the next one's numbers. */
     static uint32_t gaps_told, gap_frames_told, gap_short_told,
                     gap_short_frames_told, ring_full_told,
                     anchor_late_told, anchor_soon_told, gap_resyncs_told,
@@ -149,15 +195,26 @@ void telemetry_tick(void)
     const int32_t lead_min = rx_lead_min_us;
     const int32_t ring_low = ring_low_ms;
     const int32_t hold_max = fec_hold_max_us;
+    /* Cleared as they are read, so each line is its own window: a maximum
+     * summed across windows is not a maximum of anything. The read and the
+     * clear are not atomic against the tasks that write them, and losing one
+     * sample of an extreme to that race costs a diagnostic nothing -- which is
+     * why these are gauges and the counters above are not. */
     rx_gap_max_us = 0;
     rx_burst_max = 0;
     rx_lead_min_us = ARRIVAL_UNSEEN;
     ring_low_ms = ARRIVAL_UNSEEN;
     fec_hold_max_us = 0;
 
+    /* Each starve callback is one DMA descriptor's worth of digital zero, and
+     * i2s_start() sets the descriptor to AUDIO_FRAMES -- so the count means
+     * nothing until it is turned into time. */
     const uint32_t starved_ms = (starve_now - starve_told) * AUDIO_FRAMES
                               * 1000 / stream_rate;
 
+    /* Printed as text so that "nothing measured this window" and "measured
+     * zero" cannot be read as each other. Zero lead is exactly the reading
+     * that matters, so it must not share a spelling with no reading at all. */
     char lead_s[16], ring_s[16];
     if (lead_min == ARRIVAL_UNSEEN) {
         snprintf(lead_s, sizeof(lead_s), "none");
@@ -170,6 +227,10 @@ void telemetry_tick(void)
         snprintf(ring_s, sizeof(ring_s), "%ld ms", (long)ring_low);
     }
 
+    /* The DOWNLINK signal: how well this unit hears the hub. The hub's own
+     * report measures the uplink, and the two should read roughly symmetric
+     * because antenna gain is reciprocal -- a pair that does not is worth
+     * seeing. It is also the number the self-mute decides on. */
     wifi_ap_record_t ap;
     char rssi_s[16];
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
@@ -178,6 +239,10 @@ void telemetry_tick(void)
         snprintf(rssi_s, sizeof(rssi_s), "none");
     }
 
+    /* fec-parity rides this line and not RX 5s deliberately. On that line it
+     * would be invisible in exactly the windows that matter, because RX prints
+     * only when a fault counter moved -- and "the hub stopped sending parity"
+     * moves no fault counter on this unit at all. */
     static uint32_t fec_parity_told;
     const uint32_t fec_parity_now = n_fec_parity_rx;
 
@@ -191,17 +256,26 @@ void telemetry_tick(void)
              lead_insane_now - lead_insane_told, ring_s,
              (long)(hold_max / 1000), starved_ms, rssi_s,
 
+             /* On the every-window line, because a unit that has taken itself
+              * off the floor looks exactly like a dead one from anywhere
+              * else. */
              self_muted ? "  ** SELF-MUTED, off the hub's send list **" : "");
     audio_rx_told = audio_rx_now;
     fec_parity_told = fec_parity_now;
     starve_told = starve_now;
     lead_insane_told = lead_insane_now;
 
+    /* Once a minute: twelve of these 5 s windows. */
     static int health_left;
     if (--health_left <= 0) {
         health_left = 12;
+        /* Only valid in-task, which is why it is sampled here and not
+         * wherever it is printed. */
         hw_drift = uxTaskGetStackHighWaterMark(NULL);
 
+        /* Taken and reset together with the all-time minimum beside it: the
+         * pair dates a dip to this line, which a watermark alone never
+         * could. */
         const uint32_t heap_win = heap_min_window;
         heap_min_window = UINT32_MAX;
         const uint32_t heap_int_win = heap_int_window;
@@ -241,6 +315,9 @@ void telemetry_tick(void)
                  visualiser_source_name(), visualiser_hop(),
                  n_frames_rx, n_frames_bad);
 
+        /* The catch-up gets its own keys rather than riding the trim totals:
+         * a drain deliberately exceeds any rate the trim could claim, so
+         * summing them would hide the trim entirely. */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
                       " frames | catchup-drops %" PRIu32 " catchup-dups %"
                       PRIu32 " | retunes %" PRIu32 " coarse | volume %u/%d "
@@ -259,7 +336,10 @@ void telemetry_tick(void)
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
 #if CONFIG_DANCEFLOOR_WIFI_LOGS
-
+        /* The same figures as the HEALTH line above, structured, for the
+         * collector. Some field names are shared with the hub's health message
+         * and mean different things on each -- the struct is one wire format
+         * for two roles. */
         static uint32_t health_seq;
         health_msg_t h;
         memset(&h, 0, sizeof h);

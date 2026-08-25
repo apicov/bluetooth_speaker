@@ -1,3 +1,11 @@
+/**
+ * @file out.c
+ * @brief The I2S channel, the write path, and retuning the output clock.
+ *
+ * This is the one place the sample width changes: the rest of the firmware
+ * carries interleaved 16-bit stereo and counts frames, and the widening to the
+ * output word happens here, on the way to the DAC.
+ */
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -28,8 +36,29 @@
 
 #include "sat.h"
 
+/** @brief Running total of DMA starve events. @see dma_starve_count() */
 static volatile uint32_t s_dma_starve;
 
+/**
+ * @brief I2S send-queue-overflow callback: count a starved DMA traversal.
+ *
+ * @param h   Channel handle, unused.
+ * @param e   Event data, unused.
+ * @param ctx User context, unused.
+ * @return false — nothing was woken, so no yield is needed.
+ *
+ * The driver raises this when the queue is full at descriptor completion, i.e.
+ * one full DMA traversal went out with no writer keeping up. With
+ * `auto_clear` on, that traversal is digital zero on the DAC.
+ *
+ * @note IRAM_ATTR because `CONFIG_I2S_ISR_IRAM_SAFE` is not set, so this may
+ * be reached with the flash cache disabled and a handler in flash would fault.
+ *
+ * Counted only while @ref playing and not @ref retuning — a starved channel is
+ * a fault only if a writer was meant to be keeping up with it. Counting every
+ * overflow instead makes the total enormous on a healthy unit, says nothing
+ * about playback, and hides the starves that matter.
+ */
 static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, void *ctx)
 {
     (void)h; (void)e; (void)ctx;
@@ -39,17 +68,24 @@ static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, vo
     return false;
 }
 
+/* dma_starve_count() is documented at its declaration in sat.h. */
 uint32_t dma_starve_count(void)
 {
     return s_dma_starve;
 }
 
+/* i2s_start() is documented at its declaration in sat.h. */
 void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
 
+    /* One descriptor per chunk, so a chunk written is a descriptor sent. Both
+     * units must carry the same value: it sets the pipeline latency. */
     chan_cfg.dma_frame_num = AUDIO_FRAMES;
 
+    /* Silence on starve rather than the last buffer repeated. The driver
+     * zeroes each buffer at its own EOF, before the pointer reaches the queue
+     * i2s_channel_write() pops from, so it cannot race the writer. */
     chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
 
@@ -66,6 +102,8 @@ void i2s_start(uint32_t rate)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
 
+    /* Registered before enable, so the callback is in place for the first
+     * traversal. */
     const i2s_event_callbacks_t cbs = { .on_send_q_ovf = on_tx_starved };
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(i2s_tx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
@@ -76,6 +114,22 @@ void i2s_start(uint32_t rate)
              AUDIO_CHANNEL_MODE_NAME);
 }
 
+/**
+ * @brief Hand already-widened samples to the I2S channel.
+ *
+ * @param pcm   Output-word samples.
+ * @param bytes Length of @p pcm in bytes.
+ *
+ * A failed write does NOT block, so ignoring the return value would spin this
+ * task at memory speed for as long as the channel is down — which is what a
+ * retune does to it. The short delay is what makes a failure cost time rather
+ * than buffer.
+ *
+ * While @ref s_refill_active, it also times each write: an
+ * i2s_channel_write() that returns faster than @ref REFILL_FAST_US did not
+ * block, so the DAC was not pacing it and any phase reading dated inside that
+ * window is measured against a reference that was not running.
+ */
 static void dac_write(const uint8_t *pcm, size_t bytes)
 {
     size_t written = 0;
@@ -98,8 +152,14 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
     }
 }
 
+/** @brief Output gain ramp state, so a stream starts with a fade rather than
+ *  an edge. @see write_audio_reset_ramp() */
 static audio_ramp_t s_ramp;
 
+/* write_audio() is documented at its declaration in sat.h.
+ *
+ * The staging buffer is static rather than on the stack: it is 2 kB against
+ * the play task's 4 kB. */
 void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol)
 {
     static audio_out_sample_t out[AUDIO_FRAMES * AUDIO_CHANNELS];
@@ -107,22 +167,28 @@ void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol)
     dac_write((const uint8_t *)out, n_frames * AUDIO_OUT_FRAME_BYTES);
 }
 
+/* write_audio_reset_ramp() is documented at its declaration in sat.h. */
 void write_audio_reset_ramp(void)
 {
     s_ramp.cur = 0;
 }
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-
+/* vis_master_to_local() is documented at its declaration in sat.h. Before the
+ * first anchor stream_offset is zero, so this is the identity -- a frame drawn
+ * then is drawn at the instant it names, which is the best available answer. */
 int64_t vis_master_to_local(int64_t master_us)
 {
     return sync_to_local(master_us, stream_offset);
 }
 #endif
 
+/* retune_output() is documented at its declaration in sat.h. */
 void retune_output(uint32_t hz)
 {
-
+    /* Nothing the servo computes may panic the speaker. A wrapped phase error
+     * can produce an absurd rate, and ESP_ERROR_CHECK on it would abort the
+     * board: a refused retune costs sync, an abort costs the unit. */
     const int64_t low  = (int64_t)stream_rate - RATE_TRIM_MAX_HZ;
     const int64_t high = (int64_t)stream_rate + RATE_TRIM_MAX_HZ;
     if ((int64_t)hz < low || (int64_t)hz > high) {
@@ -135,6 +201,8 @@ void retune_output(uint32_t hz)
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
     const int64_t down_at = esp_timer_get_time();
 
+    /* Park playback before taking the channel down, and count the park as part
+     * of the outage: audio is stopped for it just as surely. */
     retuning = true;
     vTaskDelay(pdMS_TO_TICKS(2));
 
@@ -142,6 +210,8 @@ void retune_output(uint32_t hz)
     if (err == ESP_OK) {
         err = i2s_channel_reconfig_std_clock(i2s_tx, &clk);
 
+        /* Re-enable whatever happened above, so a failed reconfig leaves a
+         * running channel rather than a unit that reads as a dead board. */
         const esp_err_t on = i2s_channel_enable(i2s_tx);
         if (err == ESP_OK) {
             err = on;
@@ -161,10 +231,15 @@ void retune_output(uint32_t hz)
              tx_rate, hz, retune_outage_us);
     tx_rate = hz;
 
+    /* Arm the cost report: playback attributes its next reading to this
+     * retune, which is one printed number instead of a difference between two
+     * 5 s ticks. */
     retune_phase_before = phase_err_us;
     retune_watch = true;
 
+    /* After the two above, never before: the play task reads them in that
+     * order, and arming the tail first would let it narrate a crossing against
+     * a phase_before belonging to the previous retune. */
     retune_tail_left = 3;
     retune_done_at = esp_timer_get_time();
-
 }
