@@ -1249,11 +1249,36 @@ extern volatile bool playing;
  * should be producing sound and is not.
  */
 
-/* Sustained starvation before a unit takes itself off the air. Long enough that
- * a burst of loss or one re-anchor does not trigger it -- those cost a few
- * hundred ms and recover on their own -- and short enough that the rest of the
- * floor is not held under for long. */
-#define MUTE_AFTER_US    3000000
+/*
+ * How long a unit must hear nothing before it gives up, and how little counts
+ * as nothing.
+ *
+ * Three seconds is long enough that a burst of loss or one re-anchor does not
+ * reach it -- both cost a few hundred ms and recover on their own -- and short
+ * enough that the floor is not held under while it decides.
+ *
+ * MUTE_AUDIO_MIN is a tenth of what three seconds should deliver (~50 packets a
+ * second, so ~150), not zero. The state being caught is not silence but a
+ * trickle: the deaf satellite on 2026-08-25 read `pkts 3`, then 1, then 1, then
+ * 0, and a threshold of zero would have waited for the one window in four that
+ * happened to reach it.
+ */
+#define MUTE_WINDOW_US   3000000
+#define MUTE_AUDIO_MIN   15
+
+/*
+ * The signal below which "no audio" means deaf rather than idle.
+ *
+ * This is the whole of the idle-floor defence: between tracks nothing arrives
+ * at ANY satellite, and muting then would cost up to MUTE_RETRY_US of silence
+ * at the start of every track on every speaker. A unit that hears the AP well
+ * and receives nothing is idle; one that hears it at -96 dBm is deaf.
+ *
+ * -85 dBm sits in a 30 dB gap rather than near either side of it: the healthy
+ * units on that floor read -44 and -66, the deaf one -96. It is not a
+ * sensitivity threshold and should not be tuned like one.
+ */
+#define MUTE_RSSI_FLOOR  (-85)
 
 /* How often a muted unit tries again. Every 10 s it probes for MUTE_TRIAL_US to
  * find out whether the link came back, which is what makes plugging an antenna
@@ -1272,6 +1297,10 @@ extern volatile bool playing;
  * ms plus the wait for an anchorable packet.
  */
 #define MUTE_TRIAL_US    5000000
+
+/* Ticks of probe_task in one MUTE_WINDOW_US, which is the width of the arrival
+ * history mute_tick() keeps. */
+#define MUTE_SLOTS       (MUTE_WINDOW_US / (PROBE_PERIOD_MS * 1000))
 
 extern volatile bool     self_muted;      /* true while off the hub's send list */
 extern volatile uint32_t n_self_mutes;    /* times it took itself off */

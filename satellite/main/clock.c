@@ -6,6 +6,7 @@
  *
  * Split out of main.c on 2026-08-12; the bodies are unchanged.
  */
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -41,35 +42,66 @@
 /*
  * One tick of the self-mute state machine. True means "stay off the air".
  *
- * Three states, held in two timestamps: playing (both zero), muted (s_muted_at
- * set), and on trial (s_trial_until in the future). The trial exists because a
- * rejoining unit starves by construction -- see MUTE_TRIAL_US.
+ * WHAT IT WATCHES, AND WHY IT IS NOT STARVATION. The first version keyed on the
+ * DAC starving while `playing`, and on the 2026-08-25 antenna tests it never
+ * fired once -- because a satellite that has gone deaf does not starve. It
+ * PARKS. The play task gives up, `playing` goes false, and out.c stops counting
+ * starvation with it, so the detector was blind by construction in exactly the
+ * state it existed for:
  *
- * Starvation is sampled as a DELTA rather than a level: dma_starve_count() is
- * cumulative, so what matters is whether it moved since the last tick, which is
- * "the DAC emitted silence in the last 250 ms". A unit that is playing properly
- * never moves it at all.
+ *     sat_s3   pkts 3 | starved 667 ms | lead-min -191 ms
+ *              pkts 1 | starved   0 ms | lead-min none | ring-low none
+ *              pkts 0 | starved   0 ms | hub-rssi -96 dBm
+ *
+ * `lead-min none` and `ring-low none` are the gauges the playback loop sets, so
+ * their absence is the park. Meanwhile probe_task kept probing -- uplink still
+ * works fine at -96 dBm -- so the hub held it as a client (`stations 3`) and
+ * went on unicasting audio at it: `tx-fail 521 (470 audio)` with txdone
+ * collapsed from ~3080 to 34, and sat_classic down to `pkts 9`.
+ *
+ * So the signal is AUDIO NOT ARRIVING, which is true whether the unit is
+ * playing, parked, or somewhere between.
+ *
+ * RSSI IS THE SECOND HALF, and it is what stops an idle floor muting itself.
+ * "No audio" alone cannot tell "the hub is not sending" from "I cannot hear the
+ * hub", and the first is every gap between tracks. A unit that is associated
+ * with a workable signal and receiving nothing is simply idle and must stay
+ * registered; one receiving nothing at MUTE_RSSI_FLOOR is deaf. Measured, the
+ * two are 30 dB apart -- healthy units read -44 and -66, the deaf one -96 --
+ * so the floor is nowhere near either.
  */
 static bool mute_tick(void)
 {
-    static uint32_t prev_starve;
-    static int64_t  s_bad_since;     /* when the current bad stretch began */
-    static int64_t  s_muted_at;      /* when it went off the air; 0 = on */
-    static int64_t  s_trial_until;   /* grace after coming back */
+    static uint32_t prev_rx;
+    static uint16_t hist[MUTE_SLOTS];   /* audio datagrams per tick, sliding */
+    static uint32_t hist_sum;           /* their total, kept incrementally */
+    static int      slot;
+    static int64_t  s_muted_at;         /* when it went off the air; 0 = on */
+    static int64_t  s_trial_until;      /* grace after coming back */
 
     const int64_t now = esp_timer_get_time();
-    const uint32_t starve = dma_starve_count();
-    const bool bad = (starve != prev_starve);
-    prev_starve = starve;
+
+    /* Slide the window: this tick's arrivals in, the oldest tick's out. */
+    const uint32_t rx = n_audio_rx;
+    const uint32_t delta = rx - prev_rx;
+    prev_rx = rx;
+    hist_sum -= hist[slot];
+    hist[slot] = (uint16_t)(delta > UINT16_MAX ? UINT16_MAX : delta);
+    hist_sum += hist[slot];
+    slot = (slot + 1) % MUTE_SLOTS;
 
     if (s_muted_at) {
         if (now - s_muted_at < MUTE_RETRY_US) {
             return true;
         }
-        /* Try again. The clock starts afresh and the trial window keeps the
-         * rejoin's own starvation from being read as a verdict on it. */
+        /*
+         * Try again. The history is cleared with the timers: while muted this
+         * unit is off the send list and receiving nothing BY DESIGN, so
+         * carrying that forward would re-mute the trial on its first tick.
+         */
+        memset(hist, 0, sizeof(hist));
+        hist_sum = 0;
         s_muted_at = 0;
-        s_bad_since = 0;
         s_trial_until = now + MUTE_TRIAL_US;
         self_muted = false;
         n_self_retries++;
@@ -78,16 +110,21 @@ static bool mute_tick(void)
         return false;
     }
 
-    if (!bad || now < s_trial_until) {
-        s_bad_since = 0;             /* playing, or still being given a chance */
-        return false;
+    if (now < s_trial_until || hist_sum >= MUTE_AUDIO_MIN) {
+        return false;                   /* being given its chance, or receiving */
     }
-    if (!s_bad_since) {
-        s_bad_since = now;
-        return false;
+
+    /*
+     * Nothing is arriving. Deaf, or just an idle floor? Only the radio can say,
+     * and it is asked HERE rather than every tick because this point is reached
+     * only after MUTE_WINDOW_US of silence -- rare, where the tick is not.
+     */
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return false;                   /* not associated: already off the list */
     }
-    if (now - s_bad_since < MUTE_AFTER_US) {
-        return false;
+    if (ap.rssi > MUTE_RSSI_FLOOR) {
+        return false;                   /* heard well enough; the hub is quiet */
     }
 
     /*
@@ -95,14 +132,16 @@ static bool mute_tick(void)
      * not about to be sent, and stops spending airtime on frames it cannot
      * acknowledge -- which is airtime every other speaker gets back.
      */
+    memset(hist, 0, sizeof(hist));
+    hist_sum = 0;
     s_muted_at = now;
-    s_bad_since = 0;
     self_muted = true;
     n_self_mutes++;
-    ESP_LOGE(TAG, "MUTING: starved for %d s and still not playing. Leaving the "
-                  "hub's send list so the rest of the floor gets the airtime; "
-                  "retrying every %d s.",
-             (int)(MUTE_AFTER_US / 1000000), (int)(MUTE_RETRY_US / 1000000));
+    ESP_LOGE(TAG, "MUTING: %" PRIu32 " audio packets in %d s at %d dBm -- deaf, "
+                  "not idle. Leaving the hub's send list so it stops retrying "
+                  "frames I cannot acknowledge; trying again every %d s.",
+             hist_sum, (int)(MUTE_WINDOW_US / 1000000), (int)ap.rssi,
+             (int)(MUTE_RETRY_US / 1000000));
     return true;
 }
 
