@@ -1,4 +1,14 @@
-
+/**
+ * @file test_audio_shift.c
+ * @brief Host test for the catch-up crossfade.
+ *
+ * audio_shift_chunk() runs on both units from one implementation, so the
+ * properties below are what stops the two correcting differently -- and it
+ * edits audio, so a fault in it is heard rather than logged. The cases pin
+ * what the header promises: the two strands are the right material, the output
+ * is continuous into the next chunk, the crossfade holds its level, and
+ * neither strand is read past its end.
+ */
 #include "audio_shift.h"
 
 #include <stdio.h>
@@ -9,11 +19,25 @@
 #include <math.h>
 
 #ifndef M_PI
+/** @brief Not in strict C11's math.h; the level case needs a sine. */
 #define M_PI 3.14159265358979323846
 #endif
 
+/** @brief Cases that did not hold; main() returns non-zero if any. */
 static int failures = 0;
 
+/**
+ * @brief Report one case and record a failure.
+ *
+ * Prints whether it held rather than asserting, so one run says which cases
+ * hold and which do not instead of stopping at the first.
+ *
+ * @param name    What is being pinned.
+ * @param cond    Whether it held.
+ * @param detail  The measured figures, or NULL. Printed on a passing line too,
+ *                so a case that stops meaning what it says is visible before
+ *                it starts failing.
+ */
 static void check(const char *name, bool cond, const char *detail)
 {
     printf("%-46s %s%s%s\n", name, cond ? "PASS" : "FAIL",
@@ -21,10 +45,25 @@ static void check(const char *name, bool cond, const char *detail)
     if (!cond) failures++;
 }
 
+/** @brief Output frames per chunk, matching AUDIO_FRAMES. */
 #define FRAMES 256
+/** @brief Interleaved channels, matching AUDIO_CHANNELS. */
 #define CHANS  2
+/** @brief Input frames the largest shift can ask for -- the ceiling both units
+ *         size their real buffers from. */
 #define INMAX  (FRAMES + CATCHUP_SHIFT_MAX + 1)
 
+/**
+ * @brief Fill a buffer with a per-frame ramp, the two channels offset from
+ *        each other.
+ *
+ * A ramp makes every frame identifiable, so a case can say WHICH input frame
+ * an output frame came from rather than only that it looks plausible.
+ *
+ * @param buf   Interleaved output, n * CHANS samples.
+ * @param n     Frames to fill.
+ * @param base  Value of frame 0, channel 0.
+ */
 static void ramp(int16_t *buf, unsigned n, int base)
 {
     for (unsigned i = 0; i < n; i++) {
@@ -33,6 +72,7 @@ static void ramp(int16_t *buf, unsigned n, int base)
     }
 }
 
+/** @brief The plain head is the unshifted strand and the plain tail the shifted one, for every shift in range and in both directions. */
 static void test_strands(void)
 {
 
@@ -73,6 +113,7 @@ static void test_strands(void)
     }
 }
 
+/** @brief The next chunk starts adjacent to the last frame emitted, so a run of shifted chunks has no seam. */
 static void test_continuity(void)
 {
 
@@ -104,6 +145,7 @@ static void test_continuity(void)
     }
 }
 
+/** @brief A crossfade of a signal with itself at a small offset comes out at roughly its own level -- no dip to hear. */
 static void test_level(void)
 {
 
@@ -134,6 +176,7 @@ static void test_level(void)
     }
 }
 
+/** @brief A whole sequence of shifted chunks reconstructs the input with exactly the shifted frames skipped or replayed. */
 static void test_chunk_seam(void)
 {
 
@@ -154,6 +197,7 @@ static void test_chunk_seam(void)
     }
 }
 
+/** @brief Neither strand is read past its end and the fade window stays inside the chunk, for every shift and fade the clamps allow. */
 static void test_fade_bounds(void)
 {
 
@@ -168,6 +212,10 @@ static void test_fade_bounds(void)
     check("fade 2: degenerate crossfade still exact", ok, NULL);
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
     test_strands();

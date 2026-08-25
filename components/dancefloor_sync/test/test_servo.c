@@ -1,4 +1,18 @@
 
+/**
+ * @file test_servo.c
+ * @brief Host test for the shared rate servo.
+ *
+ * df_servo.c is deliberately free of FreeRTOS, i2s and timers precisely so it
+ * can be driven from here under plain gcc, which is how a change to the loop
+ * is checked before any board is flashed. Both units run this same loop, so a
+ * case that fails here is a cross-unit sync error waiting to happen.
+ *
+ * What each case pins is the boundary a soak found the hard way -- the depth
+ * net being a floor rather than a replacement, the catch-up hysteresis, the
+ * cooldown, the fine/coarse split at RATE_TRIM_MAX_HZ, and the deadband being
+ * measured against the trim already applied rather than against zero.
+ */
 #include "df_servo.h"
 
 #include "audio_shift.h"
@@ -8,8 +22,21 @@
 #include <stdbool.h>
 #include <inttypes.h>
 
+/** @brief Cases that did not hold; main() returns non-zero if any. */
 static int failures = 0;
 
+/**
+ * @brief Report one case and record a failure.
+ *
+ * Prints whether it held rather than asserting, so one run says which cases
+ * hold and which do not instead of stopping at the first.
+ *
+ * @param name    What is being pinned.
+ * @param cond    Whether it held.
+ * @param detail  The measured figures, or NULL. Printed on a passing line too,
+ *                so a case that stops meaning what it says is visible before
+ *                it starts failing.
+ */
 static void check(const char *name, bool cond, const char *detail)
 {
     printf("%-52s %s%s%s\n", name, cond ? "PASS" : "FAIL",
@@ -17,8 +44,15 @@ static void check(const char *name, bool cond, const char *detail)
     if (!cond) failures++;
 }
 
+/** @brief The stream rate every case runs at. Nothing here depends on its
+ *         exact value; it only has to be the same on both sides of a
+ *         comparison. */
 #define RATE 44100
 
+/**
+ * @brief A neutral input: phase valid, nothing armed, clock on rate.
+ * @return The struct, for a case to perturb one field of.
+ */
 static df_servo_in_t base(void)
 {
     df_servo_in_t in = {
@@ -36,6 +70,17 @@ static df_servo_in_t base(void)
     return in;
 }
 
+/**
+ * @brief One window: fold in a reading, then decide on it.
+ *
+ * The two calls in the order the firmware makes them, since df_servo_step()
+ * acts on what df_servo_ema() left behind.
+ *
+ * @param s    The loop's carried state.
+ * @param in   This window's measurements.
+ * @param err  The phase reading to fold in.
+ * @return What the servo decided.
+ */
 static df_servo_out_t step(df_servo_t *s, df_servo_in_t *in, int32_t err)
 {
     df_servo_out_t out;
@@ -44,6 +89,7 @@ static df_servo_out_t step(df_servo_t *s, df_servo_in_t *in, int32_t err)
     return out;
 }
 
+/** @brief The average adopts its first sample, weights a new one by a quarter, adopts again after a reset, and converges rather than overshooting. */
 static void test_ema(void)
 {
     df_servo_t s = {0};
@@ -61,6 +107,7 @@ static void test_ema(void)
     check("ema: settles on a standing error", t.err_ema == 10000, NULL);
 }
 
+/** @brief The depth net is a FLOOR: it only ever strengthens a correction that already agrees with it, and never caps one. Held off, it does nothing. */
 static void test_depth_net(void)
 {
 
@@ -102,6 +149,7 @@ static void test_depth_net(void)
           out5.adj == 0 && !out5.depth_net_fired, NULL);
 }
 
+/** @brief A wild phase reading cannot produce a wild rate: the correction is clamped to RATE_TRIM_MAX_HZ in both directions. */
 static void test_clamp(void)
 {
 
@@ -118,6 +166,7 @@ static void test_clamp(void)
           out2.adj == -RATE_TRIM_MAX_HZ, NULL);
 }
 
+/** @brief The catch-up debt: capped at CATCHUP_MAX_US, deepened but not weakened on the same side, replaced on a sign flip, stood down below CATCHUP_CLEAR_US, held off during the start hold, and silent without a phase reading. */
 static void test_catchup(void)
 {
 
@@ -206,6 +255,7 @@ static void test_catchup(void)
     check("catchup: silent without a phase reading", !out10.catchup_write, NULL);
 }
 
+/** @brief When the servo acts at all: the deadband, the cooldown that follows a correction, and the boundary at RATE_TRIM_MAX_HZ where a fine trim becomes a coarse retune. */
 static void test_act(void)
 {
 
@@ -267,6 +317,7 @@ static void test_act(void)
     check("act: still does not act on it", !out7.act, NULL);
 }
 
+/** @brief The deadband is measured against the trim ALREADY APPLIED, so restating a standing trim is not a correction. */
 static void test_deadband_is_against_applied_trim(void)
 {
     df_servo_t s = {0};
@@ -277,6 +328,10 @@ static void test_deadband_is_against_applied_trim(void)
           !out.act, NULL);
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
     test_ema();

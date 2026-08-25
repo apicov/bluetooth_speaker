@@ -1,4 +1,25 @@
 
+/**
+ * @file test_sync_proto.c
+ * @brief Host test for the wire format, the clock estimator, the phase median,
+ *        the link CRC, the volume taper and the XOR parity.
+ *
+ * sync_proto.h is free of ESP-IDF precisely so all of it can be driven here
+ * under plain gcc: this is the part of the system most likely to be subtly
+ * wrong, and hardware bring-up is a bad place to discover that.
+ *
+ * Three kinds of case, and the distinction matters when one fails:
+ *
+ *   BEHAVIOUR -- the estimator, the median, the taper, the parity. A failure
+ *                is a bug in the arithmetic.
+ *   LAYOUT    -- struct sizes and the *_MSG_BYTES macros, pinned to their
+ *                current values. A failure means the WIRE FORMAT moved, and
+ *                every unit on the floor must be reflashed together.
+ *   CEILING   -- one limit against another, e.g. that the WiFi payload ceiling
+ *                still covers the SPI one. A failure means two headers have
+ *                drifted apart and something will silently refuse traffic the
+ *                other end considers legal.
+ */
 #include "sync_proto.h"
 #include "audio_out.h"
 
@@ -9,6 +30,18 @@
 #include <limits.h>
 #include <math.h>
 
+/**
+ * @brief An independent CRC-16/CCITT-FALSE, to check sbc_link_crc16() against.
+ *
+ * Written out here rather than called from the component, so a case comparing
+ * the two is comparing two implementations rather than one with itself. It is
+ * itself checked against the algorithm's published "123456789" vector before
+ * anything is compared to it.
+ *
+ * @param p  Bytes to cover.
+ * @param n  How many.
+ * @return The CRC.
+ */
 static uint16_t ref_crc16(const uint8_t *p, size_t n)
 {
     uint16_t crc = 0xFFFF;
@@ -21,8 +54,21 @@ static uint16_t ref_crc16(const uint8_t *p, size_t n)
     return crc;
 }
 
+/** @brief Cases that did not hold; main() returns non-zero if any. */
 static int failures = 0;
 
+/**
+ * @brief Report one case and record a failure.
+ *
+ * Prints whether it held rather than asserting, so one run says which cases
+ * hold and which do not instead of stopping at the first.
+ *
+ * @param name    What is being pinned.
+ * @param cond    Whether it held.
+ * @param detail  The measured figures, or NULL. Printed on a passing line too,
+ *                so a case that stops meaning what it says is visible before
+ *                it starts failing.
+ */
 static void check(const char *name, bool cond, const char *detail)
 {
     printf("%-46s %s%s%s\n", name, cond ? "PASS" : "FAIL",
@@ -30,13 +76,41 @@ static void check(const char *name, bool cond, const char *detail)
     if (!cond) failures++;
 }
 
+/** @brief Seeded, so a failing run reproduces exactly. */
 static uint32_t rng_state = 0x1234567u;
+/**
+ * @brief A linear congruential value in a range.
+ *
+ * Its own generator rather than rand(), so the jitter a case sees does not
+ * depend on the host's C library.
+ *
+ * @param lo  Lowest value, inclusive.
+ * @param hi  Highest, inclusive.
+ * @return The value.
+ */
 static int32_t rnd(int32_t lo, int32_t hi)
 {
     rng_state = rng_state * 1664525u + 1013904223u;
     return lo + (int32_t)((rng_state >> 8) % (uint32_t)(hi - lo + 1));
 }
 
+/**
+ * @brief Synthesise one probe exchange with a KNOWN offset and path, and fold
+ *        it in.
+ *
+ * Building the four timestamps from a true offset and the three delays is what
+ * lets a case state the answer it expects: the estimator's error is then
+ * measured against a number the test chose rather than against another
+ * estimate. Splitting the path into up and down is what makes ASYMMETRY
+ * expressible, which is the estimator's one irreducible error.
+ *
+ * @param e        The estimator.
+ * @param t1       Satellite transmit, satellite clock.
+ * @param offset   The true offset, which the estimate is scored against.
+ * @param up       Satellite-to-master transit.
+ * @param service  How long the master held it.
+ * @param down     Master-to-satellite transit.
+ */
 static void probe(sync_est_t *e, int64_t t1, int64_t offset, int64_t up,
                   int64_t service, int64_t down)
 {
@@ -46,8 +120,16 @@ static void probe(sync_est_t *e, int64_t t1, int64_t offset, int64_t up,
     sync_est_add(e, t1, t2, t3, t4);
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
+    /* THE CLOCK ESTIMATOR. That a clean path is exact, that jitter and a retry
+     * outlier are rejected by minimum-RTT selection, that asymmetry costs
+     * exactly half of itself, and that a clock-origin step throws the window
+     * away rather than anchoring a unit on a clock that no longer exists. */
     const int64_t TRUE_OFFSET = 1234567;
     int64_t est;
 
@@ -177,6 +259,10 @@ int main(void)
             early = early || sync_phase_median(&h, &med);
             sync_phase_push(&h, 1000);
         }
+        /* THE PHASE MEDIAN. That it refuses to answer on too few readings,
+         * ignores the slots the reset zeroed, keeps only the newest window,
+         * and cannot be moved by a single outlier -- which is the whole reason
+         * the splice uses it rather than the newest reading. */
         check("no median below SYNC_PHASE_MIN", !early, NULL);
         check("a median appears at SYNC_PHASE_MIN", sync_phase_median(&h, &med), NULL);
     }
@@ -237,6 +323,10 @@ int main(void)
         char d[80];
         snprintf(d, sizeof d, "hdr=%zu frame=%zu", sizeof(spi_link_hdr_t),
                  (size_t)SBC_LINK_FRAME_BYTES);
+        /* CEILINGS AND LAYOUT, across the two headers. The SPI slave's DMA
+         * needs the frame to be a multiple of four; the WiFi payload ceiling
+         * must cover the SPI one, or the hub refuses what the link delivered;
+         * and a real A2DP payload must still fit one datagram. */
         check("the SPI frame is a multiple of 4 bytes",
               sizeof(spi_link_hdr_t) == 12 && SBC_LINK_FRAME_BYTES % 4 == 0, d);
     }
@@ -269,6 +359,9 @@ int main(void)
     }
 
     {
+        /* THE LINK CRC, against the independent implementation above: that it
+         * covers header then payload, that the crc field does not feed itself,
+         * and that it catches an error the XOR byte it replaced would miss. */
         check("the reference CRC matches the published vector",
               ref_crc16((const uint8_t *)"123456789", 9) == 0x29B1, NULL);
 
@@ -320,6 +413,10 @@ int main(void)
         char d[96];
         snprintf(d, sizeof d, "log=%zu health=%zu sub=%zu",
                  sizeof(log_msg_t), sizeof(health_msg_t), sizeof(log_sub_msg_t));
+        /* WIRE LAYOUT, pinned. health_msg_t in particular is unpacked by the
+         * collector from a hard-coded struct format, and the hub relays a
+         * satellite's snapshot by sizeof rather than by received length -- so
+         * a size that moves silently is a version skew nothing would report. */
         check("the log/health message sizes are pinned",
               sizeof(log_msg_t) == 222 && sizeof(health_msg_t) == 108 &&
               sizeof(log_sub_msg_t) == 5, d);
@@ -337,6 +434,12 @@ int main(void)
     }
 
     {
+        /* THE VOLUME TAPER. That the endpoints are exact, that it never goes
+         * backwards, that every step is the same size in dB, that the widening
+         * multiply cannot overflow at any level and any sample, and that the
+         * ramp reaches its target and stops there. Integer throughout, so both
+         * chips compute the same samples -- which is why these are pinned here
+         * rather than trusted to the generator that produced the table. */
         check("full volume is exactly unity",
               audio_volume_q15(AUDIO_VOL_MAX) == 32768, "no rounding loss at the top");
         check("zero volume is silence", audio_volume_q15(0) == 0, NULL);
@@ -523,6 +626,9 @@ int main(void)
     }
 
     {
+        /* ...and what a unit does before anything has told it a level. See
+         * audio_vol_effective(): silence, then a bounded fallback, and a
+         * deliberate mute honoured as a mute. */
         check("an untold unit plays silence",
               audio_vol_effective(99, false, false) == 0,
               "the level beside the flag is meaningless until the flag is set");
@@ -563,6 +669,12 @@ int main(void)
             }
             built = built && audio_fec_xor_in(acc, &span, &grp[i]);
         }
+        /* THE XOR PARITY. That the span covers the longest member, that any
+         * single loss is rebuilt BYTE FOR BYTE including its header, and that
+         * the two failure modes the scheme must refuse -- two losses in one
+         * group, and a recovery for the wrong seq -- are in fact refused. The
+         * uneven payload lengths are the point: implicit zero padding is what
+         * lets unequal SBC frames need no length table on the wire. */
         check("parity spans the longest member's codeword",
               built && span == AUDIO_MSG_BYTES(877), NULL);
 
