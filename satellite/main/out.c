@@ -1,10 +1,3 @@
-/*
- * The audio output: the I2S channel, the write path, and retuning its clock.
- *
- * Split out of main.c on 2026-08-12; the bodies are unchanged. The retune_*
- * state the servo and the play task share moved to sat.h with everything else
- * that crosses a task boundary.
- */
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -35,48 +28,6 @@
 
 #include "sat.h"
 
-/* -------------------------------------------------------------------- i2s */
-
-/*
- * The moment silence starts, counted.
- *
- * auto_clear below makes a starved channel emit digital zero instead of
- * repeating itself, which is right, and which made every stall shorter than the
- * 500 ms underrun timeout completely invisible: the DAC went quiet, nothing
- * incremented, nothing logged, and samples_played did not advance -- so the
- * only trace was a phase error the servo then chased with a retune that cost
- * another few ms of silence. A gap nobody could see, causing corrections nobody
- * could explain.
- *
- * The driver already knows. It keeps a queue of played descriptors for the
- * writer to refill, and raises this when that queue is full at the instant
- * another descriptor finishes -- meaning the DMA has been all the way round its
- * ring without the writer taking a single buffer back. With auto_clear on, that
- * is exactly when the output becomes zeroes. No polling, no proxy, no guess at
- * a threshold.
- *
- * ISR context: increment and return, nothing woken, so no yield. IRAM_ATTR is
- * not required -- CONFIG_I2S_ISR_IRAM_SAFE is unset, so the driver masks the
- * interrupt across flash writes and a callback in flash would be safe -- but it
- * is three instructions, and an ISR that never has to be masked is cheaper than
- * one that does.
- *
- * ONLY COUNTED WHILE SOMETHING IS SUPPOSED TO BE FEEDING IT, which is the whole
- * difference between a number worth reading and one that is not. Counting every
- * overflow made this read ~20000 on a healthy unit: the channel is enabled from
- * boot, so before a stream anchors -- and through every underrun park and
- * re-anchor -- nothing writes, every descriptor completion overflows, and it
- * accrues at ~172/s for as long as that lasts. The total then said nothing about
- * playback and looked like a catastrophe. It was also frozen across consecutive
- * HEALTH lines, which is what gave it away.
- *
- * `playing` is false whenever the play task is parked, and `retuning` covers the
- * re-enable after a clock change, where the descriptors are empty by
- * construction and the first traversal would starve however well-behaved the
- * writer is -- that cost is already reported as `channel down`. What is left is
- * the case that matters: the DAC ran dry while a writer was meant to be keeping
- * up with it, which on this unit means the receive path did not deliver.
- */
 static volatile uint32_t s_dma_starve;
 
 static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, void *ctx)
@@ -85,7 +36,7 @@ static bool IRAM_ATTR on_tx_starved(i2s_chan_handle_t h, i2s_event_data_t *e, vo
     if (playing && !retuning) {
         s_dma_starve++;
     }
-    return false;          /* nothing woken, so no yield */
+    return false;
 }
 
 uint32_t dma_starve_count(void)
@@ -96,32 +47,9 @@ uint32_t dma_starve_count(void)
 void i2s_start(uint32_t rate)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    /* One descriptor per chunk, so a write never spans two and the disable
-     * waits at most one descriptor period for it. See the hub's copy for the
-     * mechanism; both units must carry it, because this also sets the output
-     * pipeline latency the servo absorbs at startup. */
+
     chan_cfg.dma_frame_num = AUDIO_FRAMES;
-    /*
-     * A starved channel must go SILENT, not repeat itself.
-     *
-     * The TX descriptors are a circular list, so a channel left enabled with
-     * nobody writing replays its last dma_desc_num x AUDIO_FRAMES -- 34.8 ms --
-     * forever, at 28.7 Hz. That is what the room heard when Bluetooth dropped
-     * mid-track: play_task takes the underrun branch, parks, and stops writing,
-     * but nothing disables the channel, so the DMA carries on with whatever it
-     * was holding until the phone comes back.
-     *
-     * This makes the driver zero each buffer at its own EOF -- after it has
-     * played, before the writer is handed it back -- so a stall drains to
-     * digital zero within one traversal and stays there. It cannot race the
-     * writer: the clear happens before the pointer reaches the queue
-     * i2s_channel_write() pops from.
-     *
-     * No sync cost, and it must be on BOTH units. The number of buffers in
-     * flight is unchanged, so the pipeline latency the servo absorbs at startup
-     * is unchanged, and so is the REFILL figure that measures it. What would be
-     * unequal, if only one unit carried it, is what the floor sounds like.
-     */
+
     chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx, NULL));
 
@@ -137,8 +65,7 @@ void i2s_start(uint32_t rate)
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx, &std_cfg));
-    /* Registered before enable: the callback must be in place for the first
-     * traversal, which is the one a cold start is most likely to starve. */
+
     const i2s_event_callbacks_t cbs = { .on_send_q_ovf = on_tx_starved };
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(i2s_tx, &cbs, NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx));
@@ -153,9 +80,7 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
 {
     size_t written = 0;
     const int64_t w0 = s_refill_active ? esp_timer_get_time() : 0;
-    /* Second line of defence behind the `retuning` park: a failed write does
-     * NOT block, so ignoring it lets this task spin through the ring at memory
-     * speed. That is what a retune used to cost. */
+
     if (i2s_channel_write(i2s_tx, pcm, bytes, &written, portMAX_DELAY) != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -173,33 +98,6 @@ static void dac_write(const uint8_t *pcm, size_t bytes)
     }
 }
 
-/*
- * The LEDs used to be fed from here, at the DAC, so that they reacted to what
- * this speaker was actually playing rather than to what had merely arrived.
- *
- * They are fed from the receive path now. The objection to that was real -- ~200
- * ms of ring sits between arrival and the speaker, so lights driven from
- * arrival ran that far ahead of the sound -- and it stopped applying when
- * rendering became scheduled: a frame is drawn when the instant it names comes
- * round, not when it was computed, so where it was computed no longer decides
- * when it is seen. What moving it buys is those 200 ms as processing headroom,
- * which is what lets an algorithm cost more than one frame period.
- *
- * Anyone putting this back must put the scheduling back too, or the lights lead
- * the sound by the whole buffer again.
- */
-/*
- * The one place the sample width changes, and the only caller of dac_write().
- *
- * Takes RING-domain frames and hands the DAC domain-converted ones, so every
- * caller keeps counting in frames and no byte count crosses the boundary
- * outside this function. The level is applied here now rather than by the
- * caller: the conversion is out of place, so the splice's `const quiet` buffer
- * -- which must not be written to, and which needs widening even though it
- * needs no attenuating -- goes through the same path as real audio.
- *
- * The staging buffer is static, not on the stack: 2 kB against a 4 kB task.
- */
 static audio_ramp_t s_ramp;
 
 void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol)
@@ -209,29 +107,13 @@ void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol)
     dac_write((const uint8_t *)out, n_frames * AUDIO_OUT_FRAME_BYTES);
 }
 
-/*
- * Start every stream from silence.
- *
- * The DAC has just been handed its first samples after a park, so the ramp is
- * what stands between the room and a cold-start edge. It costs 46 ms of fade at
- * the top of a stream that is about to be spliced into position anyway.
- */
 void write_audio_reset_ramp(void)
 {
     s_ramp.cur = 0;
 }
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
-/*
- * When a master-clock instant falls on this board's clock.
- *
- * The same conversion playback uses, against the same slewed offset, so the
- * strip and the speaker are answering to one timeline rather than two. Before
- * the first anchor stream_offset is 0 and this is the identity, which dates the
- * handful of frames produced before a timeline exists into the past -- they are
- * drawn at once, which is the right thing to do with a frame that has no
- * schedule to keep.
- */
+
 int64_t vis_master_to_local(int64_t master_us)
 {
     return sync_to_local(master_us, stream_offset);
@@ -240,14 +122,7 @@ int64_t vis_master_to_local(int64_t master_us)
 
 void retune_output(uint32_t hz)
 {
-    /*
-     * Nothing the servo computes may panic the speaker.
-     *
-     * This aborted the board with ESP_ERROR_CHECK when a wrapped phase error
-     * produced a rate of ~4.29e9 Hz: the servo arithmetic went wrong, and what
-     * the room heard was a satellite rebooting. A refused retune costs sync; an
-     * abort costs the unit. Clamp, log, carry on playing at the current rate.
-     */
+
     const int64_t low  = (int64_t)stream_rate - RATE_TRIM_MAX_HZ;
     const int64_t high = (int64_t)stream_rate + RATE_TRIM_MAX_HZ;
     if ((int64_t)hz < low || (int64_t)hz > high) {
@@ -260,16 +135,13 @@ void retune_output(uint32_t hz)
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
     const int64_t down_at = esp_timer_get_time();
 
-    /* Park playback before taking the channel down, and count the park as part
-     * of the outage -- audio is stopped for it just as surely. */
     retuning = true;
     vTaskDelay(pdMS_TO_TICKS(2));
 
     esp_err_t err = i2s_channel_disable(i2s_tx);
     if (err == ESP_OK) {
         err = i2s_channel_reconfig_std_clock(i2s_tx, &clk);
-        /* Re-enable whatever happened: leaving the channel down stalls playback
-         * silently, which reads as a dead board rather than a failed trim. */
+
         const esp_err_t on = i2s_channel_enable(i2s_tx);
         if (err == ESP_OK) {
             err = on;
@@ -289,25 +161,10 @@ void retune_output(uint32_t hz)
              tx_rate, hz, retune_outage_us);
     tx_rate = hz;
 
-    /* Ask playback to report the first phase it measures after this, so the net
-     * cost is one printed number rather than a difference between two 5 s log
-     * ticks with several ms of wander in each. */
     retune_phase_before = phase_err_us;
     retune_watch = true;
-    /* Ordered after the two above: the play task reads them together and this
-     * is what arms the narration. See retune_done_at. */
+
     retune_tail_left = 3;
     retune_done_at = esp_timer_get_time();
 
-    /*
-     * Nothing to tell the visualiser. It counts what ARRIVES now, and a retune
-     * disturbs playback rather than arrival -- so the block grid it rides on is
-     * untouched by anything that happens here.
-     *
-     * It used to need telling, on the reasoning that disabling the channel
-     * discarded the DMA buffer, which the playback task had already counted as
-     * played and already fed onward. Two things retired that: the analysis is no
-     * longer on the playback path at all, and the REFILL instrument showed the
-     * descriptors are not discarded in the first place.
-     */
 }

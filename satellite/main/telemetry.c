@@ -1,19 +1,3 @@
-/*
- * Everything this unit says about itself: the windowed heap figures, the
- * allocation-failure report, the receive path's 5 s window, and the HEALTH and
- * MEM lines a long run is judged on.
- *
- * It lives apart from the servo it used to be nested inside. Why it runs on
- * that task is unchanged and still matters -- narrating from the receive path
- * is what closes the feedback loop the RX counters exist to undo, so the
- * talking has to happen somewhere that can afford to block on a UART -- but
- * "a task that can afford to wait" is a scheduling property, not a reason for
- * rate control and health reporting to share a function body.
- *
- * Called once per 5 s window by drift_task, before the servo, in the order the
- * single-file version ran them. Split out of main.c on 2026-08-12; the body is
- * unchanged apart from one level of indentation.
- */
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -44,14 +28,6 @@
 
 #include "sat.h"
 
-/*
- * Records only, and in IRAM. IDF marks heap_caps_alloc_failed() HEAP_IRAM_ATTR
- * because the heap is usable with the flash cache disabled, so a hook in flash
- * would fault when reached from an ISR or during a flash write -- a diagnostic
- * for running out of memory that crashes under the one condition it exists to
- * observe. It also runs inside the allocator, and ESP_LOGx allocates, so
- * drift_task does the talking within 5 s.
- */
 IRAM_ATTR void on_alloc_failed(size_t size, uint32_t caps, const char *function_name)
 {
     (void)function_name;
@@ -73,10 +49,6 @@ void telemetry_tick(void)
         heap_int_window = heap_int_now;
     }
 
-    /* Said once, and within 5 s of the fact rather than at the next soak
-     * line -- see the hub's copy, which also carries why this reports both
-     * pools, why `min` is the figure that explains a failure when the live
-     * ones no longer can, and why the hook cannot sample them itself. */
     static uint32_t alloc_fail_told;
     if (n_alloc_fail != alloc_fail_told) {
         alloc_fail_told = n_alloc_fail;
@@ -93,25 +65,10 @@ void telemetry_tick(void)
                  heap_now);
     }
 
-    /*
-     * The largest phase step playback saw this window.
-     *
-     * Recorded there, printed here, for the reason the RX counters below are:
-     * the play task is the audio path. Cleared as it is taken, so a quiet
-     * window says nothing at all.
-     *
-     * pad is the WINDOW delta, differenced against the last value told. The
-     * play task records the since-boot cumulative n_short_frames, and printing
-     * that raw made every PHASE STEP line claim all padding since power-on --
-     * on a long soak the first step of the evening read 25299 frames of pad
-     * accumulated by delivery bursts hours old, which is a HEALTH figure, not
-     * a step figure. The delta here is the padding that rode along with THIS
-     * step; the cumulative keeps its home on the HEALTH line.
-     */
     if (step_report_pending) {
         step_report_pending = false;
         static uint32_t step_pad_told;
-        const uint32_t pad_total = step_report_pad;   /* read once: it moves */
+        const uint32_t pad_total = step_report_pad;
         ESP_LOGW(TAG, "PHASE STEP: %+ld -> %+ld us (%+ld) | buffer %ld ms | "
                       "pad %" PRIu32 " frames | trim %+ld Hz",
                  (long)step_report_from, (long)step_report_to,
@@ -123,27 +80,6 @@ void telemetry_tick(void)
         step_report_mag = 0;
     }
 
-    /*
-     * The receive path's window, said here because it cannot afford to say
-     * it itself -- see the counters' declaration.
-     *
-     * Only when something moved, so a healthy run stays quiet, and one line
-     * per 5 s window however bad it gets. That bound is the point: the
-     * failure this replaces produced output in proportion to the damage,
-     * from the task that had to stop the damage.
-     */
-    /*
-     * short_frames rides on this line as well as the 60 s HEALTH totals.
-     *
-     * It belongs beside gaps because it is the other half of the same event and
-     * the only one that moves this unit PERMANENTLY: a short read pads the DAC
-     * to a full chunk, the pad takes DAC time, and samples_played does not count
-     * it -- so every padded frame is a frame of the timeline this unit will
-     * never get back. The soak that found the delivery-burst fault accumulated
-     * 25299 of them, 574 ms, and it was only visible by differencing two HEALTH
-     * lines a minute apart. As a per-window delta beside the gaps that caused
-     * it, it reads directly.
-     */
     static uint32_t gaps_told, gap_frames_told, gap_short_told,
                     gap_short_frames_told, ring_full_told,
                     anchor_late_told, anchor_soon_told, gap_resyncs_told,
@@ -205,35 +141,6 @@ void telemetry_tick(void)
     fec_bad_told = fec_bad_now;
     short_frames_told = short_frames_now;
 
-    /*
-     * HOW THE AUDIO ARRIVED, and what the DAC did about it.
-     *
-     * UNCONDITIONAL, unlike the RX line above, and that is the point rather
-     * than an oversight. These are gauges: the interesting reading is a
-     * maximum against a steady state, so a window that prints nothing is
-     * indistinguishable from a window that was never measured. The TSF line
-     * carries the same lesson in its own comment -- twice in this experiment a
-     * diagnostic failed by staying quiet -- and the cost here is one line per
-     * CONFIG_DANCEFLOOR_LOG_PERIOD_S on a console that already carries several.
-     *
-     * WHAT A HEALTHY WINDOW LOOKS LIKE: ~250 packets over 5 s, gap max 20-30
-     * ms, burst max 1-2, lead min near the hub's LEAD_US of 250 ms, ring low
-     * near RING_TARGET_MS, starved 0 ms. A steady-state line that does not read
-     * like that is a bug in the measurement, and it is much cheaper to find
-     * before a soak than in one.
-     *
-     * WHAT TO READ WHEN IT IS NOT: gap max ~= the phase step beside it, with
-     * lead min collapsed toward zero, means the hub stamped on time and the
-     * transport held the packets. gap max the same size with lead min still
-     * near 250 ms means they were stamped late and the fault is upstream of the
-     * air -- compare the hub's own fan-out gap, which is the other half of the
-     * pair. Either way ring low and starved say what it cost.
-     *
-     * Cleared as they are read, so each line is its own window. The read and
-     * the clear are not atomic against the tasks that write them; losing one
-     * sample of a maximum to that race costs a diagnostic nothing, which is why
-     * these are gauges and the counters beside them are not.
-     */
     static uint32_t audio_rx_told, starve_told, lead_insane_told;
     const uint32_t audio_rx_now = n_audio_rx, starve_now = dma_starve_count();
     const uint32_t lead_insane_now = n_lead_insane;
@@ -247,22 +154,10 @@ void telemetry_tick(void)
     rx_lead_min_us = ARRIVAL_UNSEEN;
     ring_low_ms = ARRIVAL_UNSEEN;
     fec_hold_max_us = 0;
-    /*
-     * Each starve callback is one DMA descriptor's worth of digital zero, and
-     * i2s_start() sets dma_frame_num to AUDIO_FRAMES -- so the count converts
-     * to the milliseconds of silence the room actually got. That conversion is
-     * the whole reason the figure moves here as well as onto HEALTH: as a bare
-     * count it needs arithmetic against a constant in another file before it
-     * can be compared with the phase step printed beside it.
-     */
+
     const uint32_t starved_ms = (starve_now - starve_told) * AUDIO_FRAMES
                               * 1000 / stream_rate;
-    /*
-     * The two minima print as text so "nothing measured" and "measured zero"
-     * cannot be read as each other. A window with no audio in it has no lead,
-     * and a window where the ring hit zero is the reading the line exists for;
-     * a single number would have to spell one of them with the other's value.
-     */
+
     char lead_s[16], ring_s[16];
     if (lead_min == ARRIVAL_UNSEEN) {
         snprintf(lead_s, sizeof(lead_s), "none");
@@ -274,40 +169,7 @@ void telemetry_tick(void)
     } else {
         snprintf(ring_s, sizeof(ring_s), "%ld ms", (long)ring_low);
     }
-    /*
-     * KEY THEN NUMBER, hyphenated, like ring-full and dma-starve and every other
-     * figure on these lines. tools/soak/capture.py scans for exactly that shape
-     * and turns each pair into a metrics.csv row, so "gap max 214" would land as
-     * a metric called `max` and collide with `burst max` on the same line. The
-     * house style is not decoration here; it is the wire format.
-     *
-     * "ARRIVAL 5s:" is literal, as "RX 5s:" above it is, because capture.py
-     * classifies on a literal prefix. The two windows are the same window and
-     * are labelled the same way.
-     */
-    /*
-     * THE DOWNLINK, WHICH NOTHING MEASURED UNTIL NOW.
-     *
-     * The hub prints `rssi-min`, and that is esp_wifi_ap_get_sta_list() -- the
-     * signal it HEARS FROM us. It says nothing about the signal we hear from
-     * IT, and the two are only equal if both ends are healthy. Every soak on
-     * file has therefore measured one direction and assumed the other.
-     *
-     * It matters because of what the 2026-08-24 run could not decide. Frames
-     * are held and released in bursts with ZERO final ack failures across
-     * 3,003,948 of them, and a chain of retries that all SUCCEED looks exactly
-     * like that while holding a transmit buffer the whole time. A weak or
-     * mismatched antenna on the hub would do it, and the hub's own -37 dBm
-     * cannot rule it out -- that is the uplink.
-     *
-     * Read as a PAIR against the hub's rssi-min for the same minute. Antenna
-     * gain is reciprocal, so a healthy link reads roughly symmetric; a
-     * persistent gap between the two is a fault in one end's transmit chain
-     * rather than in the air between them.
-     *
-     * Text, not a number, so a failed read cannot be mistaken for 0 dBm --
-     * the same rule lead-min and ring-low on this line already follow.
-     */
+
     wifi_ap_record_t ap;
     char rssi_s[16];
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
@@ -315,23 +177,10 @@ void telemetry_tick(void)
     } else {
         snprintf(rssi_s, sizeof(rssi_s), "none");
     }
-    /*
-     * fec-parity rides HERE rather than on the RX line above, and beside `pkts`
-     * on purpose: it should read pkts/K and nothing else, so the pair is a
-     * one-glance check that the parity lane is alive. On the RX line it would
-     * be invisible in exactly the windows that matter, because that line prints
-     * only when a fault counter moved -- and "the hub stopped sending parity"
-     * moves no fault counter on this unit at all.
-     */
+
     static uint32_t fec_parity_told;
     const uint32_t fec_parity_now = n_fec_parity_rx;
-    /*
-     * fec-hold-max sits beside ring-low deliberately. The hold is the only
-     * mechanism in this path that stops writing to the ring on purpose, so if
-     * ring-low has moved since parity was switched on, these two adjacent
-     * figures are what say whether the hold is why. Expect 0 in a window with no
-     * losses, and at most (K-2) packet times -- ~40 ms at K=4 -- in one with.
-     */
+
     ESP_LOGW(TAG, "ARRIVAL 5s: pkts %" PRIu32 " | fec-parity %" PRIu32
                   " | gap-max %ld ms | "
                   "burst-max %" PRIu32 " | lead-min %s | lead-drop %" PRIu32
@@ -341,26 +190,18 @@ void telemetry_tick(void)
              (long)(gap_max / 1000), burst_max, lead_s,
              lead_insane_now - lead_insane_told, ring_s,
              (long)(hold_max / 1000), starved_ms, rssi_s,
-             /* Loud, and on the line that prints every window: a unit that has
-              * taken itself off the floor looks exactly like a dead one from
-              * anywhere else, and "why is that speaker silent" must not be a
-              * mystery. See self_muted in sat.h. */
+
              self_muted ? "  ** SELF-MUTED, off the hub's send list **" : "");
     audio_rx_told = audio_rx_now;
     fec_parity_told = fec_parity_now;
     starve_told = starve_now;
     lead_insane_told = lead_insane_now;
 
-    /* Soak line, every 60 s, ahead of the streaming check below: if audio
-     * has stopped, that is when the heap and the counters matter most.
-     * Totals, not rates -- see the hub's copy. */
     static int health_left;
     if (--health_left <= 0) {
-        health_left = 12;                      /* 12 x 5 s */
+        health_left = 12;
         hw_drift = uxTaskGetStackHighWaterMark(NULL);
-        /* `window` is the lowest this minute, `min` the lowest since boot.
-         * The pair dates a dip to this line, which the watermark alone
-         * never could. Taken and cleared, like every windowed counter. */
+
         const uint32_t heap_win = heap_min_window;
         heap_min_window = UINT32_MAX;
         const uint32_t heap_int_win = heap_int_window;
@@ -400,23 +241,6 @@ void telemetry_tick(void)
                  visualiser_source_name(), visualiser_hop(),
                  n_frames_rx, n_frames_bad);
 
-        /*
-         * Its own line for the same reason MEM has one -- see the hub's copy.
-         *
-         * This is what says the fine rate trim is running at all. `trim` is
-         * what the servo asked for; the two totals are what playback actually
-         * did about it, which is the only pair that can disagree. Expect one
-         * frame per ~1.6 s in one direction at ~14 ppm of real drift; flat
-         * means the trim is off, and both climbing means it is hunting across
-         * zero. See n_trim_drops.
-         *
-         * The catch-up pair beside them is the same instrument for the
-         * large-error drain: flat while |phase| stays under CATCHUP_ARM_US,
-         * a burst of a few seconds when a knock is being paid off. They are
-         * NOT part of the trim's frames/s arithmetic -- a drain deliberately
-         * exceeds any rate the trim could claim -- which is why they get
-         * their own keys rather than riding the totals above.
-         */
         ESP_LOGW(TAG, "TRIM: %+ld Hz | dropped %" PRIu32 " dup %" PRIu32
                       " frames | catchup-drops %" PRIu32 " catchup-dups %"
                       PRIu32 " | retunes %" PRIu32 " coarse | volume %u/%d "
@@ -425,9 +249,6 @@ void telemetry_tick(void)
                  n_catchup_drops, n_catchup_dups, n_retunes,
                  audio_volume, AUDIO_VOL_MAX, n_vol_rx);
 
-        /* Its own line rather than four more fields above -- see the hub's
-         * copy for why, and for what the two pools mean. Here they should
-         * read the same: no PSRAM on this board. */
         ESP_LOGW(TAG, "MEM: internal %u free (min %u, window %" PRIu32
                       ", largest %u) | total %" PRIu32 " (largest %u)",
                  (unsigned)heap_caps_get_free_size(CAP_USABLE_INTERNAL),
@@ -438,10 +259,7 @@ void telemetry_tick(void)
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
 #if CONFIG_DANCEFLOOR_WIFI_LOGS
-        /* The structured twin of the HEALTH line, for the collector's CSV.
-         * The MEM figures are console-only -- see the hub's copy.
-         * Every field is already in scope here; the role aliases are
-         * documented on health_msg_t in sync_proto.h. */
+
         static uint32_t health_seq;
         health_msg_t h;
         memset(&h, 0, sizeof h);

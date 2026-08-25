@@ -1,76 +1,3 @@
-/*
- * The satellite's shared state, and who owns each piece of it.
- *
- * main.c was one 2437-line file until 2026-08-12. Splitting it into modules
- * made a question explicit that had always been there: sixty-odd values cross
- * between the receive task, the playback task, the servo and the reporting, and
- * nothing said which task was allowed to write which. The comments below are
- * the originals, and several of them answer exactly that question -- the
- * 32-bit-not-64 rule on marker_sample and samples_in is the clearest.
- *
- * OWNERSHIP, stated once so it can be checked:
- *
- *   rx_task     writes the stream anchor and everything describing arrival:
- *               stream_start_local, anchor_at, stream_rate, samples_in,
- *               marker_sample, restart_pos, the phase queue head, the tsf_*
- *               pair, resync_request, anchor_provisional, and the n_gap*,
- *               n_ring_full, n_anchor_* counters.
- *   play_task   writes what playback has reached: the phase queue tail,
- *               phase_err_us, phase_valid, phase_stepped, phase_hist, the
- *               splice_report_* set, n_underruns, n_splices, n_short_*,
- *               n_trim_drops / n_trim_dups, hw_play, and the refill pair. It
- *               owns stream_offset once a stream is running, and READS
- *               rate_trim_hz.
- *   drift_task  writes the servo's own state, rate_trim_hz, the retune_* set
- *               and the windowed heap figures, and READS everything else in
- *               order to report it.
- *   wifi_event  writes n_wifi_drops, wifi_down_at, rejoined_at and net.c's
- *               own reconnect state, which probe_task reads through
- *               wifi_retry_tick() -- and which writes n_wifi_lease_fail.
- *
- * `volatile` here means "another task writes this", not "this is atomic". A
- * 64-bit load is two instructions on this CPU, so a reader can catch half of a
- * write -- which is why marker_sample and samples_in are deliberately 32-bit,
- * as their own comment explains. The 64-bit values that cross tasks were left
- * unexamined for a long time; docs/satellite-audit.md F3 is the audit of them,
- * and this is where the conclusions live.
- *
- * WHAT TEARING ACTUALLY COSTS, per value, because it is not uniform. A torn
- * read only differs from both the old and the new value when the write changes
- * the HIGH word. For a monotonic microsecond clock that happens every 2^32 us
- * -- once per 71.6 minutes -- and for anything that is set to 0, or crosses
- * zero, every time.
- *
- *   tsf.offset_us / tsf.at   FIXED, and it needed fixing twice over. An offset
- *                            hovers near zero and changes sign, so the high
- *                            word flips constantly; and the two were read
- *                            separately when they only mean anything together.
- *                            Both are now under one sequence lock. See
- *                            tsf_reading_t.
- *
- *   stream_start_local       NOT fixed, and a seqlock is the WRONG fix: it has
- *                            two writers. rx_task writes the anchor instant,
- *                            play_task writes 0 when it parks, and a seqlock
- *                            with two writers is silently broken. The exposure
- *                            is real but small -- play's write of 0 can be seen
- *                            by the servo as a large nonzero value, costing one
- *                            5 s window in which it believes a stream is
- *                            running; and rx's anchor write tears harmfully
- *                            only across a 71.6-minute boundary. The honest fix
- *                            is to give it one owner, which is a design change
- *                            and wants a bench run behind it.
- *
- *   anchor_at                NOT fixed. One writer, but the only reader uses it
- *                            as `now - anchor_at < DEPTH_NET_HOLD_US`, so a
- *                            torn read costs one window of the depth net being
- *                            wrongly held or released. Cheap to fix with a
- *                            seqlock if it ever earns one.
- *
- *   wifi_down_at,            NOT fixed, deliberately. These feed log lines and
- *   rejoined_at,             nothing else. A torn read prints one wrong number
- *   retune_outage_us,        and no servo acts on it. Fixing them would add
- *   retune_done_at           machinery to the diagnostics for no behaviour.
- */
 #pragma once
 
 #include <stdbool.h>
@@ -89,51 +16,12 @@
 
 extern const char *TAG;
 
-/* The SSID and password are the hub's, and are declared once in
- * components/dancefloor_sync/Kconfig -- they are one link seen from both ends,
- * and were previously a #define here and another in the hub with nothing
- * checking they agreed. */
 #define AP_SSID    CONFIG_DANCEFLOOR_AP_SSID
 #define AP_PASS    CONFIG_DANCEFLOOR_AP_PASS
-#define MASTER_IP  "192.168.4.1"        /* esp_netif SoftAP default */
+#define MASTER_IP  "192.168.4.1"
 
-#define PROBE_PERIOD_MS 250             /* see docs/clock-sync.md §3 */
+#define PROBE_PERIOD_MS 250
 
-/*
- * Must hold the master's lead time plus headroom for jitter -- specifically
- * LEAD_US + RESYNC_US, which is how far the hub's timeline can legitimately be
- * from real time when a chunk is stamped.
- *
- * 80 kB, up from 64: 464 ms at 44.1 kHz stereo against 371 ms.
- *
- * The 16 kB buys the hub's RESYNC_US the headroom its own comment says it
- * wants and cannot have. Delivery from the Bluetooth bridge is bursty by
- * construction -- A2DP packets arrive ~23/s carrying ~43 ms each -- and the
- * measured swing of the hub's timeline against real time reaches +-132 ms
- * against a 120 ms threshold. So it trips about seven times a minute on
- * entirely normal delivery. Raising the threshold past the swing was blocked by
- * this constant: 200 + 120 = 320 already sat close enough to 371 that 150 was
- * not affordable.
- *
- * It is affordable here rather than on the hub because the hub is not the unit
- * that has to hold it. This one is, and it is the classic ESP32 -- 117 kB free
- * with a largest block of 106 kB, so 80 kB fits and 107 kB (which is what a
- * 500 ms lead would need) would not allocate at all. That asymmetry is worth
- * knowing before anyone proposes a longer lead on the strength of the S3 hub's
- * PSRAM: the buffer a lead has to fit in is on the other board.
- *
- * Set through DANCEFLOOR_RING_KB now rather than fixed here, because with a
- * second target the "117 kB free" above stops being the only answer -- an S3
- * satellite has 512 kB of internal SRAM. The Kconfig help says why raising it on
- * the S3 beyond the shared default is a measurement nobody has taken rather than
- * a free win.
- *
- * THE DEFAULT IS 96 kB (557 ms), not the 80 the arithmetic above works in. It
- * went 80 -> 96 when LEAD_US went 250 -> 350, because the depth net's +-120 ms
- * excursion then reached 470 ms and 80 kB holds 464 -- see RING_TARGET_MS below,
- * which is where that change is recorded. The 64 -> 80 paragraphs above are kept
- * as the history of the constant and are read at the numbers they name.
- */
 #define RING_BYTES  (CONFIG_DANCEFLOOR_RING_KB * 1024)
 
 extern int sock;
@@ -141,214 +29,49 @@ extern sync_est_t est;
 extern StreamBufferHandle_t ring;
 extern i2s_chan_handle_t i2s_tx;
 
-/* Local-clock instant the next byte entering the ring should reach the DAC.
- * Zero means playback has not started. */
 extern volatile int64_t stream_start_local;
-/*
- * When the current stream was anchored. Written by the receive task, read by
- * the drift servo, which holds its depth safety net off for a while after --
- * see DEPTH_NET_HOLD_US.
- */
+
 extern volatile int64_t anchor_at;
 extern volatile uint32_t stream_rate;
-extern uint32_t tx_rate;  /* what the output clock is actually set to */
-/*
- * Local -> master conversion used by playback. Seeded at anchoring and then
- * slewed towards the live estimate -- see track_offset(). Owned by the playback
- * task once a stream is running; the receive task only writes it while playback
- * is parked waiting for one.
- */
-extern int64_t stream_offset;
-extern int64_t offset_slew_last;  /* when the slew last moved it */
-/*
- * 32-bit, not 64: these are read by the playback task while the receive task
- * writes them, and a 64-bit load is two instructions on this CPU -- a torn read
- * yields a garbage position and a wild marker. int32 holds 13 hours of frames
- * at 44.1 kHz, which is longer than any party.
- */
-extern volatile int32_t marker_sample;  /* ring position of a tagged packet */
-extern volatile int32_t samples_in;  /* frames written into the ring */
+extern uint32_t tx_rate;
 
-/*
- * Phase tracking.
- *
- * Servoing on buffer depth matches the playback RATE to the arrival rate, but
- * says nothing about POSITION. Depth also moves with network jitter, so the
- * servo nudges the rate in response to noise -- and two units seeing different
- * jitter end up with rates differing by ~0.03% at any instant, which is
- * several ms of relative movement between markers. Observed as 10-25 ms of
- * wander between hub and satellite, with each unit's own buffer perfectly
- * stable.
- *
- * Every packet says exactly when its first sample should play. Recording that
- * against the ring position it lands at gives a direct phase measurement when
- * playback reaches it: where we are, versus where the timeline says we should
- * be. Correcting that holds position rather than merely matching rates.
- *
- * Single producer (receive task), single consumer (playback), 32-bit indices,
- * so no locking is needed.
- */
+extern int64_t stream_offset;
+extern int64_t offset_slew_last;
+
+extern volatile int32_t marker_sample;
+extern volatile int32_t samples_in;
+
 #define PHASE_Q_LEN 32
 typedef struct {
-    int32_t pos;        /* ring frame position where this packet's audio starts */
-    int64_t play_at;    /* master-clock instant that sample should be heard */
+    int32_t pos;
+    int64_t play_at;
 } phase_pt_t;
 
 extern phase_pt_t phase_q[PHASE_Q_LEN];
 extern volatile uint32_t phase_head, phase_tail;
-extern volatile int32_t phase_err_us;  /* + = playing late */
+extern volatile int32_t phase_err_us;
 extern volatile bool phase_valid;
-/*
- * The last few raw readings, for the splice alone. Play task only -- pushed in
- * the crossing loop, read and reset in the splice, reset at the top of the
- * outer loop -- so no volatile and no lock, unlike everything around it.
- *
- * The servo has smoothed its input since it was measured triggering on noise;
- * the splice never did, and it is the larger correction of the two. See
- * sync_phase_hist_t. Nothing acts on this yet: it is measured against the raw
- * value first, on the same boundaries, and only then does the splice move.
- */
+
 extern sync_phase_hist_t phase_hist;
-extern volatile int32_t restart_pos;  /* ring position of a track boundary */
-/*
- * Set after a splice. The phase genuinely steps at that instant, so the running
- * average from before it describes a situation that no longer exists -- seen as
- * "phase -2153 us (smoothed +26992 us)", with the servo acting on the stale
- * figure. Splices are rare, so re-seeding here costs nothing; re-seeding on
- * every correction, as an earlier version did, destroys the smoothing entirely.
- */
+extern volatile int32_t restart_pos;
+
 extern volatile bool phase_stepped;
 
-/* Never splice more than this in one go. A larger error means something is
- * wrong that a splice will not fix, and a 150 ms jump is very audible even at a
- * track change. */
 #define MAX_SPLICE_MS 150
 
-/*
- * An insert may not push the ring past this far below capacity, since
- * 2026-08-18. The same 50 ms as the catch-up drain's "level >= target + 50
- * refuses inserts" -- the system's existing definition of "too deep to add
- * to". The splice's insert takes DAC time and consumes nothing from the
- * ring, so while its zeros play, receive keeps pushing: on the 2026-08-18
- * soak, 150 ms inserts into already-brimming rings took both satellites to
- * the 464 ms ceiling and 121/89 decoded blocks were dropped at rx as
- * ring-full. The skip side needs no such clamp -- its discard loop reads
- * with a zero timeout and stops on an empty ring by construction.
- */
 #define SPLICE_INSERT_HEADROOM_MS 50
 
-/*
- * Beyond this, the phase reading is not describing our playback at all.
- *
- * Drift is ~0.8 ms per minute and delivery jitter is a few ms, so a whole
- * second cannot be either. What it does mean is that the stamps arriving now
- * were issued against a different clock origin than the one playback anchored
- * to. Servoing on that is meaningless; re-anchoring is the only thing that
- * helps.
- */
 #define PHASE_INSANE_US 1000000
 
-/*
- * What an anchorable packet looks like. See the refusals in handle_audio().
- *
- * The hub stamps every chunk LEAD_US = 350 ms ahead, so a healthy packet
- * arrives with most of that still in front of it -- a good anchor was measured
- * at "in 154 ms", back when the lead was 200. The number is not arbitrary
- * caution: the scheduled wait below is the ONLY thing that prefills the ring,
- * so whatever lead survives to here is the prefill, and some fraction of the
- * design depth is the least worth starting on. WHAT fraction is the note below
- * this one -- it stopped being "half" when the lead moved to 350 and this
- * constant did not follow.
- *
- * It was 20 ms, chosen as "the floor below which prefill is not worth having",
- * and that was the wrong test. A run cleared it by four milliseconds: 144
- * packets refused, then one accepted at +24 ms, anchoring with `buffer 0 ms`.
- * The ring then overfilled to 400 ms behind it (ring-full 59), phase reached
- * +118 ms, and the servo spent over 200 seconds walking it back. The guard
- * fired 144 times and still let through the one that mattered.
- *
- * There is a real tension in the value, and it is not resolved so much as
- * chosen. The hub's RESYNC_US allows its timeline to wander 150 ms from real
- * time before slewing, so a perfectly healthy packet arriving during a trough
- * can show as little as ~50 ms of lead -- below this floor. Such a packet WILL
- * be refused. That is deliberate: anchoring mid-trough is how a stream starts
- * with a lead it cannot keep, and troughs recover within a second or two, so
- * refusing costs a second and buys an anchor taken on the recovery instead.
- * ANCHOR_GIVE_UP_US bounds the cost if the trough is not a trough.
- *
- * Tied by convention to the hub's LEAD_US, which this unit cannot see. If the
- * lead ever changes, this is the second place to look.
- *
- * A second between anchors, against a hub that would supply forty-nine packets
- * in that time: if none of them anchors, the link is not in a state a re-anchor
- * can fix.
- *
- * Five seconds before giving up and anchoring anyway. Long enough that no
- * plausible burst of lateness reaches it, short enough that a genuine
- * lead/path mismatch does not leave a speaker silent for a whole track.
- */
-/*
- * 125000 WAS "half the hub's lead", set when LEAD_US became 250 ms. It went
- * 100 -> 125 because the lead did, not because the reasoning changed; leaving it
- * at 100 would have quietly loosened the guard from half a lead to two fifths.
- *
- * IT IS NO LONGER HALF. The lead then went 250 -> 350 and this did not follow,
- * so the guard is 125 of 350 -- between a third and a half, and loosened by
- * exactly the drift the paragraph above was written to prevent. That is a
- * SIDE EFFECT, not a decision: no run re-derived the ratio at the longer lead,
- * and nothing here argues a third is the right number. hub.h's RESYNC_HARD_US
- * note reads the guard at 125 ms and is consistent with this value, so the two
- * headers agree on what the constant IS; what is open is what it should be.
- *
- * Raising it to 175 (half of 350) is the obvious candidate and is deliberately
- * NOT done here, because it tightens a guard whose whole tension is that
- * tightening it refuses healthy packets -- see the trough paragraph above.
- * That is a measurement, not an edit.
- *
- * The tension the paragraph above describes is what raising the lead was partly
- * for. 251 anchors were refused in three hours against a measured mean lead of
- * 146 ms: RESYNC_US lets the hub's timeline sit 150 ms below target, so a
- * perfectly healthy packet in a trough showed under this floor and was refused,
- * exactly as predicted. Both ends of that moved -- the centre is 350 now -- so
- * the distribution should clear this by more than it did, not less.
- */
 #define ANCHOR_MIN_LEAD_US     125000
 #define ANCHOR_MIN_INTERVAL_US 1000000
 #define ANCHOR_GIVE_UP_US      5000000
 
-/*
- * A gap beyond this is an outage, not jitter, and is re-anchored rather than
- * filled with silence. See the reasoning at the fill in handle_audio().
- *
- * 150 ms is about seven packets. Normal loss on a healthy link is one to three
- * -- 20 to 60 ms -- so this sits well clear of anything that should be filled,
- * while staying below the RING_TARGET_MS (250) that a fill this size would
- * otherwise push the ring past.
- */
 #define GAP_RESYNC_MS 150
 
-/* How long after an anchor the drift servo ignores buffer depth and servos on
- * phase alone. See the safety net in drift_task() for what it was doing to a
- * ring that had simply not finished filling yet. */
 #define DEPTH_NET_HOLD_US      20000000
 
-/*
- * A track-boundary correction waiting to be reported to the hub, so it can
- * print how far apart the units had drifted -- see splice_msg_t. Written by
- * playback, sent by the probe task, because a sendto() in the audio path is
- * exactly the kind of thing that costs a buffer.
- */
-/*
- * The largest phase step seen this window, for drift_task to narrate.
- *
- * Written by playback, printed by the 5 s window, for exactly the reason
- * splice_report_* is: the play task is the audio path and must not log. At
- * 115200 a status line is ~12 ms of blocking UART against 34.8 ms of DMA, and
- * steps arrive in bursts -- the first version of this instrument logged inline
- * and was audible. Largest-per-window, because a burst of ten says the same
- * thing as its biggest member.
- */
-extern volatile int32_t step_report_mag;   /* 0 = nothing to report */
+extern volatile int32_t step_report_mag;
 extern volatile int32_t step_report_from, step_report_to;
 extern volatile int32_t step_report_ring, step_report_trim;
 extern volatile uint32_t step_report_pad;
@@ -356,140 +79,43 @@ extern volatile bool    step_report_pending;
 
 extern volatile int32_t splice_report_us;
 extern volatile int32_t splice_report_phase;
-/* SHADOW: the correction the median would have produced instead. Acted on by
- * nothing here; the hub prints it beside the real one so both units' figures
- * are compared at the same boundary. See splice_msg_t.applied_alt_us.
- *
- * Three boundaries have been captured so far and the median agreed with the raw
- * reading at every one of them -- sat -3/-3, -1/-1, +4/+4 ms, and the hub the
- * same. That is the shadow doing its job and finding nothing: at a track
- * boundary the phase is evidently stable enough that smoothing changes no
- * decision. Three is too few to retire it on, so it stays; if it is still
- * three-for-three after a long evening, the median machinery can come out of
- * the audio path and phase_hist with it. */
+
 extern volatile int32_t splice_report_alt;
 extern volatile bool    splice_report_pending;
 
-/*
- * The TSF-derived clock offset, and when it was last updated.
- *
- * Written by the receive task, read by playback. Zero `at` means no usable TSF
- * message has arrived, in which case everything falls back to the probe
- * estimator exactly as before -- both units may have TSF unavailable, the
- * satellite may not have associated yet, or the hub may be an older build that
- * does not send MSG_TSF at all.
- */
-/*
- * Read and written as a PAIR, under a sequence lock, and not directly.
- *
- * Two things were wrong with the plain pair of volatiles these replace, and the
- * second is the one that matters.
- *
- * TEARING: both are 64-bit and a 64-bit load is two instructions on this CPU,
- * so a reader can catch one half of a write. An offset hovers near zero and
- * changes sign, which flips the high word between 0 and 0xFFFFFFFF -- exactly
- * the case where the two halves do not belong together and the result is not
- * close to either value.
- *
- * PAIRING, which no amount of per-field atomicity would fix: clock_offset()
- * reads `at`, decides the reading is fresh, and then reads `us`. A publish
- * landing between those two lines gives it a fresh timestamp and the offset
- * from before it -- and that offset is what the stream anchors on, where an
- * error is baked in for the life of the stream. It is the same shape as the
- * bug docs/clock-sync.md section 9 records: invisible, because every log line
- * downstream is derived from the same wrong number.
- *
- * A sequence lock is the right tool because there is exactly ONE writer
- * (rx_task, in the MSG_TSF arm) and several readers. The writer never blocks;
- * a reader retries only if a publish overlapped it. Do not add a second writer
- * without replacing this -- a seqlock with two writers is silently broken.
- *
- * THE RETRY IS BOUNDED, AND THAT IS NOT BELT-AND-BRACES. It hung a board.
- *
- * On the 2026-08-25 soak sat_classic stopped playing with its ring still full
- * at 323 ms, the DAC starving 4992 ms of every 5 s window, and the task
- * watchdog firing eight times on IDLE1. Every one of the eight backtraces was
- * inside this reader's retry loop, and `ring-low` read `none` -- the playback
- * inner loop had not run at all.
- *
- * The loop used to be `while ((s0 & 1u) || s0 != tsf.seq)`, unbounded and with
- * no yield in it. `tsf.seq` is odd for exactly the window between the writer's
- * two increments, and a reader that enters while it is odd can only leave when
- * the writer finishes. play_task is priority 8 PINNED TO CORE 1; rx_task, the
- * writer, is priority 7 and unpinned. A publish executing on core 1 when
- * playback becomes ready is preempted by it, and playback then spins forever
- * waiting for the writer it just displaced -- seqlock priority inversion, and
- * the reader spinning is what prevents the writer from ever completing.
- *
- * The exact route that left seq odd on that run is not recoverable from the
- * log, and it does not need to be. An unbounded wait for another task, taken
- * with no lock and no yield, is wrong whatever leads into it: any route that
- * leaves seq odd wedges the unit permanently, and one did.
- *
- * So the reader gives up instead. Failing costs one chunk's worth of the
- * estimator, which is the fallback that already exists here for the case where
- * TSF is simply unavailable, and which every caller already handles.
- */
-
-/*
- * How many times a reader retries before falling back to the estimator.
- *
- * Real contention needs one retry: the writer's critical section is four stores
- * and two fences, far shorter than a reader's pass. Eight is well past any
- * legitimate collision, so reaching the end of them means the writer is not
- * running -- which is the pathological case this bound exists for, not a busy
- * one to be waited out.
- */
 #define TSF_READ_TRIES 8
 typedef struct {
-    volatile uint32_t seq;      /* odd while a write is in progress */
+    volatile uint32_t seq;
     volatile int64_t  offset_us;
-    volatile int64_t  at;       /* local time the offset was derived; 0 = never */
+    volatile int64_t  at;
 } tsf_reading_t;
 
 extern tsf_reading_t tsf;
 
-/* Writer side. rx_task only. */
 static inline void tsf_publish(int64_t offset_us, int64_t at)
 {
-    tsf.seq++;                              /* now odd: a write is in progress */
+    tsf.seq++;
     __atomic_thread_fence(__ATOMIC_RELEASE);
     tsf.offset_us = offset_us;
     tsf.at = at;
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    tsf.seq++;                              /* even again: consistent */
+    tsf.seq++;
 }
 
-/*
- * Reads that gave up after TSF_READ_TRIES and fell back to the estimator.
- *
- * MUST BE ZERO. The writer's critical section is a handful of stores, so losing
- * eight races in a row does not happen to a healthy system -- this counts the
- * condition that used to hang the board instead, and any movement at all means
- * the writer was unable to run while a reader wanted it. One is worth
- * investigating; a rate here is the priority inversion recurring, and the fix
- * would be to stop pinning playback above the writer rather than to raise
- * TSF_READ_TRIES.
- */
 extern volatile uint32_t n_tsf_read_fail;
 
-/*
- * Reader side. True with a pair that was published together; false if the
- * writer could not be caught between publishes in TSF_READ_TRIES attempts, in
- * which case the outputs are untouched and the caller must not use them.
- */
 static inline bool tsf_read(int64_t *offset_us, int64_t *at)
 {
     for (int t = 0; t < TSF_READ_TRIES; t++) {
         const uint32_t s0 = tsf.seq;
         if (s0 & 1u) {
-            continue;                       /* a publish is in progress */
+            continue;
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         const int64_t us = tsf.offset_us;
         const int64_t a  = tsf.at;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (s0 == tsf.seq) {                /* no publish overlapped the read */
+        if (s0 == tsf.seq) {
             *offset_us = us;
             *at = a;
             return true;
@@ -499,31 +125,16 @@ static inline bool tsf_read(int64_t *offset_us, int64_t *at)
     return false;
 }
 
-/* tsf_fresh() is below, after TSF_MAX_AGE_US, which it needs. */
-extern volatile uint32_t n_tsf_used;  /* anchors that used TSF */
-extern volatile uint32_t n_tsf_fallback;  /* anchors that fell back */
+extern volatile uint32_t n_tsf_used;
+extern volatile uint32_t n_tsf_fallback;
 
-/*
- * How stale a TSF offset may be and still be preferred over the estimator.
- * Messages arrive with every probe reply, 4/s, so a second means several have
- * been missed and the link is not healthy enough to trust the last one.
- */
 #define TSF_MAX_AGE_US 1000000
 
-/*
- * True if a TSF reading exists and is fresh enough to prefer over the
- * estimator, and if so what it is.
- *
- * The freshness test and the value it vouches for come out of ONE tsf_read(),
- * which is the whole point of the pair -- see tsf_reading_t. Every caller that
- * used to read tsf_offset_at, decide, and then read tsf_offset_us goes through
- * here instead.
- */
 static inline bool tsf_fresh(int64_t now, int64_t *offset_us)
 {
     int64_t us, at;
     if (!tsf_read(&us, &at)) {
-        return false;          /* no consistent pair; the estimator stands in */
+        return false;
     }
     if (at && now - at < TSF_MAX_AGE_US) {
         if (offset_us) *offset_us = us;
@@ -532,853 +143,159 @@ static inline bool tsf_fresh(int64_t now, int64_t *offset_us)
     return false;
 }
 
-/*
- * Cumulative totals for a long run, never reset. The 5 s lines answer "what is
- * happening now"; only a total answers "has this been happening slowly for an
- * hour", and nothing here had one. See the hub's copy.
- */
-extern volatile uint32_t n_underruns;  /* playback ran dry */
-extern volatile uint32_t n_reanchors;  /* streams anchored, first included */
-extern volatile uint32_t n_splices;  /* track-boundary corrections applied */
+extern volatile uint32_t n_underruns;
+extern volatile uint32_t n_reanchors;
+extern volatile uint32_t n_splices;
 extern volatile uint32_t n_retunes;
 extern volatile uint32_t n_retunes_bad;
-/*
- * Gaps the air made, counted at DETECTION and before anything tries to repair
- * them -- so this is a measure of the link, not of the concealment.
- *
- * Kept that way deliberately. On the 2026-08-24 A/B it is what proved the clean
- * channel and not the FEC was carrying the run: had it counted only the losses
- * the repair missed, "FEC 1 and FEC 0 both flawless" would have been unreadable.
- * A parity build and a bare build must be comparable on this number.
- *
- * n_gap_frames is deliberately NOT its partner any more. That counts silence
- * actually written, so a repaired gap adds to this and not to that, and the
- * printed line says both: how much was lost, and how much of it was heard.
- */
+
 extern volatile uint32_t n_gaps;
-/*
- * XOR parity, receiving end. n_gaps is what the air lost; these say what the
- * speaker got back.
- *
- * n_fec_recovered is packets rebuilt WHOLE. That word is the difference between
- * this scheme and the one it replaced: a recovery used to be about three
- * quarters of a payload plus a silence pad plus a decode error, so `gaps 1 |
- * fec 1` read as though the two cancelled when ~6 ms of the 20 was still
- * silence. There is no partial recovery now -- audio_fec_extract() either
- * returns the packet that went missing or refuses -- so gaps minus recovered is
- * exactly the silence that reached the room, and the two counters this replaces
- * (a short-frames tally and a copy-decode error count) have nothing left to
- * measure.
- *
- * n_fec_lost is the other outcome: a hole parity could not close. Two losses in
- * one group, a gap of more than one packet, a parity that never arrived, or a
- * resync that threw the group away. It ends in the same fill_gap() the receiver
- * would have done without parity at all, so this is not a fault -- it is the
- * fraction of losses the scheme does not cover.
- *
- * The two are exhaustive by construction: every gap detected is offered to
- * parity exactly once and lands in one column or the other, so
- *
- *     n_gaps == n_fec_recovered + n_fec_lost
- *
- * across any window. That identity is the point. A burst loss that parity
- * cannot touch would otherwise appear in neither column and the repair rate
- * would read better than it was.
- *
- * n_fec_holds is how often packets were held behind a hole waiting for a
- * parity. Read against n_fec_recovered: holds that did not become recoveries
- * are n_fec_lost, and a hold costs up to (K-2) packet times of ring depth
- * whichever way it ends. A rate here far above the loss rate means groups are
- * being opened and abandoned, not that anything was repaired.
- *
- * n_fec_parity_rx is arrival proof for the parity lane itself. It should sit at
- * the audio packet rate divided by K -- ~12/s at K=4 -- and a zero here with
- * audio flowing says the hub is not sending parity at all, which no other
- * counter on this unit would distinguish from a channel that simply never lost
- * anything.
- *
- * n_fec_bad must stay at zero. It counts a parity that arrived and could not be
- * trusted: a count field that disagrees with this build's K, or a rebuilt header
- * that is not the packet that went missing. Both mean the two firmwares
- * disagree about the wire, and neither is a radio problem.
- */
+
 extern volatile uint32_t n_fec_recovered;
 extern volatile uint32_t n_fec_lost;
 extern volatile uint32_t n_fec_holds;
 extern volatile uint32_t n_fec_parity_rx;
 extern volatile uint32_t n_fec_bad;
-/*
- * Three faults that used to happen silently. Each was a `continue`, a `break` or
- * a bare `return false` with nothing recorded, so a run in which any of them
- * fired looked exactly like a clean one.
- *
- * n_seq_dropped -- a packet older than expected. Should be 0: the hub sends
- *   each once and a group frame is not retried. Non-zero means either something
- *   is duplicating, or packets are arriving out of order -- and a reorder means
- *   the "gap" before it was never a loss, so the silence filled for it was
- *   inserted against a packet that did arrive.
- * n_decode_err -- a live-stream SBC frame that would not decode. The rest of
- *   that packet is dropped, so the timeline is short by whatever it held, and
- *   no other counter sees it.
- * n_recv_err -- recvfrom() returning an error rather than a datagram. The old
- *   code spun on this at priority 7 without counting it.
- */
-/*
- * Re-anchors forced because a gap fill did not fit the ring.
- *
- * Distinct from n_gap_resyncs, which is a gap longer than GAP_RESYNC_MS: that
- * one says the air was bad, this one says the ring could not absorb a burst
- * arriving faster than it plays. Both end in a reset and a re-anchor, and
- * telling them apart is what says whether to spend the next effort on loss or
- * on buffering.
- */
+
 extern volatile uint32_t n_gap_short_resyncs;
 extern volatile uint32_t n_seq_dropped;
 extern volatile uint32_t n_decode_err;
 extern volatile uint32_t n_recv_err;
-extern volatile uint32_t n_wifi_drops;  /* disconnects from the hub's AP */
-/*
- * Associations that never produced a DHCP lease, and were torn down for it.
- *
- * Separate from n_wifi_drops because the two say opposite things about where to
- * look. A drop is the radio losing a link it had; this is the radio perfectly
- * happy with a link that is useless -- associated, no address, probes going
- * nowhere. It is the fault WIFI_LEASE_TIMEOUT_US exists to end, and if it ever
- * climbs the question is the hub's DHCP server, not the air.
- *
- * Each one is followed by a disconnect this unit asked for, so n_wifi_drops
- * counts it too. Reading them together is the point: drops well above lease
- * failures is an ordinary flaky link, drops tracking them one for one is this.
- */
+extern volatile uint32_t n_wifi_drops;
+
 extern volatile uint32_t n_wifi_lease_fail;
-/*
- * The receive path's own instruments, counted here rather than logged there.
- *
- * These three used to be an ESP_LOGW each, per event, from inside
- * handle_audio() -- which runs in rx_task, which is the only thing draining a
- * UDP mailbox six datagrams deep against ~136 datagrams a second. The console
- * is a 115200-baud UART, so a ~60-character line is ~5 ms of blocking write.
- *
- * That closes a loop: packet loss makes lines, lines block the receive task,
- * a blocked receive task overflows the mailbox, and the overflow is more loss.
- * A run of it printed several hundred lines across six seconds and the loss
- * outlived the disturbance that started it by about that much.
- *
- * So the audio path increments and drift_task talks, within 5 s, from a task
- * that can afford to wait on a UART. Cumulative, like every other counter here;
- * the narration below prints the window by subtracting what it said last time.
- */
-extern volatile uint32_t n_gap_frames;  /* silence actually inserted; a repaired gap adds none */
-extern volatile uint32_t n_gap_short;  /* gap fills the ring could not take */
+
+extern volatile uint32_t n_gap_frames;
+extern volatile uint32_t n_gap_short;
 extern volatile uint32_t n_gap_short_frames;
-extern volatile uint32_t n_ring_full;  /* decoded blocks dropped, ring full */
-extern volatile uint32_t n_gap_resyncs;  /* gaps too large to fill, re-anchored */
-extern volatile uint32_t n_anchor_upgrades;  /* provisional anchors replaced */
-/*
- * Set by the receive task when a gap is too large to fill, cleared by the
- * playback task when it parks. See GAP_RESYNC_MS.
- */
+extern volatile uint32_t n_ring_full;
+extern volatile uint32_t n_gap_resyncs;
+extern volatile uint32_t n_anchor_upgrades;
+
 extern volatile bool resync_request;
-/*
- * Set when ANCHOR_GIVE_UP_US forced an anchor onto a packet that was already
- * late. Playback is running but its position is known to be wrong, so the
- * receive path keeps watching for a packet it could have anchored on properly.
- */
+
 extern volatile bool anchor_provisional;
-extern volatile uint32_t n_anchor_late;  /* anchors refused, play_at already past */
-extern volatile uint32_t n_anchor_soon;  /* anchors refused, one just happened */
-/*
- * Phase points dropped because phase_q was full. The only loss path in this
- * file that had no counter, which is the one thing the rest of this system is
- * built not to allow: every real fault here was invisible until something
- * counted it. A full queue means playback is not consuming points as fast as
- * the receive path records them, and the servo silently stops getting fresh
- * input while every log line still reads normally.
- */
+extern volatile uint32_t n_anchor_late;
+extern volatile uint32_t n_anchor_soon;
+
 extern volatile uint32_t n_phase_drop;
-/*
- * Ring reads that came back short of a full chunk, and the frames of silence
- * padded in to cover them.
- *
- * FIXED 2026-08-14; these stay as the instrument that says whether it mattered.
- *
- * The pad is played but was never in the ring, and samples_played used to
- * advance by a whole chunk regardless -- so every later phase point was
- * displaced by the pad and the servo's only input carried a permanent bias.
- * That is the exact shape of the "silence inserted for a lost packet was not
- * counted in samples_in" bug, which put this unit ~20 ms out per loss and
- * stayed hidden because the marker was derived from the same count. The hub
- * had counted the ring's return value since it was written; this unit did not,
- * and playback advances by what came out of the ring here now too.
- *
- * The ring's trigger level is one chunk, so a short read means the 500 ms
- * timeout expired on a partly-filled ring -- a near-underrun. n_short_frames
- * is what the bias WOULD have been, in frames; it has read 0 on every run so
- * far, which is why the fix is expected to change nothing visible.
- */
+
 extern volatile uint32_t n_short_reads;
 extern volatile uint32_t n_short_frames;
 
-/*
- * HOW AUDIO ARRIVES, as opposed to whether it arrives at all -- the measurement
- * this unit did not have, and the one the 2026-08-19 soak needed.
- *
- * That soak recorded nine phase steps of +35 to +205 ms on this unit with the
- * hub clean throughout: `local ring 230-295 ms`, phase within +-6 ms, tx-fail 0
- * in 57 of 59 windows. Every step reported `buffer 0 ms`, and dma_starve_count()
- * moved by the step size divided by a descriptor period -- so the ring emptied,
- * the play task blocked, and auto_clear put digital zero on the DAC for as long
- * as the hole lasted. Silence takes DAC time that samples_played does not count,
- * which is what makes the unit permanently late and arms the catch-up drain the
- * room hears as a semitone of pitch.
- *
- * What nothing could say is WHO HELD THE PACKETS. Every loss counter read zero
- * -- seq-drop, decode-err, recv-err, wifi-drops, fec-err -- and the ring went
- * from empty to 425 ms of a 464 ms capacity inside one window, dropping decoded
- * blocks as ring-full at the far end of it. Nothing was lost; something was
- * delayed and then released in a lump. Whether the lump formed in the hub's
- * transmit path or on the air is the question, and neither unit measured the
- * arrival cadence that would answer it.
- *
- * THE LEAD IS THE DISCRIMINATOR, and it costs no protocol change: audio_msg_t
- * already carries play_at on the master clock, and rx_task already timestamps
- * every datagram the instant recvfrom() returns. So
- *
- *     lead = play_at - (arrival converted to master)
- *
- * is how much of the hub's LEAD_US survived the trip. In steady state it is
- * ~350 ms. If a gap in arrivals comes with a COLLAPSED lead, the hub stamped
- * those packets on time and the transport held them. If the gap comes with the
- * lead still near 350 ms, they were stamped late and the fault is upstream of
- * the air. The hub's own fan-out interval (hub.h, n_fanout_gap_max_us) is the
- * other half of that comparison.
- *
- * GAUGES, NOT COUNTERS: each is the extreme seen since the telemetry task last
- * read it, and the telemetry task clears it as it reads. That is the same
- * arrangement the TSF line's span_max already uses, and for the same reason --
- * a maximum summed across windows is not a maximum of anything. rx_task is the
- * only writer of the first three and the play task the only writer of the
- * fourth, so the race is one-sided: a clear that lands between a reader's load
- * and its store costs one window one sample, which is a price a diagnostic can
- * pay and a counter cannot. n_audio_rx is a plain cumulative counter like its
- * neighbours above, differenced for the window.
- *
- * The sentinel on the two minima is INT32_MAX, meaning "nothing measured this
- * window" -- distinct from a measured zero, which is exactly the reading that
- * matters. The line says so rather than printing a number nothing stands
- * behind.
- */
 #define ARRIVAL_UNSEEN INT32_MAX
-extern volatile uint32_t n_audio_rx;      /* audio datagrams taken */
-extern volatile int32_t  rx_gap_max_us;   /* longest silence between two of them */
-extern volatile uint32_t rx_burst_max;    /* longest run arriving < RX_BURST_US apart */
-extern volatile int32_t  rx_lead_min_us;  /* least of play_at - arrival, in master us */
-extern volatile uint32_t n_lead_insane;   /* ...and readings refused as not-a-lead */
-extern volatile int32_t  ring_low_ms;     /* shallowest the play task found the ring */
-/*
- * Longest a packet waited behind a hole for its parity, this window.
- *
- * THE ONE NUMBER THE PARITY DESIGN RESTS ON. A loss can only be repaired once
- * the group's parity arrives, so the receiver holds the packets behind the hole
- * until it does -- and every claim about whether that is affordable is a claim
- * about this figure. The arithmetic says (K-2) packet times: ~40 ms at K=4,
- * against a 350 ms LEAD_US and a 350 ms RING_TARGET_MS.
- *
- * A gauge rather than an assertion because the arithmetic assumes the hub sends
- * parity promptly after the group's last packet, and nothing on this end can
- * know that it did. Read beside ring-low on the same line: the hold is the one
- * mechanism in the receive path that deliberately stops writing to the ring, so
- * if ring-low has moved since parity was switched on, this says whether the hold
- * is why.
- *
- * Zero is the normal reading. A hold only starts when a packet is lost.
- */
+extern volatile uint32_t n_audio_rx;
+extern volatile int32_t  rx_gap_max_us;
+extern volatile uint32_t rx_burst_max;
+extern volatile int32_t  rx_lead_min_us;
+extern volatile uint32_t n_lead_insane;
+extern volatile int32_t  ring_low_ms;
+
 extern volatile int32_t  fec_hold_max_us;
 
-/*
- * Close enough together to be one release rather than two arrivals.
- *
- * Packets are stamped ~20 ms apart and paced by the hub's DAC, so anything
- * under a millisecond or two did not travel independently: it came out of a
- * queue that had been holding it. Two is comfortably clear of the ~20 ms
- * cadence and of the jitter around it, and low enough that a merely early
- * packet does not read as a burst.
- */
 #define RX_BURST_US 2000
 
-/*
- * Beyond this a lead reading is not a lead, and is REFUSED rather than clamped.
- *
- * The bound is PHASE_INSANE_US for the reason that constant already exists: at
- * that size the number is not describing delivery, it is describing a timeline
- * this unit is no longer on. A real lead lives inside LEAD_US plus the hub's
- * RESYNC_US of wander, and the worst genuine reading ever recorded is -365 ms.
- *
- * MEASURED, on the 2026-08-19 23:19 soak. The hub was reflashed while this unit
- * stayed up; it reconnected, and the first packets of the new stream were dated
- * against an offset still describing the hub that had gone -- the TSF line beside
- * it reads `steps tsf -11693006470 us`, an 11693-second step. The lead came out
- * at about -11693 s, hit the int32 clamp, and printed as `lead-min -2147483 ms`.
- * One sample then owned the window's minimum AND the whole run's summary, which
- * reported `lead-min worst -2147483 ms` across 29 otherwise clean minutes.
- *
- * This is the same failure play.c's PHASE_INSANE_US branch was written for --
- * "an hour of error wrapped to -699 seconds, the smoothing overflowed on top of
- * it, and the servo asked for a 4.29 GHz sample rate" -- reappearing in a
- * diagnostic instead of in the servo. A gauge that clamps is a gauge that lies
- * about its own worst case, so this one refuses and says how often.
- */
 #define LEAD_INSANE_US PHASE_INSANE_US
-/*
- * TSF samples whose read pair took longer than TSF_SPAN_MAX_US -- i.e. samples
- * something preempted between the two counter reads, so the offset they carry
- * is off by whatever landed in the gap.
- *
- * COUNTED, NOT ENFORCED. TSF is the anchor clock source now, and a threshold
- * chosen blind could silently demote it to the probe estimator, which is worse
- * -- that is a regression wearing no log line. This says what the reject rate
- * WOULD be, so the threshold can be chosen from the distribution instead.
- *
- * ENFORCING IT AT 100 us WOULD NOT BE FREE, which is the opposite of what the
- * earlier logs suggested. Those all read `wide-span 0`; the run of 2026-08-12
- * 16:39 read 1 in the first five seconds and 21 by 65 s, against roughly 240
- * samples a minute -- call it 9% -- with the reported `span max` reaching 210
- * and 214 us in ordinary windows.
- *
- * So the counter did its job: a threshold picked from the old logs would have
- * looked free and then quietly demoted TSF to the probe estimator for one
- * sample in eleven, which is exactly the regression-wearing-no-log-line this
- * was written to prevent. What changed between the runs is not known -- more
- * traffic, a different board, the split moving where the read pair sits
- * relative to other work in rx_task -- and that is worth establishing before
- * any threshold is chosen, because it decides whether 100 us is too tight or
- * the spans are a symptom.
- */
+
 #define TSF_SPAN_MAX_US 100
 extern volatile uint32_t n_tsf_wide;
-/*
- * When this unit went off the air, and when it came back.
- *
- * The suspicion being measured: nothing invalidates the probe estimator's
- * window on a disconnect. sync_est_offset() selects the lowest-RTT sample in a
- * 10-sample window and neither it nor sync_est_settled() decays with time, so
- * after an outage of any length the unit may anchor on an offset measured
- * before the drop -- and an offset error at the anchor is baked in for the life
- * of the stream, since play_at is consulted once. The first anchor after a
- * rejoin therefore says which clock it used and how stale the estimator's
- * newest sample was. If it reads "TSF" the concern does not arise, because TSF
- * is re-derived from a fresh beacon; if it reads "probe" with an age spanning
- * the outage, it does.
- */
+
 extern volatile int64_t wifi_down_at;
-extern volatile int64_t rejoined_at;  /* 0 = the next anchor is not the first */
-extern volatile int64_t est_newest_at;  /* when the newest probe landed */
-extern volatile uint32_t n_frames_rx;  /* analysis frames taken from the hub */
-extern volatile uint32_t n_frames_bad;  /* ... and rejected, wrong size */
-extern volatile uint32_t hw_play;  /* stack headroom, sampled in-task */
+extern volatile int64_t rejoined_at;
+extern volatile int64_t est_newest_at;
+extern volatile uint32_t n_frames_rx;
+extern volatile uint32_t n_frames_bad;
+extern volatile uint32_t hw_play;
 extern volatile uint32_t hw_drift;
 
-/*
- * Heap, dated, and allocation failures made audible. The hub's copy carries the
- * reasoning; this is the same instrument on the other unit.
- *
- * It is here despite no pressure ever having been observed on a satellite --
- * 52 kB free analysing locally, 118 kB being given its frames, against a hub
- * that reached 2040 bytes. Which is the point: the value of a windowed minimum
- * is that it says nothing, every minute, until the minute it does. A counter
- * that only exists on the unit already known to be sick cannot tell you the
- * other one just got sick too, and these two units do not have the same job or
- * the same failure.
- */
 extern volatile uint32_t heap_min_window;
-/*
- * The pool ordinary allocations actually draw from.
- *
- * MALLOC_CAP_INTERNAL ALONE IS NOT THAT POOL, and getting this wrong hid a dead
- * satellite for an evening. On the classic ESP32 the IRAM heap is registered as
- * INTERNAL|EXEC|32BIT (heap/port/esp32/memory_layout.c) -- internal, but neither
- * 8-bit accessible nor DEFAULT, so nothing that needs byte access can touch it.
- * A task stack cannot. malloc() cannot. This unit reported
- *
- *   MEM: internal 31760 free (min 31424, ..., largest 30720) | total 396 (largest 208)
- *
- * while three of its four tasks were failing to start on 4096-byte requests. The
- * 31 kB was real and entirely useless; 396 bytes was the truth. Adding 8BIT is
- * what makes the figure describe the memory a stack can be cut from -- and it is
- * exactly the mask of the request that was failing, caps 0x804.
- *
- * The hub's copy carries the same constant for the same reason, though it is the
- * S3 where the two masks nearly agree: no IRAM-only region is registered there.
- */
+
 #define CAP_USABLE_INTERNAL (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
 
 extern volatile uint32_t heap_int_window;
 extern volatile uint32_t n_alloc_fail;
-extern volatile uint32_t alloc_fail_size;  /* the largest request that failed */
+extern volatile uint32_t alloc_fail_size;
 extern volatile uint32_t alloc_fail_caps;
 
-/*
- * Tasks that did not start, which used to be unsayable.
- *
- * Every xTaskCreate here passed NULL for the handle and threw the return value
- * away, so a unit that could not start its play task ran on without one and
- * looked from the outside exactly like a satellite that had gone quiet: still
- * associated, still holding a lease, no audio, no LEDs, and -- because the
- * missing task was often drift_task -- no HEALTH line to say otherwise. That is
- * the same silent-failure class the allocation hook above exists to end, left in
- * the one place it could take the whole unit down.
- *
- * Reported on the join line rather than only where it happens: see task_start().
- */
 extern volatile uint32_t n_task_fail;
 extern char s_task_fail_names[64];
 
-
-/*
- * Target buffer depth: the hub stamps audio LEAD_US ahead, so in steady state
- * that much should be sitting here waiting.
- *
- * IT IS THE HUB'S LEAD_US AND MUST TRACK IT. This unit cannot see that constant
- * -- it is compiled into a different image -- so the two are held equal by
- * convention, and a mismatch does not fail loudly: the servo's depth safety net
- * would simply hold this unit at the wrong depth, which reads as a standing
- * phase error nothing explains. 350 since the lead became 350.
- *
- * AND IT DRAGGED THE RING SIZE WITH IT, which is the part that is easy to miss.
- * The depth net clamps at +-120 ms (df_servo.c), so an ordinary excursion sits
- * at 350 + 120 = 470 ms -- past the 464 ms an 80 kB ring holds, which would drop
- * audio on ring-full in normal running. CONFIG_DANCEFLOOR_RING_KB went 80 -> 96
- * with this change: 96 kB is 557 ms and leaves 87 ms above that excursion, and
- * 207 ms above the target itself, which is the 214 ms the 250/80 kB pairing had.
- *
- * The 16 kB comes out of a classic ESP32 with no PSRAM, which ran `heap 80584
- * (min 74532, largest 73728)` before this. The ring is allocated at boot, when
- * the largest block is at its biggest, so it should fit -- but this is the
- * change to suspect first if this unit stops booting, and the wall is real:
- * ~106 kB is the largest block there has ever been here, and a 500 ms lead
- * would want ~107 kB.
- */
 #define RING_TARGET_MS 350
 
-/*
- * How much unpaced audio a playback START puts in before the DAC begins pacing.
- *
- * i2s_channel_write() does not block until the descriptors are full, so the
- * first writes after the channel has been idle return at memory speed:
- * samples_played advances by the whole DMA depth against a wrote_at that has
- * barely moved, and every phase reading dated inside that window is measured
- * against a reference the DAC is not pacing.
- *
- * THE RETUNE HALF OF THIS QUESTION IS ANSWERED AND HAS BEEN REMOVED. It asked
- * whether i2s_channel_disable() discards the DMA descriptors or drains them,
- * because the two answers predict opposite signs for the phase step a retune
- * causes. Across the collected bench logs, 25 of 26 post-retune measurements
- * read `0 frames` and the twenty-sixth read 256 -- so it DRAINS, there is
- * nothing to refill, and the first write after a retune blocks immediately.
- * retune_output()'s closing comment already relies on that result. What used to
- * arm this after a retune, and the `s_refill_why` that told the two cases
- * apart, are gone with the question.
- *
- * The START case is not answered and is kept. Two measurements, both `1536
- * frames (34 ms)`, against packets arriving ~20 ms apart -- so roughly the
- * first one or two crossings of a fresh stream are dated against an unpaced
- * reference. Whether to withhold them is the open question; this is the
- * instrument that sizes it, and two samples is not yet enough to act on.
- *
- * Play task only -- it arms and clears these, so no volatile.
- */
-#define REFILL_FAST_US 1000     /* below this, the write did not block */
+#define REFILL_FAST_US 1000
 extern bool    s_refill_active;
 extern int32_t s_refill_frames;
 
-/* ----------------------------------------------------------------- drift */
-
-/*
- * RATE_TRIM_MAX_HZ -- the widest trim the servo may ask for, and the boundary
- * between its two actuators -- now lives in audio_shift.h, so that this unit
- * and the hub cannot disagree about how fast either may correct. The general
- * reasoning is there; what is this unit's own is that the COARSE case is not a
- * hypothetical here. i2s_start() is called with a hardcoded 44100 before any
- * stream exists, so a hub streaming a source measured at ~42600 is matched by
- * the servo walking tx_rate there in one step through retune_output(). That
- * happens once per stream, and software could not absorb it -- 40000 ppm drains
- * the ring in seconds.
- */
-
-/*
- * The FINE rate correction, in Hz, written by the servo and read by playback.
- *
- * This is what the servo used to hand to retune_output(). It now names a rate
- * the DAC is NOT running at: the clock stays put and playback consumes the ring
- * at an effective (tx_rate + rate_trim_hz) instead, by dropping one frame when
- * it needs to get through the stream faster and duplicating one when it needs
- * to get through it slower. Positive means playing late, so consume faster.
- *
- * Why it is worth the trouble: a clock retune takes the I2S channel down for
- * 1.7-6.2 ms, measured on the bench below, once every 20-45 s -- to apply +-4 Hz
- * against ~14 ppm of real drift. One frame in ~71000 is inaudible, and unlike a
- * retune it is continuous rather than stepped.
- *
- * Identical to the hub's, deliberately and to the arithmetic: unequal
- * correction between the two units is a cross-unit sync error by construction,
- * which is the same reason PHASE_DEADBAND_US is shared rather than per-unit.
- *
- * Persists across a playback restart, exactly as tx_rate does. Zeroed only when
- * a coarse retune moves the clock, because the clock then carries what this was
- * carrying.
- */
 extern volatile int32_t rate_trim_hz;
 
-/*
- * Playback volume, 0-127, AUDIO_VOL_MAX being unity.
- *
- * MEANINGLESS UNTIL audio_vol_known. This used to default to AUDIO_VOL_MAX, on
- * the rule that a satellite which never hears a MSG_VOL should play loud rather
- * than silent; audio_vol_effective() in audio_out.h is where that rule was
- * reconsidered and what replaced it. A satellite cannot play audio it has not
- * been sent, and whoever sends the audio sends the level, so there is nothing to
- * be loud for.
- *
- * Written by rx_task, read by playback, applied at the output. The hub sends
- * full-scale audio and this level separately, and both units run the same
- * integer taper on it, so two speakers told the same number produce the same
- * level.
- *
- * WRITE ORDER IS LOAD-BEARING: rx_task stores the level and only then sets
- * audio_vol_known. Both are single-byte volatile stores, so a reader that
- * observes the flag has necessarily observed the level that goes with it, and no
- * lock is needed for a pair this shape.
- */
 extern volatile uint8_t audio_volume;
 
-/*
- * Whether anything has ever said how loud, this boot.
- *
- * Sticky. A hub going away does not make the last level wrong -- it takes the
- * audio with it -- so nothing clears this. The fallback for a hub that never
- * speaks at all is a deadline in the play task, not a reset of this flag; see
- * audio_vol_effective() for why that distinction matters.
- */
 extern volatile bool audio_vol_known;
 
-/*
- * MSG_VOL messages taken, REPEATS INCLUDED.
- *
- * Counted before the change test, not after, which is the whole point: the fault
- * this exists to make visible is a unit that hears audio and never hears a level,
- * and that unit's symptom is silence on this counter while the level it is
- * playing at is stale. A counter that only moved on change could not tell that
- * apart from a level nobody has touched.
- *
- * On the TRIM line as `vol-rx`, so tools/soak/capture.py's KEYNUM pass turns it
- * into a metrics column with no parser change.
- */
 extern volatile uint32_t n_vol_rx;
 
-/*
- * Frames the fine rate trim has dropped from, and duplicated into, the stream.
- *
- * The instrument for rate_trim_hz, in before the trim was ever flashed: a
- * correction you cannot see in a log is a correction you cannot attribute.
- *
- * The rate is |rate_trim_hz| frames per second, by construction. Measured on
- * the first run that played: 501 frames in the 60 s window where the trim was
- * -14 then -10 Hz, and 220 where it was -6 then -2. Converging from the ~-32 ms
- * startup phase runs at ~14/s for a minute or two; steady state is ~1/s,
- * because real drift is 0.6 Hz and the trim is whole Hz; the depth net is 20/s.
- * See the hub's copy for the full table.
- *
- * Flat when rate_trim_hz is non-zero means the trim is not running; both
- * climbing together means the servo is hunting across zero.
- */
 extern volatile uint32_t n_trim_drops;
 extern volatile uint32_t n_trim_dups;
 
-/*
- * The faded catch-up: audio_shift.h is the mechanism, and these are its state.
- *
- * catchup_frames is the debt, in signed FRAMES: positive means skip that many
- * (playing late), negative means replay that many (early). servo_tick ARMS it
- * -- raises it toward the measured error, or clears it under CATCHUP_CLEAR_US
- * -- and play_task is the only thing that shrinks it, one chunk's shift at a
- * time as the crossfade actually spends it. Read wherever the phase error is
- * being reasoned about; the TRIM line prints the totals below it.
- *
- * The two counters are the catch-up's share of dropping/duplicating, kept
- * apart from n_trim_drops/n_trim_dups because they measure a different
- * mechanism with a different expected rate: the trim runs at |rate_trim_hz|
- * frames/s in normal service, the catch-up at up to 1376 frames/s for the few
- * seconds a large error takes to drain. On the soak this replaces, the same
- * error took over a minute of the boundary splice's 150 ms jumps instead.
- */
 extern volatile int32_t  catchup_frames;
 extern volatile uint32_t n_catchup_drops;
 extern volatile uint32_t n_catchup_dups;
 
-/*
- * What a retune costs. A COARSE-ONLY path since 2026-08-14 -- the servo reaches
- * it only when the correction exceeds RATE_TRIM_MAX_HZ, i.e. essentially only
- * when first matching the stream's rate.
- *
- * The channel is DOWN across disable/reconfig/enable, and real time passes with
- * no audio playing, so playback returns that far behind the timeline. This was
- * once thought to be offset by the disable DISCARDING the DMA buffer -- audio
- * already counted in samples_played -- which would skip content and push the
- * other way. It does not: the REFILL note below records 25 of 26 post-retune
- * measurements reading `0 frames`, so the disable DRAINS the descriptors and
- * there is nothing to refill. The step is simply the outage.
- *
- * These record it directly and the NET at the writer, which is what the servo
- * has to correct. The bench put it at 1.8-5.8 ms down against a 1.1-6.9 ms
- * step, mean 3.3 against 3.1 -- the step IS the outage, to within the several
- * ms phase wanders on its own between 5 s log ticks.
- */
 extern volatile int32_t retune_phase_before;
-extern volatile bool    retune_watch;  /* playback reports the next reading */
+extern volatile bool    retune_watch;
 extern volatile int64_t retune_outage_us;
 
-/*
- * When the retune finished, and how many crossings have been narrated since.
- *
- * MEASUREMENT ONLY -- the servo still withholds exactly one reading, so this
- * build behaves identically to the last and merely says more.
- *
- * The bench numbers behind the one-shot withholding were taken here: 19
- * same-rate retunes, net +4.4 ms against a 3.6 ms outage, every one positive,
- * the crossing landing 1-22 ms after the retune and inside the refill every
- * time. Crossings arrive one per packet, ~20 ms apart, so one withheld reading
- * covers perhaps the first of a disturbance that reaches 22 ms -- and whatever
- * is left goes to the servo as position error, so each retune injects what the
- * next one corrects. These lines say how far the tail actually reaches, which
- * is what sizes a settle window instead of guessing one.
- *
- * STILL OPEN, AND THE COLLECTED LOGS SAY IT REACHES FURTHER THAN THAT. Across
- * 78 narrated tail crossings the crossing lands 17 to 74 ms after the retune,
- * median 43 ms -- so the three narrated here do not reach the end of it, and
- * the single withheld RETUNE COST reading (which crossed 2.8 to 14 ms after)
- * covers only its beginning. The withheld reading is doing less than it looks.
- *
- * What the logs cannot settle is how much of that is the retune. `net` is
- * measured from the phase before the retune, so it carries whatever drift and
- * delivery jitter happened in the intervening 43 ms as well, and the largest
- * |net| seen (11.4 ms) is not attributable to the retune on this evidence.
- * Sizing a settle window needs the disturbance separated from the background,
- * which needs the bench retune (CONFIG_DANCEFLOOR_RETUNE_BENCH_S) on one unit
- * against an undisturbed reference -- that is what that option is for.
- */
 extern volatile int64_t retune_done_at;
 extern volatile uint8_t retune_tail_left;
 
-/*
- * Held across a retune, and the playback task parks on it.
- *
- * i2s_channel_write() returns IMMEDIATELY once the channel is disabled -- it
- * does not block, and dac_write() did not look at the return value -- so for
- * the whole outage the play task ran flat out: pulling chunks from the ring,
- * counting them in samples_played, feeding them to the visualiser, and throwing
- * them at a channel that was not running. Milliseconds of outage cost tens of
- * milliseconds of buffer.
- *
- * Measured on hardware: a 7.7 ms outage produced a +42 ms phase step, 5432
- * bytes overflowed the visualiser's buffer, and it re-aligned nine times in one
- * window. The short outages, where the task had less time to spin, cost +4 ms.
- *
- * The hub has had this since "a measured 54 ms correction cost 177 ms of
- * buffer". It was never ported here, and every satellite retune paid for it
- * until it was.
- *
- * Still required, and still cheap to keep: retunes are COARSE-ONLY since
- * 2026-08-14, so this now guards a path taken about once per stream instead of
- * every 20-45 s. The fine correction that replaced it never takes the channel
- * down and so never needs a park -- see rate_trim_hz.
- */
 extern volatile bool retuning;
-/*
- * True while the play task is inside its write loop, i.e. while something is
- * supposed to be feeding the DAC.
- *
- * Read from the I2S ISR, which is the only reason it exists: a starved channel
- * is a fault only if a writer was meant to be keeping up with it. Set by the
- * play task on either side of that loop and by nothing else, so it needs no
- * lock -- a torn read is not possible on a bool and the worst a stale one costs
- * is one counted or uncounted starve at a park boundary.
- *
- * The hub's s_playing is the same flag for the same reason; it predates this and
- * the servo already used it.
- */
+
 extern volatile bool playing;
 
-/*
- * SELF-MUTING: a satellite that cannot play takes itself off the hub's send
- * list, because on a shared radio its failure is not private.
- *
- * WHAT THIS IS FOR, measured on 2026-08-25. sat_s3's antenna was removed, taking
- * it to -98 dBm. It could no longer hear the hub -- but the hub, with a better
- * antenna and receiver, could still hear ITS probes, so it stayed registered and
- * the hub went on unicasting audio to a station that would never acknowledge
- * any of it. Every one of those frames was retried to the limit, and on a
- * half-duplex medium that airtime comes out of everyone else's share.
- *
- * sat_classic, whose own signal never moved, went from
- *
- *     pkts 253 | gap-max  59 ms | lead-min +216 ms | starved    0 ms
- * to  pkts 111 | gap-max 247 ms | lead-min -965 ms | starved 1039 ms
- *
- * and back the moment the antenna returned. One deaf speaker was taking the
- * floor down with it.
- *
- * PINNING THE PHY RATE DOES NOT FIX IT and was tried: at 24 Mbps the deaf
- * station fails every frame and burns the FULL retry chain each time, where
- * rate adaptation would at least have let it succeed occasionally at 1 Mbps.
- * The rate was never the lever. The retries are, and ESP-IDF exposes no retry
- * limit -- so the only remedy left is to stop sending to it at all.
- *
- * WHY THE SATELLITE DECIDES AND NOT THE HUB. The link is asymmetric: from the
- * hub's side a deaf satellite looks perfectly alive, because its probes keep
- * arriving. Only the satellite can see that nothing is coming back. So the unit
- * that knows takes itself out, and registration already has the mechanism --
- * the hub keeps a client for CLIENT_TIMEOUT_US after its last probe, so
- * "stop probing" IS "leave the send list", within two seconds and with no
- * protocol change.
- *
- * STARVATION IS THE TRIGGER, AND IT IS SAFE TO USE because out.c counts it only
- * while `playing` is true. When the source stops, every satellite parks and the
- * counter stops with it -- so an idle floor cannot mute itself, which would
- * otherwise have cost up to MUTE_RETRY_US of silence at the start of every
- * track. What remains is exactly the case worth acting on: the unit believes it
- * should be producing sound and is not.
- */
-
-/*
- * How long a unit must hear nothing before it gives up, and how little counts
- * as nothing.
- *
- * Three seconds is long enough that a burst of loss or one re-anchor does not
- * reach it -- both cost a few hundred ms and recover on their own -- and short
- * enough that the floor is not held under while it decides.
- *
- * MUTE_AUDIO_MIN is a tenth of what three seconds should deliver (~50 packets a
- * second, so ~150), not zero. The state being caught is not silence but a
- * trickle: the deaf satellite on 2026-08-25 read `pkts 3`, then 1, then 1, then
- * 0, and a threshold of zero would have waited for the one window in four that
- * happened to reach it.
- */
 #define MUTE_WINDOW_US   3000000
 #define MUTE_AUDIO_MIN   15
 
-/*
- * The signal below which "no audio" means deaf rather than idle.
- *
- * This is the whole of the idle-floor defence: between tracks nothing arrives
- * at ANY satellite, and muting then would cost up to MUTE_RETRY_US of silence
- * at the start of every track on every speaker. A unit that hears the AP well
- * and receives nothing is idle; one that hears it at -96 dBm is deaf.
- *
- * -85 dBm sits in a 30 dB gap rather than near either side of it: the healthy
- * units on that floor read -44 and -66, the deaf one -96. It is not a
- * sensitivity threshold and should not be tuned like one.
- */
 #define MUTE_RSSI_FLOOR  (-85)
 
-/*
- * When a muted unit comes back: WHEN THE SIGNAL RETURNS, not on a timer.
- *
- * It was a 10 s timer, and that flapped. Each retry re-registers the unit, so
- * the hub resumes unicasting to it for the trial window plus the three seconds
- * needed to establish it is still deaf -- roughly eight seconds of renewed
- * airtime theft out of every eighteen. On the 2026-08-25 17:05 run it cycled
- * eight times, and that is what "connects and disconnects many times before
- * really disconnecting" looks like from the room.
- *
- * The waste was blind guessing, and the answer sat in the mute's own log line
- * the whole time: `MUTING ... at -96 dBm`, then -98, -99, -100. A muted unit can
- * still read the AP's beacon -- esp_wifi_sta_get_ap_info() needs association,
- * not a place on the send list -- so it can watch for the antenna coming back
- * without rejoining to find out. While the signal stays down that costs the
- * floor nothing at all.
- *
- * MUTE_RSSI_REJOIN sits above MUTE_RSSI_FLOOR deliberately: 5 dB of hysteresis,
- * so a unit hovering at the threshold cannot chatter across it. Sustained for
- * MUTE_REJOIN_TICKS, so one lucky beacon does not count.
- */
 #define MUTE_RSSI_REJOIN  (-80)
-#define MUTE_REJOIN_TICKS 8         /* ~2 s at PROBE_PERIOD_MS */
+#define MUTE_REJOIN_TICKS 8
 
-/*
- * The fallback, and only that. If the signal never recovers the unit tries
- * anyway once a minute, because an RSSI that cannot be read -- or one that lies
- * -- must not be able to wedge a working speaker off the floor forever. Long,
- * because this is the case where retrying is known to be futile.
- */
 #define MUTE_RETRY_US   60000000
 
-/*
- * Grace after un-muting, before starvation counts again.
- *
- * A unit rejoining is starving BY CONSTRUCTION: the hub has to notice its probe,
- * the stream has to be re-anchored, and the ring has to fill. Judging it during
- * that would re-mute every trial immediately and the unit would never come back.
- * Sized well past a re-anchor, which ANCHOR_MIN_LEAD_US bounds at a few hundred
- * ms plus the wait for an anchorable packet.
- */
 #define MUTE_TRIAL_US    5000000
 
-/* Ticks of probe_task in one MUTE_WINDOW_US, which is the width of the arrival
- * history mute_tick() keeps. */
 #define MUTE_SLOTS       (MUTE_WINDOW_US / (PROBE_PERIOD_MS * 1000))
 
-extern volatile bool     self_muted;      /* true while off the hub's send list */
-extern volatile uint32_t n_self_mutes;    /* times it took itself off */
-extern volatile uint32_t n_self_retries;  /* times it tried coming back */
+extern volatile bool     self_muted;
+extern volatile uint32_t n_self_mutes;
+extern volatile uint32_t n_self_retries;
 
-
-
-/* ------------------------------------------------------------- module entry */
-/*
- * One prototype per thing another module calls. Anything absent from this list
- * is private to its file and should stay `static` there.
- */
-
-/* net.c -- joining the AP, and the socket everything rides on */
 void wifi_start_sta(void);
 void socket_start(void);
-/* Re-ask for the association when the backoff since the last drop is up. Must
- * be called periodically or a disconnected unit never comes back; the probe
- * task carries it. See wifi_retry_tick() for why it is not a task of its own
- * and not the vTaskDelay in the event handler it replaced. */
+
 void wifi_retry_tick(void);
 
-/* out.c -- the I2S channel, the write path, and retuning its clock */
 void i2s_start(uint32_t rate);
-/* How many times the DMA has run out of audio to send -- see on_tx_starved().
- * A running total, not a rate; a retune contributes by construction. */
+
 uint32_t dma_starve_count(void);
 void write_audio(const int16_t *frames, size_t n_frames, uint8_t vol);
 
-/* Put the output gain back to silence, so a stream starts with a fade in
- * rather than an edge. Called by playback when it begins feeding. */
 void write_audio_reset_ramp(void);
 void retune_output(uint32_t hz);
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 int64_t vis_master_to_local(int64_t master_us);
 #endif
 
-/* clock.c -- which offset to believe, and keeping it current */
 void probe_task(void *arg);
 bool clock_offset(int64_t *out, bool *used_tsf);
 void track_offset(void);
 
-/* rx.c -- demux, anchor and gap policy, decode, ring feed */
 void rx_task(void *arg);
 
-/* play.c -- the playback timeline */
 void play_task(void *arg);
 
-/* servo.c -- one 5 s window of rate control */
 void servo_tick(void);
 
-/* telemetry.c -- one 5 s window of reporting, and the allocator hook */
 void telemetry_tick(void);
-/* IRAM_ATTR is on the definition only: repeating the section attribute here
- * makes GCC complain that .iram1.1 conflicts with .iram1.0. */
+
 void on_alloc_failed(size_t size, uint32_t caps, const char *function_name);
