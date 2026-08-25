@@ -1,3 +1,13 @@
+/**
+ * @file patterns.cpp
+ * @brief The built-in patterns, and the registry visualiser.cpp selects from.
+ *
+ * patterns.hpp says what each one is for. What is here is the rendering, and
+ * every line of it obeys the rule at the top of analysis.hpp: the only inputs
+ * are the frame's own fields, and every animation is derived from the frame's
+ * SHARED instant rather than from anything local. That is what keeps two
+ * strips agreeing without either knowing the other exists.
+ */
 #include "patterns.hpp"
 
 #include <cmath>
@@ -6,8 +16,16 @@
 namespace df {
 namespace {
 
+/** @brief One LED's colour. */
 struct Rgb { uint8_t r, g, b; };
 
+/**
+ * @brief HSV to RGB.
+ * @param h  Hue, 0..360.
+ * @param s  Saturation, 0..1.
+ * @param v  Value, 0..1.
+ * @return The colour.
+ */
 Rgb hsv2rgb(float h, float s, float v)
 {
     const float c = v * s;
@@ -27,18 +45,33 @@ Rgb hsv2rgb(float h, float s, float v)
              static_cast<uint8_t>((bf + m) * 255.0f) };
 }
 
+/** @brief Clamp to 0..1. @param v The value. @return It, clamped. */
 float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
+/** @brief How long the hue takes to go round once. Slow enough that a static
+ *         room does not look frozen between hits, and derived from the frame's
+ *         shared instant rather than accumulated per render -- see the rule at
+ *         the top of analysis.hpp. */
 constexpr float HUE_PERIOD_US = 28.0f * 1000000.0f;
 
+/** @brief Time constant of the pulse envelope's decay, applied over the gap
+ *         between two frames' instants -- so a unit that rendered a different
+ *         number of times still decays by the same amount. */
 constexpr float DECAY_TAU_US = 140000.0f;
 
+/** @brief How much of each end of the strip the bass pushes colour into. */
 constexpr float EDGE_WIDTH = 0.15f;
 
+/** @brief The boom envelope's decay, longer than the pulse's because the drum
+ *         it follows is slower than the transients the wideband detector
+ *         fires on. */
 constexpr float BOOM_TAU_US = 260000.0f;
 
+/** @brief The one instance of each pattern. Static, so nothing allocates. */
 PulsePattern s_pulse;
-BoomPattern  s_boom;
+BoomPattern  s_boom;   /**< See s_pulse. */
+/** @brief The registry, in the shape the analyser one also uses: a static
+ *         table, no dynamic registration. */
 Pattern *const s_patterns[] = { &s_pulse, &s_boom };
 
 }
@@ -51,7 +84,9 @@ void PulsePattern::reset()
 
 void PulsePattern::render(const Frame &f, uint8_t *rgb, uint32_t count)
 {
-
+    /* Decayed over the gap between two frames' SHARED instants, not per render
+     * call and not against a local clock. A unit that dropped frames or
+     * rendered at a different rate still arrives at the same level. */
     if (last_due_us_ != 0 && f.due_us > last_due_us_) {
         const float dt = static_cast<float>(f.due_us - last_due_us_);
         level_ *= std::exp(-dt / DECAY_TAU_US);

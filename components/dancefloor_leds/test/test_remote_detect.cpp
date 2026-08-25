@@ -1,4 +1,20 @@
-
+/**
+ * @file test_remote_detect.cpp
+ * @brief Host test for the remote path: that a unit given bands over the wire
+ *        reaches the same decisions as the unit that computed them.
+ *
+ * df::RemoteDetect is meant to be the second half of df::Analysis::process(),
+ * line for line, so that the FFT can run in one place while every unit still
+ * decides its own onsets. This is what holds those two implementations
+ * together: it runs both over the same audio, through the actual wire format,
+ * and requires the detector fields to match.
+ *
+ * The lossy case is the other half. A unit that misses frames has a different
+ * flux history from its neighbours and WILL disagree on the marginal onsets --
+ * that is inherent, not a bug. What must be true is that it CONVERGES, within
+ * the history length, because that history is the only state there is. The
+ * case measures the worst disagreement streak and requires it to end.
+ */
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -156,6 +172,10 @@ int lossy(const std::vector<int16_t> &pcm, int *worst)
 
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
     const std::vector<int16_t> pcm = make_audio();

@@ -1,4 +1,20 @@
-
+/**
+ * @file test_pattern_sync.cpp
+ * @brief Host test for the one rule at the top of analysis.hpp: a Pattern must
+ *        be a pure function of the Frames it has been given.
+ *
+ * Breaking that rule does not fail loudly on a floor -- it fails as strips
+ * that agree at first and drift apart over minutes, which is expensive to
+ * diagnose. So it is enforced MECHANICALLY here, by running a pattern as two
+ * units that differ in every way two real units differ: when they joined, how
+ * many times each rendered, and which frames each lost. Byte-identical output
+ * is the requirement.
+ *
+ * DriftPattern is the control, and the reason this test can be trusted: it
+ * accumulates per render call, which is one of the ways the rule has actually
+ * been broken here, and the test REQUIRES it to fail. A conformance test with
+ * no failing case only proves it is not looking.
+ */
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -190,6 +206,10 @@ int gap(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
 
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
     const std::vector<int16_t> pcm = make_audio();

@@ -1,4 +1,27 @@
-
+/**
+ * @file test_align.c
+ * @brief Host test for the block alignment: that two units cut their analysis
+ *        windows at the same sample positions.
+ *
+ * The single most sync-critical property in this component, and the one
+ * nothing on a board can check -- a unit doing its own analysis exchanges
+ * nothing with its neighbours, which is exactly what makes them stay in step
+ * and exactly what makes a disagreement invisible. So it is checked here, by
+ * simulating two units side by side.
+ *
+ * The model mirrors visualiser.cpp's feed and analysis stages: a stream fifo,
+ * a byte counter, an origin published to a reader that counts from it. What
+ * the cases vary is everything a real floor varies -- when each unit joined,
+ * how the audio was chunked into it, whether one of them dropped bytes, and
+ * whether a splice went unreported. The requirement is always the same: the
+ * two units must cut identical blocks, and must recover to identical blocks
+ * after any of it.
+ *
+ * LABEL_CLOCK against LABEL_DUE is the case that justifies the design. Feeding
+ * from a CLOCK reading rather than from the scheduled instant is what an
+ * earlier version did, and the test carries it so the failure it produces is
+ * visible rather than argued about.
+ */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -6,23 +29,48 @@
 
 #include "analysis_config.h"
 
+/* The firmware's own window and hop, from the shared header rather than
+ * restated here -- a test cutting a different grid from the code would prove
+ * nothing about it. */
+/** @brief The analysis window. */
 #define FFT_N        DF_FFT_N
+/** @brief ...and the hop between windows. */
 #define HOP_N        DF_HOP_N
+/** @brief What one window carries into the next. */
 #define TAIL_N       DF_TAIL_N
+/** @brief Interleaved channels, as the firmware has them. */
 #define CHANNELS     2
+/** @brief Bytes per audio frame. */
 #define FRAME_BYTES  (CHANNELS * (int)sizeof(int16_t))
+/** @brief Bytes per analysis window. */
 #define BLOCK_BYTES  (FFT_N * FRAME_BYTES)
+/** @brief The simulated stream buffer's depth. */
 #define STREAM_BYTES (BLOCK_BYTES * 4)
+/** @brief Frames per feed call, so the audio arrives in chunks rather than all
+ *         at once -- a real caller feeds a packet at a time. */
 #define CHUNK_FRAMES 256
 
+/**
+ * @brief The simulated stream buffer.
+ *
+ * Holds one int64 per audio FRAME rather than samples: each carries the label
+ * that frame should end up with, so a window can be checked against what it
+ * was actually made of. That is the whole trick this test rests on -- the
+ * audio is its own expected answer.
+ */
 typedef struct {
-    int64_t frame[STREAM_BYTES / FRAME_BYTES];
-    int n;
+    int64_t frame[STREAM_BYTES / FRAME_BYTES];   /**< The labels. */
+    int n;                                       /**< How many are held. */
 } fifo_t;
 
+/** @brief Room left. @param f The fifo. @return Frames it can still take. */
 static int fifo_space(const fifo_t *f) {
     return (int)(sizeof(f->frame) / sizeof(f->frame[0])) - f->n;
 }
+/** @brief Push frames, taking only what fits -- the firmware's stream buffer
+ *         drops the rest, and so must this.
+ *  @param f  The fifo. @param src Labels. @param nframes How many.
+ *  @return How many were taken. */
 static int fifo_push(fifo_t *f, const int64_t *src, int nframes) {
     int room = fifo_space(f);
     int take = nframes < room ? nframes : room;
@@ -30,6 +78,9 @@ static int fifo_push(fifo_t *f, const int64_t *src, int nframes) {
     f->n += take;
     return take;
 }
+/** @brief Pop up to @p nframes frames.
+ *  @param f  The fifo. @param[out] dst Labels. @param nframes How many wanted.
+ *  @return How many were given. */
 static int fifo_pop(fifo_t *f, int64_t *dst, int nframes) {
     int take = nframes < f->n ? nframes : f->n;
     memcpy(dst, f->frame, (size_t)take * sizeof(int64_t));
@@ -38,41 +89,84 @@ static int fifo_pop(fifo_t *f, int64_t *dst, int nframes) {
     return take;
 }
 
+/** @brief The drift tolerance in FRAMES, matching ALIGN_DRIFT_US in
+ *         visualiser.cpp at the reference rate. */
 #define DRIFT_FRAMES (2 * 44100 / 1000)
 
+/** @brief Whether the simulated feed runs the drift check. Turned off to show
+ *         what an unreported splice costs WITHOUT it, which is what the check
+ *         was added for. */
 static int g_drift_check = 1;
 
+/** @brief One simulated unit: the feed side, the analysis side, and what its
+ *         windows turned out to be. Mirrors visualiser.cpp's state field for
+ *         field, because a model that simplified it would stop testing it. */
 typedef struct {
-    fifo_t   fifo;
+    fifo_t   fifo;                  /**< The stream buffer between the two sides. */
 
-    int      align_pending, mark_align_point, skip_frames;
-    uint32_t sent_total, align_at;
-    int64_t  pending_block_index, align_block_index;
-    uint32_t align_gen;
+    int      align_pending;         /**< An alignment is wanted. */
+    int      mark_align_point;      /**< The next bytes fed carry the origin. */
+    int      skip_frames;           /**< Part-hop still to drop before it. */
+    uint32_t sent_total;            /**< Frames fed since boot. */
+    uint32_t align_at;              /**< Where the origin falls in that count. */
+    int64_t  pending_block_index;   /**< The block index it lands on... */
+    int64_t  align_block_index;     /**< ...once published. */
+    uint32_t align_gen;             /**< Bumped when an origin is published. */
 
-    int64_t  ref_frame;
-    uint32_t ref_byte;
-    int      ref_valid, drifts;
+    int64_t  ref_frame;             /**< The reference pair the drift check... */
+    uint32_t ref_byte;              /**< ...extrapolates from. */
+    int      ref_valid;             /**< Whether it means anything yet. */
+    int      drifts;                /**< Times the check re-derived the origin. */
 
-    int64_t  raw[FFT_N];
-    int      filled;
-    uint32_t recv_total, epoch, seen_gen;
-    int64_t  block_index;
+    int64_t  raw[FFT_N];            /**< The window being filled. */
+    int      filled;                /**< How much of it. */
+    uint32_t recv_total;            /**< Frames taken from the fifo. */
+    uint32_t epoch;                 /**< Unused by the model; kept for symmetry. */
+    uint32_t seen_gen;              /**< The last origin this side adopted. */
+    int64_t  block_index;           /**< Counted from that origin. */
 
-    int      blocks, misaligned, mislabelled, drops, discontiguous;
-    int64_t  last_block_start, last_block_index;
+    int      blocks;                /**< Windows cut. */
+    int      misaligned;            /**< ...that did not start on a hop boundary. */
+    int      mislabelled;           /**< ...whose index did not match their audio. */
+    int      drops;                 /**< Frames the fifo refused. */
+    int      discontiguous;         /**< Windows that did not follow the last. */
+    int64_t  last_block_start;      /**< For the contiguity check. */
+    int64_t  last_block_index;      /**< Likewise. */
 
-    int64_t  worst_err;
+    int64_t  worst_err;             /**< Worst label error seen, in frames. */
 } unit_t;
 
+/** @brief Reset a unit to its boot state. @param u The unit. */
 static void unit_init(unit_t *u) {
     memset(u, 0, sizeof(*u));
     u->align_pending = 1;
 }
 
+/**
+ * @brief Label the audio from a CLOCK reading, which is the way that does not
+ *        work.
+ *
+ * Two units reach the feed a few milliseconds apart, so each labels the same
+ * audio differently and their block grids come apart by that skew. Carried
+ * here so the failure is visible rather than argued about; the two-unit case
+ * runs both modes and requires this one to disagree.
+ */
 #define LABEL_CLOCK 0
+/** @brief Label it by the SCHEDULED instant, which is what the firmware does:
+ *         every unit is handed the same instant for the same audio, so every
+ *         unit derives the same label. */
 #define LABEL_DUE   1
 
+/**
+ * @brief Feed one run of audio into a unit, the way visualiser_feed() does.
+ *
+ * @param u            The unit.
+ * @param first        Label of the first frame.
+ * @param nframes      How many frames.
+ * @param mode         LABEL_CLOCK or LABEL_DUE.
+ * @param skew_frames  How far this unit's own clock is from its neighbour's;
+ *                     only LABEL_CLOCK is affected by it, which is the point.
+ */
 static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_frames) {
     int64_t buf[CHUNK_FRAMES];
     for (int i = 0; i < nframes; i++) buf[i] = first + i;
@@ -117,14 +211,28 @@ static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_
     if (took < nframes) { u->align_pending = 1; u->drops++; }
 }
 
+/** @brief feed_mode() in the mode the firmware uses.
+ *  @param u  The unit. @param first First label. @param nframes How many. */
 static void feed(unit_t *u, int64_t first, int nframes) {
     feed_mode(u, first, nframes, LABEL_DUE, 0);
 }
 
+/** @brief The analysis side ignores alignment entirely -- the behaviour before
+ *         any of this existed, kept so the cases show what it costs. */
 #define READER_NONE 0
+/** @brief It honours the byte position but not the generation, so it cannot
+ *         tell a new origin from the old one. */
 #define READER_BYTE 1
+/** @brief It honours both, which is what visualiser_task() does. */
 #define READER_GEN  2
 
+/**
+ * @brief Drain what has been fed and cut windows from it, the way
+ *        visualiser_task() does, checking each one as it goes.
+ *
+ * @param u        The unit.
+ * @param variant  READER_NONE, READER_BYTE or READER_GEN.
+ */
 static void reader(unit_t *u, int variant) {
     int64_t tmp[FFT_N];
     int want = FFT_N - u->filled;
@@ -175,6 +283,9 @@ static void reader(unit_t *u, int variant) {
     u->filled = TAIL_N;
 }
 
+/** @brief One unit, fed evenly, against one reader variant.
+ *  @param variant  READER_NONE, READER_BYTE or READER_GEN.
+ *  @param name     What the line should say. */
 static void run(int variant, const char *name) {
     unit_t u; unit_init(&u);
     srand(12345);
@@ -198,6 +309,18 @@ static void run(int variant, const char *name) {
                ? "<-- BROKEN" : "aligned and labelled");
 }
 
+/**
+ * @brief A splice mid-stream: audio the timeline accounts for never arrives.
+ *
+ * @param realign  Whether the caller reports it, as visualiser_realign() does.
+ * @param check    Whether the drift check is on.
+ * @param name     What the line should say.
+ *
+ * The pair is the point. Reported, the origin is re-derived at the instant of
+ * the event. Unreported but checked, it is re-derived once the error grows
+ * past the tolerance. Neither, and every window from then on is mislabelled,
+ * for good.
+ */
 static void splice_case(int realign, int check, const char *name) {
     unit_t u; unit_init(&u);
     int64_t pos = 4096;
@@ -222,6 +345,17 @@ static void splice_case(int realign, int check, const char *name) {
                ? "<-- BROKEN" : "aligned and labelled");
 }
 
+/**
+ * @brief A hole in delivery: audio the timeline does NOT account for arrives,
+ *        or a run of it goes missing.
+ *
+ * @param check      Whether the drift check is on.
+ * @param size       How big the hole is, in frames.
+ * @param alternate  Whether to alternate the sign, so the errors could cancel
+ *                   -- which is the case a check comparing only against the
+ *                   last reading would miss.
+ * @param name       What the line should say.
+ */
 static void hole_case(int check, int size, int alternate, const char *name) {
     unit_t u; unit_init(&u);
     int64_t pos = 4096;
@@ -247,6 +381,18 @@ static void hole_case(int check, int size, int alternate, const char *name) {
                   : (u.worst_err > DRIFT_FRAMES + size ? "<-- UNBOUNDED" : "bounded"));
 }
 
+/**
+ * @brief TWO units, joining at different times with different clock skew, and
+ *        the requirement that they cut identical blocks.
+ *
+ * The case the whole file exists for. Under LABEL_DUE they must agree exactly,
+ * whatever the skew; under LABEL_CLOCK they must not, which is what says the
+ * test can tell the difference.
+ *
+ * @param mode     LABEL_CLOCK or LABEL_DUE.
+ * @param name     What the line should say.
+ * @param skew_ms  How far apart the two units' own clocks are.
+ */
 static void two_units(int mode, const char *name, int skew_ms) {
     unit_t a, b; unit_init(&a); unit_init(&b);
     int skew = skew_ms * 44100 / 1000;
@@ -268,6 +414,10 @@ static void two_units(int mode, const char *name, int skew_ms) {
            name, skew_ms, compared, mismatch, mismatch ? "<-- DISAGREE" : "identical");
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void) {
     printf("block alignment across dropped feeds:\n");
     run(READER_NONE, "feed-side discard only");

@@ -1,14 +1,35 @@
-
+/**
+ * @file test_beat_detect.c
+ * @brief Host test for the onset detector.
+ *
+ * Synthetic bands rather than recordings: what is pinned here is the
+ * detector's LOGIC -- that it fires on a rise and not on a decay, that the
+ * refractory window suppresses a double-trigger, that the adaptive threshold
+ * tracks a noise floor instead of firing on it, and that a timeline restart
+ * does not wedge the refractory gate. The tuning against real music is a
+ * separate exercise, done with the pattern harness over a corpus.
+ *
+ * Both units run this detector from the same code -- see df::RemoteDetect --
+ * so a case failing here is a cross-unit disagreement, not just a quality
+ * regression.
+ */
 #include "beat_detect.h"
 
 #include <stdio.h>
 #include <string.h>
 
+/** @brief One frame period at the reference rate and hop, so a case can space
+ *         its synthetic frames the way real ones arrive. */
 #define HOP_US 11610
+/** @brief Frames between beats at 120 BPM -- a tempo chosen only because it is
+ *         ordinary; nothing here tracks tempo. */
 #define FRAMES_PER_BEAT_120 43
 
+/** @brief Cases that did not hold; main() returns non-zero if any. */
 static int failures = 0;
 
+/** @brief Report one case. @param name What is pinned. @param cond Whether it
+ *         held. @param detail The measured figures, or NULL. */
 static void check(const char *name, bool cond, const char *detail)
 {
     printf("%-46s %s%s%s\n", name, cond ? "PASS" : "FAIL",
@@ -16,13 +37,22 @@ static void check(const char *name, bool cond, const char *detail)
     if (!cond) failures++;
 }
 
+/** @brief Seeded, so a failing run reproduces exactly. */
 static uint32_t rng_state = 0xbeef1234u;
+/** @brief A little band noise, so the adaptive threshold has something to
+ *         track rather than collapsing onto an exactly flat history.
+ *  @param amp  Amplitude. @return The sample. */
 static float noise(float amp)
 {
     rng_state = rng_state * 1664525u + 1013904223u;
     return ((float)((rng_state >> 8) & 0xffff) / 65535.0f - 0.5f) * 2.0f * amp;
 }
 
+/** @brief Build one frame of a decaying kick, bass-heavy and falling away over
+ *         the frames after the stroke.
+ *  @param[out] band     The four bands.
+ *  @param frames_since  Frames since the stroke.
+ *  @param level         Its peak level. */
 static void kick_frame(float band[BEAT_BANDS], int frames_since, float level)
 {
     float env = (frames_since < 0) ? 0.0f : level / (1.0f + (float)frames_since * 1.5f);
@@ -32,6 +62,10 @@ static void kick_frame(float band[BEAT_BANDS], int frames_since, float level)
     band[3] = 0.02f + env * 0.05f;
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
 

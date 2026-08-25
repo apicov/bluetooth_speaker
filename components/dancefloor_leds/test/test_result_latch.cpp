@@ -1,4 +1,26 @@
-
+/**
+ * @file test_result_latch.cpp
+ * @brief Host test for df::ResultLatch: that a slow analyser's answer reaches
+ *        the same frame on every unit.
+ *
+ * The latch is where a result waits for the moment it describes, and its
+ * correctness claim is a cross-unit one: every unit latches the same result
+ * into the same frame index REGARDLESS of when its own inference finished,
+ * which is the one thing about it that genuinely differs per board. So the
+ * cases publish at deliberately different times on two simulated units and
+ * require identical output.
+ *
+ * The rest are the failure modes that must not be hidden: a result that
+ * arrives too late is COUNTED rather than quietly landing in a later frame, an
+ * overrun is counted rather than dropped, a flush drops answers dated against
+ * a timeline that no longer exists, and a slot the unit computes itself is
+ * left alone.
+ *
+ * The two analysers at the end are a matched pair, and the second is the
+ * control: one keys its answer on the WINDOW, which is shared, and must
+ * converge across units; the other keys on its own CALL COUNT, which is not,
+ * and the test requires it to be caught.
+ */
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -311,6 +333,10 @@ void test_a_call_counting_analyser_is_caught()
 
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main()
 {
     std::printf("hop %d, one frame is %lld us\n\n", DF_HOP_N, (long long)HOP_US);

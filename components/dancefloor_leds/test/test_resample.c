@@ -1,4 +1,20 @@
-
+/**
+ * @file test_resample.c
+ * @brief Host test for the fixed-point resampler.
+ *
+ * Two kinds of case. The SIGNAL ones check it is a resampler at all: unity DC
+ * gain, an in-band tone surviving, a tone above the new Nyquist NOT folding
+ * back into the band, and an output count that tracks the ratio rather than
+ * being assumed.
+ *
+ * The other kind is about determinism, which is why this resampler is fixed
+ * point in the first place -- see resample.h. A unit running a model must
+ * produce the same answer as its neighbours, and the resampler is upstream of
+ * everything, so the filter table is pinned by CHECKSUM. The table is built
+ * with doubles, which are soft-float on both parts and so should come out
+ * identical; that is a real argument and also the kind that quietly stops
+ * being true, and this is what would notice.
+ */
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -8,11 +24,16 @@
 #include "resample.h"
 
 #ifndef M_PI
+/** @brief -std=c11 is strict enough to hide it. */
 #define M_PI 3.14159265358979323846
 #endif
 
+/** @brief Cases that did not hold; main() returns non-zero if any. */
 static int failures = 0;
 
+/** @brief Report one case, with the measured figures formatted in.
+ *  @param name  What is pinned. @param cond Whether it held.
+ *  @param fmt   printf format for the detail, then its arguments. */
 static void check(const char *name, int cond, const char *fmt, ...)
 {
     char detail[160];
@@ -24,6 +45,11 @@ static void check(const char *name, int cond, const char *fmt, ...)
     if (!cond) failures++;
 }
 
+/** @brief Amplitude at one frequency, by direct correlation against a
+ *         quadrature pair -- a one-bin DFT, which is all these cases need and
+ *         needs no FFT to be trusted.
+ *  @param x  Samples. @param n How many. @param hz The frequency.
+ *  @param rate  Their sample rate. @return The amplitude, 0..1 of full scale. */
 static double amplitude_at(const int16_t *x, int n, double hz, int rate)
 {
     double re = 0, im = 0;
@@ -35,6 +61,9 @@ static double amplitude_at(const int16_t *x, int n, double hz, int rate)
     return 2.0 * sqrt(re * re + im * im) / n / 32768.0;
 }
 
+/** @brief Fill a buffer with a sine.
+ *  @param[out] x  Samples. @param n How many. @param hz The frequency.
+ *  @param rate    Their sample rate. @param amp Amplitude, 0..1. */
 static void fill_sine(int16_t *x, int n, double hz, int rate, double amp)
 {
     for (int i = 0; i < n; i++) {
@@ -42,6 +71,15 @@ static void fill_sine(int16_t *x, int n, double hz, int rate, double amp)
     }
 }
 
+/** @brief Push through the resampler in chunks, as a real caller does.
+ *
+ * The chunking is the point: the phase accumulator must carry across calls, so
+ * a run split into pieces has to produce exactly what one call would.
+ *
+ *  @param r  The resampler. @param in Input. @param n How many.
+ *  @param[out] out  Output. @param max_out Room in it.
+ *  @param chunk     Input samples per call.
+ *  @return Output samples produced. */
 static int push_chunked(resampler_t *r, const int16_t *in, int n,
                         int16_t *out, int max_out, int chunk)
 {
@@ -54,6 +92,8 @@ static int push_chunked(resampler_t *r, const int16_t *in, int n,
     return produced;
 }
 
+/** @brief A constant comes out at the same level: the filter rows are
+ *         normalised to unity DC gain, per phase. */
 static void test_dc_gain_is_unity(void)
 {
     resampler_t r;
@@ -73,6 +113,8 @@ static void test_dc_gain_is_unity(void)
           "mean %.1f, expected 10000", mean);
 }
 
+/** @brief A tone well inside the new Nyquist survives decimation at close to
+ *         its original amplitude. */
 static void test_a_tone_in_band_survives(void)
 {
     resampler_t r;
@@ -87,6 +129,9 @@ static void test_a_tone_in_band_survives(void)
           "amplitude %.3f of full scale, sent 0.9", a);
 }
 
+/** @brief ...and one above it does NOT fold back into the band. This is the
+ *         case the tap count was raised for: energy in front of a model at a
+ *         frequency nobody played is worse than losing the top of the band. */
 static void test_a_tone_above_nyquist_does_not_alias(void)
 {
     resampler_t r;
@@ -102,6 +147,9 @@ static void test_a_tone_above_nyquist_does_not_alias(void)
           "alias amplitude %.4f, sent 0.9", folded);
 }
 
+/** @brief A second in is a second out, at every rate the bridge advertises --
+ *         the output count varies by one from call to call, and must still be
+ *         right in the aggregate. */
 static void test_output_count_tracks_the_ratio(void)
 {
     const struct { int in, out; } rates[] = {
@@ -129,6 +177,8 @@ static void test_output_count_tracks_the_ratio(void)
           ok ? "44.1/48/32/16 kHz all within 2 samples" : detail);
 }
 
+/** @brief resample_max_out() really does bound the output, so a caller sizing
+ *         its buffer from it cannot hit the silent drop. */
 static void test_max_out_bounds_what_is_produced(void)
 {
     resampler_t r;
@@ -149,6 +199,8 @@ static void test_max_out_bounds_what_is_produced(void)
           "worst run produced %d samples from 512", worst);
 }
 
+/** @brief A reset unit matches a fresh one exactly -- what resample_reset()
+ *         has to mean for a splice not to smear across the join. */
 static void test_reset_clears_the_history(void)
 {
     resampler_t a, b;
@@ -169,6 +221,9 @@ static void test_reset_clears_the_history(void)
           "%d vs %d samples", na, nb);
 }
 
+/** @brief The filter table's checksum, pinned. The table is built with
+ *         doubles, which should be identical on both cores; this is what would
+ *         notice if that ever stopped being true. */
 static void test_the_table_has_not_moved(void)
 {
 
@@ -193,6 +248,10 @@ static void test_the_table_has_not_moved(void)
 
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void)
 {
     test_dc_gain_is_unity();

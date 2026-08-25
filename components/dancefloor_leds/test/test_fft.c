@@ -1,21 +1,41 @@
-
+/**
+ * @file test_fft.c
+ * @brief Host test for the host FFT.
+ *
+ * fft_host.c exists so the analysis pipeline runs unchanged on a laptop, which
+ * is only worth anything if it computes the same transform the board does. So
+ * this checks it against a directly evaluated DFT: same normalisation, same
+ * natural bin order, same conventions as the vendor transform it stands in
+ * for.
+ *
+ * A slow reference on purpose. Two implementations that share an optimisation
+ * share its bugs.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
 #ifndef M_PI
+/** @brief -std=c11 is strict enough to hide it. */
 #define M_PI 3.14159265358979323846
 #endif
 #include <string.h>
 
 void df_fft_radix2(float *d, int n);
 
+/** @brief Cases that did not hold; main() returns non-zero if any. */
 static int failures;
+/** @brief Report one case. @param name What is pinned. @param ok Whether it
+ *         held. @param note The measured figures, or NULL. */
 static void check(const char *name, int ok, const char *note) {
     printf("%-46s %s  %s\n", name, ok ? "PASS" : "FAIL", note ? note : "");
     if (!ok) failures++;
 }
 
+/**
+ * @brief Run every case and report.
+ * @return 0 if all held, 1 otherwise, so `make check` fails the build.
+ */
 int main(void) {
     enum { N = 256 };
     static float in[N], buf[2 * N];

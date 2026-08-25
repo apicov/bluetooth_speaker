@@ -1,4 +1,14 @@
 
+/**
+ * @file analyser_tflm.cpp
+ * @brief The TFLM boilerplate every model-backed analyser would otherwise
+ *        repeat. analyser_tflm.hpp has the contract and the how-to.
+ *
+ * Every failure path here logs and returns false rather than asserting: a unit
+ * that cannot run its model must still light up from its neighbours, and
+ * df::Analyser::init() returning false is exactly what the lane is built to
+ * handle.
+ */
 #include "analyser_tflm.hpp"
 
 #if CONFIG_DANCEFLOOR_ML_TFLM
@@ -11,9 +21,11 @@
 
 namespace df {
 namespace {
+/** @brief Log tag. */
 constexpr const char *TAG = "tflm";
 }
 
+/* Declared in analyser_tflm.hpp, like everything below it. */
 TflmAnalyser::~TflmAnalyser()
 {
     delete interp_;
@@ -23,6 +35,8 @@ TflmAnalyser::~TflmAnalyser()
 
 bool TflmAnalyser::init(int frames_per_s)
 {
+    /* Re-entrant on a rate change: the arena and the interpreter survive, and
+     * only the subclass's hook needs telling. */
     if (ready_) {
         return on_rate(frames_per_s);
     }
@@ -54,7 +68,9 @@ bool TflmAnalyser::init(int frames_per_s)
     }
 
     if (interp_->AllocateTensors() != kTfLiteOk) {
-
+        /* The two causes are indistinguishable from here, so the message names
+         * both: the arena is too small, or an op the model uses is missing
+         * from the resolver. */
         ESP_LOGE(TAG, "%s: AllocateTensors failed with a %u B arena -- either it "
                       "is too small, or an op is missing from ops()",
                  name, (unsigned)arena_.bytes);
@@ -67,6 +83,12 @@ bool TflmAnalyser::init(int frames_per_s)
     ESP_LOGI(TAG, "%s: ready, %u of %u B used, arena in %s",
              name, (unsigned)arena_used(), (unsigned)arena_.bytes, arena_where());
 
+    /*
+     * Warned about, not refused. A float model is WRONG on a mixed floor --
+     * see analyser_tflm.hpp -- but it is not wrong on a floor of identical
+     * boards, and refusing to run one would make the bench case impossible.
+     * So it runs and says so.
+     */
     if (const TfLiteTensor *t = in(0)) {
         if (t->type != kTfLiteInt8 && t->type != kTfLiteUInt8) {
             ESP_LOGW(TAG, "%s: input is not quantised. Two units running this "
@@ -109,4 +131,4 @@ const char *TflmAnalyser::arena_where() const
 
 }
 
-#endif
+#endif /* CONFIG_DANCEFLOOR_ML_TFLM */

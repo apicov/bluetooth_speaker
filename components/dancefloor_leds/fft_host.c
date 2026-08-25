@@ -1,15 +1,41 @@
-
+/**
+ * @file fft_host.c
+ * @brief Radix-2 complex FFT for the host harness.
+ *
+ * The firmware uses esp-dsp, which is hardware-assisted and stays as it is.
+ * This exists so tools/pattern_lab and the unit tests can run the identical
+ * analysis pipeline on a laptop without pulling in ESP-IDF, and it compiles to
+ * nothing on a board.
+ *
+ * Two correct FFTs of the same input agree to float rounding, not bit for bit,
+ * so a threshold decision on a knife edge could in principle differ between
+ * the harness and the board. That is fine for designing patterns and would not
+ * be fine for anything claiming exact equivalence -- if that is ever needed,
+ * compile this on the target too and drop esp-dsp.
+ *
+ * Output is in natural bin order, matching esp-dsp's transform followed by its
+ * bit-reversal, and matching numpy. test_fft.c checks that against a directly
+ * evaluated DFT.
+ */
 #ifndef ESP_PLATFORM
 
 #include <math.h>
 
 #ifndef M_PI
+/** @brief -std=c11 is strict enough to hide it. */
 #define M_PI 3.14159265358979323846
 #endif
 
+/**
+ * @brief In-place radix-2 complex FFT.
+ *
+ * @param d  Complex interleaved, 2*n floats. Replaced by the transform, in
+ *           natural bin order.
+ * @param n  Transform length; must be a power of two.
+ */
 void df_fft_radix2(float *d, int n)
 {
-
+    /* Decimation in time: bit-reverse the input, then combine in place. */
     for (int i = 1, j = 0; i < n; i++) {
         int bit = n >> 1;
         for (; j & bit; bit >>= 1) {
@@ -47,4 +73,4 @@ void df_fft_radix2(float *d, int n)
     }
 }
 
-#endif
+#endif /* !ESP_PLATFORM */

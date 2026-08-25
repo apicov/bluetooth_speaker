@@ -1,4 +1,8 @@
-
+/**
+ * @file ml_arena.c
+ * @brief The tensor arena allocator. ml_arena.h has the contract and the
+ *        argument for why this asks for PSRAM and says which heap it got.
+ */
 #include "ml_arena.h"
 
 #include <string.h>
@@ -6,10 +10,15 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
+/** @brief Log tag. */
 static const char *TAG = "mlarena";
 
+/** @brief TFLM aligns its own tensors within the arena but assumes the arena
+ *         itself is aligned; an unaligned base silently costs the head of
+ *         it. */
 #define ARENA_ALIGN 16
 
+/* Declared in ml_arena.h, like the two below it. */
 bool ml_arena_take(ml_arena_t *a, size_t bytes, const char *name)
 {
     if (!a || bytes == 0) {
@@ -20,6 +29,15 @@ bool ml_arena_take(ml_arena_t *a, size_t bytes, const char *name)
         name = "model";
     }
 
+    /*
+     * PSRAM first, and only by explicit capability.
+     *
+     * With capability-only PSRAM allocation this is the only way to reach it,
+     * which is exactly the property that lets PSRAM be enabled at all without
+     * moving anything else. On a board with no PSRAM the capability simply
+     * cannot be satisfied and this returns NULL, which is the intended path
+     * and not an error -- hence no log here.
+     */
 #ifdef MALLOC_CAP_SPIRAM
     a->base = heap_caps_aligned_alloc(ARENA_ALIGN, bytes,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -33,6 +51,18 @@ bool ml_arena_take(ml_arena_t *a, size_t bytes, const char *name)
     }
 #endif
 
+    /*
+     * Internal SRAM, and said loudly.
+     *
+     * This is a satellite's only option and it is the one that hurts: the same
+     * heap the ring, the WiFi buffers and every stack come from, on a board
+     * with tens of kilobytes free while analysing. A model sized for the hub
+     * landing here does not fail at the allocation -- it fails later, as an
+     * audio dropout nobody connects to the model.
+     *
+     * So the free figures are printed beside the request. If the margin looks
+     * thin here it IS thin, and the answer is a smaller model.
+     */
     a->base = heap_caps_aligned_alloc(ARENA_ALIGN, bytes,
                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (a->base) {
