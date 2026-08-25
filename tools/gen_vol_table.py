@@ -1,40 +1,13 @@
 #!/usr/bin/env python3
-"""
-Generate the volume taper table in audio_out.h.
-
-The taper is LINEAR IN dB: every step of the AVRCP level is the same number of
-decibels, from FLOOR_DB at 1 up to unity at AUDIO_VOL_MAX. That is the whole
-design, and it is why the table is generated rather than written -- the property
-worth having is a relationship, and a relationship is easy to break by hand.
-
-It replaced a square law, which spent the slider unevenly: measured against the
-levels a phone actually sends (it steps in multiples of five), one click near the
-bottom was a 4-7 dB jump and one click near the top was half a decibel. The
-useful range was all crammed into the bottom of the travel, which is exactly
-where a square law has the least resolution to give.
-
-Floats live here and never in the firmware. The hub is an LX7 and the satellite
-an LX6, and a float evaluated on both could round differently and put the same
-stream out at two levels -- the same class of fault as the two disagreeing about
-rate. A constant table cannot: it is the same bytes in both images.
-
-    tools/gen_vol_table.py            # print the C literal for audio_out.h
-    tools/gen_vol_table.py --check    # print the dB the table actually realises
-
-Q16, unity 65536, because that is what makes the widening multiply in
-audio_volume_write_i32() exact: unity becomes a shift of 16 and nothing is
-discarded at any level. See audio_out.h.
-"""
 import argparse
 import math
 
-VOL_MAX = 127        # AVRCP's own range, sbc_link.h
-FLOOR_DB = -60.0     # the level at 1; 0 is a hard mute and is not on the curve
-UNITY = 65536        # q16
+VOL_MAX = 127
+FLOOR_DB = -60.0
+UNITY = 65536
 
 
 def gain(v):
-    """The q16 gain for level v."""
     if v <= 0:
         return 0
     if v >= VOL_MAX:
@@ -69,7 +42,6 @@ def check():
         print("%3d %8d %9.3f %s" % (v, t[v], db, step))
     assert all(t[v] > t[v - 1] for v in range(2, VOL_MAX + 1)), "not monotonic"
     assert t[0] == 0 and t[VOL_MAX] == UNITY
-    # The bound the exactness argument in audio_out.h rests on.
     worst = max(abs(x) * max(t) for x in (-32768, 32767))
     assert worst <= 2 ** 31, worst
     print("\nstrictly monotonic; endpoints exact; |in*g| <= 2^31 at the extremes")

@@ -1,39 +1,4 @@
 #!/usr/bin/env python3
-"""
-Syntax-check firmware sources without idf.py.
-
-Reuses the exact compile command a previous `idf.py build` recorded in
-build/compile_commands.json, but runs it with -fsyntax-only, so it needs no
-working IDF virtualenv and writes no objects. It catches what a full build
-catches short of linking: unbalanced preprocessor nesting, missing symbols,
-type errors, bad format strings.
-
-It is a fast check, not a substitute for a build. Two limits are worth knowing:
-
-  * A stale compile_commands.json describes the file list and flags of the last
-    real build, so a NEW source file has no entry until the project is
-    configured again -- the script says so rather than skipping silently.
-  * It only compiles the branches the LAST BUILD's sdkconfig selected. Code
-    behind a Kconfig symbol that was `n` is never seen, which is exactly where
-    an edit rots unnoticed. Use --with / --without to reach those branches:
-
-        tools/syntax_check.py satellite
-        tools/syntax_check.py satellite/main/play.c              # one file
-        tools/syntax_check.py satellite --with CONFIG_DANCEFLOOR_ENABLE_MARKER \\
-                                        --with CONFIG_DANCEFLOOR_MARKER_GPIO=4
-        tools/syntax_check.py satellite --with CONFIG_DANCEFLOOR_OUT_MONO \\
-                                        --without CONFIG_DANCEFLOOR_OUT_STEREO
-
-Overrides are applied by writing a patched COPY of the generated sdkconfig.h to
-a temporary directory and putting it first on the include path. Passing plain
--D does not work: it lands before the real sdkconfig.h, which then redefines the
-symbol, and IDF builds with -Werror.
-
-Kconfig dependencies are NOT modelled. `depends on` means real menuconfig would
-define a parent and its children together, so force them together -- otherwise
-you get an "undeclared" error that is an artifact of the override rather than a
-defect in the code.
-"""
 import json
 import shlex
 import shutil
@@ -53,7 +18,6 @@ def db_for(project: Path):
 
 
 def patched_config(cmd, sets, unsets, tmp: Path):
-    """Write a shadowing sdkconfig.h into tmp; return the -I flag for it."""
     real = None
     for a in cmd:
         if a.startswith("-I") and a.endswith("/config"):
@@ -76,11 +40,7 @@ def patched_config(cmd, sets, unsets, tmp: Path):
 
 
 def check(entry, sets, unsets) -> bool:
-    # shlex, not split(): the command carries -DIDF_VER=\"v6.0.1\", and naive
-    # splitting tears the quotes off and the compiler reports an unterminated
-    # string from <command-line>.
     cmd = shlex.split(entry["command"])
-    # Drop the object output and compile-only flag; add syntax-only.
     out = [a for i, a in enumerate(cmd)
            if a != "-c" and not (a == "-o" or (i and cmd[i - 1] == "-o"))]
     out.append("-fsyntax-only")
@@ -131,15 +91,11 @@ def main():
         project, want = target.parents[1], (ROOT / target).resolve()
 
     entries = db_for(ROOT / project)
-    # Only this project's own sources; components come along via the includes.
     maindir = ROOT / project / "main"
     mine = [e for e in entries if maindir in Path(e["file"]).parents]
     if not mine:
         sys.exit(f"no entries for {project}/main in compile_commands.json")
 
-    # Files added since the last configure have no entry. Every source in one
-    # component compiles with the same flags, so clone a sibling's and swap the
-    # filename -- that is what lets this check a split before idf.py has seen it.
     known = {Path(e["file"]).resolve() for e in mine}
     template = mine[0]
     for path in sorted(maindir.glob("*.c")):
