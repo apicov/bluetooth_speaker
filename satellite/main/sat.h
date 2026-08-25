@@ -1208,6 +1208,76 @@ extern volatile bool retuning;
  */
 extern volatile bool playing;
 
+/*
+ * SELF-MUTING: a satellite that cannot play takes itself off the hub's send
+ * list, because on a shared radio its failure is not private.
+ *
+ * WHAT THIS IS FOR, measured on 2026-08-25. sat_s3's antenna was removed, taking
+ * it to -98 dBm. It could no longer hear the hub -- but the hub, with a better
+ * antenna and receiver, could still hear ITS probes, so it stayed registered and
+ * the hub went on unicasting audio to a station that would never acknowledge
+ * any of it. Every one of those frames was retried to the limit, and on a
+ * half-duplex medium that airtime comes out of everyone else's share.
+ *
+ * sat_classic, whose own signal never moved, went from
+ *
+ *     pkts 253 | gap-max  59 ms | lead-min +216 ms | starved    0 ms
+ * to  pkts 111 | gap-max 247 ms | lead-min -965 ms | starved 1039 ms
+ *
+ * and back the moment the antenna returned. One deaf speaker was taking the
+ * floor down with it.
+ *
+ * PINNING THE PHY RATE DOES NOT FIX IT and was tried: at 24 Mbps the deaf
+ * station fails every frame and burns the FULL retry chain each time, where
+ * rate adaptation would at least have let it succeed occasionally at 1 Mbps.
+ * The rate was never the lever. The retries are, and ESP-IDF exposes no retry
+ * limit -- so the only remedy left is to stop sending to it at all.
+ *
+ * WHY THE SATELLITE DECIDES AND NOT THE HUB. The link is asymmetric: from the
+ * hub's side a deaf satellite looks perfectly alive, because its probes keep
+ * arriving. Only the satellite can see that nothing is coming back. So the unit
+ * that knows takes itself out, and registration already has the mechanism --
+ * the hub keeps a client for CLIENT_TIMEOUT_US after its last probe, so
+ * "stop probing" IS "leave the send list", within two seconds and with no
+ * protocol change.
+ *
+ * STARVATION IS THE TRIGGER, AND IT IS SAFE TO USE because out.c counts it only
+ * while `playing` is true. When the source stops, every satellite parks and the
+ * counter stops with it -- so an idle floor cannot mute itself, which would
+ * otherwise have cost up to MUTE_RETRY_US of silence at the start of every
+ * track. What remains is exactly the case worth acting on: the unit believes it
+ * should be producing sound and is not.
+ */
+
+/* Sustained starvation before a unit takes itself off the air. Long enough that
+ * a burst of loss or one re-anchor does not trigger it -- those cost a few
+ * hundred ms and recover on their own -- and short enough that the rest of the
+ * floor is not held under for long. */
+#define MUTE_AFTER_US    3000000
+
+/* How often a muted unit tries again. Every 10 s it probes for MUTE_TRIAL_US to
+ * find out whether the link came back, which is what makes plugging an antenna
+ * back in enough to recover with no intervention. The cost while a unit is
+ * genuinely broken is one short burst of airtime every 10 s, against the
+ * continuous drain it replaces. */
+#define MUTE_RETRY_US   10000000
+
+/*
+ * Grace after un-muting, before starvation counts again.
+ *
+ * A unit rejoining is starving BY CONSTRUCTION: the hub has to notice its probe,
+ * the stream has to be re-anchored, and the ring has to fill. Judging it during
+ * that would re-mute every trial immediately and the unit would never come back.
+ * Sized well past a re-anchor, which ANCHOR_MIN_LEAD_US bounds at a few hundred
+ * ms plus the wait for an anchorable packet.
+ */
+#define MUTE_TRIAL_US    5000000
+
+extern volatile bool     self_muted;      /* true while off the hub's send list */
+extern volatile uint32_t n_self_mutes;    /* times it took itself off */
+extern volatile uint32_t n_self_retries;  /* times it tried coming back */
+
+
 
 /* ------------------------------------------------------------- module entry */
 /*

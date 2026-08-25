@@ -336,11 +336,16 @@ void telemetry_tick(void)
                   " | gap-max %ld ms | "
                   "burst-max %" PRIu32 " | lead-min %s | lead-drop %" PRIu32
                   " | ring-low %s | fec-hold-max %ld ms"
-                  " | starved %" PRIu32 " ms | hub-rssi %s",
+                  " | starved %" PRIu32 " ms | hub-rssi %s%s",
              audio_rx_now - audio_rx_told, fec_parity_now - fec_parity_told,
              (long)(gap_max / 1000), burst_max, lead_s,
              lead_insane_now - lead_insane_told, ring_s,
-             (long)(hold_max / 1000), starved_ms, rssi_s);
+             (long)(hold_max / 1000), starved_ms, rssi_s,
+             /* Loud, and on the line that prints every window: a unit that has
+              * taken itself off the floor looks exactly like a dead one from
+              * anywhere else, and "why is that speaker silent" must not be a
+              * mystery. See self_muted in sat.h. */
+             self_muted ? "  ** SELF-MUTED, off the hub's send list **" : "");
     audio_rx_told = audio_rx_now;
     fec_parity_told = fec_parity_now;
     starve_told = starve_now;
@@ -370,6 +375,7 @@ void telemetry_tick(void)
                       " | alloc-fail %" PRIu32
                       " | clock %s (tsf %" PRIu32 "/probe %" PRIu32
                       ", wide-span %" PRIu32 ", tsf-read-fail %" PRIu32 ")"
+                      " | self-mutes %" PRIu32 " (retries %" PRIu32 ")"
                       " | phase-drop %" PRIu32 " short-reads %" PRIu32
                       " (%" PRIu32 " frames)"
                       " | dma-starve %" PRIu32 " short-resync %" PRIu32
@@ -387,6 +393,7 @@ void telemetry_tick(void)
                  n_alloc_fail,
                  tsf_fresh(esp_timer_get_time(), NULL) ? "TSF" : "probe",
                  n_tsf_used, n_tsf_fallback, n_tsf_wide, n_tsf_read_fail,
+                 n_self_mutes, n_self_retries,
                  n_phase_drop, n_short_reads, n_short_frames,
                  dma_starve_count(), n_gap_short_resyncs,
                  n_seq_dropped, n_decode_err, n_recv_err,

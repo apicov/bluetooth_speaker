@@ -38,6 +38,74 @@
 
 /* --------------------------------------------------------------- receiving */
 
+/*
+ * One tick of the self-mute state machine. True means "stay off the air".
+ *
+ * Three states, held in two timestamps: playing (both zero), muted (s_muted_at
+ * set), and on trial (s_trial_until in the future). The trial exists because a
+ * rejoining unit starves by construction -- see MUTE_TRIAL_US.
+ *
+ * Starvation is sampled as a DELTA rather than a level: dma_starve_count() is
+ * cumulative, so what matters is whether it moved since the last tick, which is
+ * "the DAC emitted silence in the last 250 ms". A unit that is playing properly
+ * never moves it at all.
+ */
+static bool mute_tick(void)
+{
+    static uint32_t prev_starve;
+    static int64_t  s_bad_since;     /* when the current bad stretch began */
+    static int64_t  s_muted_at;      /* when it went off the air; 0 = on */
+    static int64_t  s_trial_until;   /* grace after coming back */
+
+    const int64_t now = esp_timer_get_time();
+    const uint32_t starve = dma_starve_count();
+    const bool bad = (starve != prev_starve);
+    prev_starve = starve;
+
+    if (s_muted_at) {
+        if (now - s_muted_at < MUTE_RETRY_US) {
+            return true;
+        }
+        /* Try again. The clock starts afresh and the trial window keeps the
+         * rejoin's own starvation from being read as a verdict on it. */
+        s_muted_at = 0;
+        s_bad_since = 0;
+        s_trial_until = now + MUTE_TRIAL_US;
+        self_muted = false;
+        n_self_retries++;
+        ESP_LOGW(TAG, "trying the floor again after %d s off it",
+                 (int)(MUTE_RETRY_US / 1000000));
+        return false;
+    }
+
+    if (!bad || now < s_trial_until) {
+        s_bad_since = 0;             /* playing, or still being given a chance */
+        return false;
+    }
+    if (!s_bad_since) {
+        s_bad_since = now;
+        return false;
+    }
+    if (now - s_bad_since < MUTE_AFTER_US) {
+        return false;
+    }
+
+    /*
+     * Off. The hub drops this unit CLIENT_TIMEOUT_US after the probe that is
+     * not about to be sent, and stops spending airtime on frames it cannot
+     * acknowledge -- which is airtime every other speaker gets back.
+     */
+    s_muted_at = now;
+    s_bad_since = 0;
+    self_muted = true;
+    n_self_mutes++;
+    ESP_LOGE(TAG, "MUTING: starved for %d s and still not playing. Leaving the "
+                  "hub's send list so the rest of the floor gets the airtime; "
+                  "retrying every %d s.",
+             (int)(MUTE_AFTER_US / 1000000), (int)(MUTE_RETRY_US / 1000000));
+    return true;
+}
+
 void probe_task(void *arg)
 {
     (void)arg;
@@ -62,6 +130,22 @@ void probe_task(void *arg)
          * longer taken on the event loop's task.
          */
         wifi_retry_tick();
+
+        /*
+         * Whether this unit is fit to be on the floor at all, decided on this
+         * task's tick because this task is what puts it there -- see self_muted
+         * in sat.h for the measurement that made it necessary.
+         *
+         * Both sends are gated, not just the probe. MSG_SPLICE reaches
+         * client_seen() on the hub exactly as MSG_TIME_REQ does, so a track
+         * boundary landing during a mute would re-register the unit for another
+         * CLIENT_TIMEOUT_US and undo it, once per track, for as long as the
+         * fault lasted.
+         */
+        if (mute_tick()) {
+            vTaskDelay(pdMS_TO_TICKS(PROBE_PERIOD_MS));
+            continue;
+        }
 
         time_msg_t msg = { .type = MSG_TIME_REQ, .seq = seq++, .t1 = esp_timer_get_time() };
         sendto(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&dest, sizeof(dest));

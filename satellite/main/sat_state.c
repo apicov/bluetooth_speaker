@@ -82,6 +82,9 @@ volatile uint32_t n_gap_resyncs;  /* gaps too large to fill, re-anchored */
 volatile uint32_t n_anchor_upgrades;  /* provisional anchors replaced */
 volatile bool resync_request;
 volatile bool anchor_provisional;
+volatile bool     self_muted;
+volatile uint32_t n_self_mutes;
+volatile uint32_t n_self_retries;
 volatile uint32_t n_anchor_late;  /* anchors refused, play_at already past */
 volatile uint32_t n_anchor_soon;  /* anchors refused, one just happened */
 volatile uint32_t n_phase_drop;

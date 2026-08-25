@@ -62,6 +62,10 @@ COUNTERS = {
     # the unbounded version of that loop hung a satellite on 2026-08-25 with a
     # full ring and a starving DAC. See tsf_read() in satellite/main/sat.h.
     "tsf-read-fail",
+    # A satellite that took itself off the hub's send list because it could not
+    # play. Not a fault in itself -- it is the unit protecting the floor -- but
+    # it means one speaker was silent, and that must never be a mystery.
+    "self-mutes",
 }
 
 # What must stay at zero for a soak to have gone well, and what a non-zero
@@ -77,6 +81,7 @@ FAULTS = [
     ("retunes_refused", "a retune was refused as insane"),
     ("seq-drop",     "packets arrived older than expected"),
     ("tsf-read-fail", "a TSF seqlock read gave up -- the writer could not run (sat.h)"),
+    ("self-mutes",   "this unit went silent to stop starving the other speakers of airtime"),
     ("decode-err",   "SBC frames that would not decode"),
     ("recv-err",     "recvfrom() errors"),
     ("wifi-drops",   "lost association with the hub"),
