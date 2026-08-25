@@ -82,3 +82,6 @@ logs-*/
 # `doxygen Doxyfile` in that directory. The Doxyfile is the tracked input; the
 # HTML and the warning log it writes beside it are not.
 satellite/doc-gen/
+
+# Same for hub_s3/.
+hub_s3/doc-gen/

@@ -1,0 +1,70 @@
+# Doxygen configuration for the hub firmware.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as satellite/Doxyfile: the run is a CHECK, not just a renderer.
+# EXTRACT_ALL is off and WARN_IF_UNDOCUMENTED is on, so anything declared and
+# left undocumented is a warning rather than a silently empty page;
+# WARN_IF_DOC_ERROR catches an @param naming a parameter that does not exist.
+# A clean doc-gen/doxygen.warn is the coverage test.
+
+PROJECT_NAME           = "Dancefloor hub"
+PROJECT_BRIEF          = "Takes the bridge's SBC audio over SPI, keeps the master clock, streams to the satellites over WiFi"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = main
+FILE_PATTERNS          = *.c *.h
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build*/* */managed_components/*
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+# Without these Doxygen skips every #if-guarded block: the visualiser, the
+# marker instrument, the FEC layer and the open-AP branch. Numeric symbols
+# carry their Kconfig defaults; the feature bools default off in some cases
+# and are on here so the code they guard is still documented. They decide
+# what is DOCUMENTED, not what is built.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+PREDEFINED             = CONFIG_DANCEFLOOR_AUDIO_FEC_K=4 \
+                         CONFIG_DANCEFLOOR_ENABLE_VISUALISER=1 \
+                         CONFIG_DANCEFLOOR_ENABLE_MARKER=1 \
+                         CONFIG_DANCEFLOOR_WIFI_LOGS=1 \
+                         CONFIG_DANCEFLOOR_WIFI_CHANNEL=0 \
+                         CONFIG_DANCEFLOOR_WIFI_PHY_RATE_MBPS=6 \
+                         CONFIG_DANCEFLOOR_PUBLISH_FRAMES=1 \
+                         CONFIG_DANCEFLOOR_RETUNE_BENCH_S=0 \
+                         CONFIG_DANCEFLOOR_AP_OPEN=1 \
+                         CONFIG_DANCEFLOOR_DISABLE_PMF=1 \
+                         IRAM_ATTR= \
+                         __attribute__(x)=
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+HAVE_DOT               = NO
