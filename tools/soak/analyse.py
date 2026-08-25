@@ -748,7 +748,7 @@ def main():
                 continue
             par = gauge(met, u, "arrival", "fec-parity")
             par_n = int(par["value"].sum()) if par is not None and not par.empty else 0
-            if tx == 0 and par_n == 0:
+            if not tx_med and par_n == 0:
                 print(f"  {u}: {gaps:,} lost on the air, all of them silence --"
                       " this run had no parity to repair them.")
                 continue
