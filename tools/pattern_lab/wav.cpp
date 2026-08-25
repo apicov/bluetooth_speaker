@@ -1,3 +1,7 @@
+/**
+ * @file wav.cpp
+ * @brief The RIFF chunk walk behind wav_read(). Declared in wav.hpp.
+ */
 #include "wav.hpp"
 
 #include <cstdio>
@@ -5,9 +9,31 @@
 
 namespace {
 
+/**
+ * @brief Read exactly @p n bytes, or report failure.
+ * @param f  The open file.
+ * @param p  Where to put them.
+ * @param n  How many. A short read is a failure, not a partial success.
+ * @return True if all @p n arrived.
+ */
 bool rd(std::FILE *f, void *p, size_t n) { return std::fread(p, 1, n, f) == n; }
 
+/**
+ * @brief Little-endian 32-bit field, assembled by hand.
+ *
+ * RIFF is little-endian whatever the host is, so the bytes are shifted into
+ * place rather than cast through a pointer -- which would also be unaligned.
+ *
+ * @param p  Four bytes.
+ * @return Their value.
+ */
 uint32_t le32(const uint8_t *p) { return uint32_t(p[0]) | (p[1] << 8) | (p[2] << 16) | (uint32_t(p[3]) << 24); }
+
+/**
+ * @brief The same for a 16-bit field. @see le32
+ * @param p  Two bytes.
+ * @return Their value.
+ */
 uint16_t le16(const uint8_t *p) { return uint16_t(uint16_t(p[0]) | (p[1] << 8)); }
 
 }
@@ -25,6 +51,8 @@ bool wav_read(const std::string &path, Wav &out, std::string &err)
     int bits = 0;
     bool have_fmt = false;
 
+    /* Chunks in whatever order they come, skipping the ones this does not
+     * know, until data arrives or the file runs out. */
     for (;;) {
         uint8_t ch[8];
         if (!rd(f, ch, 8)) { err = have_fmt ? "no data chunk" : "no fmt chunk"; std::fclose(f); return false; }

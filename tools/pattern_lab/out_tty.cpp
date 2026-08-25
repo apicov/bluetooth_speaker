@@ -1,3 +1,8 @@
+/**
+ * @file out_tty.cpp
+ * @brief The escape codes, the bar glyphs and the sleep behind TtyRender.
+ *        Declared in out_tty.hpp.
+ */
 #include "out_tty.hpp"
 
 #include <chrono>
@@ -7,15 +12,29 @@
 
 namespace {
 
+/**
+ * @brief Monotonic microseconds, for pacing.
+ *
+ * steady_clock rather than system_clock: the render only ever measures
+ * intervals, and a clock that can be stepped backwards would stall it.
+ *
+ * @return Microseconds since an arbitrary origin.
+ */
 int64_t now_us()
 {
     using namespace std::chrono;
     return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+/** @brief Nine glyphs, so a band reads as a height rather than a number. */
 const char *BAR[9] = { " ", "▁", "▂", "▃", "▄",
                        "▅", "▆", "▇", "█" };
 
+/**
+ * @brief Pick the glyph for a band value.
+ * @param v  Nominally 0..1; anything outside is clamped rather than refused.
+ * @return One of BAR, never null.
+ */
 const char *bar(float v)
 {
     int i = (int)(v * 8.0f + 0.5f);
@@ -28,6 +47,8 @@ const char *bar(float v)
 
 void TtyRender::begin(int leds, const char *pattern_name)
 {
+    /* Not a terminal: the carriage returns below would make a mess of a file,
+     * and the caller has --png and --csv for that. */
     enabled_ = isatty(STDOUT_FILENO);
     if (!enabled_) {
         std::fprintf(stderr, "stdout is not a terminal -- skipping the live render\n");
@@ -47,9 +68,12 @@ void TtyRender::frame(const uint8_t *rgb, int leds, const df::Frame &f, double s
     frames_++;
     if (f.onset) {
         onsets_++;
-        onset_hold_ = 3;
+        onset_hold_ = 3;        /* one frame is under 12 ms; three is visible */
     }
 
+    /* Paced against the audio rather than against a frame counter: due_us is
+     * the instant this block would be heard, so sleeping until it keeps the
+     * render honest even on a machine slower than the strip. */
     if (speed > 0.0) {
         const int64_t due  = start_us_ + (int64_t)((double)f.due_us / speed);
         const int64_t wait = due - now_us();

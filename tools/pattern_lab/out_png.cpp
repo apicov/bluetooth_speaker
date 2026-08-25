@@ -1,3 +1,9 @@
+/**
+ * @file out_png.cpp
+ * @brief A PNG writer in eighty lines, since zlib is already linked for the
+ *        deflate and the rest of the format is three chunks. Declared in
+ *        out_png.hpp.
+ */
 #include "out_png.hpp"
 
 #include <cstdio>
@@ -7,12 +13,32 @@
 
 namespace {
 
+/**
+ * @brief Append a big-endian 32-bit value.
+ *
+ * PNG is big-endian throughout, which is the one thing about the format that
+ * has to be got right in more than one place.
+ *
+ * @param v  Grown by four bytes.
+ * @param x  The value to append.
+ */
 void be32(std::vector<uint8_t> &v, uint32_t x)
 {
     v.push_back(uint8_t(x >> 24)); v.push_back(uint8_t(x >> 16));
     v.push_back(uint8_t(x >> 8));  v.push_back(uint8_t(x));
 }
 
+/**
+ * @brief Write one PNG chunk: length, type, payload, CRC.
+ *
+ * The CRC covers the type and the payload but not the length, which is the
+ * detail the format gets wrong in every hand-rolled writer.
+ *
+ * @param f     Open for binary writing.
+ * @param type  Exactly four characters, not NUL-terminated on the wire.
+ * @param data  The payload; may be null when @p len is zero.
+ * @param len   Payload length.
+ */
 void chunk(std::FILE *f, const char *type, const uint8_t *data, size_t len)
 {
     std::vector<uint8_t> hdr;
@@ -34,6 +60,9 @@ bool png_write(const std::string &path, const uint8_t *rgb, int w, int h, std::s
 {
     if (w <= 0 || h <= 0) { err = "empty image"; return false; }
 
+    /* Every scanline is prefixed with a filter byte, and 0 means "none" --
+     * flat colour deflates well enough that choosing per line would buy
+     * nothing. */
     std::vector<uint8_t> raw;
     raw.reserve(size_t(h) * (size_t(w) * 3 + 1));
     for (int y = 0; y < h; y++) {
