@@ -14,6 +14,15 @@ build.*/
 sdkconfig.s3
 sdkconfig.s3.old
 
+# Same rule, for the parity-off image the K=4/K=0 A/B is measured against:
+#
+#   idf.py -B build.k0 -DSDKCONFIG=sdkconfig.k0 build
+#
+# Generated from sdkconfig with one symbol changed, so it is output like the
+# rest of them and not an input anybody should be editing.
+sdkconfig.k0
+sdkconfig.k0.old
+
 # Fetched by the component manager from idf_component.yml
 managed_components/
 dependencies.lock
