@@ -1,3 +1,32 @@
+/**
+ * @file converge.cpp
+ * @brief converge: how long a detector that missed frames takes to agree with
+ *        one that did not.
+ *
+ * Two units applying the same constants to the same bands make the same
+ * decisions only if they hold the same state, and the state is BEAT_HIST
+ * frames of flux history plus a refractory instant. So a unit that missed
+ * frames disagrees with its neighbours until that history has turned over.
+ * The turnover is BEAT_HIST frames exactly and needs no measuring; what needs
+ * measuring is how much of it is VISIBLE, since a difference in the threshold
+ * changes a decision only when the flux lands between the two thresholds. That
+ * smaller number is what a strip shows, and it is what this reports.
+ *
+ * The input is a pattern_lab --csv, and only its band0..band3 columns are
+ * read. That is a constraint rather than a convenience: Frame::band is four
+ * floats that already travel between units, while Frame::mag is 512 floats
+ * that are local-only and null on a received frame. A probe that needed mag
+ * would be measuring something a satellite could not do.
+ *
+ * C++ rather than C so the boom detector's constants can come from
+ * analysis.hpp. A tool with its own copy of what the firmware does measures
+ * something other than what it reports.
+ *
+ *   make && ./converge trace.csv --detector boom --gap 10
+ *
+ * @see BEAT_HIST in components/dancefloor_leds/include/beat_detect.h, which
+ *      carries the tuning argument this probe supplies the other half of.
+ */
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -8,16 +37,32 @@
 #include <string>
 #include <vector>
 
-#include "analysis.hpp"
+#include "analysis.hpp"      /* BOOM_* and, through it, beat_detect.h */
 
 namespace {
 
+/** @brief One pattern_lab --csv, reduced to what this probe reads. */
 struct Trace {
-    int window = 0, hop = 0, rate = 0;
-    std::vector<int64_t> t_us;
-    std::vector<std::array<float, BEAT_BANDS>> band;
+    int window = 0;   /**< FFT length the trace was cut with. */
+    int hop = 0;      /**< Samples between frames; the only thing that turns frames into milliseconds. */
+    int rate = 0;     /**< Sample rate the trace was analysed at. */
+    std::vector<int64_t> t_us;                            /**< Each frame's instant. */
+    std::vector<std::array<float, BEAT_BANDS>> band;      /**< Each frame's four band values. */
 };
 
+/**
+ * @brief Read a pattern_lab --csv into a Trace.
+ *
+ * The "# window=... hop=... rate=..." header is required, not decoration:
+ * every figure this program prints is in frames, and frames are only
+ * milliseconds once the hop is known. A trace without it is rejected rather
+ * than assumed.
+ *
+ * @param path  The CSV.
+ * @param out   Filled in on success.
+ * @param err   Set to a short reason when this returns false.
+ * @return True if the header was found and at least 64 frames were read.
+ */
 bool read_trace(const char *path, Trace &out, std::string &err)
 {
     std::FILE *f = std::fopen(path, "r");
@@ -33,8 +78,11 @@ bool read_trace(const char *path, Trace &out, std::string &err)
             }
             continue;
         }
-        if (line[0] == 'b') continue;
+        if (line[0] == 'b') continue;            /* the column header */
 
+        /* block,time_s,band0,band1,band2,band3,... -- everything past the
+         * bands is the firmware's own decisions, which this recomputes and
+         * must not read. */
         double time_s;
         float b[BEAT_BANDS];
         size_t blk;
@@ -54,11 +102,23 @@ bool read_trace(const char *path, Trace &out, std::string &err)
     return true;
 }
 
-enum class Which { Beat, Boom };
+/** @brief Which of the firmware's two detectors is under test. */
+enum class Which {
+    Beat,   /**< The wideband one, over all four bands. */
+    Boom,   /**< The low-band one; the upper three bands are masked to zero. */
+};
 
+/**
+ * @brief Set a detector up exactly as Analysis::init() sets it up.
+ *
+ * @param d               Zeroed and initialised in place.
+ * @param w               Which detector's constants to install.
+ * @param floor_override  Applied last when non-negative, so a sweep over the
+ *                        floor holds everything else at the shipped values.
+ */
 void configure(beat_det_t *d, Which w, float floor_override)
 {
-    beat_det_init(d);
+    beat_det_init(d);                       /* installs the wideband defaults */
     if (w == Which::Boom) {
         d->threshold_k   = df::BOOM_THRESHOLD_K;
         d->refractory_us = df::BOOM_REFRACTORY_US;
@@ -67,12 +127,26 @@ void configure(beat_det_t *d, Which w, float floor_override)
     if (floor_override >= 0.0f) d->flux_floor = floor_override;
 }
 
+/**
+ * @brief Reduce a frame to what the chosen detector sees.
+ * @param in  All four bands.
+ * @param w   Beat passes them through; Boom keeps band 0 and zeroes the rest,
+ *            which is how analysis.cpp reduces the same detector to the low
+ *            band alone.
+ * @return The bands to feed beat_det_update().
+ */
 std::array<float, BEAT_BANDS> masked(const std::array<float, BEAT_BANDS> &in, Which w)
 {
     if (w == Which::Beat) return in;
     return { in[0], 0.0f, 0.0f, 0.0f };
 }
 
+/**
+ * @brief A percentile, by nearest rank.
+ * @param v  Taken by value because it is sorted in place.
+ * @param p  0..1.
+ * @return The value at that rank, or 0 for an empty input.
+ */
 double pct(std::vector<int> v, double p)
 {
     if (v.empty()) return 0;
@@ -81,6 +155,7 @@ double pct(std::vector<int> v, double p)
     return v[std::min(i, v.size() - 1)];
 }
 
+/** @brief Print the option list to stderr. Used for -h and for a bad call. */
 void usage()
 {
     std::fprintf(stderr,
@@ -93,6 +168,21 @@ void usage()
 
 }
 
+/**
+ * @brief Run one reference detector over the whole trace, then one lagging
+ *        detector per trial, and report how they differ.
+ *
+ * Three figures come out, all per trial and reported as percentiles:
+ * state_*, the frames until the two thresholds are bit-equal, which is history
+ * equality and is bounded by BEAT_HIST by construction; converge_*, the frames
+ * until the last DISAGREEING decision, which is the visible number; and
+ * disagree_mean, how many decisions differed at all.
+ *
+ * @param argc  As usual.
+ * @param argv  As usual; see usage() for what is accepted.
+ * @return 0 on success, 1 on an unreadable or too-short trace, 2 on a bad
+ *         argument.
+ */
 int main(int argc, char **argv)
 {
     std::string path;
@@ -128,6 +218,8 @@ int main(int argc, char **argv)
 
     const int n = int(tr.t_us.size());
 
+    /* The reference unit: fed every frame, once, since it is the same run for
+     * every trial. */
     std::vector<char>  ref_onset(n);
     std::vector<float> ref_thresh(n);
     {
@@ -140,6 +232,11 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Trials are spread over the track rather than repeated at one point,
+     * because a loss during a quiet passage and a loss during a chorus are
+     * different events and the interesting figure is the tail. The margins
+     * keep every resume point clear of the warm-up at the start and leave room
+     * to observe convergence before the end. */
     const int lo = std::max(4 * BEAT_HIST, 64);
     const int hi = n - (8 * BEAT_HIST + gap) - 1;
     if (hi <= lo) { std::fprintf(stderr, "track too short for %d trials at BEAT_HIST %d\n", trials, BEAT_HIST); return 1; }
@@ -153,11 +250,14 @@ int main(int argc, char **argv)
         configure(&d, which, floor_override);
         int last = -1, count = 0, state = -1;
         for (int i = 0; i < n; i++) {
-            if (i >= s && i < resume) continue;
+            if (i >= s && i < resume) continue;           /* the frames it never saw */
             const auto b = masked(tr.band[i], which);
             const bool on = beat_det_update(&d, b.data(), tr.t_us[i], nullptr);
             if (i < resume) continue;
             if ((on ? 1 : 0) != ref_onset[i]) { last = i - resume; count++; }
+            /* The pure-state figure: the threshold is a function of the
+             * history alone, so bit-equality of it is history equality.
+             * Recorded to confirm the BEAT_HIST bound, not to discover it. */
             if (state < 0 && beat_det_last_threshold(&d) == ref_thresh[i]) state = i - resume;
         }
         last_disagree.push_back(last < 0 ? 0 : last + 1);
@@ -173,6 +273,8 @@ int main(int argc, char **argv)
         if (disagree_count[i] == 0) zero++;
     }
 
+    /* One line of key=value, so a sweep over BEAT_HIST reads as a table and
+     * sweep.py can parse it by splitting on whitespace. */
     std::printf("hist=%d detector=%s hop=%d gap=%d trials=%d "
                 "state_p50=%.0f state_p95=%.0f "
                 "converge_p50=%.0f converge_p95=%.0f converge_p95_ms=%.1f "
