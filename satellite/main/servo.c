@@ -63,8 +63,10 @@ void servo_tick(void)
      * alone would not notice until it was too late.
      *
      * The RAW reading, not the median -- which is where this unit differs from
-     * the hub. Whether it should also smooth is a question with an answer in
-     * the soak logs, and not one to settle as a side effect of sharing code. */
+     * the hub, deliberately. Whether it should also smooth is a real question,
+     * and the log line below prints raw, median and smoothed side by side so a
+     * soak can answer it. docs/open-questions.md carries the test and the
+     * decision that follows from each outcome. */
     int32_t ph = phase_valid ? phase_err_us : 0;
     const bool stepped = phase_stepped;
     if (phase_stepped) {
