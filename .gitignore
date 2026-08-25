@@ -94,3 +94,6 @@ components/*/doc-gen/
 
 # Same for bt_bridge/.
 bt_bridge/doc-gen/
+
+# Same for tools/.
+tools/doc-gen/

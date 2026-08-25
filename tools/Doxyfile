@@ -1,0 +1,60 @@
+# Doxygen configuration for the host-side tools.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as the firmware and component Doxyfiles: the run is a CHECK, not
+# just a renderer. EXTRACT_ALL is off and WARN_IF_UNDOCUMENTED is on, so
+# anything declared and left undocumented is a warning rather than a silently
+# empty page; WARN_IF_DOC_ERROR catches an @param naming a parameter that does
+# not exist. A clean doc-gen/doxygen.warn is the coverage test.
+#
+# Two settings here have no counterpart in the firmware Doxyfiles, and both are
+# load-bearing. PYTHON_DOCSTRING must be NO: left at its default the docstrings
+# below would be rendered as preformatted text with the special commands inert,
+# so every @param in this tree would be a literal five characters. And the input
+# is C++ as well as Python, so OPTIMIZE_OUTPUT_FOR_C is off.
+#
+# A module docstring needs no @file -- Doxygen documents a Python file as a
+# module from the docstring alone. Module-level constants do need a doc block,
+# either `## text` on the line above or `##< text` trailing.
+
+PROJECT_NAME           = "Dancefloor tools"
+PROJECT_BRIEF          = "Host-side harnesses that build, drive, capture and analyse the dancefloor"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = .
+FILE_PATTERNS          = *.py *.cpp *.hpp
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */__pycache__/* */logs-soak-*/* */doc-gen/*
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+EXTRACT_ANON_NSPACES   = YES
+OPTIMIZE_OUTPUT_FOR_C  = NO
+PYTHON_DOCSTRING       = NO
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = NO
+SEARCH_INCLUDES        = NO
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+HAVE_DOT               = NO
