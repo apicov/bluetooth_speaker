@@ -105,6 +105,34 @@ static bool mute_tick(void)
         s_trial_until = now + MUTE_TRIAL_US;
         self_muted = false;
         n_self_retries++;
+
+        /*
+         * AND THROW THE CLOCK AWAY, because muting stopped the probes that feed
+         * it and a stale offset is worse than none.
+         *
+         * Probes carry clock sync as well as registration, so a unit that has
+         * been off for MUTE_RETRY_US has an estimator whose newest sample is
+         * that old. Anchoring on it is what anchor_stream's "first anchor after
+         * a rejoin" warning exists to flag, and on the 2026-08-25 run this path
+         * produced exactly that, twice:
+         *
+         *   first anchor after a rejoin: PROBE ESTIMATOR, newest probe 28450 ms old
+         *   first anchor after a rejoin: PROBE ESTIMATOR, newest probe 42598 ms old
+         *
+         * The anchor lands displaced, and the servo then HOLDS the unit there
+         * rather than walking it off -- sat_s3 sat at phase -29 ms while
+         * sat_classic held -151 us. Recovered packets, and still out of sync
+         * with the floor, which is worse than staying muted.
+         *
+         * So the estimate goes with the mute. sync_est_settled() then refuses
+         * to anchor until a full window of fresh probes exists, which costs
+         * about 2.5 s of the trial and buys an anchor built on this side of the
+         * outage. The TSF reading is dropped for the same reason: `at` of zero
+         * is "never seen", so tsf_fresh() declines until the hub sends another.
+         */
+        sync_est_init(&est);
+        est_newest_at = 0;
+        tsf_publish(0, 0);
         ESP_LOGW(TAG, "trying the floor again after %d s off it",
                  (int)(MUTE_RETRY_US / 1000000));
         return false;
