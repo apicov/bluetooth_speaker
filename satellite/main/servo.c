@@ -13,35 +13,18 @@
  * running, how deep the ring is, which actuator a correction reaches, and
  * every log line.
  */
-#include <stdio.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/stream_buffer.h"
-#include "driver/gpio.h"
-#include "driver/i2s_std.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
-#include "esp_app_desc.h"
-#include "nvs_flash.h"
 
-#include "audio_out.h"
-#include "sync_proto.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+
 #include "audio_shift.h"
 #include "df_servo.h"
-#include "sbc_link.h"
-#include "sbc_decoder.h"
-#include "visualiser.h"
-#include "wifi_log.h"
+#include "sync_proto.h"
 
 #include "sat.h"
 

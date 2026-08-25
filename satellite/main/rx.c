@@ -29,33 +29,22 @@
  * block this task, a blocked task overflows the mailbox, and the overflow is
  * more loss. Faults are counted here and narrated by telemetry.c.
  */
-#include <stdio.h>
+#include <inttypes.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/stream_buffer.h"
-#include "driver/gpio.h"
-#include "driver/i2s_std.h"
-#include "esp_event.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "esp_netif.h"
-#include "esp_app_desc.h"
-#include "nvs_flash.h"
 
-#include "audio_out.h"
-#include "sync_proto.h"
-#include "sbc_link.h"
 #include "sbc_decoder.h"
+#include "sbc_link.h"
+#include "sync_proto.h"
 #include "visualiser.h"
-#include "wifi_log.h"
 
 #include "sat.h"
 
@@ -333,45 +322,42 @@ static bool fill_gap(uint32_t missing, uint32_t per_frames)
      * a gap that parity repairs adds to n_gaps and nothing to this. The two
      * together say how much was lost and how much of it was heard. */
     n_gap_frames += frames_missing;
-    {
 
-        if (frames_missing > (uint32_t)((uint64_t)GAP_RESYNC_MS * stream_rate / 1000)) {
-            n_gap_resyncs++;
-            resync_request = true;
-            have_seq = false;
-            return false;
+    if (frames_missing > (uint32_t)((uint64_t)GAP_RESYNC_MS * stream_rate / 1000)) {
+        n_gap_resyncs++;
+        resync_request = true;
+        have_seq = false;
+        return false;
+    }
+
+    /* A snapshot -- the playback task is draining the ring concurrently
+     * -- so the per-packet loop below still checks what it got. */
+    size_t room = xStreamBufferSpacesAvailable(ring);
+    uint32_t can_take = (uint32_t)(room / (AUDIO_CHANNELS * sizeof(int16_t)));
+    if (can_take < frames_missing) {
+        n_gap_short++;
+        n_gap_short_frames += frames_missing - can_take;
+        n_gap_short_resyncs++;
+        resync_request = true;
+        have_seq = false;
+        return false;
+    }
+
+    uint32_t filled = 0;
+    for (uint32_t i = 0; i < missing && filled < frames_missing; i++) {
+        uint32_t per = frames_missing - filled;
+        if (per > per_frames) {
+            per = per_frames;
         }
-
-        /* A snapshot -- the playback task is draining the ring concurrently
-         * -- so the per-packet loop below still checks what it got. */
-        size_t room = xStreamBufferSpacesAvailable(ring);
-        uint32_t can_take = (uint32_t)(room / (AUDIO_CHANNELS * sizeof(int16_t)));
-        if (can_take < frames_missing) {
+        uint32_t got = fill_gap_silence(per);
+        filled += got;
+        if (got < per) {
             n_gap_short++;
-            n_gap_short_frames += frames_missing - can_take;
+            n_gap_short_frames += per - got;
             n_gap_short_resyncs++;
             resync_request = true;
             have_seq = false;
             return false;
-        }
-
-        uint32_t filled = 0;
-        for (uint32_t i = 0; i < missing && filled < frames_missing; i++) {
-            uint32_t per = frames_missing - filled;
-            if (per > per_frames) {
-                per = per_frames;
-            }
-            uint32_t got = fill_gap_silence(per);
-            filled += got;
-            if (got < per) {
-
-                n_gap_short++;
-                n_gap_short_frames += per - got;
-                n_gap_short_resyncs++;
-                resync_request = true;
-                have_seq = false;
-                return false;
-            }
         }
     }
     return true;

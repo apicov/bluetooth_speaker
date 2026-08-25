@@ -6,33 +6,20 @@
  * carries interleaved 16-bit stereo and counts frames, and the widening to the
  * output word happens here, on the way to the DAC.
  */
-#include <stdio.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
+#include <inttypes.h>
+
+#include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/stream_buffer.h"
-#include "driver/gpio.h"
-#include "driver/i2s_std.h"
-#include "esp_event.h"
+
+#include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
-#include "esp_app_desc.h"
-#include "nvs_flash.h"
 
 #include "audio_out.h"
+#include "audio_shift.h"
 #include "sync_proto.h"
-#include "sbc_link.h"
-#include "sbc_decoder.h"
-#include "visualiser.h"
-#include "wifi_log.h"
 
 #include "sat.h"
 

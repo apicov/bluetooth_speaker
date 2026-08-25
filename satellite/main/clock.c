@@ -7,34 +7,20 @@
  * registration: the hub keeps a client for as long as its probes keep
  * arriving, so stopping them is how a satellite leaves the send list.
  */
+#include <arpa/inet.h>
 #include <inttypes.h>
-#include <stdio.h>
+#include <netinet/in.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/stream_buffer.h"
-#include "driver/gpio.h"
-#include "driver/i2s_std.h"
-#include "esp_event.h"
+
 #include "esp_log.h"
-#include "esp_heap_caps.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "esp_netif.h"
-#include "esp_app_desc.h"
-#include "nvs_flash.h"
 
-#include "audio_out.h"
 #include "sync_proto.h"
-#include "sbc_link.h"
-#include "sbc_decoder.h"
-#include "visualiser.h"
-#include "wifi_log.h"
 
 #include "sat.h"
 
