@@ -1,0 +1,64 @@
+# Doxygen configuration for the bridge firmware.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as hub_s3/Doxyfile, satellite/Doxyfile and the four component ones:
+# the run is a CHECK, not just a renderer. EXTRACT_ALL is off and
+# WARN_IF_UNDOCUMENTED is on, so anything declared and left undocumented is a
+# warning rather than a silently empty page; WARN_IF_DOC_ERROR catches an
+# @param naming a parameter that does not exist. A clean doc-gen/doxygen.warn
+# is the coverage test.
+
+PROJECT_NAME           = "Dancefloor bridge"
+PROJECT_BRIEF          = "Takes A2DP from the phone and forwards the undecoded SBC to the hub over SPI"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = main
+FILE_PATTERNS          = *.c *.h
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build*/* */managed_components/*
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+# Without these Doxygen skips the LED branches, which are #if-guarded on pins
+# that may be absent. Values are the Kconfig defaults; the link's SPI clock is
+# here because sbc_link.h reads it and this project includes that header.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+PREDEFINED             = CONFIG_BRIDGE_BT_DEVICE_NAME="Dancefloor" \
+                         CONFIG_BRIDGE_LED_CONNECTED_GPIO=32 \
+                         CONFIG_BRIDGE_LED_STREAMING_GPIO=33 \
+                         CONFIG_BRIDGE_LED_ACTIVE_LOW=1 \
+                         CONFIG_DANCEFLOOR_SBC_LINK_SPI_HZ=5000000 \
+                         IRAM_ATTR= \
+                         __attribute__(x)=
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+HAVE_DOT               = NO

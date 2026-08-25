@@ -91,3 +91,6 @@ hub_s3/doc-gen/
 # and its headers are the contract between them -- a component that is only
 # ever checked through whichever project happens to include it is not checked.
 components/*/doc-gen/
+
+# Same for bt_bridge/.
+bt_bridge/doc-gen/
