@@ -1,0 +1,55 @@
+# Doxygen configuration for the led_strip_wrapper component.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as hub_s3/Doxyfile and satellite/Doxyfile: the run is a CHECK, not
+# just a renderer. EXTRACT_ALL is off and WARN_IF_UNDOCUMENTED is on, so
+# anything declared and left undocumented is a warning rather than a silently
+# empty page. A clean doc-gen/doxygen.warn is the coverage test.
+
+PROJECT_NAME           = "Dancefloor LED strip wrapper"
+PROJECT_BRIEF          = "One C++ face over the managed led_strip driver, so the strip type is a build-time choice"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = .
+FILE_PATTERNS          = *.cpp *.hpp
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build*/* */managed_components/*
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+
+# NOT OPTIMIZE_OUTPUT_FOR_C: this component is a C++ class and that switch
+# would hide it.
+TYPEDEF_HIDES_STRUCT   = YES
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+PREDEFINED             = IRAM_ATTR= \
+                         __attribute__(x)=
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+HAVE_DOT               = NO

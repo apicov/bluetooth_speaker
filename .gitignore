@@ -85,3 +85,9 @@ satellite/doc-gen/
 
 # Same for hub_s3/.
 hub_s3/doc-gen/
+
+# Same for each component. They carry their own Doxyfile rather than being
+# swept up by the two firmware ones, because dancefloor_sync is linked by both
+# and its headers are the contract between them -- a component that is only
+# ever checked through whichever project happens to include it is not checked.
+components/*/doc-gen/

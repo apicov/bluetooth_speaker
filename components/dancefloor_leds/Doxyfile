@@ -1,0 +1,78 @@
+# Doxygen configuration for the dancefloor_leds component.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as hub_s3/Doxyfile and satellite/Doxyfile: the run is a CHECK, not
+# just a renderer. EXTRACT_ALL is off and WARN_IF_UNDOCUMENTED is on, so
+# anything declared and left undocumented is a warning rather than a silently
+# empty page; WARN_IF_DOC_ERROR catches an @param naming a parameter that does
+# not exist. A clean doc-gen/doxygen.warn is the coverage test.
+
+PROJECT_NAME           = "Dancefloor LEDs"
+PROJECT_BRIEF          = "Analysis, beat detection and the patterns the strip is drawn with"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = . include test
+FILE_PATTERNS          = *.c *.h *.cpp *.hpp
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build*/* */managed_components/*
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+
+# NOT OPTIMIZE_OUTPUT_FOR_C, unlike the other three: half of this component is
+# C++ and that switch hides the class structure the analysers are built on.
+TYPEDEF_HIDES_STRUCT   = YES
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+# Without these Doxygen skips every #if-guarded block: the ML lane, the remote
+# source, the LED marker and the strip-type branches. Values are the Kconfig
+# defaults, except the feature bools that default off, which are on here so
+# the code they guard is still documented. Only ONE of each choice group is
+# set, since the source treats them as mutually exclusive. They decide what is
+# DOCUMENTED, not what is built.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+PREDEFINED             = CONFIG_DANCEFLOOR_ENABLE_VISUALISER=1 \
+                         CONFIG_DANCEFLOOR_LED_GPIO=18 \
+                         CONFIG_DANCEFLOOR_LED_COUNT=8 \
+                         CONFIG_DANCEFLOOR_LED_BRIGHTNESS=10 \
+                         CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=1 \
+                         CONFIG_DANCEFLOOR_LED_MARKER_GPIO=2 \
+                         CONFIG_DANCEFLOOR_LED_MARKER_ACTIVE_LOW=1 \
+                         CONFIG_DANCEFLOOR_LED_PATTERN="pulse" \
+                         CONFIG_DANCEFLOOR_ML=1 \
+                         CONFIG_DANCEFLOOR_ML_TFLM=1 \
+                         CONFIG_DANCEFLOOR_ML_ARENA_KB=64 \
+                         CONFIG_DANCEFLOOR_ML_SLOTS=2 \
+                         CONFIG_DANCEFLOOR_LOG_PERIOD_S=20 \
+                         CONFIG_FREERTOS_HZ=100 \
+                         CONFIG_SPIRAM=1 \
+                         CONFIG_SPIRAM_USE_CAPS_ALLOC=1 \
+                         IRAM_ATTR= \
+                         __attribute__(x)=
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+HAVE_DOT               = NO

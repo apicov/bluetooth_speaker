@@ -1,0 +1,73 @@
+# Doxygen configuration for the dancefloor_sync component.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as hub_s3/Doxyfile and satellite/Doxyfile: the run is a CHECK, not
+# just a renderer. EXTRACT_ALL is off and WARN_IF_UNDOCUMENTED is on, so
+# anything declared and left undocumented is a warning rather than a silently
+# empty page; WARN_IF_DOC_ERROR catches an @param naming a parameter that does
+# not exist. A clean doc-gen/doxygen.warn is the coverage test.
+#
+# This component is the one both firmwares link, so its headers are the
+# contract between them -- which is exactly why it is checked on its own
+# rather than only through whichever project happens to include it.
+
+PROJECT_NAME           = "Dancefloor sync"
+PROJECT_BRIEF          = "The wire protocol, the shared rate servo and the audio shift both units correct with"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+# The tests are in: they pin the branches soaks found the hard way, so what
+# each case is holding down is worth documenting too.
+INPUT                  = . include test
+FILE_PATTERNS          = *.c *.h
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build*/* */managed_components/*
+# The test harness's own stub of the Kconfig header; PREDEFINED below supplies
+# those symbols, and documenting the stub would only duplicate them.
+EXCLUDE                = test/sdkconfig.h
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+# Without these Doxygen skips every #if-guarded block: the WiFi log relay and
+# the channel-mode branches. Values are the Kconfig defaults, except the
+# feature bools that default off, which are on here so the code they guard is
+# still documented. They decide what is DOCUMENTED, not what is built.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+PREDEFINED             = CONFIG_DANCEFLOOR_WIFI_LOGS=1 \
+                         CONFIG_DANCEFLOOR_SBC_LINK_SPI_HZ=5000000 \
+                         CONFIG_LOG_COLORS=1 \
+                         CONFIG_LOG_VERSION=1 \
+                         CONFIG_LOG_VERSION_1=1 \
+                         IRAM_ATTR= \
+                         __attribute__(x)=
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+HAVE_DOT               = NO

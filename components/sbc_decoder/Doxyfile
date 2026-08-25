@@ -1,0 +1,59 @@
+# Doxygen configuration for the sbc_decoder component.
+#
+# Run from this directory:  doxygen Doxyfile
+#
+# Same deal as hub_s3/Doxyfile and satellite/Doxyfile: the run is a CHECK, not
+# just a renderer. EXTRACT_ALL is off and WARN_IF_UNDOCUMENTED is on, so
+# anything declared and left undocumented is a warning rather than a silently
+# empty page. A clean doc-gen/doxygen.warn is the coverage test.
+#
+# ONLY THE WRAPPER IS IN. oi/ is the Android/Open Interface SBC decoder,
+# vendored under Apache-2.0 and carrying its own upstream comments. Rewriting
+# those would strip attribution context and make every future diff against
+# upstream unreadable, so the tree walk stops at this directory.
+
+PROJECT_NAME           = "Dancefloor SBC decoder"
+PROJECT_BRIEF          = "The wrapper the firmware decodes through; the codec itself is vendored in oi/"
+OUTPUT_DIRECTORY       = doc-gen
+OUTPUT_LANGUAGE        = English
+
+INPUT                  = . include
+FILE_PATTERNS          = *.c *.h
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */build*/* */managed_components/* */oi/*
+
+EXTRACT_STATIC         = YES
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = NO
+EXTRACT_LOCAL_CLASSES  = NO
+
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+JAVADOC_AUTOBRIEF      = NO
+ALWAYS_DETAILED_SEC    = NO
+REPEAT_BRIEF           = NO
+
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+WARN_LOGFILE           = doc-gen/doxygen.warn
+QUIET                  = YES
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = NO
+PREDEFINED             = IRAM_ATTR= \
+                         __attribute__(x)=
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HTML_OUTPUT            = html
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+HAVE_DOT               = NO
