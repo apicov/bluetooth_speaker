@@ -1,26 +1,3 @@
-#!/usr/bin/env python3
-"""
-sweep -- drive pattern_lab over the corpus and reduce its output to the tuning
-tables.
-
-This exists because the previous retune left no manifest. The booms-per-minute
-ladder in components/dancefloor_leds/analysis.cpp is the only record of it, and
-that comment does not say which tracks, which hop, or which command -- so
-reproducing it meant guessing at all three. Every number the retune rested on is
-produced by a subcommand here, so the command IS the provenance.
-
-Stdlib only, deliberately: this box has no numpy on either interpreter, and a
-tool whose job is to still run in a year should not acquire a dependency to
-compute a percentile.
-
-  ./sweep.py manifest                       the corpus, with sha256s
-  ./sweep.py control                        (re)generate the negative control
-  ./sweep.py baseline                       reproduce the hop-1024 record
-  ./sweep.py sweep --detector boom          the flux floor ladder
-  ./sweep.py hist                           BEAT_HIST, both axes
-  ./sweep.py instants                       boom instants, hop 1024 vs 512
-"""
-
 import argparse
 import concurrent.futures
 import hashlib
@@ -36,7 +13,7 @@ import wave
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent                      # the dancefloor tree
+ROOT = HERE.parent.parent
 LAB = ROOT / "tools" / "pattern_lab"
 
 ANCHOR_DIR = Path.home() / "dancefloor-tracks"
@@ -44,37 +21,21 @@ BREADTH_DIR = Path.home() / "Music" / "forro"
 ZABUMBA_DIR = Path.home() / "Music" / "zabumba"
 CACHE = Path(os.environ.get("DF_TUNING_CACHE", Path.home() / ".cache" / "dancefloor-tuning"))
 
-# The zabumba material is cut into labelled segments rather than used whole:
-# two of the six recordings are lessons, and one of those carries half a minute
-# of pure talking that is worth keeping on purpose as a negative control. The
-# table is checked in beside this file because a segment boundary is a tuning
-# input like any other. ./sweep.py segments shows how it was proposed; what is
-# checked in is what a human then confirmed by ear.
 ZAB_SEGMENTS = HERE / "zabumba_segments.csv"
 ZAB_LABELS = HERE / "zabumba_labels.csv"
 
-RATE = 44100                                    # df::RATE
+RATE = 44100
 
-# ffmpeg is pinned to the firmware's rate and channel count rather than left to
-# follow the source: pattern_lab analyses whatever rate the file carries, and a
-# 48 kHz decode would move every band edge relative to the tuning.
 FFMPEG = ["ffmpeg", "-v", "error", "-i", "{src}",
           "-ar", str(RATE), "-ac", "2", "-c:a", "pcm_s16le", "-y", "{dst}"]
 
-# The firmware's own marginal test, verbatim from visualiser.cpp: within 10% of
-# the threshold, counted PER FRAME. Per boom it would read as a 3x regression
-# where there is none -- the frame count doubled at hop 512 while the 200 ms
-# refractory held the boom count nearly constant.
 MARGIN = 0.1
 
-
-# --------------------------------------------------------------------------
-# corpus
 
 class Track:
     def __init__(self, label, source, wav, group, span=None):
         self.label, self.source, self.wav, self.group = label, source, wav, group
-        self.span = span               # (start_s, end_s) for a cut segment, else None
+        self.span = span
 
 
 def sha256(path):
@@ -97,12 +58,8 @@ def decode(src, dst):
 
 
 def corpus(groups, quiet=False):
-    """The tracks, decoding and caching the lossy half on first use."""
     out = []
     if "anchor" in groups:
-        # Top level only. xotes/ is excluded: roughly 60 of its 129 files are
-        # 44-byte headers with no audio and about 20 are advertising, neither of
-        # which is forro, and an average over them would not mean anything.
         for p in sorted(ANCHOR_DIR.glob("*.wav")):
             out.append(Track(p.stem, p, p, "anchor"))
     if "breadth" in groups:
@@ -129,24 +86,12 @@ def corpus(groups, quiet=False):
     return out
 
 
-# --------------------------------------------------------------------------
-# the zabumba set: isolated drumming, cut into labelled segments
-#
-# This is the only group with positive ground truth behind it, and the only one
-# on which "did it fire on a drum stroke" is answerable at all -- on a full mix
-# a rate ladder cannot tell a suppressed stroke from an absent one. It does not
-# replace the anchor set, which is lossless and carries the comparison against
-# the record; these six are lossy rips through room and camera mics and answer a
-# different question. Do not read one group's ladder as the other's.
-
 def zab_sources():
-    """The six recordings, whatever container they arrived in."""
     return sorted(p for p in ZABUMBA_DIR.iterdir()
                   if p.suffix.lower() in (".opus", ".mp4", ".m4a", ".wav", ".mp3"))
 
 
 def zab_full_wav(src):
-    """The whole recording at the firmware's rate, decoded once and cached."""
     dst = CACHE / "wav" / "zabumba" / (src.stem + ".full.wav")
     if not dst.exists():
         decode(src, dst)
@@ -154,14 +99,6 @@ def zab_full_wav(src):
 
 
 def zab_cut(src, start, end):
-    """
-    One segment, cut from the cached full decode with the stdlib wave module.
-
-    Cut here rather than with ffmpeg -ss so the boundary is an exact sample
-    index rather than whatever the container's seek lands on. The labels in
-    zabumba_labels.csv are instants within these cuts, so a boundary that moved
-    by a few milliseconds between runs would silently shift every one of them.
-    """
     dst = CACHE / "wav" / "zabumba" / f"{src.stem}.{start:g}-{end:g}.wav"
     if dst.exists():
         return dst
@@ -182,7 +119,6 @@ def zab_cut(src, start, end):
 
 
 def zab_segment_rows():
-    """The checked-in segment table, or an empty list before it is written."""
     if not ZAB_SEGMENTS.exists():
         return []
     rows = []
@@ -209,73 +145,31 @@ def zabumba_tracks(label, group):
     return out
 
 
-# --------------------------------------------------------------------------
-# the negative control
-
 def make_control(path, seconds=30):
-    """
-    Dither, a sustained accordion-ish chord that changes, and a triangle. No
-    drum anywhere in it.
-
-    This is the acceptance test at the low end of the ladder, and without it
-    "lower floor -> more booms" has no cost attached. analysis.cpp records that
-    0.02 produces exactly zero booms on such a passage and 0.012 produces about
-    three a minute; that is the only measurement in the original sweep that says
-    what the extra sensitivity costs.
-
-    It is not silence with a beep. The bass CHANGES -- a left hand moving every
-    two bars gives band 0 genuine rises to be wrong about -- and the triangle
-    puts continuous energy in the top band at eighth-note rate, which is exactly
-    the thing the boom detector exists to ignore. A floor that fires here is
-    following the music rather than the drum.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(20260804)              # seeded: the sha256 is in the manifest
+    rng = random.Random(20260804)
     n = seconds * RATE
-    bass_notes = [55.0, 61.74, 49.0, 65.41]    # A1, B1, G1, C2 -- inside band 0
+    bass_notes = [55.0, 61.74, 49.0, 65.41]
     frames = bytearray()
-    # Phase is integrated rather than computed as f*t, and the triangle gets a
-    # 3 ms attack rather than being switched on. Both are the same bug, and the
-    # first draft of this file had both: a step discontinuity is BROADBAND, so a
-    # note change and a gated 6.3 kHz sine were each dumping energy straight
-    # into band 0 -- 43 to 129 Hz, the only band the boom detector sees. It fired
-    # 66 times in 30 seconds on what was supposed to be material with no drum in
-    # it, and it was right to. The control has to be free of transients the
-    # detector is CORRECT to find, or it measures the synthesis and not the floor.
     phase_bass = 0.0
     phase_tri = 0.0
     for i in range(n):
         t = i / RATE
-        # A note every 500 ms, each with a 30 ms attack and a slow decay. This is
-        # the part that gives the control teeth: a bass note starting IS a rise
-        # in band 0, and it is not a drum. A drone would have been silent at
-        # every floor and would have proved nothing. 30 ms is a plucked or bowed
-        # bass; a zabumba's mallet stroke is nearer 5, and telling those apart is
-        # what the floor is being asked to do.
         note_t = t % 0.5
         f0 = bass_notes[int(t / 0.5) % len(bass_notes)]
         note_env = min(1.0, note_t / 0.030) * math.exp(-note_t * 1.2)
         phase_bass += 2 * math.pi * f0 / RATE
         phase_tri += 2 * math.pi * 6300.0 / RATE
-        # Calibrated, not chosen: this puts band 0's median at ~0.03, which is
-        # where the anchor corpus actually sits (Chororo 0.031, Alumiar 0.029)
-        # and what analysis.cpp records for real forro. The first draft used
-        # 0.20, which put band 0 at 0.31 -- ten times the music. At that level a
-        # steady sine's own leakage ripple, from a 55 Hz period that does not
-        # divide the window, swings the band by +-0.02 frame to frame, which is
-        # the whole flux floor. The control was measuring its own synthesis.
         env = 0.0137 * (0.95 + 0.05 * math.sin(2 * math.pi * 0.3 * t)) * note_env
         v = env * math.sin(phase_bass)
-        v += 0.5 * env * math.sin(3 * phase_bass)            # reedy, not pure
-        # Right hand, well above band 0.
+        v += 0.5 * env * math.sin(3 * phase_bass)
         for h in (392.0, 493.88, 587.33):
             v += 0.05 * math.sin(2 * math.pi * h * t)
-        # Triangle: eighths at 120 BPM, 3 ms attack then decay, 6.3 kHz.
         ph = t % 0.25
         if ph < 0.12:
             attack = min(1.0, ph / 0.003)
             v += 0.10 * attack * math.exp(-ph * 30.0) * math.sin(phase_tri)
-        v += rng.uniform(-1.0, 1.0) * 0.0005                 # dither
+        v += rng.uniform(-1.0, 1.0) * 0.0005
         s = max(-32768, min(32767, int(v * 20000)))
         frames += struct.pack("<hh", s, s)
     with wave.open(str(path), "wb") as w:
@@ -286,21 +180,7 @@ def make_control(path, seconds=30):
     print(f"wrote {path} ({seconds} s)", file=sys.stderr)
 
 
-# --------------------------------------------------------------------------
-# running pattern_lab
-
 def newest_source(*dirs):
-    """
-    mtime of the most recently touched file that goes into a host binary.
-
-    The cache below is keyed on (hop, hist) alone, which was silently wrong the
-    first time the component grew a feature: pattern_lab acquired --dump in
-    ac311de and every cached binary predated it, so a sweep run afterwards was
-    measuring the previous month's detector and reporting it as today's. A
-    cached artefact older than its sources is the one failure mode a tuning
-    harness cannot be allowed to have, since nothing about the output says which
-    code produced it.
-    """
     newest = 0.0
     for d in dirs:
         for pat in ("*.c", "*.cpp", "*.h", "*.hpp", "Makefile"):
@@ -310,7 +190,6 @@ def newest_source(*dirs):
 
 
 def build_lab(hop, hist=None):
-    """One binary per (hop, hist), cached, because a sweep rebuilds otherwise."""
     tag = f"hop{hop}" + (f".hist{hist}" if hist else "")
     out = CACHE / "bin" / f"pattern_lab.{tag}"
     if out.exists() and out.stat().st_mtime >= newest_source(LAB, ROOT / "components" / "dancefloor_leds"):
@@ -337,15 +216,6 @@ def run_dump(binary, wav, prefix):
 
 
 def read_band_dump(prefix):
-    """
-    Frame::band per frame, from pattern_lab --dump.
-
-    The reader half of this format is tools/pattern_lab/dump_load.py, which
-    needs numpy and says so. This one does not: four float32 per frame is a
-    struct.unpack, and everything here has to keep running on the stdlib.
-    Both read the same .meta sidecar, so a truncated file is caught here for
-    the same reason it is caught there.
-    """
     meta = {}
     for line in Path(str(prefix) + ".meta").read_text().splitlines():
         line = line.strip()
@@ -362,12 +232,6 @@ def read_band_dump(prefix):
 
 
 def metrics(csv):
-    """
-    Everything a table needs, from one pass over the trace.
-
-    Counted from the CSV rather than from pattern_lab's stderr summary so that
-    the boom count and the marginal rate are known to come from the same frames.
-    """
     frames = 0
     booms = onsets = 0
     marg_boom = marg_beat = 0
@@ -377,7 +241,7 @@ def metrics(csv):
     onset_at = []
     with open(csv) as f:
         for line in f:
-            if line[0] == "#" or line[0] == "b":       # header comment, column header
+            if line[0] == "#" or line[0] == "b":
                 continue
             c = line.rstrip("\n").split(",")
             if len(c) < 14:
@@ -456,9 +320,6 @@ def measure_all(tracks, binary, flags=(), jobs=None):
         return list(ex.map(lambda t: measure(t, binary, flags), tracks))
 
 
-# --------------------------------------------------------------------------
-# reporting helpers
-
 def rng_str(vals, fmt="{:.0f}"):
     if not vals:
         return "-"
@@ -469,9 +330,6 @@ def med(vals):
     return pctile(vals, 0.50)
 
 
-# --------------------------------------------------------------------------
-# subcommands
-
 def cmd_manifest(args):
     tracks = corpus(args.groups)
     print("| Track | Set | Source | s | Hz | sha256 |")
@@ -479,8 +337,6 @@ def cmd_manifest(args):
     for t in tracks:
         rate, secs = wav_info(t.wav)
         if t.span:
-            # A segment's source sha256 is shared with its siblings, so it does
-            # not identify the material a label is keyed to. The cut does.
             kind = f"{t.source.suffix.lstrip('.')}, cut {t.span[0]:g}-{t.span[1]:g} s"
             digest = sha256(t.wav)
         else:
@@ -509,12 +365,6 @@ def cmd_control(args):
 
 
 def cmd_baseline(args):
-    """
-    The gate. analysis.cpp records, at hop 1024 over the ten anchor tracks:
-    median low-band flux 0.0000, p90 0.016-0.019, p99 0.038-0.131, and 68-134
-    booms/min at floor 0.02. If this does not land there the harness is not
-    measuring what the record measured, and nothing after it means anything.
-    """
     lab = build_lab(1024)
     rows = measure_all(corpus(["anchor"]), lab)
     print("| Track | booms/min | onsets/min | marginal/frame | flux p50 | p90 | p99 |")
@@ -534,27 +384,6 @@ def cmd_baseline(args):
 
 
 def zab_seconds(binary, wav, window=1.0):
-    """
-    Per-window statistics for segmenting a recording into drumming and talking.
-
-    Three numbers, all from Frame::band so that nothing here can measure
-    something a satellite could not -- a rule rather than a coincidence:
-
-      b0      median band 0 -- 43-129 Hz, the mallet stroke's own band
-      rise    p90 of the frame-to-frame rise in band 0 -- transients, not level,
-              which is what separates drumming from a sustained low note
-      b1      median band 1 -- 172-1034 Hz, where a voice's vowels are
-      b2      median band 2 -- 1034-5039 Hz, where a voice's consonants are and
-              where the drum has almost nothing
-
-    A drum passage is high `rise`; a talking passage is low `rise` with band 1
-    still present, which is also what separates talking from the silence
-    between takes. Level alone would not do it: a ringing drum head and a
-    speaking voice can share a band-0 median, and only the rise tells them
-    apart. b2 was the obvious choice for the speech half and is the wrong one --
-    on these recordings it sits at 0.001-0.008 whether anyone is talking or
-    not, while b1 moves by a factor of ten.
-    """
     with tempfile.TemporaryDirectory() as td:
         prefix = Path(td) / "seg"
         run_dump(binary, wav, prefix)
@@ -578,14 +407,6 @@ def zab_seconds(binary, wav, window=1.0):
 
 
 def cmd_segments(args):
-    """
-    Propose the segment table, which is then confirmed by ear and checked in.
-
-    Proposed rather than written: this classifier is a convenience for finding
-    the boundaries, not evidence. What is checked in is what a human confirmed,
-    and that distinction is the whole point: a tuning input with no provenance
-    is worth nothing.
-    """
     lab = build_lab(args.hop)
     print("# proposed segments -- confirm by ear before checking in")
     print(f"# rise >= {args.rise} -> drum;  rise < {args.rise} and b1 >= {args.b1} -> speech")
@@ -606,9 +427,6 @@ def cmd_segments(args):
                 klass.append("speech")
             else:
                 klass.append("quiet")
-        # Runs, with short interruptions absorbed: a bar's rest inside a groove
-        # is not a segment boundary, and one struck drum inside a sentence is
-        # not a drum segment.
         runs = []
         for i, k in enumerate(klass):
             if runs and runs[-1][0] == k:
@@ -632,37 +450,11 @@ def cmd_segments(args):
             print(f"{src.stem},{a * args.window:g},{b * args.window:g},{k}")
 
 
-# --------------------------------------------------------------------------
-# ground truth
-#
-# The corpus has never had any. Every table the sweep produces is a rate -- booms
-# per minute against a floor -- plus a synthetic negative control, and a
-# rate says how OFTEN the detector fired, never whether it fired on a drum
-# stroke. On a full mix that gap cannot be closed: a suppressed stroke and an
-# absent one look identical from the outside. On isolated drumming it can, and
-# this is the machinery for closing it.
-#
-# The candidates below are generated deliberately over-sensitively. Rejecting is
-# quick and hunting is not, so the human pass should be reading a list that is
-# too long rather than searching the audio for what is missing.
-
-CAND_REFRACTORY_S = 0.060      # two candidates closer than this are one stroke
-CAND_RISE = 0.004              # deliberately far under any shipped flux floor
+CAND_REFRACTORY_S = 0.060
+CAND_RISE = 0.004
 
 
 def zab_candidates(binary, wav, offset=0.0):
-    """
-    Every plausible stroke instant in one segment, with a guess at its class.
-
-    Peaks in band 0's rise and in band 2's rise, merged. Both are needed: band 0
-    finds the mallet stroke on the big head, band 2 finds the stick stroke on
-    the thin one, and the second is not a distraction but the point -- the
-    tapa-confusion figure in cmd_zabumba is the number the band-0-only design
-    exists to keep small, and it cannot be computed without tapas labelled.
-
-    The guess is which of the two bands rose more. It is a guess; the ear
-    decides.
-    """
     with tempfile.TemporaryDirectory() as td:
         prefix = Path(td) / "cand"
         run_dump(binary, wav, prefix)
@@ -678,8 +470,6 @@ def zab_candidates(binary, wav, offset=0.0):
             v = rise[i][k]
             if v < CAND_RISE:
                 continue
-            # A local maximum over the window either side, so one stroke's
-            # attack ramp does not become four candidates.
             if any(rise[j][k] > v for j in range(i - 2, i + 3) if j != i):
                 continue
             peaks.append((i, k, v))
@@ -689,9 +479,6 @@ def zab_candidates(binary, wav, offset=0.0):
     for i, k, v in peaks:
         t = offset + i * hop / rate
         if out and t - out[-1][0] < CAND_REFRACTORY_S:
-            # Same stroke seen in both bands, or the tail of the previous one.
-            # Keep the stronger, and let a mallet stroke win a tie: a boom
-            # mislabelled tapa is the error that costs a real detection.
             if v > out[-1][2] or k == 0:
                 out[-1] = (out[-1][0], k if v > out[-1][2] else out[-1][1], max(v, out[-1][2]))
             continue
@@ -700,15 +487,6 @@ def zab_candidates(binary, wav, offset=0.0):
 
 
 def write_click_track(wav, cands, offset, dst):
-    """
-    The segment in one ear, a click at each candidate in the other.
-
-    This is the whole verification interface, and it is one file rather than a
-    UI because the judgement being asked for is "did that click land on a
-    stroke, and was it the right kind" -- which is a listening task. Boom
-    guesses click high, tapa guesses click low, so the class is audible too and
-    a mislabelled stroke does not need to be looked up.
-    """
     with wave.open(str(wav), "rb") as r:
         rate, ch, width = r.getframerate(), r.getnchannels(), r.getsampwidth()
         n = r.getnframes()
@@ -738,7 +516,6 @@ def write_click_track(wav, cands, offset, dst):
 
 
 def read_labels():
-    """file -> [(t_s, class)], from the checked-in hand-verified table."""
     out = {}
     if not ZAB_LABELS.exists():
         return out
@@ -754,13 +531,6 @@ def read_labels():
 
 
 def cmd_label(args):
-    """
-    Generate candidates and a click track for the human pass.
-
-    Instants are absolute seconds into the full recording, not offsets into a
-    segment, so that moving a segment boundary later does not silently shift
-    every label inside it.
-    """
     lab = build_lab(args.hop)
     have = read_labels()
     rows = [r for r in zab_segment_rows() if r[3] == "drum"]
@@ -821,15 +591,6 @@ def cmd_sweep(args):
 
 
 def cmd_hist(args):
-    """
-    BEAT_HIST on both of its axes at once, because it is the only constant here
-    whose meaning changed rather than its scale, and because the second axis is
-    invisible to the corpus.
-
-    Left half: what the music says -- rate, marginal frames, and how noisy the
-    threshold estimate is. Right half: what a lost frame costs, from converge,
-    which is the sync axis the third source mode will care about.
-    """
     tracks = corpus(args.groups)
     print(f"# BEAT_HIST at hop {args.hop}")
     print()
@@ -842,10 +603,6 @@ def cmd_hist(args):
         rows = measure_all(tracks, lab)
         span_ms = hist * args.hop * 1000.0 / RATE
 
-        # One trace for the probe, written once and reused at every HIST. The
-        # bands are an output of the FFT and the band edges, neither of which
-        # BEAT_HIST touches, so re-deriving them per row would only introduce a
-        # second thing that moves.
         probe_csv = CACHE / f"probe.hop{args.hop}.csv"
         if not probe_csv.exists():
             run_lab(lab, tracks[0].wav, probe_csv)
@@ -879,12 +636,6 @@ def build_converge(hist, hop):
 
 
 def cmd_instants(args):
-    """
-    Whether it is the same detector on a finer grid, or a different one with a
-    similar count. Counts alone cannot tell those apart -- a matched count with
-    shifted timing is a different detector -- so every hop-1024 boom is matched
-    to the nearest hop-512 boom and the distances are reported.
-    """
     flags = []
     if args.boom_floor is not None:
         flags = ["--boom-floor", str(args.boom_floor)]
@@ -901,8 +652,6 @@ def cmd_instants(args):
         d = [min((abs(x - y) for y in b), default=9.9) for x in a]
         w12 = sum(1 for x in d if x <= 0.012)
         w23 = sum(1 for x in d if x <= 0.023)
-        # Unmatched in the other direction: a hop-512 boom with no hop-1024 boom
-        # near it is extra sensitivity, which is expected and is not a failure.
         e = [min((abs(y - x) for x in a), default=9.9) for y in b]
         u512 = sum(1 for x in e if x > 0.023)
         print(f"| {t.label} | {len(a)} | {len(b)} | {100*w12/max(1,len(a)):.0f}% | "
@@ -916,8 +665,6 @@ def cmd_instants(args):
           f"{100*tot[3]/max(1,tot[0]):.1f}% within one window; "
           f"{tot[4]} hop-1024 booms unmatched, {tot[5]} hop-512 booms new")
 
-
-# --------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
