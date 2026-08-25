@@ -403,7 +403,44 @@ extern volatile bool    splice_report_pending;
  * (rx_task, in the MSG_TSF arm) and several readers. The writer never blocks;
  * a reader retries only if a publish overlapped it. Do not add a second writer
  * without replacing this -- a seqlock with two writers is silently broken.
+ *
+ * THE RETRY IS BOUNDED, AND THAT IS NOT BELT-AND-BRACES. It hung a board.
+ *
+ * On the 2026-08-25 soak sat_classic stopped playing with its ring still full
+ * at 323 ms, the DAC starving 4992 ms of every 5 s window, and the task
+ * watchdog firing eight times on IDLE1. Every one of the eight backtraces was
+ * inside this reader's retry loop, and `ring-low` read `none` -- the playback
+ * inner loop had not run at all.
+ *
+ * The loop used to be `while ((s0 & 1u) || s0 != tsf.seq)`, unbounded and with
+ * no yield in it. `tsf.seq` is odd for exactly the window between the writer's
+ * two increments, and a reader that enters while it is odd can only leave when
+ * the writer finishes. play_task is priority 8 PINNED TO CORE 1; rx_task, the
+ * writer, is priority 7 and unpinned. A publish executing on core 1 when
+ * playback becomes ready is preempted by it, and playback then spins forever
+ * waiting for the writer it just displaced -- seqlock priority inversion, and
+ * the reader spinning is what prevents the writer from ever completing.
+ *
+ * The exact route that left seq odd on that run is not recoverable from the
+ * log, and it does not need to be. An unbounded wait for another task, taken
+ * with no lock and no yield, is wrong whatever leads into it: any route that
+ * leaves seq odd wedges the unit permanently, and one did.
+ *
+ * So the reader gives up instead. Failing costs one chunk's worth of the
+ * estimator, which is the fallback that already exists here for the case where
+ * TSF is simply unavailable, and which every caller already handles.
  */
+
+/*
+ * How many times a reader retries before falling back to the estimator.
+ *
+ * Real contention needs one retry: the writer's critical section is four stores
+ * and two fences, far shorter than a reader's pass. Eight is well past any
+ * legitimate collision, so reaching the end of them means the writer is not
+ * running -- which is the pathological case this bound exists for, not a busy
+ * one to be waited out.
+ */
+#define TSF_READ_TRIES 8
 typedef struct {
     volatile uint32_t seq;      /* odd while a write is in progress */
     volatile int64_t  offset_us;
@@ -423,17 +460,43 @@ static inline void tsf_publish(int64_t offset_us, int64_t at)
     tsf.seq++;                              /* even again: consistent */
 }
 
-/* Reader side. Returns a pair that was published together. */
-static inline void tsf_read(int64_t *offset_us, int64_t *at)
+/*
+ * Reads that gave up after TSF_READ_TRIES and fell back to the estimator.
+ *
+ * MUST BE ZERO. The writer's critical section is a handful of stores, so losing
+ * eight races in a row does not happen to a healthy system -- this counts the
+ * condition that used to hang the board instead, and any movement at all means
+ * the writer was unable to run while a reader wanted it. One is worth
+ * investigating; a rate here is the priority inversion recurring, and the fix
+ * would be to stop pinning playback above the writer rather than to raise
+ * TSF_READ_TRIES.
+ */
+extern volatile uint32_t n_tsf_read_fail;
+
+/*
+ * Reader side. True with a pair that was published together; false if the
+ * writer could not be caught between publishes in TSF_READ_TRIES attempts, in
+ * which case the outputs are untouched and the caller must not use them.
+ */
+static inline bool tsf_read(int64_t *offset_us, int64_t *at)
 {
-    uint32_t s0;
-    do {
-        s0 = tsf.seq;
+    for (int t = 0; t < TSF_READ_TRIES; t++) {
+        const uint32_t s0 = tsf.seq;
+        if (s0 & 1u) {
+            continue;                       /* a publish is in progress */
+        }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        *offset_us = tsf.offset_us;
-        *at = tsf.at;
+        const int64_t us = tsf.offset_us;
+        const int64_t a  = tsf.at;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    } while ((s0 & 1u) || s0 != tsf.seq);
+        if (s0 == tsf.seq) {                /* no publish overlapped the read */
+            *offset_us = us;
+            *at = a;
+            return true;
+        }
+    }
+    n_tsf_read_fail++;
+    return false;
 }
 
 /* tsf_fresh() is below, after TSF_MAX_AGE_US, which it needs. */
@@ -459,7 +522,9 @@ extern volatile uint32_t n_tsf_fallback;  /* anchors that fell back */
 static inline bool tsf_fresh(int64_t now, int64_t *offset_us)
 {
     int64_t us, at;
-    tsf_read(&us, &at);
+    if (!tsf_read(&us, &at)) {
+        return false;          /* no consistent pair; the estimator stands in */
+    }
     if (at && now - at < TSF_MAX_AGE_US) {
         if (offset_us) *offset_us = us;
         return true;

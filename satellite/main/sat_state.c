@@ -54,6 +54,7 @@ volatile int32_t splice_report_phase;
 volatile int32_t splice_report_alt;
 volatile bool    splice_report_pending;
 tsf_reading_t tsf;
+volatile uint32_t n_tsf_read_fail;
 volatile uint32_t n_tsf_used;  /* anchors that used TSF */
 volatile uint32_t n_tsf_fallback;  /* anchors that fell back */
 volatile uint32_t n_underruns;  /* playback ran dry */

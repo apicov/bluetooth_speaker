@@ -58,6 +58,10 @@ COUNTERS = {
     # a clean run, a burst of a few seconds per knock.
     # See components/dancefloor_sync/audio_shift.h.
     "catchup-drops", "catchup-dups",
+    # A seqlock reader that gave up and fell back to the estimator. Must be 0:
+    # the unbounded version of that loop hung a satellite on 2026-08-25 with a
+    # full ring and a starving DAC. See tsf_read() in satellite/main/sat.h.
+    "tsf-read-fail",
 }
 
 # What must stay at zero for a soak to have gone well, and what a non-zero
@@ -72,6 +76,7 @@ FAULTS = [
     ("alloc-fail",   "an allocation failed"),
     ("retunes_refused", "a retune was refused as insane"),
     ("seq-drop",     "packets arrived older than expected"),
+    ("tsf-read-fail", "a TSF seqlock read gave up -- the writer could not run (sat.h)"),
     ("decode-err",   "SBC frames that would not decode"),
     ("recv-err",     "recvfrom() errors"),
     ("wifi-drops",   "lost association with the hub"),

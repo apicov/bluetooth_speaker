@@ -369,7 +369,7 @@ void telemetry_tick(void)
                       " | wifi-drops %" PRIu32 " (no-lease %" PRIu32 ")"
                       " | alloc-fail %" PRIu32
                       " | clock %s (tsf %" PRIu32 "/probe %" PRIu32
-                      ", wide-span %" PRIu32 ")"
+                      ", wide-span %" PRIu32 ", tsf-read-fail %" PRIu32 ")"
                       " | phase-drop %" PRIu32 " short-reads %" PRIu32
                       " (%" PRIu32 " frames)"
                       " | dma-starve %" PRIu32 " short-resync %" PRIu32
@@ -386,7 +386,7 @@ void telemetry_tick(void)
                  n_anchor_late + n_anchor_soon, n_wifi_drops, n_wifi_lease_fail,
                  n_alloc_fail,
                  tsf_fresh(esp_timer_get_time(), NULL) ? "TSF" : "probe",
-                 n_tsf_used, n_tsf_fallback, n_tsf_wide,
+                 n_tsf_used, n_tsf_fallback, n_tsf_wide, n_tsf_read_fail,
                  n_phase_drop, n_short_reads, n_short_frames,
                  dma_starve_count(), n_gap_short_resyncs,
                  n_seq_dropped, n_decode_err, n_recv_err,
