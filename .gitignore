@@ -77,3 +77,8 @@ logs-*/
 # Kate's swap files, written beside the file being edited as .<name>.kate-swp
 # and left behind by a crash or a kill. Editor state, and nobody else's.
 .*.kate-swp
+
+# Doxygen output for satellite/, regenerated from the sources by
+# `doxygen Doxyfile` in that directory. The Doxyfile is the tracked input; the
+# HTML and the warning log it writes beside it are not.
+satellite/doc-gen/
