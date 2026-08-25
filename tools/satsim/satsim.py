@@ -403,16 +403,33 @@ def main():
     if missing:
         for s in sats:
             s.sock.close()
+        hub_net = ipaddress.IPv4Network(f"{args.hub}/24", strict=False)
         iface = next((i for a, i in local_v4()
-                      if ipaddress.IPv4Address(a) in ipaddress.IPv4Network("192.168.4.0/24")),
-                     "<wlan>")
+                      if ipaddress.IPv4Address(a) in hub_net), None)
+
+        # THE ASSOCIATION FIRST, and the aliases only once there is something to
+        # add them to. This used to print the alias commands regardless, with
+        # "<wlan>" standing in for the interface it had not found -- N lines that
+        # look ready to paste and cannot work, with the one sentence that
+        # explains why underneath them. An alias on the wrong interface would not
+        # reach the hub anyway; not being on its AP is the whole fault, and it is
+        # what this has to say first.
+        if iface is None:
+            here = [f"{a} on {i}" for a, i in local_v4() if i != "lo"]
+            print(f"This machine has no {hub_net} address, so it is not on the "
+                  f"hub's SoftAP.")
+            print("Join the hub's network first (SSID and password are "
+                  "DANCEFLOOR_AP_SSID / DANCEFLOOR_AP_PASS in")
+            print("components/dancefloor_sync/Kconfig), then run this again.")
+            if here:
+                print("\nCurrently: " + ", ".join(here))
+            return 1
+
         print(f"{len(missing)} of {args.n} addresses are not on this machine.")
-        print("Run these (needs root), then start again:\n")
+        print(f"Run these (needs root) on {iface}, then start again:\n")
         for ip in missing:
             print(f"  sudo ip addr add {ip}/24 dev {iface}")
         print("\nTo undo afterwards: same lines with 'del' instead of 'add'.")
-        if iface == "<wlan>":
-            print("\nNo 192.168.4.x address here -- is this machine on the hub's AP?")
         return 1
 
     socks = [s.sock for s in sats]
