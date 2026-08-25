@@ -226,11 +226,24 @@ def window_sum(df, unit, metric):
     A LOWER BOUND, NOT A TOTAL, and callers must say so. The hub's log lines do
     not all reach the capture: on the 2026-08-25 soak its HEALTH lines arrived
     60, 120, 180, 240, 300, 361, 420, 540 and 780 s apart -- exact multiples of
-    their 60 s period, so whole lines are dropped rather than emitted late --
+    their 60 s period, so whole lines are missing rather than emitted late --
     while both satellites' arrived 60 s apart 104 times out of 104. Two thirds
     of the hub's windows were missing, and every sum over them was short by
     about that factor: `frames done 185,916` for a run that transmitted ~150/s
     for an hour.
+
+    THE HUB IS NOT WHAT DROPS THEM, and an earlier version of this note said it
+    was. The hub's SERIAL CAPTURE flaps: that same run recorded 578 "capture:
+    opened" and 577 "capture: ... lost" cycles on the hub's FTDI adapter --
+    "device reports readiness to read but returned no data (device disconnected
+    or multiple access on port?)" -- against one open for sat_classic and two
+    for sat_s3. Whatever was in flight at each disconnect is gone.
+
+    That matters because it is fixable at the cable rather than in the firmware,
+    and because "multiple access on port" suggests something else is reading the
+    same tty -- a stray `idf.py monitor` will do it. Fix that and the hub's
+    windows come back; until then the arithmetic below is what keeps the numbers
+    honest.
 
     RATIOS BETWEEN TWO OF THESE ARE STILL SOUND -- both terms are undercounted
     by the same sampling, so txdone-fail/txdone survives it. Absolute totals and
@@ -271,7 +284,7 @@ def cover_note(n, win_s, covered_s, span_s):
     if pct >= 95.0:
         return ""
     return (f"    (over {n} captured {win_s:.0f} s windows = {pct:.0f}% of the run"
-            f" -- the hub drops log lines, so counts here are LOWER BOUNDS)")
+            f" -- the hub's serial capture flaps, so counts here are LOWER BOUNDS)")
 
 
 def tx_faults(df, unit):
@@ -657,10 +670,9 @@ def main():
         # PER WINDOW, NOT SUMMED, and that is not a style choice.
         #
         # The hub's status line is emitted on time but does not all reach the
-        # capture: on the 2026-08-25 soak its HEALTH lines arrived 60, 120, 180,
-        # 240 ... 780 s apart -- exact multiples of their 60 s period, so whole
-        # lines are being dropped, while the satellites' came 60 s apart 104
-        # times out of 104. Roughly two thirds of the hub's lines were missing.
+        # capture -- its serial adapter flapped 578 times on the 2026-08-25 run,
+        # against one reconnect for sat_classic. Roughly two thirds of the hub's
+        # lines were missing. See window_sum() for the evidence and the fix.
         #
         # A per-window counter summed over the windows that happened to arrive is
         # therefore not a run total, it is a sample presented as one. This
@@ -698,8 +710,8 @@ def main():
 
         print(f"       withheld under backoff: {hub_hits('fec-cong')} of {nwin}"
               f" windows   ungroupable: {hub_hits('fec-skip')} of {nwin} windows")
-        print("       (windows OBSERVED, not elapsed. The hub drops log lines --"
-              " see the note above -- so these are lower bounds,")
+        print("       (windows OBSERVED, not elapsed. The hub's serial capture"
+              " flaps -- see window_sum() -- so these are lower bounds,")
         print("        and the satellite rows below are the side to trust.)")
         cong_hits = hub_hits("fec-cong")
         if k_val == 0:
