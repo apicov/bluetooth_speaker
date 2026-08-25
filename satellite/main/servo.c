@@ -89,13 +89,14 @@ void servo_tick(void)
     }
     const int32_t err_ema = df_servo_ema(&s_servo, ph, stepped);
 
-    /* The catch-up arm's input, taken inline just above the decision it gates,
-     * so there is no window between the read and the write for a splice to
-     * land in and no re-test is needed. sync_phase_median() leaves med alone
-     * when the history is too short, so the raw reading survives as the
-     * fallback. */
-    int32_t med = phase_err_us;
-    const bool have_med = sync_phase_median(&phase_hist, &med);
+    /* The catch-up arm's input: the median the play task publishes, NOT
+     * phase_hist itself. That history is play-task-only and is reset under
+     * this task's feet, so reading it from here would be an unsynchronised
+     * read of a struct being rewritten. The raw reading stands in until a
+     * median exists, which is what leaves the stand-down arm working while the
+     * history refills after a splice or a re-anchor. */
+    const bool have_med = phase_med_valid;
+    const int32_t med = have_med ? phase_med_us : phase_err_us;
 
     /* Once per log period, not every window: the servo below still runs at 5 s
      * and still sees every sample, it just stops narrating. Raw, median and

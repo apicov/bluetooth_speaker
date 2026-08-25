@@ -132,6 +132,11 @@ static bool mute_tick(void)
         return false;
     }
 
+    /* Read before the clear below, or the line reports the zero it just wrote
+     * rather than the trickle that triggered the mute -- which is the number
+     * that says deaf rather than merely quiet. */
+    const uint32_t heard = hist_sum;
+
     memset(hist, 0, sizeof(hist));
     hist_sum = 0;
     s_muted_at = now;
@@ -139,8 +144,9 @@ static bool mute_tick(void)
     n_self_mutes++;
     ESP_LOGE(TAG, "MUTING: %" PRIu32 " audio packets in %d s at %d dBm -- deaf, "
                   "not idle. Leaving the hub's send list so it stops retrying "
-                  "frames I cannot acknowledge; trying again every %d s.",
-             hist_sum, (int)(MUTE_WINDOW_US / 1000000), (int)ap.rssi,
+                  "frames I cannot acknowledge; back when the signal returns, "
+                  "or in %d s if it does not.",
+             heard, (int)(MUTE_WINDOW_US / 1000000), (int)ap.rssi,
              (int)(MUTE_RETRY_US / 1000000));
     return true;
 }

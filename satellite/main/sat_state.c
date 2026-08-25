@@ -48,6 +48,8 @@ volatile uint32_t phase_head, phase_tail;
 volatile int32_t phase_err_us;
 volatile bool phase_valid;
 sync_phase_hist_t phase_hist;
+volatile int32_t phase_med_us;
+volatile bool phase_med_valid;
 volatile int32_t restart_pos = -1;
 volatile bool phase_stepped;
 volatile int32_t step_report_mag;

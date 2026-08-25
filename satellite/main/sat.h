@@ -17,7 +17,8 @@
  *   the @ref phase_q head, the @ref tsf pair, @ref resync_request,
  *   @ref anchor_provisional, @ref audio_volume and the arrival gauges.
  * - **play_task** writes what playback has reached: the @ref phase_q tail,
- *   @ref phase_err_us, @ref phase_stepped, @ref phase_hist, the
+ *   @ref phase_err_us, @ref phase_stepped, @ref phase_hist and the
+ *   @ref phase_med_us pair it publishes from it, the
  *   `splice_report_*` and `step_report_*` sets, @ref playing,
  *   @ref ring_low_ms and the refill pair. It reads @ref rate_trim_hz.
  * - **drift_task** runs @ref telemetry_tick() then @ref servo_tick(). The
@@ -210,12 +211,29 @@ extern volatile bool phase_valid;
  * reading when the history is too short — a boundary correction is the largest
  * single move this unit makes, and one noisy reading should not size it.
  *
- * @warning Written by play_task and read by the servo (servo.c), so despite
- * being a plain non-`volatile` struct it is not single-task state. The read is
- * of a `const` pointer and a stale median costs one window, but the access is
- * unsynchronised.
+ * @warning PLAY TASK ONLY. It is a plain non-`volatile` struct and it is reset
+ * under its own task's feet at every splice, so nothing on another task may
+ * read it — the servo takes @ref phase_med_us instead.
  */
 extern sync_phase_hist_t phase_hist;
+
+/**
+ * @brief The median of @ref phase_hist, published for the servo.
+ *
+ * The servo runs on drift_task and cannot read @ref phase_hist itself, so
+ * play_task computes the median where it pushes the reading and publishes it
+ * here. Computed on the play task rather than in the servo because it needs
+ * the packet-cadence history — the readings it summarises span a couple of
+ * hundred milliseconds, which is far shorter than a servo window.
+ *
+ * Single writer (play_task), single reader (the servo), 32-bit, so no lock is
+ * needed.
+ */
+extern volatile int32_t phase_med_us;
+/** @brief Whether @ref phase_med_us summarises this stream's current position.
+ *  Cleared wherever @ref phase_hist is reset, because a median taken before a
+ *  splice or a re-anchor describes a position the unit has left. */
+extern volatile bool phase_med_valid;
 /** @brief Ring frame position of a track boundary, or -1 for none. rx_task
  *  sets it, play_task clears it once the splice is done. */
 extern volatile int32_t restart_pos;

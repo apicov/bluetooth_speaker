@@ -257,6 +257,7 @@ void play_task(void *arg)
 
         /* Every reading in the history was measured against that stream too. */
         sync_phase_reset(&phase_hist);
+        phase_med_valid = false;
 
         /* Same reason: an armed debt described a position on the old stream. */
         catchup_frames = 0;
@@ -355,6 +356,7 @@ void play_task(void *arg)
                                                  stream_rate / 1000000)) {
                     s_catchup_moved = 0;
                     sync_phase_reset(&phase_hist);
+                    phase_med_valid = false;
                     phase_stepped = true;
                 }
             } else if (cu) {
@@ -475,6 +477,15 @@ void play_task(void *arg)
                     phase_err_us = (int32_t)err;
                     phase_valid = true;
                     sync_phase_push(&phase_hist, (int32_t)err);
+
+                    /* Publish the median for the servo, which runs on another
+                     * task and must not touch phase_hist -- that history is
+                     * play-task-only and is reset under this task's feet. */
+                    int32_t med;
+                    if (sync_phase_median(&phase_hist, &med)) {
+                        phase_med_us = med;
+                        phase_med_valid = true;
+                    }
                 }
                 phase_tail = (phase_tail + 1) % PHASE_Q_LEN;
             }
@@ -581,6 +592,7 @@ void play_task(void *arg)
                     /* The unit has just moved, so every reading in the history
                      * describes where it used to be. */
                     sync_phase_reset(&phase_hist);
+                    phase_med_valid = false;
                     /* And the splice is the payer: an armed debt would replay
                      * the same correction on top of the one just applied. */
                     catchup_frames = 0;

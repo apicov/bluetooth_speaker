@@ -61,13 +61,15 @@
 
 /**
  * @name Reconnect state
- * Written by both the event handler and @ref wifi_retry_tick() on the probe
- * task. `volatile`, not atomic: the bools cannot tear, and the two deadlines
- * feed nothing but a compare against the current time, so the worst a stale or
- * torn read costs is one 250 ms tick of latency.
+ * Written by the event handler, and the two deadlines also by
+ * @ref wifi_retry_tick() on the probe task. `volatile`, not atomic: the bools
+ * cannot tear, and the int64s feed nothing but a compare against the current
+ * time or one log line, so the worst a stale or torn read costs is one 250 ms
+ * tick of latency or one wrong number printed.
  * @{
  */
 static volatile bool    s_assoc;    /**< Associated to the AP. */
+static volatile int64_t s_assoc_at; /**< When that association was made; handler only. */
 static volatile bool    s_link_up;  /**< Associated AND holding a lease. */
 static volatile int64_t s_retry_at; /**< When to re-attempt the connect. */
 static volatile int64_t s_lease_at; /**< When to give up waiting for DHCP. */
@@ -96,9 +98,14 @@ void wifi_retry_tick(void)
             return;
         }
         n_wifi_lease_fail++;
-        ESP_LOGE(TAG, "associated to \"%s\" for %d ms with no DHCP lease -- "
+        /* Measured from the association, not assumed from the timeout. The
+         * deadline is pushed forward rather than cleared, so a link that keeps
+         * failing arrives here repeatedly and the elapsed time is a multiple of
+         * WIFI_LEASE_TIMEOUT_US -- printing that constant would report the
+         * first ten seconds every time and hide how long this has gone on. */
+        ESP_LOGE(TAG, "associated to \"%s\" for %lld ms with no DHCP lease -- "
                       "dropping the association to start over",
-                 AP_SSID, WIFI_LEASE_TIMEOUT_US / 1000);
+                 AP_SSID, s_assoc_at ? (now - s_assoc_at) / 1000 : -1);
         /* disconnect() rather than a bare retry: it raises the
          * STA_DISCONNECTED the handler already deals with, and re-association
          * runs DHCP from the start. */
@@ -141,6 +148,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         /* Not logged on its own -- an association without a lease is not a
          * join. What it starts is the DHCP watchdog. */
         s_assoc = true;
+        s_assoc_at = esp_timer_get_time();
         s_lease_at = esp_timer_get_time() + WIFI_LEASE_TIMEOUT_US;
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = data;
@@ -149,6 +157,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         /* Both flags down before the deadline is armed, so a tick that sees
          * the deadline cannot also see a stale state. */
         s_assoc = false;
+        s_assoc_at = 0;
         s_link_up = false;
         s_lease_at = 0;
         s_retry_at = esp_timer_get_time() + WIFI_RETRY_BACKOFF_US;
