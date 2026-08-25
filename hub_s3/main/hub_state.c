@@ -1,4 +1,10 @@
-
+/*
+ * Definitions for the state hub.h declares -- nothing but definitions.
+ *
+ * What each value means, which task writes it and what a torn read costs are
+ * documented in hub.h beside the declaration. Keeping them apart is what
+ * lets hub.h be read as the ownership document it is.
+ */
 #include "hub.h"
 
 const char *TAG = "stream";
