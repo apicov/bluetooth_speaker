@@ -11,10 +11,6 @@
  */
 #include "hub.h"
 
-/**
- * @brief Record the rate the decoder is producing and match the DAC to it.
- * @param hz  Measured input rate in Hz; 0 is ignored.
- */
 void streamer_set_sample_rate(uint32_t hz)
 {
     if (!hz) {
