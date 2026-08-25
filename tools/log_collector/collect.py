@@ -1,28 +1,4 @@
 #!/usr/bin/env python3
-"""
-Centralised log/telemetry collector for the dancefloor bench.
-
-Joins the hub's "dancefloor" WiFi (do that at the OS level first) and gathers
-logs from every WiFi unit into one merged, timestamped stream, while also
-reading the bt_bridge's console UART over USB -- the bridge has no WiFi, so its
-logs only reach the laptop by wire.
-
-Topology: each unit ships to the HUB; the hub relays its own and every
-satellite's logs/telemetry to this laptop. So every UDP packet arrives from
-192.168.4.1, and the in-band `role` / `src_ip` fields are what tell units apart
-(not the UDP source address). The bridge is the one source that comes in over
-serial, parsed from its ESP_LOG console lines.
-
-Outputs, per session directory:
-  all.jsonl   one record per log line: {ts, src, level, tag, msg}
-  health.csv  one row per MSG_HEALTH per source, numeric columns for plotting
-
-Requires pyserial only if --bridge is used (pip install pyserial); the UDP path
-is plain stdlib.
-
-The firmware side compiles out unless CONFIG_DANCEFLOOR_WIFI_LOGS is set, so a
-production hub/satellite sends nothing this script can receive.
-"""
 
 import argparse
 import csv
@@ -34,17 +10,14 @@ import sys
 import threading
 import time
 
-# --- wire format (must match components/dancefloor_sync/include/sync_proto.h) --
 
 PORT = 5001
 MSG_LOG, MSG_HEALTH, MSG_LOG_SUB = 9, 10, 11
 LOG_ROLE_HUB, LOG_ROLE_SAT = 0, 1
-LOG_SUB_MAGIC = 0x4C4F4731  # "LOG1"
+LOG_SUB_MAGIC = 0x4C4F4731
 
-# log_msg_t fixed header: type level role tag_len msg_len seq src_ip tag[16]
-LOG_HDR = struct.Struct("<BBBBHII16s")          # 30 bytes
-# health_msg_t: 4B, seq, src_ip, uptime(Q), then 22 x uint32 (heap/stack/counters)
-HEALTH = struct.Struct("<BBBBIIQ" + "I" * 22)   # 108 bytes
+LOG_HDR = struct.Struct("<BBBBHII16s")
+HEALTH = struct.Struct("<BBBBIIQ" + "I" * 22)
 HEALTH_COLS = [
     "heap_cur", "heap_min", "heap_win", "heap_largest", "hw_play", "hw_mon",
     "underruns", "reanchors_or_restarts", "splices", "retunes", "retunes_refused",
@@ -54,31 +27,20 @@ HEALTH_COLS = [
     "log_dropped", "log_no_dest",
 ]
 
-# The C side pins the same two numbers in test_sync_proto.c ("the log/health
-# message sizes are pinned"). Asserted here so an edit to a format string above
-# fails on the spot rather than silently unpacking garbage off the wire.
 assert LOG_HDR.size == 30 and HEALTH.size == 108, "wire format drifted from sync_proto.h"
 
-SUB_PKT = struct.pack("<BI", MSG_LOG_SUB, LOG_SUB_MAGIC)  # log_sub_msg_t
+SUB_PKT = struct.pack("<BI", MSG_LOG_SUB, LOG_SUB_MAGIC)
 
-# ANSI colours keyed by the level char ESP_LOG prints.
 COLOR = {"E": "\033[31m", "W": "\033[33m", "I": "\033[36m", "D": "\033[2m"}
 SRC_COLOR = "\033[35m"
 RESET = "\033[0m"
 
 
 def ip_str(src_ip):
-    """src_ip is the wire bytes (network order) read out little-endian."""
     return socket.inet_ntoa(struct.pack("<I", src_ip))
 
 
 def parse_console_line(line):
-    """Split an ESP_LOG console composite 'L (ts) tag: msg' into (level, tag, msg).
-
-    The same shape the firmware emits on UART and the collector reads off the
-    bridge's serial port. A leading ANSI colour escape is skipped, since the
-    bridge is a separate build and may have CONFIG_LOG_COLORS on. Returns
-    ('?', '', line) if the shape is not met."""
     line = line.rstrip("\r\n")
     if line.startswith("\033["):
         m = line.find("m")
@@ -101,15 +63,12 @@ def parse_console_line(line):
 
 
 class Session:
-    """Thread-safe merged sink: coloured console + jsonl + csv."""
 
     def __init__(self, out_dir):
         os.makedirs(out_dir, exist_ok=True)
         self.jsonl = open(os.path.join(out_dir, "all.jsonl"), "a", buffering=1)
         self.csvf = open(os.path.join(out_dir, "health.csv"), "a", newline="", buffering=1)
         self.csv = csv.writer(self.csvf)
-        # Append mode: a re-run against the same --out dir continues the file, so
-        # the header goes in only when it is empty.
         if self.csvf.tell() == 0:
             self.csv.writerow(["ts", "source", "role", "clock_src", "uptime_s"] + HEALTH_COLS)
         self.lock = threading.Lock()
@@ -131,7 +90,6 @@ class Session:
     def health(self, source, role, clock_src, uptime_s, values):
         with self.lock:
             self.csv.writerow([self._ts(), source, role, clock_src, uptime_s] + list(values))
-            # A short line so a live console also shows health arriving.
             print(f"\033[32m[{self._ts()}]{RESET} {SRC_COLOR}{source:<14}{RESET} "
                   f"HEALTH up {uptime_s}s heap {values[0]} (win {values[2]}) "
                   f"underruns {values[6]}")
@@ -142,10 +100,6 @@ def udp_loop(sock, session):
         try:
             pkt, _ = sock.recvfrom(2048)
         except (socket.timeout, TimeoutError):
-            # The socket's 1 s timeout, not an error: quiet units are the normal
-            # case. TimeoutError is an OSError subclass, so it must be caught
-            # first or the clause below would end the capture on the first
-            # idle second.
             continue
         except OSError:
             return
@@ -168,7 +122,7 @@ def udp_loop(sock, session):
 
 def serial_loop(port, baud, session):
     try:
-        import serial  # pyserial
+        import serial
     except ImportError:
         print("pyserial not installed -- bridge serial tap disabled "
               "(pip install pyserial)", file=sys.stderr)
@@ -220,7 +174,7 @@ def main():
             try:
                 sock.sendto(SUB_PKT, (args.hub, args.port))
             except OSError:
-                pass  # not on the AP yet; try again next interval
+                pass
             time.sleep(args.sub_interval)
     except KeyboardInterrupt:
         print("\nstopped")

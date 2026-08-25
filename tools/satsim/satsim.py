@@ -1,49 +1,4 @@
 #!/usr/bin/env python3
-"""
-N fake satellites on a laptop, to load the hub's unicast fan-out.
-
-This is a LOAD GENERATOR, not an instrument. It makes the hub believe N more
-speakers are on the floor so it fans audio and analysis frames out to N more
-destinations; what that does to the real satellites is the measurement, and it
-is taken on them.
-
-N SOURCE IPs, NOT N PORTS. client_seen() (hub_s3/main/clients.c) matches on
-sin_addr.s_addr alone, so N sockets sharing the laptop's one address collapse
-into a single client slot -- the hub would fan out to one destination and this
-would look like it was working. Each fake satellite therefore needs its own
-address, added as an alias on the interface already associated to the SoftAP.
-The script says which commands to run; they need root, so it does not run them.
-
-Registration is by probe: a unit that has probed within CLIENT_TIMEOUT_US is on
-the send list. So each fake satellite sends the same MSG_TIME_REQ a real one
-does, at the same 250 ms period, and that is the whole of what puts it on the
-list.
-
-IT ALSO VERIFIES THE HUB'S XOR PARITY, which is the one thing here that IS an
-instrument. Every group is rebuilt K times -- each member withheld from the XOR
-in turn and reconstructed from the parity and the other K-1 -- and compared byte
-for byte against the packet that actually arrived. The drops are simulated
-rather than waited for, because a clean link loses nothing and waiting for real
-loss would test the repair path roughly never; withholding covers all K
-positions on every group instead.
-
-That checks the HUB'S ENCODER and the wire format against an implementation
-sharing no code with it. The host suite in components/dancefloor_sync/test
-checks the codec against itself, which cannot catch the codec and the sender
-agreeing on something wrong; this can. `--self-test` proves the checker itself
-both passes a good parity and fails a corrupted one, with no hub needed.
-
-What it CANNOT test is the satellite's receive path: there is no ring, no hold
-and no re-anchoring here, so fec-held, fec-hold-max and the repair-into-the-ring
-logic only ever run on real firmware against real loss.
-
-What it is uniquely good for is the OTHER half. N fake satellites is N more
-unicast destinations, which is the direct route to exhausting the hub's transmit
-pool -- and parity is supposed to stand down under that pressure rather than
-displace the audio it protects. Watch fec-cong rise on the hub's status line
-while tx-fail (audio) stays flat. If both move together, that design premise is
-wrong.
-"""
 
 import argparse
 import errno
@@ -55,8 +10,8 @@ import subprocess
 import sys
 import time
 
-SYNC_PORT = 5001                # sync_proto.h
-PROBE_PERIOD = 0.250            # PROBE_PERIOD_MS, satellite/main/sat.h
+SYNC_PORT = 5001
+PROBE_PERIOD = 0.250
 
 MSG_TIME_REQ = 1
 MSG_TIME_RSP = 2
@@ -65,44 +20,27 @@ MSG_FRAME = 8
 MSG_AUDIO_FEC = 14
 AUDIO_FMT_SBC = 1
 
-# All packed, little-endian. See components/dancefloor_sync/include/sync_proto.h
-TIME_MSG = struct.Struct("<BIqqq")              # type, seq, t1, t2, t3
-AUDIO_HDR = struct.Struct("<BBBBHIIIq")         # ..., payload_len, seq, rate, frames, play_at
-FRAME_HDR = struct.Struct("<BBB")               # type, len, count
-FEC_HDR = struct.Struct("<BBHI")                # type, count, span, base_seq
+TIME_MSG = struct.Struct("<BIqqq")
+AUDIO_HDR = struct.Struct("<BBBBHIIIq")
+FRAME_HDR = struct.Struct("<BBB")
+FEC_HDR = struct.Struct("<BBHI")
 
-# AUDIO_HDR.size is AUDIO_MSG_BYTES(0). The codeword a group XORs is this header
-# followed by the payload, zero-padded to the longest member -- see
-# audio_fec_msg_t in sync_proto.h.
 assert AUDIO_HDR.size == 26, "audio_msg_t's header moved; this script is stale"
 assert FEC_HDR.size == 8, "AUDIO_FEC_HDR_BYTES moved; this script is stale"
 
 
 def xor_bytes(a, b):
-    """XOR of two byte strings, zero-padded to the longer.
-
-    Via int rather than a loop: a group is ~900 bytes and this runs four times
-    per group per satellite, and the script's job is to LOAD the hub rather than
-    to become the thing that cannot keep up with it.
-    """
     n = max(len(a), len(b))
     return (int.from_bytes(a.ljust(n, b"\0"), "little")
             ^ int.from_bytes(b.ljust(n, b"\0"), "little")).to_bytes(n, "little")
 
 
 def codeword(raw):
-    """The bytes of one audio datagram that its group's parity covers."""
     plen = struct.unpack_from("<H", raw, 4)[0]
     return raw[:AUDIO_HDR.size + plen]
 
 
 def fec_extract(acc, span, want_seq):
-    """Rebuild one member from a completed XOR, or None if it is not a packet.
-
-    The same four checks audio_fec_extract() applies in sync_proto.c, written
-    independently against the header rather than shared with it: the point of a
-    second implementation is that it can disagree.
-    """
     if span < AUDIO_HDR.size or len(acc) < AUDIO_HDR.size:
         return None
     kind, fmt, _marker, _restart, plen, seq, _rate, _frames, _at = \
@@ -119,28 +57,11 @@ def now_us():
 
 
 class Sat:
-    """One fake satellite: a socket on its own address, and what it has seen."""
 
     def __init__(self, ip, verify=False):
         self.ip = ip
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # ASK FOR A BIG RECEIVE BUFFER, because the default one makes this
-        # script invent packet loss that never happened.
-        #
-        # N fake satellites are N unicast streams to ONE laptop radio and one IP
-        # stack -- eight of them is ~340 kB/s of audio plus parity arriving at a
-        # single station. A first run at n=8 reported 5,613 packets "lost" while
-        # the two REAL satellites in the same minutes read pkts 250, fec-parity
-        # 62, starved 0: the floor was perfect and the drops were all on this
-        # side of the air.
-        #
-        # Parity suffered worst -- 0.8-7.6/s against an expected 12.5 -- and the
-        # shape says why. Parity is the FIFTH datagram of a burst of five, so it
-        # arrives when the socket buffer is at its fullest and is the first thing
-        # the kernel discards. A load generator whose own receive path is the
-        # bottleneck reports the hub as broken when it is fine, which is worse
-        # than not measuring at all.
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         self.rcvbuf = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         self.sock.bind((ip, SYNC_PORT))
@@ -153,10 +74,6 @@ class Sat:
         self.parity = 0
         self.last_seq = None
 
-        # Parity verification, on one satellite by default -- see main(). Every
-        # client receives the SAME parity, so checking it N times costs N times
-        # as much and proves nothing extra, and this script's first duty is to
-        # be a load generator rather than the thing that stops keeping up.
         self.fec = FecVerifier() if verify else None
 
     def probe(self, hub):
@@ -165,7 +82,7 @@ class Sat:
         try:
             self.sock.sendto(msg, (hub, SYNC_PORT))
         except OSError:
-            pass                # a probe lost to a full queue is a probe lost
+            pass
 
     def recv(self):
         while True:
@@ -189,9 +106,6 @@ class Sat:
                 if self.fec:
                     self.fec.note(seq, data)
             elif kind == MSG_AUDIO_FEC and len(data) >= FEC_HDR.size:
-                # Counted whatever else happens to it: the hub unicasts parity to
-                # every registered client, fake ones included, so a run that does
-                # not count it under-reports its own fan-out by 1/K.
                 self.parity += 1
                 if self.fec:
                     self.fec.check(data)
@@ -202,18 +116,15 @@ class Sat:
 
 
 class FecVerifier:
-    """Checks the hub's XOR parity against an implementation it shares no code
-    with. Separate from Sat so it can be exercised without a socket -- see
-    self_test()."""
 
     def __init__(self):
-        self.pkts = {}          # seq -> raw datagram, for the group check below
-        self.groups = 0         # parity packets whose whole group was in hand
-        self.checked = 0        # member reconstructions attempted
-        self.matched = 0        # ...that came back byte for byte
-        self.mismatch = 0       # ...that did not: a real encoder or format fault
-        self.repaired = 0       # genuinely lost members rebuilt and validated
-        self.unverifiable = 0   # group had real loss, so no byte comparison
+        self.pkts = {}
+        self.groups = 0
+        self.checked = 0
+        self.matched = 0
+        self.mismatch = 0
+        self.repaired = 0
+        self.unverifiable = 0
 
     def note(self, seq, data):
         self.pkts[seq] = data
@@ -222,39 +133,20 @@ class FecVerifier:
                 del self.pkts[old]
 
     def check(self, data):
-        """Rebuild every member of this group from the parity and compare.
-
-        THE DROPS ARE SIMULATED, NOT WAITED FOR. A clean desktop link loses
-        nothing, so waiting for real loss would test the repair path roughly
-        never. Withholding each member in turn from the XOR reconstructs it from
-        the parity and the other K-1 -- exactly what a satellite does for a
-        packet that never arrived -- and the withheld packet is still in hand to
-        compare against. Every group therefore exercises all K positions,
-        including the first-member and last-member cases that differ on the
-        satellite.
-
-        This checks the HUB's encoder and the wire format against an
-        implementation that shares no code with it. The host suite checks the
-        codec against itself; this is the half that can catch the codec and the
-        sender agreeing on something wrong.
-        """
         _kind, count, span, base = FEC_HDR.unpack_from(data)
         parity = data[FEC_HDR.size:FEC_HDR.size + span]
         if len(parity) < span or not 2 <= count <= 8:
-            self.mismatch += 1          # a parity we cannot even read
+            self.mismatch += 1
             return
 
         members = [self.pkts.get((base + i) & 0xFFFFFFFF) for i in range(count)]
         have = [m for m in members if m is not None]
 
         if len(have) < count - 1:
-            self.unverifiable += 1      # two or more genuinely missing
+            self.unverifiable += 1
             return
 
         if len(have) == count - 1:
-            # A real loss. No byte comparison possible -- the packet never
-            # arrived -- but the rebuild must still validate, which is the same
-            # test the satellite applies before it trusts a repair.
             missing = next(i for i, m in enumerate(members) if m is None)
             acc = parity
             for m in have:
@@ -280,12 +172,6 @@ class FecVerifier:
 
 
 def _fake_group(seqs, lens, k=None):
-    """A group of audio datagrams and the parity a correct hub would send.
-
-    Built from the header rather than from satsim's own helpers, so the test
-    exercises codeword()/xor_bytes()/fec_extract() rather than agreeing with
-    them by construction.
-    """
     pkts = []
     for i, (seq, plen) in enumerate(zip(seqs, lens)):
         hdr = AUDIO_HDR.pack(MSG_AUDIO, AUDIO_FMT_SBC, i == 1, i == 2,
@@ -300,12 +186,6 @@ def _fake_group(seqs, lens, k=None):
 
 
 def self_test():
-    """Prove the verifier can both pass a good parity and fail a bad one.
-
-    A checker that only ever says PASS is worth nothing, so the second half
-    corrupts the parity and requires a MISMATCH. Runs without a hub, a socket or
-    an interface alias: `satsim.py --self-test`.
-    """
     fails = 0
 
     def check(name, ok):
@@ -314,8 +194,6 @@ def self_test():
         if not ok:
             fails += 1
 
-    # Unequal payloads on purpose: the zero padding to the longest member is the
-    # part of the wire format with nothing else to hold it up.
     seqs = [1000, 1001, 1002, 1003]
     pkts, parity, _span = _fake_group(seqs, [851, 823, 877, 12])
 
@@ -326,9 +204,6 @@ def self_test():
     check("every member of a good group rebuilds byte for byte",
           v.groups == 1 and v.checked == 4 and v.matched == 4 and v.mismatch == 0)
 
-    # One member genuinely absent: no byte comparison is possible, but the
-    # rebuild must still validate -- the satellite's own test before it trusts
-    # a repair.
     v = FecVerifier()
     for seq, p in list(zip(seqs, pkts))[1:]:
         v.note(seq, p)
@@ -336,8 +211,6 @@ def self_test():
     check("a genuinely lost member rebuilds and validates",
           v.repaired == 1 and v.mismatch == 0)
 
-    # Two gone is out of one parity's reach by construction, and must be said
-    # rather than guessed at.
     v = FecVerifier()
     for seq, p in list(zip(seqs, pkts))[2:]:
         v.note(seq, p)
@@ -345,7 +218,6 @@ def self_test():
     check("two lost members are reported unverifiable, not rebuilt",
           v.unverifiable == 1 and v.matched == 0 and v.mismatch == 0)
 
-    # AND THE HALF THAT MATTERS: a wrong parity must not pass.
     bad = bytearray(parity)
     bad[FEC_HDR.size + 40] ^= 0x01
     v = FecVerifier()
@@ -354,8 +226,6 @@ def self_test():
     v.check(bytes(bad))
     check("a single flipped parity bit is caught", v.mismatch > 0)
 
-    # A span that claims more than the datagram carries is a truncated parity,
-    # and reading it as a short packet is how a repair goes wrong quietly.
     head = FEC_HDR.pack(MSG_AUDIO_FEC, 4, 9999, seqs[0])
     v = FecVerifier()
     for seq, p in zip(seqs, pkts):
@@ -368,7 +238,6 @@ def self_test():
 
 
 def local_v4():
-    """Every IPv4 address on this machine, as (addr, iface)."""
     out = subprocess.run(["ip", "-o", "-4", "addr", "show"],
                          capture_output=True, text=True).stdout
     found = []
@@ -406,9 +275,6 @@ def main():
     base = ipaddress.IPv4Address(args.base)
     ips = [str(base + i) for i in range(args.n)]
 
-    # Ask the kernel rather than parsing `ip addr`: binding is the thing that has
-    # to work, and an address that cannot be bound is the failure worth naming
-    # whatever the reason.
     missing = []
     sats = []
     for i, ip in enumerate(ips):
@@ -425,13 +291,6 @@ def main():
         iface = next((i for a, i in local_v4()
                       if ipaddress.IPv4Address(a) in hub_net), None)
 
-        # THE ASSOCIATION FIRST, and the aliases only once there is something to
-        # add them to. This used to print the alias commands regardless, with
-        # "<wlan>" standing in for the interface it had not found -- N lines that
-        # look ready to paste and cannot work, with the one sentence that
-        # explains why underneath them. An alias on the wrong interface would not
-        # reach the hub anyway; not being on its AP is the whole fault, and it is
-        # what this has to say first.
         if iface is None:
             here = [f"{a} on {i}" for a, i in local_v4() if i != "lo"]
             print(f"This machine has no {hub_net} address, so it is not on the "
@@ -453,9 +312,6 @@ def main():
     socks = [s.sock for s in sats]
     print(f"{args.n} fake satellites on {ips[0]}..{ips[-1]}, probing {args.hub} "
           f"every {PROBE_PERIOD * 1000:.0f} ms. Ctrl-C to stop.")
-    # The kernel silently caps SO_RCVBUF at net.core.rmem_max, so say what was
-    # actually granted rather than what was asked for: a small buffer here is
-    # the difference between measuring the hub and measuring this laptop.
     got = min(s.rcvbuf for s in sats)
     print(f"receive buffer {got // 1024} kB per socket"
           + ("" if got >= (1 << 20) else
@@ -492,8 +348,6 @@ def main():
                 lost = [c[2] - p[2] for c, p in zip(cur, prev)]
                 par = [(c[3] - p[3]) / dt for c, p in zip(cur, prev)]
                 registered = sum(1 for s in sats if s.replies)
-                # parity/s should be audio/s over K, and the pair is the
-                # one-glance check that the lane is alive at all.
                 fec = ""
                 v = [s.fec for s in sats if s.fec]
                 if v:
