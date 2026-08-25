@@ -10,7 +10,7 @@ bool rd(std::FILE *f, void *p, size_t n) { return std::fread(p, 1, n, f) == n; }
 uint32_t le32(const uint8_t *p) { return uint32_t(p[0]) | (p[1] << 8) | (p[2] << 16) | (uint32_t(p[3]) << 24); }
 uint16_t le16(const uint8_t *p) { return uint16_t(uint16_t(p[0]) | (p[1] << 8)); }
 
-}  // namespace
+}
 
 bool wav_read(const std::string &path, Wav &out, std::string &err)
 {
@@ -25,8 +25,6 @@ bool wav_read(const std::string &path, Wav &out, std::string &err)
     int bits = 0;
     bool have_fmt = false;
 
-    /* Walk the chunks rather than assuming fmt then data: some writers put
-     * LIST or fact chunks in between, and Python's wave module can too. */
     for (;;) {
         uint8_t ch[8];
         if (!rd(f, ch, 8)) { err = have_fmt ? "no data chunk" : "no fmt chunk"; std::fclose(f); return false; }

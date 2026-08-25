@@ -1,26 +1,3 @@
-/*
- * pattern_lab -- run the firmware's LED pipeline on a laptop, against a WAV.
- *
- * The point is turnaround. Designing a pattern is a taste problem, and taste
- * needs fast feedback far more than it needs hardware; reflashing two boards
- * and listening to a track is a minute per idea, and this is a second.
- *
- * It is not a reimplementation. analysis.cpp, beat_detect.c and patterns.cpp are
- * compiled straight from components/dancefloor_leds, so what you see here is
- * what the strips do. The only difference is the FFT -- esp-dsp on the board, a
- * plain radix-2 here -- which agrees to float rounding (see test_fft.c), so a
- * threshold decision balanced on a knife edge could in principle differ. Nothing
- * that matters for designing a pattern.
- *
- *   ./pattern_lab track.wav                    live in the terminal
- *   ./pattern_lab track.wav --png out.png      whole track as an image
- *   ./pattern_lab track.wav --csv trace.csv    per-frame numbers for tuning
- *   ./pattern_lab track.wav --no-tty --dump s  per-frame spec/mag/band for notebooks
- *   ./pattern_lab --list                       available patterns
- *
- * Feed it the WAVs that the desktop client writes -- it lives in its own
- * repository now, ../dancefloor-tools, and needs nothing from this tree.
- */
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -63,7 +40,7 @@ void usage()
         "                   compile-time -- see BEAT_THRESHOLD_K and `make HIST=`)\n");
 }
 
-}  // namespace
+}
 
 int main(int argc, char **argv)
 {
@@ -71,7 +48,7 @@ int main(int argc, char **argv)
     int  leds = 8, unit = 0, brightness = 10;
     bool tty = true, list = false;
     double speed = 1.0;
-    double boom_floor = -1, boom_k = -1, boom_refr = -1;   /* <0 = leave alone */
+    double boom_floor = -1, boom_k = -1, boom_refr = -1;
     double beat_floor = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -121,9 +98,6 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "%s: %s\n", wav_path.c_str(), err.c_str());
         return 1;
     }
-    /* The pipeline follows the file now rather than assuming 44.1 kHz, so this
-     * is a note about what the tuning was measured against, not a warning that
-     * the numbers below are wrong. */
     if (wav.rate != df::RATE) {
         std::fprintf(stderr,
             "note: %s is %d Hz -- analysed at that rate; the tuning defaults were "
@@ -131,9 +105,6 @@ int main(int argc, char **argv)
     }
 
     const size_t frames = wav.samples.size() / df::CHANNELS;
-    /* Windows start every HOP_N and are FFT_N long, so the last one that fits
-     * begins FFT_N from the end -- not frames/FFT_N, which only happened to be
-     * right while the two were the same number. */
     const size_t blocks = frames < size_t(df::FFT_N)
                           ? 0
                           : (frames - df::FFT_N) / df::HOP_N + 1;
@@ -143,28 +114,17 @@ int main(int argc, char **argv)
 
     df::Analysis analysis;
     analysis.init(wav.rate);
-    /* Unset flags fall back to what the firmware actually uses, not to a second
-     * set of literals kept here -- sweeping one value must hold the others at
-     * the shipped ones or the run measures a configuration nothing runs. */
     if (boom_floor >= 0 || boom_k >= 0 || boom_refr >= 0) {
         analysis.set_boom_tuning(
             boom_k     >= 0 ? float(boom_k)             : df::BOOM_THRESHOLD_K,
             boom_floor >= 0 ? float(boom_floor)         : df::BOOM_FLUX_FLOOR,
             boom_refr  >= 0 ? int64_t(boom_refr * 1000) : df::BOOM_REFRACTORY_US);
     }
-    /* Nothing to fall back to here -- set_beat_floor touches only the floor, so
-     * an unset flag simply leaves init()'s BEAT_FLUX_FLOOR in place. */
     if (beat_floor >= 0) {
         analysis.set_beat_floor(float(beat_floor));
     }
     pattern->reset();
 
-    /*
-     * The analyser lane, set up the way the firmware sets it up: a slot this
-     * unit computes itself in the fast lane is cleared, and everything else --
-     * slow slots included -- stays latched, because a slow result arrives
-     * through the latch here exactly as it does on a board.
-     */
     df::ResultLatch latch;
     bool ml_skip[df::ML_SLOTS];
     for (int i = 0; i < df::ML_SLOTS; i++) {
@@ -184,15 +144,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /*
-     * The slow lane, driven inline rather than on a task -- there is no audio
-     * clock here, so a frame is processed the moment it exists.
-     *
-     * There is no grid and no resampler to match any more. Analysers read the
-     * frame's spectrum, and a frame is a frame: the firmware's lane does the
-     * same call on its own task purely so a long inference does not stall the
-     * analysis one, which is not a concern on a laptop.
-     */
     df::Analyser *slow = nullptr;
     int           slow_slot = -1;
     for (int i = 0; i < df::ML_SLOTS; i++) {
@@ -203,7 +154,6 @@ int main(int argc, char **argv)
             break;
         }
     }
-    /* Frames a second, as the firmware computes it and hands it to init(). */
     const int frames_per_s = wav.rate / df::HOP_N;
     if (slow) {
         slow->init(frames_per_s);
@@ -212,23 +162,16 @@ int main(int argc, char **argv)
     }
 
     std::vector<uint8_t> rgb(size_t(leds) * 3);
-    std::vector<uint8_t> image;          /* blocks x leds, RGB */
+    std::vector<uint8_t> image;
     if (!png_path.empty()) image.reserve(blocks * size_t(leds) * 3);
 
     std::FILE *csv = nullptr;
     if (!csv_path.empty()) {
         csv = std::fopen(csv_path.c_str(), "w");
         if (!csv) { std::perror(csv_path.c_str()); return 1; }
-        /* What this run was cut by, so two CSVs can never be compared across
-         * hops by accident -- the row count and every flux figure change with
-         * it, and nothing else in the file would say why. */
         std::fprintf(csv, "# window=%d hop=%d rate=%d\n", df::FFT_N, df::HOP_N, wav.rate);
         std::fprintf(csv, "block,time_s,band0,band1,band2,band3,flux,threshold,onset,strength,"
                              "boom_flux,boom_threshold,boom,boom_strength");
-        /* One pair of columns per analyser slot, named after the analyser -- so
-         * the file says which model produced which column rather than leaving a
-         * reader to remember what slot 1 was on the day it was written. The
-         * shape follows DF_ML_SLOTS, which the provenance line above records. */
         for (int i = 0; i < df::ML_SLOTS; i++) {
             df::Analyser *a = df::analyser_at(i);
             std::fprintf(csv, ",ml%d_%s_label,ml%d_%s_score",
@@ -238,26 +181,6 @@ int main(int argc, char **argv)
         std::fprintf(csv, "\n");
     }
 
-    /*
-     * The per-frame dump, written by the same loop that feeds the strips -- so
-     * what a notebook trains against is what the firmware computed, not a
-     * re-derivation of it.
-     *
-     * spec is byte-for-byte what a satellite's analyser lane is handed. mag is
-     * the one field of Frame that no later consumer could recover: it points
-     * into `analysis` and dies at the next process(), so this loop is the last
-     * place it exists. band rides along because the wire carries it at full
-     * float precision and it costs sixteen bytes.
-     *
-     * Binary rather than CSV because a float32 survives a decimal round-trip
-     * only at nine significant digits -- and pipeline.py's validator measures
-     * differences well below what a %.4f column could even hold. The sidecar
-     * carries the grid for the same reason the CSV's provenance line does: two
-     * dumps cut at different hops must not be quietly comparable, and the
-     * dtype strings let dump_load.py size the arrays if DF_SPEC_BINS or FFT_N
-     * ever change. Native byte order, which is little-endian everywhere this
-     * builds.
-     */
     std::FILE *dump_spec = nullptr, *dump_mag = nullptr, *dump_band = nullptr;
     if (!dump_prefix.empty()) {
         const std::string spec_path = dump_prefix + ".spec.bin";
@@ -301,30 +224,17 @@ int main(int argc, char **argv)
 
     for (size_t b = 0; b < blocks; b++) {
         const int16_t *chunk = &wav.samples[b * df::HOP_N * df::CHANNELS];
-        /* From the file's rate, exactly as the firmware derives it from the
-         * stream's -- otherwise every time-based pattern runs at the wrong
-         * speed here and looks right on the boards. */
         const int64_t due_us = int64_t(b) * df::HOP_N * 1000000LL / wav.rate;
-        /* Copied rather than referenced: the analyser slots are filled in
-         * below, exactly as the firmware fills them on the way into its frame
-         * queue. f.mag still points into `analysis`, which is fine -- it is
-         * read before the next process(). */
         df::Frame f = analysis.process(chunk, int64_t(b), due_us, uint8_t(unit));
         if (f.onset) onsets++;
         if (f.boom)  booms++;
 
-        /* Before anything else touches the frame: f.mag points into `analysis`
-         * and is only readable until the next process(), which the dump is the
-         * whole reason to be here for -- see the block above. */
         if (dump_spec) {
             std::fwrite(f.spec, 1, df::SPEC_BINS, dump_spec);
             std::fwrite(f.mag, sizeof(float), df::BINS, dump_mag);
             std::fwrite(f.band, sizeof(float), BEAT_BANDS, dump_band);
         }
 
-        /* The same lanes the boards run, from the same source files, over the
-         * same bytes -- f.spec is what travels to a satellite, so this drives
-         * analysers on exactly what one of those would see. */
         df::run_fast_lane(f.spec, int64_t(b), due_us, ml_skip, f.ml);
 
         if (slow) {
@@ -337,8 +247,6 @@ int main(int argc, char **argv)
                 latch.publish(slow_slot, r);
             }
         }
-        /* And the same latch, so a slot waiting on a result behaves here the
-         * way it behaves on a strip. */
         latch.take(due_us, int64_t(df::HOP_N) * 1000000LL / wav.rate, f.ml);
         for (int i = 0; i < df::ML_SLOTS; i++) {
             if (df::result_valid(f.ml[i])) ml_results++;
@@ -346,8 +254,6 @@ int main(int argc, char **argv)
 
         pattern->render(f, rgb.data(), uint32_t(leds));
 
-        /* The firmware scales on the way to the strip, so do it here too or the
-         * image will not look like the hardware. */
         for (auto &v : rgb) v = uint8_t(v * scale);
 
         if (!image.empty() || !png_path.empty()) {
@@ -359,8 +265,6 @@ int main(int argc, char **argv)
                          b, due_us / 1e6, f.band[0], f.band[1], f.band[2], f.band[3],
                          f.flux, f.threshold, f.onset ? 1 : 0, f.strength,
                          f.boom_flux, f.boom_threshold, f.boom ? 1 : 0, f.boom_strength);
-            /* The label is printed as its NAME where the analyser has one -- a
-             * bare class id is unreadable a week later. */
             for (int i = 0; i < df::ML_SLOTS; i++) {
                 if (!df::result_valid(f.ml[i])) { std::fprintf(csv, ",,"); continue; }
                 df::Analyser *a = df::analyser_at(i);

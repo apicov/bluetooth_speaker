@@ -28,14 +28,12 @@ void chunk(std::FILE *f, const char *type, const uint8_t *data, size_t len)
     std::fwrite(crc.data(), 1, crc.size(), f);
 }
 
-}  // namespace
+}
 
 bool png_write(const std::string &path, const uint8_t *rgb, int w, int h, std::string &err)
 {
     if (w <= 0 || h <= 0) { err = "empty image"; return false; }
 
-    /* Each scanline is prefixed with a filter byte; 0 means "none", which keeps
-     * this simple and still compresses well on flat colour. */
     std::vector<uint8_t> raw;
     raw.reserve(size_t(h) * (size_t(w) * 3 + 1));
     for (int y = 0; y < h; y++) {
@@ -59,11 +57,11 @@ bool png_write(const std::string &path, const uint8_t *rgb, int w, int h, std::s
     std::vector<uint8_t> ihdr;
     be32(ihdr, uint32_t(w));
     be32(ihdr, uint32_t(h));
-    ihdr.push_back(8);      /* bit depth */
-    ihdr.push_back(2);      /* colour type 2 = truecolour RGB */
-    ihdr.push_back(0);      /* deflate */
-    ihdr.push_back(0);      /* adaptive filtering */
-    ihdr.push_back(0);      /* no interlace */
+    ihdr.push_back(8);
+    ihdr.push_back(2);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
     chunk(f, "IHDR", ihdr.data(), ihdr.size());
     chunk(f, "IDAT", z.data(), z.size());
     chunk(f, "IEND", nullptr, 0);
