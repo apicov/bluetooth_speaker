@@ -477,34 +477,23 @@ extern volatile int32_t n_lead_min_us;
  */
 void tx_fail_note(tx_lane_t lane, int err);
 /** @brief The audio downlink's entry point, kept as a name for the two send
- *         paths in timeline.c. */
-/** @brief The audio downlink's entry point, kept as a name for the two send
  *         paths in timeline.c.
  *  @param err  The errno sendto() returned. */
 void tx_fail_note_audio(int err);
-/** @brief Render the errno tally for the status line and clear it. */
 /** @brief Render the errno tally for the status line and clear it.
  *  @param buf  Output buffer.
  *  @param len  Its size. */
 void tx_fail_summary(char *buf, size_t len);
-/** @brief Render the per-lane breakdown; rendered and cleared with the errno
- *         tally so the two cannot describe different windows. */
 /** @brief Render the per-lane breakdown; rendered and cleared with the errno
  *         tally so the two cannot describe different windows.
  *  @param buf  Output buffer.
  *  @param len  Its size. */
 void tx_fail_lanes(char *buf, size_t len);
 /** @brief Render the shape of an ENOMEM storm -- beacon-spaced clusters
- *         against one unbroken stall; empty string when nothing was
- *         refused. */
-/** @brief Render the shape of an ENOMEM storm -- beacon-spaced clusters
  *         against one unbroken stall; empty string when nothing was refused.
  *  @param buf  Output buffer.
  *  @param len  Its size. */
 void tx_burst_summary(char *buf, size_t len);
-/** @brief The air's own reading, from tx_done_cb() in net.c, which survives
- *         a cache queue in front of the driver when every other stall signal
- *         does not. Always writes a non-empty string. */
 /** @brief The air's own reading, from tx_done_cb() in net.c, which survives
  *         a cache queue in front of the driver when every other stall signal
  *         does not. Always writes a non-empty string.
@@ -779,26 +768,17 @@ void wifi_start_ap(void);
 void socket_start(void);
 
 /** @brief Register or refresh a satellite on the send list; called from
- *         probe.c, since probing implies listening. */
-/** @brief Register or refresh a satellite on the send list; called from
  *         probe.c, since probing implies listening.
  *  @param from  The probe's source address. */
 void client_seen(const struct sockaddr_in *from);
-/** @brief A satellite associated: called from net.c's WiFi event handler. */
 /** @brief A satellite associated: called from net.c's WiFi event handler.
  *  @param mac  The satellite's MAC, as the event carries it.
  *  @param ip   The address the DHCP server gave it. */
 void client_joined(const uint8_t mac[6], const esp_ip4_addr_t *ip);
-/** @brief A satellite disassociated: called from net.c's event handler. */
 /** @brief A satellite disassociated: called from net.c's event handler.
  *  @param mac  The satellite's MAC. */
 void client_gone(const uint8_t mac[6]);
 
-/** @brief Copy the send list under the spinlock; returns MAX_CLIENTS slots,
- *         caller tests last_seen (a zeroed slot is "not listening"). Only
- *         the copy is shared -- message building stays per-caller, because
- *         each lane is on its own cadence and likely to grow its own rate
- *         limit. */
 /** @brief Copy the send list under the spinlock; returns MAX_CLIENTS slots,
  *         caller tests last_seen (a zeroed slot is "not listening"). Only
  *         the copy is shared -- message building stays per-caller, because
@@ -809,32 +789,23 @@ void clients_snapshot(client_t *dst);
 
 /** @brief Drop satellites past CLIENT_TIMEOUT_US. Runs before each audio
  *         send and on the 5 s tick, so clients age out while audio is
- *         stopped too. */
-/** @brief Drop satellites past CLIENT_TIMEOUT_US. Runs before each audio
- *         send and on the 5 s tick, so clients age out while audio is
  *         stopped too.
  *  @param now  Current esp_timer reading, us. */
 void clients_age(int64_t now);
 
 #if CONFIG_DANCEFLOOR_ENABLE_VISUALISER
 /** @brief Batch analysis frames and send them to every listener, paced by
- *         TX_FRAME_PACE_US (clients.c). */
-/** @brief Batch analysis frames and send them to every listener, paced by
  *         TX_FRAME_PACE_US (clients.c).
  *  @param f  The frame the analysis lane produced. */
 void publish_frame(const vis_frame_t *f);
 #endif
 
-/** @brief The playback task (play.c). */
 /** @brief The playback task (play.c).
  *  @param arg  Unused; the FreeRTOS task signature. */
 void local_play_task(void *arg);
-/** @brief The time-probe server task (probe.c). */
 /** @brief The time-probe server task (probe.c).
  *  @param arg  Unused; the FreeRTOS task signature. */
 void probe_task(void *arg);
-/** @brief The 5 s monitor task: telemetry_tick() then servo_tick(), in that
- *         order, because the counters matter most when audio has stopped. */
 /** @brief The 5 s monitor task: telemetry_tick() then servo_tick(), in that
  *         order, because the counters matter most when audio has stopped.
  *  @param arg  Unused; the FreeRTOS task signature. */
