@@ -601,24 +601,67 @@ def main():
         # lost anything.
         k = gauge(met, "hub", "status", "fec-k")
         k_val = int(k["value"].iloc[-1]) if k is not None and not k.empty else None
-        tx = window_sum(met, "hub", "fec-tx")
-        cong = window_sum(met, "hub", "fec-cong")
-        skip = window_sum(met, "hub", "fec-skip")
+        #
+        # PER WINDOW, NOT SUMMED, and that is not a style choice.
+        #
+        # The hub's status line is emitted on time but does not all reach the
+        # capture: on the 2026-08-25 soak its HEALTH lines arrived 60, 120, 180,
+        # 240 ... 780 s apart -- exact multiples of their 60 s period, so whole
+        # lines are being dropped, while the satellites' came 60 s apart 104
+        # times out of 104. Roughly two thirds of the hub's lines were missing.
+        #
+        # A per-window counter summed over the windows that happened to arrive is
+        # therefore not a run total, it is a sample presented as one. This
+        # printed "parity sent 14,251" for a run in which each satellite RECEIVED
+        # ~49,500 -- and the per-window value was right the whole time.
+        #
+        # A median over observed windows is what survives the dropped lines, and
+        # it is the figure worth reading anyway: parity should be exactly the
+        # audio packet rate divided by K, and that is a ratio, not a total.
+        txs = gauge(met, "hub", "status", "fec-tx")
+        nwin = 0 if txs is None or txs.empty else len(txs)
+        tx_med = None if not nwin else txs["value"].median()
+
+        # The status window, recovered as the SHORTEST interval between two
+        # observed lines. Dropped lines only ever create multiples of the real
+        # period, so the minimum is the period even when most are missing --
+        # which beats assuming DANCEFLOOR_LOG_PERIOD_S, since it is not logged.
+        # Median of the SHORT intervals rather than the outright minimum: the
+        # minimum is one line's arrival jitter and read 19 s for a 20 s period.
+        win_s = None
+        if nwin > 2:
+            d = txs["wall_s"].diff().dropna()
+            d = d[d > 0]
+            if not d.empty:
+                win_s = round(d[d <= d.min() * 1.5].median())
+
+        rate = f"  =  {tx_med / win_s:.1f}/s" if tx_med and win_s else ""
         print(f"  hub: K={k_val if k_val is not None else '--'}"
-              f"   parity sent {tx:,}   withheld under backoff {cong:,}"
-              f"   ungroupable {skip:,}")
+              f"   parity {fmt_or(tx_med, '.0f')} per"
+              f" {f'{win_s:.0f} s' if win_s else 'window'}{rate}")
+
+        def hub_hits(name):
+            g = gauge(met, "hub", "status", name)
+            return 0 if g is None or g.empty else int((g["value"] > 0).sum())
+
+        print(f"       withheld under backoff: {hub_hits('fec-cong')} of {nwin}"
+              f" windows   ungroupable: {hub_hits('fec-skip')} of {nwin} windows")
+        print("       (windows OBSERVED, not elapsed. The hub drops log lines --"
+              " see the note above -- so these are lower bounds,")
+        print("        and the satellite rows below are the side to trust.)")
+        cong_hits = hub_hits("fec-cong")
         if k_val == 0:
             print("       ** parity is switched OFF in this build "
                   "(DANCEFLOOR_AUDIO_FEC_K=0) -- the rows below are the "
                   "unprotected baseline **")
-        elif tx == 0:
+        elif not tx_med:
             print("       ** no parity was sent all run -- check the build and "
                   "the hub's own status line before reading anything below **")
-        if cong:
-            print(f"       {cong:,} groups stood down for the transmit pool. That is"
-                  " the design working: read it beside tx-fail (audio),")
-            print("       which must NOT have risen with it -- if both moved, parity"
-                  " is not what is holding the pool.")
+        if cong_hits:
+            print(f"       parity stood down for the transmit pool in {cong_hits}"
+                  " window(s). That is the design working: read it beside")
+            print("       tx-fail (audio), which must NOT have risen with it -- if"
+                  " both moved, parity is not what is holding the pool.")
         for u, gaps, rec, lost, held, bad in fec_rows:
             if gaps == 0:
                 print(f"  {u}: no losses this run -- parity had nothing to repair,"
