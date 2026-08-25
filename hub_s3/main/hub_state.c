@@ -1,10 +1,4 @@
-/*
- * Definitions for the state hub.h declares.
- *
- * Nothing but definitions: every comment explaining what these mean, who writes
- * them and what a torn read costs is in hub.h, beside the declaration. Keeping
- * them apart is what lets hub.h be read as the ownership document it is.
- */
+
 #include "hub.h"
 
 const char *TAG = "stream";
@@ -15,9 +9,9 @@ volatile uint32_t sample_rate = 44100;
 uint32_t tx_rate = 44100;
 uint32_t rate_ema;
 volatile int32_t rate_trim_hz;
-volatile uint8_t audio_volume;  /* meaningless until audio_vol_known */
-volatile bool audio_vol_known;  /* sticky: set by the first level from the bridge */
-volatile uint32_t n_vol_tx;  /* MSG_VOL datagrams sent to listeners */
+volatile uint8_t audio_volume;
+volatile bool audio_vol_known;
+volatile uint32_t n_vol_tx;
 #if CONFIG_DANCEFLOOR_ENABLE_MARKER
 volatile int64_t s_marker_at;
 #endif
