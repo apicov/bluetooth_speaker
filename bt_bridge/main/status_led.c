@@ -6,38 +6,12 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-/*
- * Two LEDs on the front of the bridge, so the box says what it is doing with no
- * console attached: one solid when a phone is connected, one blinking while
- * audio is actually moving.
- *
- * Both are read-only indicators -- nothing here feeds back into the link or the
- * Bluetooth stack.
- */
 #define PIN_CONNECTED CONFIG_BRIDGE_LED_CONNECTED_GPIO
 #define PIN_STREAMING CONFIG_BRIDGE_LED_STREAMING_GPIO
 
-/*
- * Either pin set to -1 removes that LED. The tests are #if rather than if,
- * because a disabled pin would otherwise leave `1ULL << -1` in the source for
- * the compiler to fold and complain about, dead branch or not.
- */
 #define HAVE_CONNECTED (PIN_CONNECTED >= 0)
 #define HAVE_STREAMING (PIN_STREAMING >= 0)
 
-/*
- * Which level lights an LED, which is a property of the wiring and not of
- * anything this file decides.
- *
- * Both LEDs have their anodes on 3V3 and their cathodes on the pins, so the pin
- * sinks the current and a LOW level lights it. Everything below is written as
- * LED_ON and LED_OFF rather than 1 and 0, so the logic reads the same either
- * way and a rewired board is a menuconfig change rather than a patch.
- *
- * Getting it wrong does not produce a dark LED, which is the trap. The
- * connected LED reads BACKWARDS -- solid whenever no phone is connected -- and
- * the streaming LED blinks in antiphase, which is undetectable on its own.
- */
 #if CONFIG_BRIDGE_LED_ACTIVE_LOW
 #define LED_ON  0
 #define LED_OFF 1
@@ -46,25 +20,9 @@
 #define LED_OFF 0
 #endif
 
-/*
- * Tick period, and the blink built on top of it.
- *
- * The tick stays fast because the connected LED and the silence check below
- * both want it: it is what decides how quickly either LED reacts to a phone
- * connecting or a stream stopping. The blink rate is separate -- one edge every
- * BLINK_HALF_MS, so on for a second and off for a second is 0.5 Hz.
- */
 #define TICK_MS 100
 #define BLINK_HALF_MS 1000
 
-/*
- * How long after the last packet the streaming LED goes dark.
- *
- * A2DP delivers a packet roughly every 20 ms while playing, so anything past a
- * few packets' worth of silence means the phone paused, went away, or the
- * stream broke. 300 ms is long enough that ordinary jitter never blinks the
- * LED off and short enough that a pause reads as immediate.
- */
 #define SILENCE_US 300000
 
 static volatile bool s_connected;
@@ -82,15 +40,6 @@ void status_led_note_audio(void)
 
 static const char *TAG = "status_led";
 
-/*
- * The LEDs are driven from a task rather than from the events themselves.
- *
- * Connection state could be written straight to the pin from the A2DP callback,
- * but the blink cannot -- it needs a clock -- and having one owner for both
- * means the two can never disagree about who last touched a pin. It also keeps
- * gpio_set_level() out of the Bluetooth stack's callback context, which is the
- * one place on this chip with no time to spare.
- */
 static void led_task(void *arg)
 {
     bool blink = false;
@@ -102,34 +51,18 @@ static void led_task(void *arg)
 #if HAVE_CONNECTED
         gpio_set_level(PIN_CONNECTED, s_connected ? LED_ON : LED_OFF);
 #endif
-        /*
-         * DELIBERATELY NOT UNDER #if HAVE_STREAMING, though the LED it also
-         * drives is. This same test is the only thing on this chip that knows
-         * the A2DP source has gone quiet, and a soak needs it said out loud:
-         * when the phone stops feeding, nothing else here logs anything at all,
-         * so the hub starves and the bridge's console shows a hole. Two runs
-         * were read that way before this existed, and neither could separate a
-         * phone that stopped sending from a bridge that failed to forward.
-         *
-         * A diagnostic that disappears when someone does not wire an LED is
-         * useless on exactly the rig that needs it, so only the gpio_set_level()
-         * below is conditional.
-         */
+
         const int64_t now_us = esp_timer_get_time();
         const bool streaming =
             s_last_audio_us != 0 && (now_us - s_last_audio_us) < SILENCE_US;
 
-        /* Edges only. The steady states are the LED's business, and a line per
-         * tick would bury the two transitions that matter. */
         if (streaming != was_streaming && s_last_audio_us != 0) {
             const int64_t held = edge_us ? now_us - edge_us : 0;
             if (streaming) {
                 ESP_LOGW(TAG, "audio resumed after %lld ms of silence",
                          held / 1000);
             } else {
-                /* Dated from the last packet, not from this tick: the silence
-                 * began when the audio did, and SILENCE_US plus up to a tick of
-                 * latency is this task noticing, not the gap itself. */
+
                 ESP_LOGW(TAG, "audio stopped, last packet %lld ms ago",
                          (now_us - s_last_audio_us) / 1000);
             }
@@ -137,14 +70,11 @@ static void led_task(void *arg)
         }
 
         if (!streaming) {
-            /* Settle dark rather than freezing wherever the last edge left it:
-             * an LED stopped mid-blink and one lit solid would read the same. */
+
             blink = false;
             since_edge_ms = 0;
         } else if (!was_streaming) {
-            /* Light the moment audio starts, rather than up to a second later.
-             * The LED is slow enough now that waiting out a half period would
-             * look like it had missed the stream entirely. */
+
             blink = true;
             since_edge_ms = 0;
         } else if ((since_edge_ms += TICK_MS) >= BLINK_HALF_MS) {
@@ -163,8 +93,7 @@ static void led_task(void *arg)
 void status_led_start(void)
 {
 #if HAVE_CONNECTED || HAVE_STREAMING
-    /* Pins only. The task below starts either way -- it carries the audio-gap
-     * diagnostic now, which a board with no LEDs still wants. */
+
     const gpio_config_t cfg = {
         .pin_bit_mask =
 #if HAVE_CONNECTED
@@ -179,11 +108,6 @@ void status_led_start(void)
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
 
-    /* Drive both dark before the task exists. gpio_config() leaves an output at
-     * 0, which on an active-low LED is LIT -- so without this both LEDs come up
-     * solid at boot and stay that way until the first tick. It is only 100 ms,
-     * but "both LEDs solid" is what a hung bridge looks like, and the boot is
-     * exactly when someone is watching for that. */
 #if HAVE_CONNECTED
     gpio_set_level(PIN_CONNECTED, LED_OFF);
 #endif
@@ -192,12 +116,8 @@ void status_led_start(void)
 #endif
 #endif
 
-    /* Lowest priority in the system: a missed tick shows as a slightly uneven
-     * blink and nothing else, which is the right thing to give up first. */
     if (xTaskCreate(led_task, "status_led", 2048, NULL, 1, NULL) != pdPASS) {
-        /* Checked like the rest, though this is the one whose loss costs
-         * nothing but the panel: dark LEDs would otherwise read as "no phone
-         * connected", which is a wrong answer rather than a missing one. */
+
         ESP_LOGE(TAG, "TASK \"status_led\" FAILED TO START -- the front panel "
                       "will stay dark and does NOT mean the link is down");
     }
