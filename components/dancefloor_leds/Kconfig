@@ -211,8 +211,8 @@ menu "Dancefloor LEDs"
             each window begins where the last one ended -- which is what shipped
             before overlap existed.
 
-            The detector has been retuned for 512 -- see docs/tuning-corpus.md,
-            which is the corpus, the commands and the ladders. The outcome was
+            The detector has been retuned for 512. tools/tuning/ holds the
+            corpus manifest and the sweep that produced it. The outcome was
             that no constant needed to move: both flux floors and BEAT_HIST are
             the same numbers at 512 as at 1024, now measured over 206 recordings
             at both hops rather than ten at one.
@@ -351,7 +351,7 @@ menu "Dancefloor LEDs"
             more: CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP now lets the WiFi and
             lwIP buffers prefer it too, because internal SRAM on that board had
             reached a 1520-byte watermark and a 1700-byte WiFi TX buffer was
-            failing to allocate. See docs/hub-s3-gap-list.md S2.4.
+            failing to allocate.
 
             That is not a competition for space -- 8 MB against an arena capped
             at 4096 kB and a WiFi ceiling near 105 kB -- but it does mean the

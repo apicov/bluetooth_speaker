@@ -3,7 +3,6 @@
 # Proposed by ./sweep.py segments (band-0 rise for the drum half, band 1 for the
 # speech half) and then CONFIRMED BY EAR. The proposal is a convenience for
 # finding boundaries, not evidence; what is checked in is what a human heard.
-# See docs/tuning-corpus.md for who confirmed it and against which decode.
 #
 # label: drum   -> the `zabumba` group, the positive corpus
 #        speech -> the `zabumba-speech` group, a real-world negative control

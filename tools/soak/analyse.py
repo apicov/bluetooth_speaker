@@ -12,7 +12,7 @@ exists to answer, in the order they matter:
   5. buffer depth              a slow drift is what a continuous trim can cause
   6. delivery                  whether audio arrived evenly, and what a hole cost
   7. the hub's refused sends    where a hole in the sound is most often made
-  8. heap                      the long-run question architecture.md 17 names
+  8. heap                      what only a run of hours can answer
   9. the source                stalls, which look like unit faults and are not
 
 REBOOTS ARE HANDLED, and this is the part worth knowing about before trusting a
@@ -450,10 +450,9 @@ def main():
         print(f"  under 3 ms: {(v <= 3).mean() * 100:.0f}%    under 6 ms:"
               f" {(v <= 6).mean() * 100:.0f}%")
         print()
-        print("  Reference: 0.5-2.5 ms is the best this project has recorded;")
-        print("  clock-sync.md documents 2-9 ms as the expected deadband-bound range.")
+        print("  Reference: 0.5-2.5 ms is the best this project has recorded.")
         if v.median() > 4:
-            print("  Sitting high in that band -- tightening the deadband is the lever,")
+            print("  Sitting well above that -- tightening the deadband is the lever,")
             print("  and the rate trim removed both things that made it unaffordable.")
 
     # ---- 3. the rate trim ---------------------------------------------------

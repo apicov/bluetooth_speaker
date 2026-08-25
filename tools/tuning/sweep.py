@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-sweep -- drive pattern_lab over the corpus and reduce its output to the tables
-in docs/tuning-corpus.md.
+sweep -- drive pattern_lab over the corpus and reduce its output to the tuning
+tables.
 
 This exists because the previous retune left no manifest. The booms-per-minute
 ladder in components/dancefloor_leds/analysis.cpp is the only record of it, and
 that comment does not say which tracks, which hop, or which command -- so
-reproducing it meant guessing at all three. Everything that document claims is
-produced by a subcommand here, and the subcommand is quoted beside the table.
+reproducing it meant guessing at all three. Every number the retune rested on is
+produced by a subcommand here, so the command IS the provenance.
 
 Stdlib only, deliberately: this box has no numpy on either interpreter, and a
 tool whose job is to still run in a year should not acquire a dependency to
@@ -48,8 +48,8 @@ CACHE = Path(os.environ.get("DF_TUNING_CACHE", Path.home() / ".cache" / "dancefl
 # two of the six recordings are lessons, and one of those carries half a minute
 # of pure talking that is worth keeping on purpose as a negative control. The
 # table is checked in beside this file because a segment boundary is a tuning
-# input like any other -- see ./sweep.py segments for how it was proposed, and
-# docs/tuning-corpus.md for who confirmed it by ear.
+# input like any other. ./sweep.py segments shows how it was proposed; what is
+# checked in is what a human then confirmed by ear.
 ZAB_SEGMENTS = HERE / "zabumba_segments.csv"
 ZAB_LABELS = HERE / "zabumba_labels.csv"
 
@@ -137,7 +137,7 @@ def corpus(groups, quiet=False):
 # a rate ladder cannot tell a suppressed stroke from an absent one. It does not
 # replace the anchor set, which is lossless and carries the comparison against
 # the record; these six are lossy rips through room and camera mics and answer a
-# different question. docs/tuning-corpus.md states the caveat in full.
+# different question. Do not read one group's ladder as the other's.
 
 def zab_sources():
     """The six recordings, whatever container they arrived in."""
@@ -538,8 +538,7 @@ def zab_seconds(binary, wav, window=1.0):
     Per-window statistics for segmenting a recording into drumming and talking.
 
     Three numbers, all from Frame::band so that nothing here can measure
-    something a satellite could not (docs/tuning-corpus.md section 9 makes that
-    a rule rather than a coincidence):
+    something a satellite could not -- a rule rather than a coincidence:
 
       b0      median band 0 -- 43-129 Hz, the mallet stroke's own band
       rise    p90 of the frame-to-frame rise in band 0 -- transients, not level,
@@ -584,8 +583,8 @@ def cmd_segments(args):
 
     Proposed rather than written: this classifier is a convenience for finding
     the boundaries, not evidence. What is checked in is what a human confirmed,
-    and docs/tuning-corpus.md records that distinction because the whole point
-    of that document is that a tuning input with no provenance is worth nothing.
+    and that distinction is the whole point: a tuning input with no provenance
+    is worth nothing.
     """
     lab = build_lab(args.hop)
     print("# proposed segments -- confirm by ear before checking in")
@@ -636,8 +635,8 @@ def cmd_segments(args):
 # --------------------------------------------------------------------------
 # ground truth
 #
-# The corpus has never had any. Every table in docs/tuning-corpus.md is a rate
-# -- booms per minute against a floor -- plus a synthetic negative control, and a
+# The corpus has never had any. Every table the sweep produces is a rate -- booms
+# per minute against a floor -- plus a synthetic negative control, and a
 # rate says how OFTEN the detector fired, never whether it fired on a drum
 # stroke. On a full mix that gap cannot be closed: a suppressed stroke and an
 # absent one look identical from the outside. On isolated drumming it can, and

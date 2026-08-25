@@ -5,7 +5,7 @@ CONFIG_FREERTOS_HZ=1000
 # 240 MHz, not the 160 MHz IDF default.
 #
 # Carried over from the S3 hub, where it was half of a change that cut analysis
-# cost in half -- see docs/hub-s3-gap-list.md S1.1. Both parts support 240; 160
+# cost in half. Both parts support 240; 160
 # is simply the default nobody changed, and this unit had never changed it
 # either. It was listed there as "portable, the classic hub could have this
 # today" and the classic hub is gone, so the satellite is now the only classic
@@ -18,9 +18,9 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 # Flash in QIO at 80 MHz, up from DIO at 40 MHz -- 4x the bandwidth on both axes
-# combined. docs/hub-s3-gap-list.md S1.2 has the reasoning: the application is
-# mapped from flash and pulled through the instruction cache a line at a time,
-# so this sets what every cache miss costs.
+# combined. The application is mapped from flash and pulled through the
+# instruction cache a line at a time, so this sets what every cache miss
+# costs.
 #
 # THREE TRAPS, all of which have caught someone already:
 #
@@ -73,7 +73,7 @@ CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 # Stated here as well as being the Kconfig default because it is the hop the
 # detector is tuned at. Both flux floors and the beat history were swept against
 # 206 recordings at 512 and none of the three moved, so a floor running this is
-# running the tuned detector -- see docs/tuning-corpus.md. Kept in the tracked
+# running the tuned detector; tools/tuning/ has the sweep. Kept in the tracked
 # config rather than left to the component default because a hop mismatch across
 # a floor is the expensive bug, and this is the unit it is most likely to happen
 # on: nothing crosses between locally analysing units, so a satellite on the

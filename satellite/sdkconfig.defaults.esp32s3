@@ -13,10 +13,10 @@
 #
 # The project deliberately does not have a satellite_s3/ directory. hub_s3/ was
 # made that way -- a copy of hub/ -- and the two shared ~1983 of ~2024 lines,
-# drifted apart in both directions, and needed a 481-line document
-# (docs/hub-s3-gap-list.md) to track what each owed the other. The classic hub
-# was eventually retired rather than reconciled. See docs/satellite-audit.md F1;
-# this file is the alternative that finding argues for.
+# drifted apart in both directions, and needed a 481-line document of its own to
+# track what each owed the other. The classic hub was eventually retired rather
+# than reconciled, and this file is the alternative: one tree, per-target
+# defaults.
 #
 # WHICH XIAO. The pad numbering -- D0=1 D1=2 D2=3 D3=4 D4=5 D5=6 D6=43 D7=44
 # D8=7 D9=8 D10=9 -- is identical across the plain XIAO ESP32-S3, the Sense and

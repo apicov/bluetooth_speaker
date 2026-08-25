@@ -4,7 +4,7 @@ Joins the master's SoftAP, keeps its clock aligned with the hub's, receives
 unicast SBC, decodes it, and plays each chunk at the instant it was stamped for.
 Drives an LED strip from the audio it is about to play — or, if built for
 `DANCEFLOOR_LED_SOURCE_REMOTE`, from analysis frames the hub sends, drawn at the
-instant each names. See [`../docs/architecture.md`](../docs/architecture.md) §12.
+instant each names.
 
 **No Bluetooth here.** The master owns the phone connection; this board only
 listens on WiFi. Any ESP32 variant would work for this role, but the project
@@ -19,11 +19,10 @@ still analyses no audio of its own. `DANCEFLOOR_ML` is what separates them and
 it is set in `sdkconfig.defaults.esp32s3` alone; see "Where a difference between
 the two goes" below for how that generalises.
 
-> [`../docs/satellite-audit.md`](../docs/satellite-audit.md) reads this firmware
-> for clarity, modularity and what a second target costs. Its findings were
-> acted on over 2026-08-12: the firmware is nine files rather than one, the
-> internal-DAC path is gone, and the S3 is a target rather than a fork. §2 of
-> the audit records what was done and what was deliberately left.
+> This firmware was read once for clarity, modularity and what a second target
+> costs, and the findings were acted on over 2026-08-12: it is nine files rather
+> than one, the internal-DAC path is gone, and the S3 is a target rather than a
+> fork.
 
 ## How the source is laid out
 
@@ -71,9 +70,8 @@ the WiFi buffer placement and the console route come from
 `sdkconfig.defaults.esp32s3`, which IDF reads after `sdkconfig.defaults` when the
 target is the S3; the pin *defaults* are also keyed on `IDF_TARGET_ESP32S3` in
 `main/Kconfig.projbuild`, so a bare `set-target` build is already correct. There
-is deliberately no `satellite_s3/` directory — see
-[`../docs/satellite-audit.md`](../docs/satellite-audit.md) §F1 for what the
-equivalent fork cost on the hub.
+is deliberately no `satellite_s3/` directory: the hub carried the equivalent
+fork for a while, and it was retired rather than reconciled.
 
 **Which XIAO.** The S3 defaults are written for the **XIAO ESP32-S3 Plus**, which
 is what `hub_s3/` runs on, so a hub and a satellite are the same board wired the
@@ -241,7 +239,7 @@ when it happens, and it is applied when playback *reaches* the flagged audio
 rather than when the notification arrives.
 
 The clock offset comes from 802.11 TSF when a fresh reading is available, and
-from the probe estimator otherwise. See `../docs/clock-sync.md`.
+from the probe estimator otherwise.
 
 ## Reading the log
 

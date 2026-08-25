@@ -7,8 +7,9 @@ one port per unit and reads them concurrently. Everything that arrives is echoed
 to this terminal, prefixed with the unit it came from, so a soak can be watched
 as well as recorded.
 
-Written for the long run architecture.md 17 asks for and has never been given:
-"the longest evidenced session is ten minutes against a four-hour target".
+Written for a long run this project had asked for and never been given: for a
+long time the longest evidenced session was ten minutes against a four-hour
+target. The session directories beside this script are what closed that.
 
 Outputs, in one session directory per run:
 

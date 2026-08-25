@@ -592,7 +592,7 @@ CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 # satellite: a hop mismatch across a floor is the expensive bug, and this build
 # makes one MORE likely rather than less, because it is the first unit on the
 # floor whose config is not a copy of the others'. Both flux floors and the beat
-# history were swept against 206 recordings at 512 -- see docs/tuning-corpus.md.
+# history were swept against 206 recordings at 512; tools/tuning/ has the sweep.
 CONFIG_DANCEFLOOR_LED_HOP_512=y
 
 # The pattern the floor runs, which is a floor-wide agreement and not a per-unit
@@ -644,8 +644,8 @@ CONFIG_DANCEFLOOR_LED_PATTERN="boom"
 # so the Sense-era warning that the card reader might contend for the D8/D9/D10
 # pads used by I2S below is simply gone, and GPIO 41/42 are ordinary pads here
 # rather than a microphone's. Nothing is lost with them: a hub analyses the
-# synchronised stream and deliberately never listens to a room
-# (architecture.md S12), so the Sense's sensors were always dead weight.
+# synchronised stream and deliberately never listens to a room, so the Sense's
+# sensors were always dead weight.
 
 # I2S to the PCM5102A, on the three SPI-labelled pads so the DAC is one ribbon
 # off the end of the header. This chip is the I2S master.
@@ -688,7 +688,9 @@ CONFIG_DANCEFLOOR_SBC_SPI_HS_PIN=3
 # WS2812 data, still via the 74AHCT125 -- the S3 drives 3.3 V exactly as the
 # classic ESP32 does, so the level shifter is no less necessary here. Driven
 # through SPI2_HOST and the GPIO matrix, which is fine at the ~2.4 MHz the
-# WS2812 encoding needs. Never RMT: see architecture.md S12.
+# WS2812 encoding needs. Never RMT: led_strip enables and disables an RMT
+# channel per frame, and rmt_disable races the transmit-done interrupt, which
+# wedges the strip after some minutes.
 CONFIG_DANCEFLOOR_LED_GPIO=1
 
 # gpio_set_level() into IRAM, for the SBC link's handshake.
@@ -766,8 +768,7 @@ CONFIG_DANCEFLOOR_ENABLE_LED_MARKER=y
 # 240 MHz LX6 with esp-dsp's generic FFT; this is an LX7 with the SIMD path, and
 # the starvation may be smaller, absent, or differently shaped. It is set here
 # because it was right there and is unlikely to hurt, which is exactly the
-# standard architecture.md's postscript says produced most of the wasted effort
-# in this project.
+# standard that produced most of the wasted effort in this project.
 #
 # Before trusting it, run it both ways and read the vis log line. That is a
 # measurement nobody has made on this part.

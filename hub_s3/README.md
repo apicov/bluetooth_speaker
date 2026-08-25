@@ -14,20 +14,20 @@ Built for a **Seeed Studio XIAO ESP32-S3 Plus**.
 > with the UART link it was the last thing still speaking. Nothing here is a port
 > any more, and there is no other hub to stay diffable against.
 
-**Run on hardware**, two sessions on 2026-08-12 — see `../docs/satellite-audit.md`
-§7.5 and §7.6 for what they showed, including four clean minutes with sync
-converging inside ~1 ms and `tx-fail` at zero after association.
+**Run on hardware**, first on 2026-08-12 and in long captures since. The
+sessions are kept in `../tools/soak/`, and `analyse.py` there reduces one to
+what held and what moved.
 
 ## Why the hub is the one role that can be an S3
 
-`../docs/architecture.md` §2 fixes the chip choice for `bt_bridge` and only for
-`bt_bridge`: A2DP is Bluetooth Classic, and of the ESP32 family only the original
-part has it. The hub runs no Bluetooth — that is the entire point of the two-chip
-split — so it is the one image in the project an S3 can carry.
+The chip choice is fixed for `bt_bridge` and only for `bt_bridge`: A2DP is
+Bluetooth Classic, and of the ESP32 family only the original part has it. The
+hub runs no Bluetooth — that is the entire point of the two-chip split — so it
+is the one image in the project an S3 can carry.
 
-What §2 *also* says is that the project chose classic ESP32 everywhere anyway,
-for one part number and interchangeable spares. This board is a departure from
-that decision, not an oversight in it. The satellite is still a classic ESP32.
+The project chose classic ESP32 everywhere anyway, for one part number and
+interchangeable spares. This board is a departure from that decision, not an
+oversight in it. The satellite is still a classic ESP32.
 
 ## Pin map
 
@@ -68,8 +68,7 @@ measures. `TRACK DIVERGENCE` over WiFi still covers every satellite, not just a
 wired one.
 
 The **74AHCT125 is still required**. The S3 drives 3.3 V exactly as the classic
-ESP32 does, so nothing about the level-shifting argument in
-`../docs/architecture.md` §12 changes.
+ESP32 does, so the level-shifting argument is unchanged.
 
 **The LED sync marker is active low**, as on every unit on this floor: the LED
 goes from 3V3 through a resistor to the pin, and the pin sinks it to light it.
@@ -152,7 +151,7 @@ Four settings that are not IDF defaults and are each load-bearing. All are in
 | CPU | **240 MHz** | with the cache below, took `analysis` 3900 → 1940 µs mean |
 | Instruction cache | **32 kB** | the S3 offers 16 or 32 and **defaults to 16** |
 | Flash | **QIO, 80 MHz** | ~40 MB/s against DIO/40's ~10; sets what every cache miss costs |
-| PSRAM | **on, `CAPS_ALLOC` only** | see `../docs/hub-audit.md` §5 |
+| PSRAM | **on, `CAPS_ALLOC` only** | nothing on the audio path may land there — see the `MEM:` note below |
 
 The instruction cache is the trap worth remembering on any future retarget:
 `CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB` has no counterpart on the classic ESP32,
@@ -183,17 +182,16 @@ larger app partition if that ever matters.
 **Do not read the `HEALTH` line's heap figures as internal memory.**
 `esp_get_free_heap_size()` reports the 8 MB PSRAM pool, which nothing on the
 audio path can use — every `HEALTH` line has read ~8.4 MB free while internal SRAM
-went to 1.5 kB. The `MEM:` line exists to replace it. `../docs/hub-audit.md` §5
-has the baselines to compare against.
+went to 1.5 kB. The `MEM:` line exists to replace it.
 
 ## Still open on this board
 
-- **`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` is carried without evidence.**
-  `../docs/architecture.md` §13 recorded pinning lwIP to CPU0 fixing the pattern
-  task (max 23226 → 5254 µs) and *failing* to improve analysis (17400 → 17370 µs),
-  concluding the latter is "mostly the FFT doing its own work". Those numbers were
-  taken on an LX6 with the generic FFT; esp-dsp has an LX7 SIMD path this part
-  uses automatically. Run it both ways before trusting it.
+- **`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y` is carried without evidence.** It
+  came from a measurement on a classic ESP32 — an LX6 running the generic FFT —
+  where pinning lwIP to CPU0 helped the pattern task and did nothing for
+  analysis. That record has since been deleted, and neither half of it transfers
+  anyway: this part is an LX7, and esp-dsp takes a SIMD path on it
+  automatically. Run it both ways before trusting it.
 - **Nothing past one satellite has been measured.** The airtime model predicts
   ~30 with rate adaptation and A-MPDU on; nobody has put more than one on the
   floor with this config.
