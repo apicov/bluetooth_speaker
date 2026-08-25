@@ -1,33 +1,4 @@
 #!/usr/bin/env python3
-"""
-Read a soak session and say what happened.
-
-Takes a directory written by capture.py and answers the questions a long run
-exists to answer, in the order they matter:
-
-  1. did anything break        the counters that must stay at zero
-  2. cross-unit divergence     the number this project measures itself on
-  3. the rate trim             is it running, at the rate it claims, and stable
-  4. phase                     where each unit settled and how far it wandered
-  5. buffer depth              a slow drift is what a continuous trim can cause
-  6. delivery                  whether audio arrived evenly, and what a hole cost
-  7. the hub's refused sends    where a hole in the sound is most often made
-  8. heap                      what only a run of hours can answer
-  9. the source                stalls, which look like unit faults and are not
-
-REBOOTS ARE HANDLED, and this is the part worth knowing about before trusting a
-number. Every counter on a HEALTH line is cumulative SINCE BOOT, so if a board
-resets mid-soak they all return to zero. Taking a maximum would then silently
-report the larger of the two runs instead of their sum. A reset shows up as the
-board's own uptime going backwards, so the run is split into boot segments at
-those points and each segment's final value is added.
-
-Requires pandas. `pip install pandas`.
-
-Usage:
-    tools/soak/analyse.py logs-soak-20260814-120000/
-    tools/soak/analyse.py logs-soak-*/ --wide wide.csv
-"""
 
 import argparse
 import os
@@ -40,36 +11,19 @@ except ImportError:
     sys.exit("pandas is missing: pip install pandas")
 
 
-# Cumulative-since-boot counters. Anything not here is treated as a gauge.
 COUNTERS = {
     "underruns", "restarts", "reanchors", "anchors", "splices", "retunes",
     "retunes_refused", "gaps", "ring-full", "dma-starve", "short-reads",
     "short-resync", "wifi-drops", "alloc-fail", "phase-drop", "seq-drop",
     "decode-err", "recv-err", "sta-left", "wifi-over",
-    # fec-trunc was the piggyback scheme's truncation count on HEALTH. The
-    # scheme is gone and so is the counter; kept here so a capture taken before
-    # XOR parity still totals correctly rather than being read as a gauge.
     "fec-trunc",
     "refill-withheld", "anchors-refused", "upgrades", "dropped", "dup",
     "wide-span", "sta-timeout",
-    # The faded catch-up's own pair, apart from the trim's dropped/dup because
-    # a drain runs at ~1376 skip / ~688 replay frames/s by design and would
-    # drown the trim's own frames/s arithmetic if mixed in. Expected: flat in
-    # a clean run, a burst of a few seconds per knock.
-    # See components/dancefloor_sync/audio_shift.h.
     "catchup-drops", "catchup-dups",
-    # A seqlock reader that gave up and fell back to the estimator. Must be 0:
-    # the unbounded version of that loop hung a satellite on 2026-08-25 with a
-    # full ring and a starving DAC. See tsf_read() in satellite/main/sat.h.
     "tsf-read-fail",
-    # A satellite that took itself off the hub's send list because it could not
-    # play. Not a fault in itself -- it is the unit protecting the floor -- but
-    # it means one speaker was silent, and that must never be a mystery.
     "self-mutes",
 }
 
-# What must stay at zero for a soak to have gone well, and what a non-zero
-# reading means. Order is roughly worst-first.
 FAULTS = [
     ("underruns",    "playback ran dry"),
     ("ring-full",    "audio dropped, ring could not take it"),
@@ -88,42 +42,16 @@ FAULTS = [
     ("phase-drop",   "phase queue full, servo starved of input"),
 ]
 
-# capture.py's pseudo-unit for the 2.4 GHz sweep. Kept in step with AIR_UNIT
-# there; the two files agree on the name and on nothing else.
 AIR_UNIT = "air"
 
 
-# A refused send arrives in bursts, not at a rate, and the difference decides
-# what a soak can be judged on.
-#
-# The three 1-hour soaks of 2026-08-22 read 569 / 0 / 52 audio refusals and that
-# looked like wild variance in a rate. It was not: all 684 of soak 122631's
-# refusals fell inside one 80 s episode, and 2,212 of soak 165644's 2,219 fell
-# inside one 170 s episode that began 3h11m into a 3h53m run which was otherwise
-# perfectly clean -- 0 underruns, 0 dma-starve, 0 ring-full before it, and 39
-# quiet minutes after. Two major episodes in 7.5 h of steady-state logging,
-# covering ~1% of the time. (A third, in the 2-minute soak 165438, fired 14 s
-# after boot and is the startup transient sdkconfig.defaults documents, not
-# this.)
-#
-# So a per-hour mean spans a quiet run and a storm and describes neither, and
-# three 1-hour runs would read 0/0/0 roughly 45% of the time with nothing fixed;
-# three 3-hour runs, roughly 9%. What a change has to be judged on is how many
-# episodes a run had and how bad they were.
-EPISODE_GAP_S = 120     # quiet time that separates one episode from the next
-EPISODE_MAJOR = 50      # refused sends that make an episode worth counting
+EPISODE_GAP_S = 120
+EPISODE_MAJOR = 50
 
-# How far either side of an episode the air sweep is read. capture.py sweeps
-# every 30 s by default, so a short blackout is caught by AT MOST ONE sweep, and
-# not necessarily the one nearest the episode: on 2026-08-23 the first blind
-# sweep fell 26 s before its episode and nearest() sampled straight past it onto
-# a sweep that read one network. Two sweeps wide, so an adjacent blackout is
-# found from either direction and one missing sweep does not hide it.
 AIR_LEAD_S = 60
 
 
 def load(paths):
-    """Concatenate one or more session directories into (metrics, events)."""
     mparts, eparts = [], []
     for p in paths:
         m = os.path.join(p, "metrics.csv")
@@ -133,9 +61,6 @@ def load(paths):
         mparts.append(pd.read_csv(m))
         if os.path.exists(e) and os.path.getsize(e) > 0:
             eparts.append(pd.read_csv(e))
-    # Stable: lines that arrived in the same millisecond (HEALTH/TRIM/MEM print
-    # back-to-back) must keep their arrival order, or esp_ms flips backwards at
-    # every burst and one boot shatters into thousands of fake ones.
     met = pd.concat(mparts, ignore_index=True).sort_values("wall_s", kind="stable")
     ev = (pd.concat(eparts, ignore_index=True).sort_values("wall_s", kind="stable")
           if eparts else pd.DataFrame(columns=["wall_s", "unit", "kind", "text"]))
@@ -143,21 +68,7 @@ def load(paths):
 
 
 def boot_segments(df):
-    """Label each row with which boot it belongs to, per unit.
-
-    The board's own uptime only ever increases within a boot, so a decrease is a
-    reset. Detected per (unit, kind) because different lines are emitted on
-    different cadences and interleave.
-    """
     df = df.sort_values(["unit", "wall_s"], kind="stable").copy()
-    # ONLY THE INSTRUMENTED KINDS VOTE ON A RESET. The generic word-then-number
-    # scan lifts "metrics" out of prose too -- a build banner's date became
-    # `aug`, an address line became `ip` -- and those carry whatever esp_ms
-    # their line had, which for a boot banner is single digits. On the
-    # 2026-08-23 15:56 soak that reported "3 boots" and "2 boots" for two
-    # satellites that never restarted: their uptime counters rose monotonically
-    # across the whole 7 h and their final `up` covered the entire run. A false
-    # split re-baselines every counter mid-run, so this has to be narrow.
     real = df["kind"].isin(["health", "trim", "status"])
     step = df["esp_ms"].where(real).groupby(df["unit"]).diff()
     df["boot"] = (step.fillna(0) < 0).groupby(df["unit"]).cumsum().astype(int)
@@ -165,36 +76,10 @@ def boot_segments(df):
 
 
 def counter_total(df, unit, metric):
-    """Sum what `metric` gained across every boot segment of `unit`, in this window.
-
-    Counters are cumulative since boot, and a capture usually opens on boards
-    that booted hours ago: the first line already carries all that history, so
-    a raw total reports the past, not the soak. Each boot segment is therefore
-    baselined at its first observed value -- for a boot watched from esp=0 that
-    baseline is ~0 and nothing changes; for one joined mid-life it subtracts
-    everything that happened before the capture started.
-    """
-    # Only HEALTH and TRIM lines carry cumulative counters. The per-window RX 5s
-    # lines repeat metric names ('gaps 1', 'ring-full 0') as gauges, and mixing
-    # those into a cumulative series makes the baseline meaningless.
     s = df[(df["unit"] == unit) & (df["metric"] == metric)
            & df["kind"].isin(["health", "trim"])]
     if s.empty:
         return None
-    #
-    # PER KIND, THEN THE LARGER -- not one pooled series. HEALTH and TRIM are
-    # two different lines and a name can appear on both meaning two different
-    # things: on the 2026-08-23 15:56 soak the hub published `dropped` on both,
-    # the health one reaching 2 and the trim one 1,976. Pooling them takes
-    # max() from whichever series happens to be higher and first() from
-    # whichever sample happens to be earliest, so the answer is a difference
-    # between two unrelated counters. It read correctly there only because the
-    # health series started at 0 and stayed small.
-    #
-    # Taking the larger of the two independently-computed totals keeps the real
-    # counter and cannot double-count the impostor. A name carried by only one
-    # kind -- which is nearly all of them -- is unaffected.
-    #
     totals = []
     for _, part in s.groupby("kind"):
         per_boot = part.groupby("boot")["value"]
@@ -203,11 +88,6 @@ def counter_total(df, unit, metric):
 
 
 def fmt_or(v, spec, dash="   --"):
-    """A number, or a dash when the run never recorded it.
-
-    Same rule the satellite's lead-min follows on the wire: a value that was
-    not measured must not render as a plausible zero.
-    """
     return dash if v is None else format(v, spec)
 
 
@@ -217,59 +97,11 @@ def gauge(df, unit, kind, metric):
 
 
 def window_sum(df, unit, metric):
-    """Sum of a per-window `status` gauge over the windows THAT WERE CAPTURED.
-
-    tx-fail and the ENOMEM shape beside it are CLEARED by the window that
-    prints them -- see tx_fail_summary() and tx_burst_summary() in
-    hub_s3/main/net.c -- so summing windows is the right shape of arithmetic.
-
-    counter_total() is the wrong helper for them twice over: it baselines each
-    boot segment against its first value, which is meaningless for a series
-    that returns to zero every window, and it reads only health and trim lines
-    while these live on the hub's `status` line.
-
-    A LOWER BOUND, NOT A TOTAL, and callers must say so. The hub's log lines do
-    not all reach the capture: on the 2026-08-25 soak its HEALTH lines arrived
-    60, 120, 180, 240, 300, 361, 420, 540 and 780 s apart -- exact multiples of
-    their 60 s period, so whole lines are missing rather than emitted late --
-    while both satellites' arrived 60 s apart 104 times out of 104. Two thirds
-    of the hub's windows were missing, and every sum over them was short by
-    about that factor: `frames done 185,916` for a run that transmitted ~150/s
-    for an hour.
-
-    THE HUB IS NOT WHAT DROPS THEM, and an earlier version of this note said it
-    was. The hub's SERIAL CAPTURE flaps: that same run recorded 578 "capture:
-    opened" and 577 "capture: ... lost" cycles on the hub's FTDI adapter --
-    "device reports readiness to read but returned no data (device disconnected
-    or multiple access on port?)" -- against one open for sat_classic and two
-    for sat_s3. Whatever was in flight at each disconnect is gone.
-
-    That matters because it is fixable at the cable rather than in the firmware,
-    and because "multiple access on port" suggests something else is reading the
-    same tty -- a stray `idf.py monitor` will do it. Fix that and the hub's
-    windows come back; until then the arithmetic below is what keeps the numbers
-    honest.
-
-    RATIOS BETWEEN TWO OF THESE ARE STILL SOUND -- both terms are undercounted
-    by the same sampling, so txdone-fail/txdone survives it. Absolute totals and
-    anything divided by wall-clock time do not. window_cover() gives callers
-    what they need to qualify the difference.
-    """
     s = gauge(df, unit, "status", metric)
     return 0 if s is None or s.empty else int(s["value"].sum())
 
 
 def window_cover(df, unit, metric="txdone"):
-    """(windows captured, window seconds, seconds those windows cover).
-
-    The window length is the median of the SHORTEST intervals between captured
-    lines: dropped lines only ever create multiples of the real period, so the
-    short end of the distribution is the period itself. The median of the short
-    ones rather than the outright minimum, since the minimum is one line's
-    arrival jitter -- it read 19 s for a 20 s period on the 2026-08-25 soak.
-
-    Returns (0, None, 0.0) when the series is too short to say anything.
-    """
     s = gauge(df, unit, "status", metric)
     if s is None or len(s) < 3:
         return (0 if s is None else len(s)), None, 0.0
@@ -282,7 +114,6 @@ def window_cover(df, unit, metric="txdone"):
 
 
 def cover_note(n, win_s, covered_s, span_s):
-    """One line saying how much of the run a window sum actually saw."""
     if not n or not win_s or span_s <= 0:
         return ""
     pct = 100.0 * covered_s / span_s
@@ -293,27 +124,11 @@ def cover_note(n, win_s, covered_s, span_s):
 
 
 def tx_faults(df, unit):
-    """The hub's refused sends, as FAULTS lines. Empty for a unit with none.
-
-    Here rather than in the FAULTS table because these are window gauges rather
-    than cumulative counters, and here AT ALL because a refused send is not a
-    hub-local inconvenience. The packet is never transmitted and never retried
-    -- send_audio_to_clients() in hub_s3/main/timeline.c drops it -- so it
-    reaches the floor as a hole.
-
-    Across the three 2026-08-22 soaks every one of the 20 starved windows had a
-    hub ENOMEM window within 25 s, none occurred without one, and the cost ran
-    at 11.2 and 12.6 ms of satellite starvation per refused audio packet. The
-    run that refused nothing starved not at all, and it was the longest of the
-    three. Before this was reported the analyser called that hub "clean".
-    """
     total = window_sum(df, unit, "tx-fail")
     if not total:
         return []
     out = [f"      {'tx-fail':18s} {total:>8,}   "
            f"sendto() refused (lower bound) -- see HUB TX below"]
-    # Absent from sessions captured before the lane split was extracted;
-    # `capture.py --replay <dir>` rebuilds those from their raw.log.
     audio = window_sum(df, unit, "tx_fail_audio")
     if audio:
         out.append(f"      {'of which audio':18s} {audio:>8,}   "
@@ -322,15 +137,6 @@ def tx_faults(df, unit):
 
 
 def error_faults(ev, unit):
-    """Level-E console lines, as FAULTS lines. Empty for a unit with none.
-
-    Not in the FAULTS table because these are log lines and not counters:
-    nothing on a HEALTH line reports them, and the case they exist for is the
-    one where HEALTH lines stop arriving altogether. A board that hard-hangs
-    prints its panic and then goes silent, so every counter freezes at its last
-    good value and the run reads clean -- which is exactly what
-    logs-soak-20260822-163605 did with 594 task_wdt rows in it.
-    """
     if ev is None or ev.empty or "level" not in ev.columns:
         return []
     e = ev[(ev["unit"] == unit) & (ev["level"] == "E")]
@@ -338,8 +144,6 @@ def error_faults(ev, unit):
         return []
     out = [f"      {'error lines':18s} {len(e):>8,}   "
            f"ESP_LOGE on the console -- read raw.log, not this summary"]
-    # The tag says which subsystem and one example says what it was; 594
-    # identical watchdog lines need one line here, not 594.
     for tag, n in e["tag"].value_counts().items():
         first = " ".join(str(e[e["tag"] == tag]["text"].iloc[0]).split())
         out.append(f"          {tag}: {n:,} -- {first[:66]}")
@@ -347,10 +151,6 @@ def error_faults(ev, unit):
 
 
 def episodes(windows, gap_s=EPISODE_GAP_S):
-    """Group non-zero tx-fail windows into bursts separated by quiet time.
-
-    Returns a list of lists of rows, in time order. See EPISODE_GAP_S.
-    """
     out = []
     for _, r in windows.iterrows():
         if not out or r["wall_s"] - out[-1][-1]["wall_s"] > gap_s:
@@ -360,13 +160,6 @@ def episodes(windows, gap_s=EPISODE_GAP_S):
 
 
 def nearest(df, wall_s):
-    """The value of `df` sampled closest in time to `wall_s`, or nan.
-
-    The lines being compared are printed by different tasks on different boards,
-    so they never share a timestamp; matching on the nearest one is what lets a
-    starved window on the satellite be read against the hub's fan-out gap for
-    the same few seconds.
-    """
     if df is None or df.empty:
         return float("nan")
     i = (df["wall_s"] - wall_s).abs().values.argmin()
@@ -395,9 +188,6 @@ def main():
 
     met, ev = load(args.session)
     met = boot_segments(met)
-    # AIR_UNIT is not a board. It carries capture.py's 2.4 GHz sweeps, and it
-    # would otherwise collect a SESSION row, an uptime and a FAULTS verdict that
-    # mean nothing. Its own section is below.
     units = sorted(u for u in met["unit"].unique() if u != AIR_UNIT)
 
     t0, t1 = met["wall_s"].min(), met["wall_s"].max()
@@ -416,7 +206,6 @@ def main():
             print(f"         every '{u}' number below mixes both streams and is"
                   f" unreliable. Re-capture with unique names per board. **")
 
-    # ---- 1. faults ----------------------------------------------------------
     head("FAULTS  (every one of these should read 0)")
     any_fault = False
     for u in units:
@@ -436,7 +225,6 @@ def main():
     if not any_fault:
         print("\n  Nothing broke.")
 
-    # ---- 2. cross-unit divergence -------------------------------------------
     head("TRACK DIVERGENCE  (the number that decides PHASE_DEADBAND_US)")
     d = met[(met["kind"] == "divergence") & (met["metric"] == "apart_ms")]
     if d.empty:
@@ -455,7 +243,6 @@ def main():
             print("  Sitting well above that -- tightening the deadband is the lever,")
             print("  and the rate trim removed both things that made it unaffordable.")
 
-    # ---- 3. the rate trim ---------------------------------------------------
     head("RATE TRIM")
     for u in units:
         drops = counter_total(met, u, "dropped") or 0
@@ -475,16 +262,11 @@ def main():
         print(line)
         print(f"      combined {(drops + dups) / span:.2f} frames/s over the run")
         if cu_drops or cu_dups:
-            # The drain's own pair, kept out of the frames/s line above because
-            # a drain pays a knock in seconds at ~1376/~688 frames/s and would
-            # drown the trim's own arithmetic. Healthy shape: a short burst per
-            # knock, drops-side or nothing.
             print(f"      catch-up: {cu_drops:,} skipped / {cu_dups:,} replayed")
             if cu_dups > max(64, drops):
                 print("      ** catchup replay dominates -- the slower-and-not-"
                       "continuous signature")
 
-        # The rate must equal |trim_hz|: that is the mechanism's own arithmetic.
         if t is not None and len(t) > 1:
             expect = t["value"].abs().mean()
             actual = (drops + dups) / span
@@ -493,7 +275,6 @@ def main():
                 verdict = "matches" if err < 35 else "** DOES NOT MATCH **"
                 print(f"      mean |trim| {expect:.1f} Hz vs {actual:.2f} frames/s"
                       f"  -> {verdict}")
-        # Both directions climbing means it crossed zero repeatedly.
         if drops and dups:
             weak = min(drops, dups) / max(drops, dups)
             if weak > 0.25:
@@ -504,64 +285,32 @@ def main():
               + ("  (coarse only, as intended)" if rt <= 2 else
                  "  ** more than a coarse match; the fine path should not retune **"))
 
-    # ---- 4. phase -----------------------------------------------------------
     head("PHASE  (+ = playing late)")
     for u in units:
         p = gauge(met, u, "status", "phase")
         if p is None or p.empty:
             continue
         v = p["value"]
-        settled = v[p["wall_s"] > t0 + 120]           # ignore the startup walk-in
+        settled = v[p["wall_s"] > t0 + 120]
         use = settled if len(settled) > 5 else v
         print(f"  {u}: median {use.median():+.0f} us   p05..p95"
               f" {use.quantile(0.05):+.0f}..{use.quantile(0.95):+.0f} us"
               f"   |max| {use.abs().max():.0f} us   n={len(use)}")
 
-    # ---- 5. buffer depth ----------------------------------------------------
     head("BUFFER DEPTH  (a steady drift is what a continuous trim can cause)")
     for u in units:
-        # The hub prints "local ring N bytes (N ms)", the satellite "buffer N ms".
         b = gauge(met, u, "status", "ring_ms")
         if b is None or b.empty:
             b = gauge(met, u, "status", "buffer")
         if b is None or len(b) < 3:
             continue
         v, x = b["value"], b["wall_s"] - t0
-        slope = np.polyfit(x, v, 1)[0] * 3600.0        # ms per hour
+        slope = np.polyfit(x, v, 1)[0] * 3600.0
         flag = "" if abs(slope) < 20 else "   ** drifting **"
         print(f"  {u}: {v.min():.0f}..{v.max():.0f} ms  median {v.median():.0f}"
               f"   trend {slope:+.1f} ms/hour{flag}")
 
-    # ---- 6. delivery --------------------------------------------------------
     head("DELIVERY  (did the audio arrive evenly, and what it cost when it did not)")
-    #
-    # The question this section exists to answer, and why it is not the buffer
-    # depth above:
-    #
-    # On the 2026-08-19 soak a satellite took nine phase steps of +35 to +205 ms
-    # while the hub stayed inside +-6 ms with tx-fail 0. Every step reported an
-    # empty ring, and dma-starve moved by the step size -- so the DAC played
-    # auto_clear silence for the length of the hole, which is time the timeline
-    # does not give back, which arms the catch-up drain the room hears as a
-    # semitone of pitch on one speaker and not the other.
-    #
-    # Nothing was LOST: seq-drop, decode-err, recv-err and wifi-drops all read
-    # zero, and the ring went from empty to 425 of its 464 ms inside one window.
-    # (That soak predates XOR parity, and its loss counter was the `err` field
-    # inside the piggyback scheme's `fec N (M ms short, K err)` line -- never a
-    # metric of its own. Today the equivalent is fec-lost, in section 6b.)
-    # So packets were held and released in a lump, and the only open question
-    # was where the lump formed. These four numbers answer it:
-    #
-    #   gap-max   longest silence between two arrivals   steady ~20 ms
-    #   lead-min  least of play_at minus arrival         steady ~LEAD_US (250 ms)
-    #   ring-low  shallowest the play task found         steady ~RING_TARGET_MS
-    #   starved   ms of digital zero the DAC emitted     steady 0
-    #
-    # A gap with the lead COLLAPSED means the hub stamped on time and the
-    # transport held them. The same gap with the lead still near 250 means they
-    # were stamped late, and the hub's own fanout-gap-max says so from the other
-    # end.
     arr = met[met["kind"] == "arrival"]
     if arr.empty:
         print("  No ARRIVAL lines -- the units predate this instrument.")
@@ -594,15 +343,8 @@ def main():
                 continue
             print(f"      starved    {st['value'].sum():.0f} ms over"
                   f" {len(starved)} window(s)  ** this is what the room heard **")
-            # Attribution, one line per starved window. The hub's fan-out gap in
-            # the same window is the other end of the comparison; without it the
-            # satellite's gap alone cannot tell a late send from a late arrival.
             fan = met[(met["kind"] == "status") &
                       (met["metric"] == "fanout-gap-max")][["wall_s", "value"]]
-            # The hub's lead at the moment it STAMPED, against the satellite's
-            # lead when the packet ARRIVED. The difference is the transit time,
-            # and it is the one number that says which side of sendto() a hole
-            # happened on. See n_lead_min_us in hub_s3/main/hub.h.
             hub_ld = met[(met["kind"] == "status") &
                          (met["metric"] == "lead-min")][["wall_s", "value"]]
             print("        when          starved   gap-max   sat lead   hub lead"
@@ -610,8 +352,6 @@ def main():
             for _, r in starved.iterrows():
                 hl = nearest(hub_ld, r["wall_s"])
                 sl = nearest(ld, r["wall_s"])
-                # nan means the gauge was not in that build; say so rather than
-                # printing it, since "nan ms" reads like a measurement.
                 hl_s = f"{hl:8.0f} ms" if hl == hl else "     n/a"
                 transit = f"{hl - sl:7.0f} ms" if hl == hl and sl == sl else "    n/a"
                 print(f"        +{r['wall_s'] - t0:7.0f}s   {r['value']:6.0f} ms"
@@ -630,28 +370,6 @@ def main():
             print("        delivery fault at all -- it was half the starvation"
                   " on the 2026-08-19 20:04 soak.")
 
-    # ---- 6b. XOR parity ----------------------------------------------------
-    #
-    # WHAT THIS SECTION IS FOR, AND THE MISTAKE IT EXISTS TO PREVENT.
-    #
-    # The 2026-08-24 A/B ran the old piggyback FEC against no FEC over matched
-    # 46-minute windows and both were flawless -- zero gaps either way. That is
-    # not evidence that redundancy works; it is evidence that the channel was
-    # quiet. Redundancy can only be judged where losses happen, so the first
-    # thing printed here is whether the run had any, and a run with none says
-    # nothing about parity at all however good the other numbers look.
-    #
-    # The pairing that matters is `gaps` against `fec` on the same unit:
-    #
-    #   gaps       what the AIR lost -- counted at detection, before any repair
-    #   fec        of those, how many came back WHOLE
-    #   fec-lost   ...and how many did not (two in a group, or no parity)
-    #   fec-held   how often packets waited behind a hole for a parity
-    #   fec-bad    parity that arrived and could not be trusted -- must be 0
-    #
-    # gaps is deliberately pre-repair, which is what let the earlier soaks prove
-    # the channel and not the FEC had fixed a run. So `gaps 40, fec 38` is the
-    # scheme working, not forty holes in the sound.
     fec_units = sorted({u for u in met[met["kind"] == "rx5s"]["unit"].unique()})
     fec_rows = []
     for u in fec_units:
@@ -666,39 +384,12 @@ def main():
                          total("fec-lost"), total("fec-held"), total("fec-bad")))
     if fec_rows:
         head("XOR PARITY  (of what the air lost, how much came back whole)")
-        # Parity arriving at all, from the satellite's ARRIVAL line: it should
-        # read the audio packet rate divided by K. A zero here with audio
-        # flowing is the one failure no other counter on the floor can see --
-        # the hub not sending parity looks exactly like a channel that never
-        # lost anything.
         k = gauge(met, "hub", "status", "fec-k")
         k_val = int(k["value"].iloc[-1]) if k is not None and not k.empty else None
-        #
-        # PER WINDOW, NOT SUMMED, and that is not a style choice.
-        #
-        # The hub's status line is emitted on time but does not all reach the
-        # capture -- its serial adapter flapped 578 times on the 2026-08-25 run,
-        # against one reconnect for sat_classic. Roughly two thirds of the hub's
-        # lines were missing. See window_sum() for the evidence and the fix.
-        #
-        # A per-window counter summed over the windows that happened to arrive is
-        # therefore not a run total, it is a sample presented as one. This
-        # printed "parity sent 14,251" for a run in which each satellite RECEIVED
-        # ~49,500 -- and the per-window value was right the whole time.
-        #
-        # A median over observed windows is what survives the dropped lines, and
-        # it is the figure worth reading anyway: parity should be exactly the
-        # audio packet rate divided by K, and that is a ratio, not a total.
         txs = gauge(met, "hub", "status", "fec-tx")
         nwin = 0 if txs is None or txs.empty else len(txs)
         tx_med = None if not nwin else txs["value"].median()
 
-        # The status window, recovered as the SHORTEST interval between two
-        # observed lines. Dropped lines only ever create multiples of the real
-        # period, so the minimum is the period even when most are missing --
-        # which beats assuming DANCEFLOOR_LOG_PERIOD_S, since it is not logged.
-        # Median of the SHORT intervals rather than the outright minimum: the
-        # minimum is one line's arrival jitter and read 19 s for a 20 s period.
         win_s = None
         if nwin > 2:
             d = txs["wall_s"].diff().dropna()
@@ -743,9 +434,6 @@ def main():
             par = gauge(met, u, "arrival", "fec-parity")
             par_n = int(par["value"].sum()) if par is not None and not par.empty else 0
             if tx == 0 and par_n == 0:
-                # A capture from before parity existed, or a run with it off.
-                # Printing a 0% repair rate here would read as a failure of the
-                # scheme rather than its absence, so say what this actually is.
                 print(f"  {u}: {gaps:,} lost on the air, all of them silence --"
                       " this run had no parity to repair them.")
                 continue
@@ -755,11 +443,6 @@ def main():
             hm = gauge(met, u, "arrival", "fec-hold-max")
             hold_s = ""
             if hm is not None and not hm.empty:
-                # The design's one load-bearing number. (K-2) packet times at
-                # ~20 ms each is what the arithmetic promises; anything far past
-                # it means the hub is not sending parity promptly after the
-                # group's last packet, and the ring depth beside it is paying
-                # for the difference.
                 worst = hm["value"].max()
                 budget = (k_val - 2) * 20 if k_val else None
                 flag = ("   ** past the (K-2) x 20 ms budget **"
@@ -779,17 +462,6 @@ def main():
                 print("       Parity covers one loss per group of K; a burst"
                       " inside one group is out of its reach by construction.")
 
-    # ------------------------------------------------------------------------
-    # THE AIR'S OWN READING, printed BEFORE the refusals and not after.
-    #
-    # Every other hub-side stall number is stamped at sendto() return, so
-    # ESP_WIFI_CACHE_TX_BUFFER_NUM silences all of them at once by queueing in
-    # PSRAM instead of refusing. air-gap-max comes from the driver's tx-done
-    # callback -- the radio finishing a frame -- so it is the one that stays
-    # honest with a queue in front of it. Read it first, or a quiet tx-fail
-    # reads as a fixed hub when it may only be a hidden one.
-    # See tx_done_cb() in hub_s3/main/net.c.
-    # ------------------------------------------------------------------------
     air_gap = gauge(met, "hub", "status", "air-gap-max")
     if air_gap is not None and not air_gap.empty:
         head("AIR GAP  (what the RADIO did -- a cache queue cannot hide this)")
@@ -806,8 +478,6 @@ def main():
         if done:
             n_w, win_s, cov = window_cover(met, "hub", "txdone")
             rate = f"  = {done / cov:.0f}/s" if cov else ""
-            # The RATIO is sound where the total is not: both terms are sampled
-            # by the same dropped lines, so the percentage survives it.
             print(f"  frames done {done:,}{rate}   never acked {fail:,}"
                   f"  ({fail / max(done, 1) * 100:.2f}% -- a ratio, so the"
                   f" sampling below does not affect it)")
@@ -824,16 +494,6 @@ def main():
                   " failure. Both look like this.")
         print()
 
-    # ------------------------------------------------------------------------
-    # THE LINK, IN BOTH DIRECTIONS.
-    #
-    # The hub's rssi-min is what it HEARS FROM the satellites (uplink); the
-    # satellites' hub-rssi is what they hear from IT (downlink). Antenna gain
-    # is reciprocal, so on a healthy pair of radios these read roughly
-    # symmetric. A persistent gap is a transmit-chain fault at the weaker end,
-    # and it is the one thing txdone-fail cannot see: a chain of retries that
-    # all SUCCEED holds a buffer for its whole length and never counts.
-    # ------------------------------------------------------------------------
     up = gauge(met, "hub", "status", "rssi-min")
     downs = {u: gauge(met, u, "arrival", "hub-rssi") for u in units if u != "hub"}
     downs = {u: d for u, d in downs.items() if d is not None and not d.empty}
@@ -866,17 +526,6 @@ def main():
             print("  is NOT the explanation for held frames. Look past the radio.")
         print()
 
-    # ---- 7. the hub's refused sends -----------------------------------------
-    #
-    # DELIVERY above says a hole was held AFTER sendto. This says whether the
-    # hub refused to make the send at all, which is the other candidate and the
-    # one that turned out to matter: on 2026-08-22 the hub read "clean" through
-    # three runs while refusing 684, 0 and 63 sends, because nothing looked.
-    #
-    # The shape matters as much as the size, and the four burst-gap buckets are
-    # what carry it -- back-to-back, sub-beacon, beacon-locked, or long
-    # stretches far apart are four different faults with four different fixes.
-    # The buckets are documented where they are measured, in hub_s3/main/net.c.
     head("HUB TX  (a refused send is a hole in the sound, not a hub-local event)")
     if air_gap is not None and not air_gap.empty:
         print("  NOTE: read AIR GAP above first. With ESP_WIFI_CACHE_TX_BUFFER_NUM"
@@ -897,9 +546,6 @@ def main():
         audio = window_sum(met, u, "tx_fail_audio")
         enomem = window_sum(met, u, "space")
         n_w, win_s, cov = window_cover(met, u, "tx-fail")
-        # Per hour OF WHAT WAS CAPTURED, not of the run: dividing a sampled sum
-        # by wall-clock time understates the rate by the sampling factor on top
-        # of the sum already being short.
         per_h = total / (cov / 3600.0) if cov else total / span_h
         print(f"  {u}: {total:,} refused in the captured windows"
               f" ({per_h:.0f}/hour while observed)")
@@ -912,9 +558,6 @@ def main():
         else:
             print("      (audio share not recorded in this session --"
                   " `capture.py --replay <dir>` rebuilds it from raw.log)")
-        # ENOMEM and EHOSTUNREACH are different faults with different fixes:
-        # a pool/load problem against an ARP-seeding problem. net.c keeps the
-        # errno tally precisely so a bare count cannot conflate them.
         if enomem and enomem < total:
             print(f"      errno split: {enomem:,} ENOMEM, {total - enomem:,} other"
                   f" -- raw.log carries the tally, and EHOSTUNREACH is an"
@@ -929,17 +572,7 @@ def main():
                    for b in ("lt25", "25-75", "75-150", "gt150")]
         have_buckets = all(b is not None and not b.empty for b in buckets)
 
-        # Episodes first, because this is the figure a verdict rests on and the
-        # per-hour number above is the one that misleads. See EPISODE_GAP_S.
         eps = episodes(windows)
-        # The status line's own cadence, so an episode's duration counts its
-        # last window rather than ending at the instant that window started.
-        #
-        # The FASTEST cadence, not the median: the hub prints this line every
-        # 20 s when quiet and every 5 s once it has something to report, so the
-        # median is the quiet rate and every episode is sampled at the other
-        # one. Taking the median stretched a 170 s episode to 185 s and gave
-        # single-window episodes a 20 s duration they never had.
         gaps = tf["wall_s"].diff()
         gaps = gaps[gaps > 0.5]
         period = gaps.min() if not gaps.empty else 5.0
@@ -949,8 +582,6 @@ def main():
         for e in eps:
             n = int(sum(r["value"] for r in e))
             a = sum(x for x in (nearest(aud, r["wall_s"]) for r in e) if x == x)
-            # Same "n/a" the per-window table below uses, for a session captured
-            # before the audio lane was split out of the tally.
             a_s = f"{a:6,.0f}" if aud is not None else "   n/a"
             dur = e[-1]["wall_s"] - e[0]["wall_s"] + period
             if n >= EPISODE_MAJOR:
@@ -990,12 +621,6 @@ def main():
                 print("        the group lanes went unicast and the signature"
                       " went with them. Do not re-open it.")
 
-        # ---- who held the pool, and whether the retry caught anything -------
-        #
-        # Both counters are new with the 2026-08-23 instrumentation and absent
-        # from every soak before it, so their absence is reported as "not
-        # measured" rather than as a zero -- the distinction the AIR section's
-        # -100 floor got wrong and this must not repeat.
         near = gauge(met, "hub", "status", "refuse-near-frame")
         rtry = gauge(met, "hub", "status", "audio-retry")
         rok = gauge(met, "hub", "status", "audio-retry-ok")
@@ -1007,8 +632,6 @@ def main():
             print(f"\n      WHO HELD THE POOL: {n_near:,.0f} of {n_ref:,.0f}"
                   f" refusals had a frame batch in flight"
                   f" ({100 * n_near / max(n_ref, 1):.0f}%).")
-            # The fork this instrument exists to resolve. See hub.h's
-            # n_refuse_near_frame for why nothing before it could.
             if n_near >= 0.5 * max(n_ref, 1):
                 print("      The frame lane is still the competitor and"
                       " TX_FRAME_PACE_US is not enough -- pace it harder or"
@@ -1019,10 +642,6 @@ def main():
                 print("      the driver's own retries, which is the air. A"
                       " hub-side lane fix cannot reach that.")
         if rtry is not None and not rtry.empty and (rok is None or rok.empty):
-            # Recoverable, and worth recovering: a retry that SUCCEEDS skips
-            # tx_fail_note_audio, so the audio lane's own failure count is
-            # exactly the retries that did not go. Reported as derived, because
-            # it holds only while every audio refusal is ENOMEM.
             n_t = rtry["value"].sum()
             aud_f = window_sum(met, "hub", "tx_fail_audio")
             print(f"\n      THE RETRY: {n_t:,.0f} attempts, and audio-retry-ok"
@@ -1043,35 +662,12 @@ def main():
     if not tx_any:
         print("  No tx-fail gauge -- the hub predates this instrument.")
 
-    # ---- 8. heap ------------------------------------------------------------
-    # ------------------------------------------------------------------------
-    # DID THE HUB PICK THE RIGHT CHANNEL?
-    #
-    # Two independent receivers see this band: the hub's own boot survey, and
-    # capture.py's sweep. Only the sweep is constant across soaks -- the hub's
-    # reading moves with whatever antenna is fitted -- so when they disagree,
-    # the sweep is the control.
-    #
-    # This check exists because they DID disagree and nothing noticed. On
-    # 2026-08-24 the hub chose ch6, a channel its own scan counted ten networks
-    # on, while the sweep read ch6 at 6 nets against ch11's ONE. The channel
-    # had also been changing silently between soaks, which quietly made every
-    # cross-run comparison on file part channel comparison.
-    # ------------------------------------------------------------------------
     chose = gauge(met, "hub", "other", "chose")
     if chose is not None and not chose.empty:
         head("CHANNEL CHOICE  (the hub's survey against capture.py's sweep)")
         cands = [1, 6, 11]
 
         def near(unit, name, when, tol=5.0):
-            """The value of `name` recorded closest to `when`, within tol seconds.
-
-            PER SURVEY, not per run. A capture can span several boots -- the
-            2026-08-24 13:33 one had two, 57 s apart, that chose DIFFERENT
-            channels -- and a median across them mixes readings from separate
-            measurements of a band that moved in between. That is a wrong
-            answer rather than an imprecise one.
-            """
             g = gauge(met, unit, "other", name)
             if g is None or g.empty:
                 return None
@@ -1133,56 +729,6 @@ def main():
                 print(f"\n  Agrees: ch{ran_on} is also the quietest the sweep can see.")
         print()
 
-    # ---- 7b. the air ---------------------------------------------------------
-    #
-    # The variable no soak before 2026-08-23 recorded, and the reason three of
-    # them failed to explain anything. An episode leaves every hub-local counter
-    # flat -- internal free, stations, churn, RSSI, the source -- so whatever
-    # starts one is outside this rig, and nothing was watching outside.
-    #
-    # READ IT FOR DISAPPEARANCE, NOT OCCUPANCY. This was built expecting a
-    # channel to get BUSIER during an episode. It does the opposite, and the
-    # reason is what the instrument actually measures: a passive scan counts the
-    # beacons it can DECODE, so a strong local interferer first stops the laptop
-    # hearing that channel's neighbours, and moments later stops the hub getting
-    # packets onto it -- retries hold TX buffers, the pool empties, sendto is
-    # refused. It is the same reason RSSI never moves through an episode: that
-    # measures the satellites' signal, not whether someone else is shouting over
-    # it.
-    #
-    # A LEAD THAT DID NOT SURVIVE ITS SECOND RUN, kept here because the next
-    # reader will otherwise find it again and be as pleased with it.
-    #
-    # 2026-08-23 10:04 (4.23 h, 507 sweeps): ch11 decoded zero networks exactly
-    # twice, and each zero was the sweep immediately before one of the run's two
-    # major episodes -- 26 s and 15 s ahead. The scan had not failed; total
-    # networks read 8 and 13 in those same sweeps and ch1/ch6 decoded normally.
-    # Two for two, and the coincidence is not cheap: with 2 zeros loose in the
-    # run, landing both in the ~4 sweeps that precede a major episode is order
-    # 1e-4. It looked like the first real lead this fault had offered.
-    #
-    # Two things in the same directory kill it as a cause.
-    #
-    # 1. The 01:38 run, 8.42 h and 1,008 sweeps on the SAME build (flashed at
-    #    01:36:42, two minutes before it started), NEVER went blind on any
-    #    channel and still produced two major episodes -- 430 and 415 refused,
-    #    both bigger than either of 10:04's. ch11 read 7 and 5 networks in the
-    #    minute before them. So a blackout is not necessary for an episode, and
-    #    whatever the mechanism is, it runs without one.
-    #
-    # 2. Zero is one step, not a cliff. Both 10:04 zeros came out of a stretch
-    #    already sitting at 1-2 networks against a run median of 4, and went
-    #    1 -> 0 -> 2. Only ONE marginal AP dropped out. Reading 1 is ordinary --
-    #    34 of 507 sweeps here, 14 of 1,008 in the 01:38 run -- so the sharp
-    #    line between 0 and 1 is a threshold on a noisy count near its floor,
-    #    not a physical difference.
-    #
-    # What is left is worth keeping instrumented and not worth acting on: the
-    # timing coincidence is real and unexplained, the cost of watching it is one
-    # nmcli call every 30 s, and at most it is one trigger among several. The
-    # BLIND SWEEPS block below counts it in BOTH directions on purpose, so a run
-    # that breaks the pattern says so as loudly as one that repeats it. That is
-    # how the 01:38 run got a hearing at all.
     head("AIR  (what else was on the band, from capture.py's sweep)")
     air = met[met["unit"] == AIR_UNIT]
     if air.empty:
@@ -1193,10 +739,6 @@ def main():
         chans = sorted({int(m[2:m.index("-")]) for m in air["metric"].unique()
                         if m.startswith("ch") and "-dbm" in m})
         sweeps = len(air[air["metric"] == f"ch{chans[0]}-dbm"]) if chans else 0
-        # One row per sweep, columns the metrics. The blind-sweep block needs
-        # every channel's count and the total from the SAME sweep -- that is
-        # what tells "one channel went deaf" from "the scan failed" -- and
-        # pivoting once is what lets them be read together.
         by_sweep = air.pivot_table(index="wall_s", columns="metric",
                                    values="value").sort_index()
 
@@ -1209,11 +751,6 @@ def main():
             if d is None or d.empty:
                 continue
             dbm[c], nets[c] = d, n
-            # A sweep that decoded nothing reports air_scan()'s -100 floor,
-            # which is a sentinel and not a level. Folding it into the median
-            # and the min claims the channel was quieter than it was ever
-            # measured to be, so the dBm stats are over the sweeps that heard
-            # something and the deaf ones are counted in their own column.
             ncol = f"ch{c}-nets"
             heard = (by_sweep[by_sweep[ncol] > 0][f"ch{c}-dbm"]
                      if ncol in by_sweep else d["value"])
@@ -1233,7 +770,6 @@ def main():
                if tf is not None and not tf.empty else [])
         majors = [e for e in eps if sum(r["value"] for r in e) >= EPISODE_MAJOR]
 
-        # ---- the call-out this section exists for ---------------------------
         blinds = []
         for w, row in by_sweep.iterrows():
             gone = [c for c in chans if row.get(f"ch{c}-nets", 1) == 0]
@@ -1241,7 +777,6 @@ def main():
                 blinds.append((w, gone, row))
 
         def episode_near(w, lo, hi):
-            """The one episode starting within [w+lo, w+hi], and its size."""
             for e in eps:
                 off = e[0]["wall_s"] - w
                 if lo <= off <= hi:
@@ -1265,16 +800,10 @@ def main():
                                    for c in chans)
                 print(f"    +{w - t0:7.0f}s  {deaf} blind   total nets"
                       f" {row.get('nets', np.nan):.0f}   ({others})")
-                # What the channel read either side, and its median. Without
-                # these a 1 -> 0 -> 2 wobble on a channel that only ever hears
-                # two APs prints exactly like one that went dark from a
-                # healthy dozen, and the two mean nothing alike.
                 i = idx.index(w)
                 for c in gone:
                     col = f"ch{c}-nets"
                     def side(j):
-                        # A blackout on the first or last sweep of a run has
-                        # only one neighbour, and 'nan' reads like a reading.
                         return (f"{by_sweep[col].iloc[j]:.0f}"
                                 if 0 <= j < len(idx) else "no sweep")
                     print(f"                 ch{c} read {side(i - 1)} before"
@@ -1288,9 +817,6 @@ def main():
                     hits += kind == "MAJOR"
                     print(f"                 -> {kind} episode {off:.0f}s later"
                           f", {n:.0f} refused")
-            # Both directions, because only the pair can falsify: blackouts that
-            # lead nowhere and episodes that arrive out of a clear band each say
-            # the lead is wrong, and each is invisible from the other side.
             def blind_before(e):
                 return any(0.0 <= e[0]["wall_s"] - w <= AIR_LEAD_S
                            for w, _, _ in blinds)
@@ -1314,10 +840,6 @@ def main():
                   f" median  (nets = fewest in the {AIR_LEAD_S}s before):")
             for e in majors:
                 mid = e[len(e) // 2]["wall_s"]
-                # The lowest count in the run-up, not the nearest one. The
-                # nearest sweep to an episode's middle can sit past a blackout
-                # that a sweep or two earlier caught -- which is exactly how the
-                # 2026-08-23 10:04 run hid the first of its two.
                 lead = by_sweep[(by_sweep.index >= e[0]["wall_s"] - AIR_LEAD_S)
                                 & (by_sweep.index <= mid)]
                 cells = []
@@ -1327,9 +849,6 @@ def main():
                     ncol = f"ch{c}-nets"
                     nv = (lead[ncol].min() if ncol in lead and not lead.empty
                           else nearest(nets[c], mid))
-                    # A blind sweep's dBm is the -100 floor. Printing it as a
-                    # level reads as 28 dB below median -- the opposite of the
-                    # alarm it is.
                     if nearest(nets[c], mid) == 0:
                         cell = f"ch{c} no decode"
                     else:
@@ -1366,7 +885,7 @@ def main():
         if h is None or len(h) < 3:
             continue
         v, x = h["value"], h["wall_s"] - t0
-        slope = np.polyfit(x, v, 1)[0] * 3600.0        # bytes per hour
+        slope = np.polyfit(x, v, 1)[0] * 3600.0
         mn = gauge(met, u, "health", "min")
         flag = "" if slope > -2000 else "   ** trending down **"
         line = (f"  {u}: {v.iloc[-1]:,.0f} B free at the end"
@@ -1379,7 +898,6 @@ def main():
             print(f"      internal pool: min {i['value'].min():,.0f} B"
                   f"  (the one that constrains the hub)")
 
-    # ---- 9. the source ------------------------------------------------------
     head("SOURCE  (a stall here looks like a unit fault and is not one)")
     pk = met[(met["kind"] == "sbc_in") & (met["metric"] == "pkts")]
     if pk.empty:
@@ -1392,19 +910,6 @@ def main():
                   f" SPI link stopped **")
             print(f"     first at +{stalls['wall_s'].iloc[0] - t0:.0f}s into the run")
 
-        # STOPPING is not the only way a source fails, and it is the rarer one.
-        # On 2026-08-23 the A2DP link HALVED for ten seconds -- sbc_in went 251
-        # packets and 44233 Hz to 128 and 22553 -- which starved the hub's own
-        # ring, jumped the timeline 4.8 s, and re-anchored both satellites five
-        # times. No window read zero and no single gap passed 266 ms, so the
-        # test above called it "the source never stopped" for the run whose
-        # entire fault was the source under-delivering.
-        #
-        # `eff` is the measure that catches it: an effective sample rate, so it
-        # does not care that these windows are a fixed packet count of varying
-        # duration. Compared against the run's own median rather than a nominal
-        # 44100, so a session at another rate still reads correctly; a few bad
-        # windows cannot move a median.
         eff = met[(met["kind"] == "sbc_in") & (met["metric"] == "eff")]
         if not eff.empty:
             nominal = eff["value"].median()
@@ -1415,21 +920,8 @@ def main():
                 print(f"     worst {weak['value'].min():.0f} Hz"
                       f" ({100 * weak['value'].min() / nominal:.0f}%)"
                       f" at +{weak.loc[weak['value'].idxmin(), 'wall_s'] - t0:.0f}s")
-                # Which of the three links dropped it. The hub can only say
-                # that audio stopped arriving; bt_bridge is the only witness to
-                # whether it ever left the phone, which is why capture.py now
-                # asks for that board. A gap logged there and no drops means the
-                # source stopped and nothing here is at fault; a hub-side
-                # shortfall with the bridge silent means it went missing between
-                # them.
                 gap = met[met["metric"] == "audio-gap-ms"]
                 drops = met[met["metric"] == "bridge-dropped"]
-                # A boundary is not the cause -- roughly 1% of them see one --
-                # but both dropouts on record sat within seconds of one, so it
-                # is worth naming when it is there.
-                # The hub's own boundary, not the satellites' echo of the same
-                # track: they re-log it a few seconds later and would name that
-                # instead, which reads as a closer boundary than there was.
                 bounds = ev[(ev["kind"] == "boundary") & (ev["unit"] == "hub")] \
                     if not ev.empty and "kind" in ev.columns else pd.DataFrame()
                 print("     window     fed   nearest track boundary   what bt_bridge saw")
@@ -1463,7 +955,6 @@ def main():
             print(f"  longest silence between packets: {g['value'].max() / 1000:.0f} ms"
                   f"   (median window max {g['value'].median() / 1000:.0f} ms)")
 
-    # ---- 10. events ----------------------------------------------------------
     head("EVENTS")
     if ev.empty:
         print("  none recorded")
@@ -1485,7 +976,6 @@ def main():
             if len(interesting) > 25:
                 print(f"    ... and {len(interesting) - 25} more (see events.csv)")
 
-    # ---- optional wide table ------------------------------------------------
     if args.wide:
         w = met.copy()
         w["bin"] = ((w["wall_s"] - t0) // args.bin) * args.bin
