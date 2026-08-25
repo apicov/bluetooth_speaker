@@ -1,18 +1,4 @@
-/*
- * The TFLM boilerplate. See analyser_tflm.hpp for how to add a model.
- *
- * NOT COMPILED BY ANY BUILD IN THIS TREE YET: DANCEFLOOR_ML_TFLM defaults to n
- * and the esp-tflite-micro dependency is commented out in idf_component.yml,
- * because nothing here has a model and the component is large.
- *
- * It does compile. Checked against esp-tflite-micro 1.3.4 headers with the
- * option forced on -- this file clean, and a throwaway subclass filling in all
- * four hooks clean beside it, with every symbol it needed from here resolving
- * including the vtable. So the API names below are real and the base class is
- * usable as one; what has NOT been proved is that a model runs, because there
- * is no model. The first build that turns this on is still the first build that
- * links against the real component.
- */
+
 #include "analyser_tflm.hpp"
 
 #if CONFIG_DANCEFLOOR_ML_TFLM
@@ -48,11 +34,7 @@ bool TflmAnalyser::init(int frames_per_s)
         ESP_LOGE(TAG, "%s: no model", name);
         return false;
     }
-    /*
-     * A schema mismatch is a converter/runtime version skew, and it is worth
-     * failing on rather than reading through: the flatbuffer would still parse
-     * into plausible-looking tensors and give answers that are simply wrong.
-     */
+
     if (model_->version() != TFLITE_SCHEMA_VERSION) {
         ESP_LOGE(TAG, "%s: model schema %u, runtime expects %d -- reconvert it",
                  name, (unsigned)model_->version(), TFLITE_SCHEMA_VERSION);
@@ -60,7 +42,7 @@ bool TflmAnalyser::init(int frames_per_s)
     }
 
     if (!ml_arena_take(&arena_, arena_bytes(), name)) {
-        return false;                    /* ml_arena_take has already said why */
+        return false;
     }
 
     interp_ = new (std::nothrow) tflite::MicroInterpreter(
@@ -72,12 +54,7 @@ bool TflmAnalyser::init(int frames_per_s)
     }
 
     if (interp_->AllocateTensors() != kTfLiteOk) {
-        /*
-         * Almost always one of two things, and the log should not make anyone
-         * guess which: the arena is too small, or the resolver was not given an
-         * op the model uses. TFLM prints the missing op itself; the size is
-         * printed here beside what was asked for.
-         */
+
         ESP_LOGE(TAG, "%s: AllocateTensors failed with a %u B arena -- either it "
                       "is too small, or an op is missing from ops()",
                  name, (unsigned)arena_.bytes);
@@ -87,20 +64,9 @@ bool TflmAnalyser::init(int frames_per_s)
         return false;
     }
 
-    /*
-     * Say what it needed, not just that it worked.
-     *
-     * arena_used() is the number DANCEFLOOR_ML_ARENA_KB should be set from, and
-     * it is only knowable after allocation -- so the workflow is deliberately
-     * "ask for too much once, read this line, set the option". Printing it
-     * every boot means nobody has to remember that.
-     */
     ESP_LOGI(TAG, "%s: ready, %u of %u B used, arena in %s",
              name, (unsigned)arena_used(), (unsigned)arena_.bytes, arena_where());
 
-    /* An int8 input is the shape a mixed floor requires -- see the note in the
-     * header. Said once, as a warning rather than a refusal: a float model is
-     * correct on a floor where only one unit runs it. */
     if (const TfLiteTensor *t = in(0)) {
         if (t->type != kTfLiteInt8 && t->type != kTfLiteUInt8) {
             ESP_LOGW(TAG, "%s: input is not quantised. Two units running this "
@@ -141,6 +107,6 @@ const char *TflmAnalyser::arena_where() const
     return ml_arena_where(&arena_);
 }
 
-}  // namespace df
+}
 
-#endif  /* CONFIG_DANCEFLOOR_ML_TFLM */
+#endif

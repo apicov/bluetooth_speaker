@@ -1,22 +1,4 @@
-/*
- * The resampler, checked for the three things that would break a model quietly.
- *
- *   gain          a level feature reads amplitude directly, so a ratio that is
- *                 not unity at DC scales every answer the model gives
- *   aliasing      the whole reason this is a filter and not a pick-every-nth.
- *                 Content above the new Nyquist that folds back appears to the
- *                 model as energy at a frequency that was never played
- *   sample count  due_us for the decimated stream is derived by COUNTING what
- *                 comes out, so a resampler that emits one extra sample per
- *                 buffer puts a unit permanently out of step with its
- *                 neighbours -- silently, and at a rate nothing else reports
- *
- * And one that would break it loudly across a mixed floor: the filter table
- * must be identical on every unit. It is built with doubles, which are
- * soft-float on both parts and therefore deterministic, but that is an argument
- * about a toolchain rather than about arithmetic -- so the table is pinned by
- * checksum here and any change to it has to be deliberate.
- */
+
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -42,7 +24,6 @@ static void check(const char *name, int cond, const char *fmt, ...)
     if (!cond) failures++;
 }
 
-/* Amplitude at `hz`, by correlation. Enough to tell 0.9 from 0.02. */
 static double amplitude_at(const int16_t *x, int n, double hz, int rate)
 {
     double re = 0, im = 0;
@@ -61,8 +42,6 @@ static void fill_sine(int16_t *x, int n, double hz, int rate, double amp)
     }
 }
 
-/* Push in realistic chunks, the way the lane does, so the phase carry between
- * calls is exercised rather than one giant buffer hiding it. */
 static int push_chunked(resampler_t *r, const int16_t *in, int n,
                         int16_t *out, int max_out, int chunk)
 {
@@ -85,7 +64,6 @@ static void test_dc_gain_is_unity(void)
 
     const int n = push_chunked(&r, in, 44100, out, 20000, 512);
 
-    /* Skip the first taps -- the history starts at zero and has to fill. */
     long sum = 0;
     int  from = RESAMPLE_TAPS * 2, cnt = 0;
     for (int i = from; i < n; i++) { sum += out[i]; cnt++; }
@@ -115,9 +93,7 @@ static void test_a_tone_above_nyquist_does_not_alias(void)
     resample_init(&r, 44100, 16000);
 
     static int16_t in[44100], out[20000];
-    /* 12 kHz against a new Nyquist of 8 kHz would fold to 4 kHz. That is the
-     * failure this filter exists to prevent, and it is inaudible in a log --
-     * the model would simply see a 4 kHz component nobody played. */
+
     fill_sine(in, 44100, 12000.0, 44100, 0.9);
     const int n = push_chunked(&r, in, 44100, out, 20000, 512);
 
@@ -140,10 +116,9 @@ static void test_output_count_tracks_the_ratio(void)
 
         static int16_t in[48000], out[60000];
         memset(in, 0, sizeof(in));
-        const int n_in = rates[k].in;                 /* one second */
+        const int n_in = rates[k].in;
         const int n = push_chunked(&r, in, n_in, out, 60000, 512);
 
-        /* One second in, one second out, to within a sample of rounding. */
         if (n < rates[k].out - 2 || n > rates[k].out + 2) {
             ok = 0;
             snprintf(detail, sizeof(detail), "%d -> %d gave %d, expected ~%d",
@@ -184,9 +159,6 @@ static void test_reset_clears_the_history(void)
     for (int i = 0; i < 4096; i++) junk[i] = (int16_t)(i * 977);
     fill_sine(in, 4096, 700.0, 44100, 0.8);
 
-    /* `a` sees noise, then is reset, then the signal. `b` sees only the signal.
-     * After a reset they must agree exactly -- that is what makes a splice
-     * survivable. */
     resample_push(&a, junk, 4096, oa, 4096);
     resample_reset(&a);
     const int na = resample_push(&a, in, 4096, oa, 4096);
@@ -199,16 +171,7 @@ static void test_reset_clears_the_history(void)
 
 static void test_the_table_has_not_moved(void)
 {
-    /*
-     * Pinned, not computed. These are the checksums this code produced when it
-     * was written; they exist so that a change to the table -- a different tap
-     * count, a different window, a toolchain that rounds differently -- is a
-     * failing test rather than two units that disagree in the field.
-     *
-     * If a change here is deliberate, update the numbers in the same commit as
-     * the change and say why. If it is not, something in the build has moved
-     * and every locally-analysing unit on the floor is now suspect.
-     */
+
     const struct { int in, out; uint32_t sum; } want[] = {
         { 44100, 16000, 0xe841ff13 },
         { 48000, 16000, 0x5416fc70 },
@@ -228,12 +191,6 @@ static void test_the_table_has_not_moved(void)
     }
     check("the filter table has not moved", ok, "%s", detail);
 
-    /*
-     * This pins the table against changes to THIS code on a host. It says
-     * nothing about whether an LX6 and an LX7 build the same table from the
-     * same source -- only two boards can answer that, which is why the lane
-     * prints its checksum at startup. Two consoles settle it.
-     */
 }
 
 int main(void)

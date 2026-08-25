@@ -1,12 +1,4 @@
-/*
- * Firmware half of the visualiser: get aligned blocks of audio out of the
- * playback path, hand them to the shared pipeline, put the result on the strip.
- *
- * Everything that decides what the lights DO lives in analysis.cpp and
- * patterns.cpp, which have no platform dependencies and are driven identically
- * by tools/pattern_lab on a laptop. This file owns only the parts that cannot
- * be: the stream buffer, the block alignment, the task, and the strip.
- */
+
 #include "visualiser.h"
 
 #include <atomic>
@@ -18,8 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
-/* xStreamBufferCreateWithCaps() -- the only way to put a stream buffer anywhere
- * but the internal heap. See where pcm_stream is created. */
+
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -38,25 +29,6 @@ namespace {
 
 constexpr const char *TAG = "vis";
 
-/*
- * The two capabilities the source choice implies, named separately because they
- * are two things and not one.
- *
- * Every conditional in this file used to test CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
- * directly, and about half of them meant "does this unit transform samples"
- * while the other half meant "does this unit take frames off the wire". Today
- * those are exact complements, so one symbol served for both and the difference
- * never showed.
- *
- * They stop being complements as soon as a unit is given a spectrum by the hub
- * and runs its own detector on it -- which is a mode this is deliberately being
- * left ready for. Such a unit takes remote frames AND decides, while analysing
- * no audio and needing none of the FFT's buffers. Adding it should be adding a
- * mode, not re-deriving which of ten conditionals meant which thing.
- *
- * So each site below says what it depends on. Nothing about the current builds
- * changes; these are still one symbol apart.
- */
 #if CONFIG_DANCEFLOOR_LED_SOURCE_REMOTE
 #define DF_ANALYSES_AUDIO      0
 #define DF_TAKES_REMOTE_FRAMES 1
@@ -65,55 +37,12 @@ constexpr const char *TAG = "vis";
 #define DF_TAKES_REMOTE_FRAMES 0
 #endif
 
-/*
- * Whether the pluggable analysers run here.
- *
- * ONE SETTING, AND IT IS ABOUT THE SPECTRUM. Analysers read the quantised
- * spectrum of a frame and nothing else -- run_fast_lane() and ml_lane_feed()
- * below are the only two readers of Frame::spec in the tree.
- *
- * IT USED TO BE INDEPENDENT OF DF_ANALYSES_AUDIO IN BOTH DIRECTIONS, on the
- * grounds that a unit given frames by the hub already had the spectrum and
- * could run a model on it. That stopped being true when spec[] came off the
- * wire: vis_frame_t carries the timeline labels and the four bands, and 64 of
- * its 96 bytes were a spectrum only an ML build ever read. A satellite with the
- * analysers off was receiving and discarding two thirds of every frame, 86
- * times a second.
- *
- * So the independence now holds in exactly one direction, and the Kconfig says
- * so rather than this file discovering it at runtime:
- *
- *   - A unit that analyses audio MAY decline the analysers. The hub does, and
- *     must: it gave up ~25 kB of internal SRAM to stop running the lane, which
- *     is the pool its WiFi TX buffers come from, and nothing about "has audio"
- *     says so.
- *   - A unit that takes frames from the wire CANNOT run them. There is no
- *     spectrum to read. DANCEFLOOR_ML depends on DANCEFLOOR_LED_SOURCE_LOCAL,
- *     so the pair is unselectable instead of silently feeding models a buffer
- *     from_wire() zeroed.
- *
- * That is what makes local analysis an S3 decision rather than a floor-wide
- * one: a unit that wants models has to compute its own spectrum, and computing
- * it costs the FFT, its 32 kB stream buffer and a task. The S3 has PSRAM for
- * the first and room for the rest; the classic ESP32 has neither, which is what
- * commit 82f4e8d measured the hard way.
- */
 #if CONFIG_DANCEFLOOR_ML
 #define DF_RUNS_ANALYSERS 1
 #else
 #define DF_RUNS_ANALYSERS 0
 #endif
 
-/*
- * The pair Kconfig already forbids, refused here too.
- *
- * DANCEFLOOR_ML depends on DANCEFLOOR_LED_SOURCE_LOCAL, so menuconfig cannot
- * offer this combination -- but sdkconfig is a generated file that people edit,
- * and the failure it would produce is the quiet kind this project keeps losing
- * evenings to: run_fast_lane() would read the spec[] from_wire() zeroed, every
- * analyser would score silence, and the strip would look fine because no
- * pattern reads spec[] anyway. Nothing would be wrong except the answers.
- */
 #if DF_TAKES_REMOTE_FRAMES && DF_RUNS_ANALYSERS
 #error "DANCEFLOOR_ML needs LED_SOURCE_LOCAL: a frame off the wire carries no spectrum for an analyser to read (see vis_frame_t)."
 #endif
@@ -124,137 +53,27 @@ using df::TAIL_N;
 using df::RATE;
 using df::CHANNELS;
 
-/*
- * Sized by how bursty the audio ARRIVES, which is not how smoothly it plays.
- *
- * This was four analysis frames -- 93 ms -- and that was right while the feed
- * came from the DAC, where audio turns up one chunk per playback pass and the
- * buffer only had to cover the analysis task being descheduled.
- *
- * Fed from the arrival side it has to cover the source's delivery pattern
- * instead, and the hub's own sbc_in line reports what that is: bursts with
- * gaps of 77 to 115 ms between them. A burst after a 105 ms gap is ~18.5 kB
- * against a 16 kB buffer, so it overflowed by about the 512 B seen dropped in
- * nearly every window on the hub and none on the satellite -- which never sees
- * it, because the hub re-sends packets paced.
- *
- * A short send is not just lost audio. It sets s_align_pending, so the unit
- * re-derives its origin and drops a block, and it does that on one unit and not
- * the other -- which is the exact divergence this whole path exists to avoid.
- *
- * Eight windows is 186 ms, comfortably past the worst gap observed and about the
- * lead the audio itself carries. The cost is 16 kB more of a 16 kB buffer, on a
- * unit with ~50 kB free.
- *
- * Sized in windows rather than hops on purpose: this covers how audio ARRIVES,
- * which is a number of bytes per burst, and bytes do not care how often they are
- * analysed. Overlapping the windows raises the frame rate without changing what
- * has to be held.
- */
 constexpr int STREAM_BYTES = FFT_N * CHANNELS * (int)sizeof(int16_t) * 8;
 constexpr uint32_t FRAME_BYTES = CHANNELS * sizeof(int16_t);
 
-/* The hop and the carried-over tail in bytes, which is the unit the accumulator
- * works in. */
 constexpr size_t HOP_BYTES  = (size_t)HOP_N * CHANNELS * sizeof(int16_t);
 constexpr size_t TAIL_BYTES = (size_t)TAIL_N * CHANNELS * sizeof(int16_t);
 
 constexpr uint32_t LED_COUNT = CONFIG_DANCEFLOOR_LED_COUNT;
 
-/*
- * One definition, in components/dancefloor_sync/Kconfig. Kconfig symbols are
- * global in ESP-IDF, so this reads it without including the audio protocol or
- * depending on that component -- which matters, because everything here has to
- * stay buildable on its own.
- *
- * The fallback keeps that true: if this component is ever built in a project
- * that has no dancefloor_sync, it compiles rather than failing on a missing
- * symbol.
- */
 #ifndef CONFIG_DANCEFLOOR_LOG_PERIOD_S
 #define CONFIG_DANCEFLOOR_LOG_PERIOD_S 20
 #endif
 constexpr int64_t LED_LOG_PERIOD_US = CONFIG_DANCEFLOOR_LOG_PERIOD_S * 1000000LL;
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-/*
- * One flash per second of MASTER-CLOCK time, on every unit at once.
- *
- * The boundary is a master instant, converted to this board's clock by the same
- * hook the render wait uses -- so every unit fires on the same instant, with
- * nothing sent between them.
- *
- * IT USED TO BE TAKEN FROM due_us, on the frame being drawn, which is a stronger
- * statement wherever it holds: the boundary is then crossed on the same BLOCK OF
- * AUDIO everywhere, with no clock read at all. It stopped holding on a unit that
- * is GIVEN its frames. Such a unit draws what the hub sends, and the hub paces
- * that lane to the DTIM beacon (TX_FRAME_PACE_US in hub.h) -- ~9.8 frames a
- * second. The drawn-frame grid is quantised to ~102 ms, so the flash landed
- * anywhere in the 100 ms after the boundary and jittered frame to frame: five
- * times what an eye resolves, on the one instrument whose whole job is to be
- * compared by eye.
- *
- * So the flash no longer reports the instant the strip drew. It reports the
- * clock, while audio is flowing -- which is the question actually being asked of
- * it. How well frames are arriving is a different question and already has an
- * instrument: `frames` in the periodic line.
- *
- * Watch two boards side by side: if the onboard LEDs flash together the whole
- * chain agrees, and if one lags it is obvious without a console. The eye
- * resolves maybe 10-20 ms, so this is a presence check rather than a
- * measurement -- the numbers live in AUDIO SYNC and TRACK DIVERGENCE.
- */
+
 constexpr int64_t LED_MARKER_PERIOD_US = 1000000;
 
-/*
- * Held for 40 ms -- measured on the clock, not waited for.
- *
- * The audio marker can afford a 200 us busy-wait; this cannot. It has to be
- * long enough to see, and blocking the render task for 40 ms would drop two
- * analysis frames and break the very alignment being demonstrated. Raising the
- * pin at one instant and lowering it at another costs nothing.
- *
- * A DURATION, and NOW MEASURED AS ONE. It was a duration converted into a count
- * of drawn frames -- ceil(40 ms / hop) -- which is right only where frames are
- * drawn on the analysis cadence this build compiles in. On a unit fed from the
- * hub they arrive on the beacon instead: the count was 4 and the hold was 4 x
- * 102 ms = ~410 ms, an even on/off blink beside the hub's 46 ms pulse, and
- * unmistakably a sync fault to anyone reading the LED the way it asks to be
- * read. The hop is not this marker's clock and never was.
- */
 constexpr int64_t LED_MARKER_HIGH_US = 40000;
 
-/*
- * How long the marker keeps reporting the timeline after the last frame drawn.
- *
- * Deliberately NOT the strip's RENDER_IDLE_US, which this shared until the
- * frame lane was paced to the beacon. At ~9.8 frames a second half a second is
- * five frames, so an ordinary congested patch (pace-skip, cong-skip in the hub's
- * log) would flip a satellite to the solid "joined and idle" level in the middle
- * of a song -- the LED reporting a stopped floor that never stopped.
- *
- * The strip keeps the shorter figure because it answers a different question:
- * what is on the strip is stale the moment the frames stop, while the marker is
- * only saying whether music is playing at all. The cost of the longer one is
- * that a floor which really has stopped takes 1.5 s to go solid.
- */
 constexpr int64_t MARKER_IDLE_US = 1500000;
 
-/*
- * Which level lights the LED, which is a property of the wiring and not of the
- * marker.
- *
- * With the LED's anode on 3V3 and its cathode on the pin, the pin sinks the
- * current and a LOW level lights it. Everything below is written in terms of ON
- * and OFF rather than 1 and 0 so that the timing above -- fire on the second
- * boundary, hold for LED_MARKER_HIGH_US -- reads the same either way, and
- * so that a rewired board is a Kconfig change rather than a code change.
- *
- * Getting this wrong shows as an INVERTED marker rather than a dark one: lit
- * for the 960 ms between flashes, dark for the 40 ms of the flash. That looks
- * like a working LED until you count, and against a correctly wired unit beside
- * it, it looks like a sync fault.
- */
 #if CONFIG_DANCEFLOOR_LED_MARKER_ACTIVE_LOW
 constexpr int LED_MARKER_ON  = 0;
 constexpr int LED_MARKER_OFF = 1;
@@ -263,36 +82,8 @@ constexpr int LED_MARKER_ON  = 1;
 constexpr int LED_MARKER_OFF = 0;
 #endif
 
-/*
- * Whether this unit is joined to the floor -- see visualiser_marker_set_link().
- *
- * Written from whatever task notices the join or the drop (on the satellite,
- * the wifi event handler) and read only by the render task, which owns the pin.
- * One bit, so a flag rather than a queue: the render task looks at it every nap
- * and the worst a missed store costs is one 20 ms nap of a stale LED.
- *
- * False by default, which is what makes this change invisible on the hub. It
- * never calls the setter, so its idle level stays LED_MARKER_OFF and its marker
- * behaves exactly as it did before this existed.
- */
 std::atomic<bool> s_marker_link{false};
 
-/*
- * The one place the marker pin is written, and the level it currently shows.
- *
- * The marker used to be a flash and nothing else, so writing the pin at the two
- * instants that mattered was the whole driver. It now has a level to hold
- * BETWEEN flashes as well, and that level has to be re-asserted whenever the
- * link changes -- which is a thing that happens while the render task is
- * napping with nothing to draw. Written naively that is a gpio_set_level() on
- * every nap of every idle unit forever; filtered here it is one write per
- * actual change, and the callers get to say "show this" without tracking what
- * is already shown.
- *
- * Render task only. The one write outside it is in visualiser_start(), before
- * that task exists, and it leaves `shown` at -1 so the first real call always
- * reaches the pin.
- */
 void marker_write(int level)
 {
     static int shown = -1;
@@ -301,19 +92,6 @@ void marker_write(int level)
     gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO), level);
 }
 
-/*
- * The boot-survey blink, which is the one thing on this pin that is NOT part
- * of the dark/solid/flash scheme -- see visualiser_marker_busy() in the header
- * for why it stands apart.
- *
- * 80 ms a toggle: fast enough to read as "working" rather than as the
- * once-a-second flash the same LED does later, and slow enough to be a blink
- * and not a dim glow.
- *
- * Its own esp_timer because the survey blocks. esp_wifi_scan_start() is called
- * synchronously and does not return for ~4.7 s, so anything driven from the
- * calling task would sit still for exactly the stretch this exists to cover.
- */
 constexpr int64_t MARKER_BUSY_TOGGLE_US = 80 * 1000;
 
 static esp_timer_handle_t s_marker_busy_timer;
@@ -327,32 +105,12 @@ static void marker_busy_cb(void *)
                    s_marker_busy_level);
 }
 
-/* What the marker holds when no audio is being drawn: lit if this unit is on
- * the floor, dark if it is not. The flash is drawn on top of this. */
 int marker_idle_level()
 {
     return s_marker_link.load(std::memory_order_relaxed) ? LED_MARKER_ON
                                                          : LED_MARKER_OFF;
 }
 
-/*
- * Act on the marker's two deadlines, from wherever the render loop happens to
- * be.
- *
- * The loop calls this on every pass rather than only where a frame is drawn.
- * That is the whole point: on a unit fed from elsewhere the loop goes ~102 ms
- * between frames, and an edge that waited for the next frame would be back to
- * reporting delivery instead of the clock. Both naps in that loop clamp
- * themselves to the nearest deadline, so "every pass" lands within a
- * millisecond or two of the instant -- see marker_clamp_nap().
- *
- * Lower before raise, so a boundary coming due in the same pass as a pending
- * lower is not cut short by it.
- *
- * Render task only, like marker_write(). Deadlines are passed in rather than
- * kept here because they belong to that task's own state, and the pin is the
- * only thing shared.
- */
 void marker_service(int64_t now, int64_t *flash_at, int64_t *lower_at)
 {
     if (*lower_at && now >= *lower_at) {
@@ -363,17 +121,7 @@ void marker_service(int64_t now, int64_t *flash_at, int64_t *lower_at)
         *flash_at = 0;
         *lower_at = now + LED_MARKER_HIGH_US;
         marker_write(LED_MARKER_ON);
-        /*
-         * Say so for the first few, then go quiet.
-         *
-         * Without this, "the LED is not blinking" is three different faults
-         * wearing the same face: the code never runs (no audio, so no frame
-         * ever reaches the arming site), the code runs but the pin is not wired
-         * to an LED on this board, or the option was not built in. Those need
-         * completely different fixes and the console could not tell them apart.
-         * If these lines appear, the firmware is doing its job and the question
-         * is the pin.
-         */
+
         static int told;
         if (told < 3) {
             told++;
@@ -384,17 +132,6 @@ void marker_service(int64_t now, int64_t *flash_at, int64_t *lower_at)
     }
 }
 
-/*
- * Shorten a nap so the render task is awake for the marker's next edge.
- *
- * Milliseconds in and out, never returning 0 where it clamps: a zero-tick delay
- * would spin the loop, and at CONFIG_FREERTOS_HZ=1000 the deadline is at most a
- * millisecond further off than the caller asked for anyway.
- *
- * This is what keeps the flash a property of the clock on a unit whose frames
- * arrive ten times a second. Without it the edges would be quantised to the
- * 20 ms idle nap, which is inside what an eye resolves but needlessly so.
- */
 int64_t marker_clamp_nap(int64_t nap_ms, int64_t flash_at, int64_t lower_at)
 {
     int64_t edge = flash_at;
@@ -412,8 +149,6 @@ int64_t marker_clamp_nap(int64_t nap_ms, int64_t flash_at, int64_t lower_at)
 }
 #endif
 
-/* Applied to the pattern's output on the way to the strip. A device concern,
- * not a pattern one -- patterns work in full range and this scales it. */
 constexpr float BRIGHTNESS = CONFIG_DANCEFLOOR_LED_BRIGHTNESS / 100.0f;
 
 #if   CONFIG_DANCEFLOOR_LED_TYPE_SK6812
@@ -426,201 +161,46 @@ constexpr LedStrip::Type STRIP_TYPE = LedStrip::Type::WS2812;
 
 StreamBufferHandle_t pcm_stream;
 std::optional<LedStrip> strip;
-/*
- * Not built where nothing analyses.
- *
- * process() is only ever called from visualiser_task, which such a unit does not
- * run -- so no FFT and no detector has ever executed there. What did happen is
- * that the object was defined anyway, reserving the whole window-sized state in
- * .bss for the entire uptime: buf_ 8 kB, win_ 4 kB, mag_ 2 kB, plus the band and
- * spectrum tables, two detectors and a Frame. init() then filled a Hann window
- * and derived band edges at boot for something that would never be asked
- * anything.
- *
- * Guarded on the capability rather than on the source option, so it stays right
- * for a unit that is given a spectrum and runs its own detector on it: that unit
- * needs the detectors and still has no use for any of this.
- */
+
 #if DF_ANALYSES_AUDIO
 df::Analysis analysis;
 #endif
 
-/*
- * The rate of the audio being fed, which is whatever the source chose.
- *
- * Atomic because two tasks read it: the playback task converts due_us to a
- * sample position in visualiser_feed(), and the analysis task converts a block
- * index back to due_us. They are the two halves of one conversion and must use
- * the same number, so there is exactly one of it.
- *
- * Starts at the rate the tuning was measured at, which is also what a source
- * almost always picks, so a unit that is never told anything behaves as it
- * always did.
- */
 std::atomic<uint32_t> s_rate{df::RATE};
 df::Pattern *pattern = nullptr;
 uint8_t pixels[LED_COUNT * 3];
 
-/*
- * Block alignment.
- *
- * The detector cuts a window of FFT_N every HOP_N samples, and every unit must
- * cut at the same positions or a transient near a boundary is split on one board
- * and centred on another -- the marginal onsets then fire on one strip and not
- * the other. Boundaries are derived from the instant audio is SCHEDULED to be
- * heard, which all units agree on, and never from a clock read here, which they
- * do not: they reach this code milliseconds apart.
- *
- * The grid is the HOP, not the window. Windows may overlap; what every unit has
- * to agree on is where one is allowed to START, and that is a multiple of HOP_N.
- * Since FFT_N is a whole number of hops, the old window grid is a subset of this
- * one -- a finer hop refines the positions rather than moving them.
- *
- * Both sides count bytes that actually passed through the buffer, so a drop
- * cannot make them disagree about position.
- */
-/*
- * Atomic because three tasks raise it: the audio task on a short send, this
- * component's own task when it starves, and the drift servo after a retune.
- * Only the audio task lowers it, with an exchange, so a request raised while an
- * alignment is being computed is not lost.
- */
 std::atomic<bool> s_align_pending{true};
 bool     s_mark_align_point;
 int32_t  s_skip_frames;
 int64_t  s_pending_block_index;
 
-std::atomic<uint32_t> s_align_at_byte;      /* byte index where aligned audio starts */
-std::atomic<long long> s_align_block_index; /* block number of that first sample */
-/*
- * Bumped on every publish, and what the analysis task actually watches.
- *
- * It used to watch s_align_at_byte, on the assumption that a new alignment
- * always carries a new byte index. It does not, and the case where it does not
- * is the common one: while this task is behind, the buffer is full and feeds are
- * rejected ENTIRELY, so s_sent_total does not move. Every rejected feed re-arms
- * the alignment, and each one then publishes the same byte index with a later
- * block index. The reader took the first and could not see any of the rest --
- * they compared equal to what it had already adopted -- so it went on labelling
- * from an origin two or three blocks stale.
- *
- * Boundaries survived that, which is why it went unnoticed for so long: the
- * discard arithmetic still lands on a multiple of HOP_N, so both units cut
- * identical windows and simply dated them differently. due_us is what carries
- * the date, and every time-driven pattern is built on it, so the strips ran the
- * same animation from different points of its cycle -- stepping further apart at
- * each burst of drops and never recovering. Modelled in test_align.c, where the
- * byte-index reader mislabels ~53% of blocks over a run and this one mislabels
- * none.
- *
- * The first publish was ignored too, for the duller reason that a byte count of
- * zero is indistinguishable from the initial value. A generation counter has
- * neither problem.
- */
-std::atomic<uint32_t> s_align_gen;
-uint32_t s_sent_total;                      /* feed side only */
+std::atomic<uint32_t> s_align_at_byte;
+std::atomic<long long> s_align_block_index;
 
-/*
- * The safety net: the origin this file is counting from, kept beside the
- * scheduled instant it was derived from, so the two can be compared.
- *
- * Everything above depends on the count of what has passed through here staying
- * true, and the only defence was that each caller REMEMBERS to report the events
- * that break it. Three do (a short send below, a splice, a retune). The list is
- * not closed, and the ones nobody thought of fail silently and for good:
- *
- *   - content dropped before it ever reaches the playback path, so the audio
- *     the timeline accounts for never arrives here (the hub's local ring and
- *     the satellite's receive ring both drop when full, and both only count it)
- *   - a short read from the playback ring, zero-filled to a whole chunk: audio
- *     the timeline does NOT account for, invented and fed here as though it were
- *     real
- *
- * Each leaves the count and the timeline permanently offset, on one unit only.
- * Measured on the host over forro-shaped material, that is not subtle: two units
- * offset by 2.9 ms already render 15% of their frames visibly differently, and
- * one packet's worth -- 42 ms -- puts 3.4% of frames in the state where one
- * strip is lit and the other is dark. It never recovers on its own.
- *
- * So stop relying on the callers being exhaustive. `due_master_us` arrives on
- * every feed and says where the timeline thinks this audio is; the count says
- * where this file thinks it is. If they disagree, the count is wrong, whatever
- * caused it, and the next scheduled instant re-derives it.
- */
-int64_t  s_ref_due;                         /* scheduled instant of the aligned frame */
-uint32_t s_ref_byte;                        /* ... and its byte index */
+std::atomic<uint32_t> s_align_gen;
+uint32_t s_sent_total;
+
+int64_t  s_ref_due;
+uint32_t s_ref_byte;
 bool     s_ref_valid;
 
-/*
- * How far the two may disagree before the origin is re-derived.
- *
- * This is a BOUND on how far the count may be from the timeline, so it is also
- * the bound on how far two units can be from each other -- and smaller is better
- * on both counts, which is the opposite of what it first looks like.
- *
- * The scheduled timeline is not exactly the content rate. The hub slews it by up
- * to 1 ms/s to walk it back to real time, and `next_play_at += frames * 1000000
- * / rate` truncates, which alone runs it ~20 ppm slow. Neither is a fault and
- * neither is worth correcting: every unit is handed the same play_at values and
- * counts the same audio, so both errors are common to all of them and cost
- * nothing at all while they stay common.
- *
- * They stop being common the moment one unit re-derives and another has not.
- * That is why the threshold wants to be small: two units differ by at most what
- * one of them has accumulated since its own last alignment, and that is bounded
- * by exactly this number. Where their origins agree -- the usual case, since a
- * track boundary re-derives every unit at once -- the trigger is a function of
- * data every unit shares, so they cross it on the same audio and stay identical
- * however often it fires.
- *
- * The cost of firing is one dropped analysis frame, one hop -- ~23 ms at hop
- * 1024 -- of the strip holding
- * its previous frame. At 20 ppm this crosses about once every 100 s on its own.
- * That is affordable, so this is set by what is NOT drift: the per-packet slew
- * step is ~20 us and the interpolation rounds to the microsecond, so 2 ms is two
- * orders of magnitude above the noise and still under one chunk of audio.
- *
- * Measured for reference, on the host over forro-shaped material: two units
- * whose audio is offset by 2.9 ms render 15% of frames visibly differently, and
- * at 42 ms -- one packet, which is what a single unreported drop used to cost
- * for good -- 3.4% of frames have one strip lit and the other dark.
- */
 constexpr int64_t ALIGN_DRIFT_US = 2000;
 
-/* Statistics, so a disagreement between two units is diagnosable rather than a
- * matter of opinion. Atomic: incremented by the audio task, read and cleared by
- * the analysis task. */
 std::atomic<uint32_t> s_dropped;
 std::atomic<uint32_t> s_aligns;
 std::atomic<uint32_t> s_onsets;
 std::atomic<uint32_t> s_frames;
-/*
- * The boom detector's own counts, because `onsets` is the wideband detector and
- * BoomPattern does not use it -- so on a floor running "boom" the log described
- * a decision nobody could see and said nothing about the one on the strip.
- *
- * `marginal` is the reason this is here rather than just `booms`. Two units
- * analyse audio a few ms apart, so their blocks overlap ~91% and their flux
- * values are close but never equal. Any block whose flux sits near its own
- * threshold can therefore fall either way, and that population -- not the
- * timeline -- is what puts one strip lit and the other dark. Counting it needs
- * one unit rather than two boards and two log windows lined up by hand.
- *
- * Within 10% of threshold is a proxy, not a derivation: the real width is the
- * flux difference between the units, which no unit can see on its own.
- */
+
 std::atomic<uint32_t> s_booms;
 std::atomic<uint32_t> s_marginal;
-/* Re-alignments nobody asked for -- see ALIGN_DRIFT_US. Reported separately
- * from s_aligns because they mean something different: an align is an event
- * being handled, a drift is an event that was never reported at all. */
+
 std::atomic<uint32_t> s_drifts;
 std::atomic<int32_t>  s_last_drift_us;
 
 [[maybe_unused]] uint32_t take(std::atomic<uint32_t> &c) { return c.exchange(0, std::memory_order_relaxed); }
 void bump(std::atomic<uint32_t> &c, uint32_t n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
-/* Running maximum. Four counters need one, and the CAS loop is the sort of thing
- * that is right three times and subtly wrong the fourth. */
+
 void note_max(std::atomic<uint32_t> &c, uint32_t v)
 {
     uint32_t prev = c.load(std::memory_order_relaxed);
@@ -628,113 +208,38 @@ void note_max(std::atomic<uint32_t> &c, uint32_t v)
     }
 }
 
-/*
- * Frames computed but not yet due.
- *
- * Analysis and display are separate stages. A frame is computed whenever the
- * audio for it is available and drawn when the instant it describes comes
- * round, which is the same schedule-the-future trick docs/clock-sync.md section
- * 4 uses for the audio itself: nothing passes between the boards at the moment
- * of drawing, they each keep the same appointment.
- *
- * What that buys is worth stating plainly, because it is not obvious. Before
- * this, a frame was drawn as soon as it was computed, so two strips agreed only
- * as closely as the two units' PLAYBACK agreed -- and each unit tolerates
- * PHASE_DEADBAND_US (7 ms) of its own error, so up to 14 ms between them, which
- * is inside what an eye resolves. Drawn on the label instead, they agree as
- * closely as the two CLOCKS do, which TSF puts under a millisecond. The servo
- * stops being in the path at all.
- *
- * Single producer (the analysis task), single consumer (the render task), so
- * the indices need no locking. They are free-running counts, not wrapped
- * positions: the difference is the depth and stays right across a uint32 wrap.
- *
- * Sized in TIME, not in frames, which is the whole point of the expression.
- *
- * 32 slots is ~740 ms at hop 1024 and comfortably more than the 200 ms of lead
- * the audio carries -- but at hop 256 the same 32 slots are 186 ms, which is
- * LESS than that lead. The analysis runs as far ahead as it has audio for, so
- * the queue would fill, overrun, and drop frames that the strip then never
- * draws. Scaling with FFT_N / HOP_N holds ~740 ms whatever the hop and leaves
- * hop 1024 exactly as it was.
- *
- * The cost is RAM, and it is not nothing: df::Frame is ~136 bytes, so this is
- * 4.4 kB at hop 1024, 8.7 kB at 512 and 17.4 kB at 256.
- *
- * Must stay a power of two. head and tail are free-running uint32 counters and
- * `% FRAME_RING` is only continuous across their wrap because 2^32 is a whole
- * number of rings.
- */
 constexpr uint32_t FRAME_RING = 32 * (FFT_N / HOP_N);
 static_assert((FRAME_RING & (FRAME_RING - 1)) == 0,
               "FRAME_RING must be a power of two -- the uint32 wrap depends on it");
 df::Frame s_fq[FRAME_RING];
-std::atomic<uint32_t> s_fq_head;    /* analysis task writes */
-std::atomic<uint32_t> s_fq_tail;    /* render task writes */
-std::atomic<uint32_t> s_fq_flush;   /* bumped to discard what is queued */
-std::atomic<uint32_t> s_late;       /* frames that came due before we got to them */
-std::atomic<uint32_t> s_overrun;    /* frames dropped because the queue was full */
-/* Frames the slow lane's queue could not take. Unlike the audio lane this
- * replaced, a loss here is not a timeline break -- every frame carries its own
- * index, so the analyser loses context and nothing after it is mislabelled. */
+std::atomic<uint32_t> s_fq_head;
+std::atomic<uint32_t> s_fq_tail;
+std::atomic<uint32_t> s_fq_flush;
+std::atomic<uint32_t> s_late;
+std::atomic<uint32_t> s_overrun;
+
 [[maybe_unused]] std::atomic<uint32_t> s_ml_dropped;
 
 #if DF_RUNS_ANALYSERS
-/* Defined below, beside the skip logic it needs; declared here because
- * enqueue() is the one site both frame sources pass through. */
+
 void run_fast_lane(const uint8_t (&spec)[df::SPEC_BINS], int64_t index,
                    int64_t due_us, df::Result out[df::ML_SLOTS]);
 #endif
-/* Render-side cost, published for the analysis task's log line. The two halves
- * scale with different things -- see the note where they are logged -- and are
- * only useful next to each other. */
+
 std::atomic<uint32_t> s_render_sum, s_render_max, s_render_n;
-/*
- * The render cost, split, and how long the task was kept from running.
- *
- * These exist to separate two explanations of the same number that call for
- * completely different fixes. At hop 512 a frame is due every 11.6 ms, and the
- * measured render max is 20 ms against a mean of 0.7 -- so one draw in a
- * thousand overruns a whole frame period and pushes the next past
- * RENDER_LATE_US. Either the work is occasionally slow, or the task is
- * occasionally not running. Timing the strip write apart from the pattern says
- * which half; timing the naps says whether the core was available at all.
- *
- * `s_wake_*` is the OVERSHOOT of a vTaskDelay, not its length, and it is a
- * one-sided measurement on purpose. vTaskDelay(N) unblocks the task at a tick
- * boundary between (N-1) and N ticks away, so quantisation at
- * CONFIG_FREERTOS_HZ=1000 can only make a nap come up SHORT. Sleeping longer
- * than asked therefore means the task was ready and not running -- there is no
- * benign explanation for a positive value beyond a tick of measurement noise,
- * which is what makes it worth reading.
- */
+
 std::atomic<uint32_t> s_pattern_sum, s_pattern_max;
 std::atomic<uint32_t> s_show_sum, s_show_max;
 std::atomic<uint32_t> s_wake_sum, s_wake_max, s_wake_n;
-/* Times the strip went dark because nothing arrived -- see RENDER_IDLE_US. */
+
 std::atomic<uint32_t> s_idle_dark;
 
-/*
- * Master -> local, or null on a unit where they are the same thing.
- *
- * A function rather than a stored offset because the satellite's is slewed
- * continuously; see visualiser_set_clock().
- */
 std::atomic<int64_t (*)(int64_t)> s_to_local{nullptr};
 
-/* Set on a unit that sends its frames onward. Null publishes nothing. */
 std::atomic<void (*)(const vis_frame_t *)> s_publish{nullptr};
 
-/* BEAT_BANDS is a macro from beat_detect.h, not a df:: member. */
 static_assert(VIS_BANDS == BEAT_BANDS, "wire frame lost a band");
 
-/* df::Frame -> the form that can leave this unit. mag has nowhere to go -- 512
- * floats pointing into an Analysis -- and the detector fields are not copies
- * either, because the receiver derives them itself from the bands: see
- * RemoteDetect, and visualiser_submit_frame() for where that runs.
- *
- * Only compiled where frames are produced here -- a unit that is given them
- * never converts one out. */
 #if DF_ANALYSES_AUDIO
 void to_wire(const df::Frame &f, vis_frame_t *w)
 {
@@ -744,24 +249,10 @@ void to_wire(const df::Frame &f, vis_frame_t *w)
 }
 #endif
 
-/* The receiver's half of the detector. Owned by whoever calls
- * visualiser_submit_frame() -- the rx task -- exactly as the analysis task owns
- * the sender's half, and reset the same way: on a rate change, seen in
- * submit_frame() rather than in the setter, because the setter runs on
- * whatever task learned the rate and this state is not ours to touch from
- * there. */
 #if DF_TAKES_REMOTE_FRAMES
 df::RemoteDetect s_remote_detect;
 #endif
 
-/* ... and back. mag stays null: it did not travel and a Pattern cannot read it
- * on a locally analysed frame either, since rendering is deferred. The
- * detector fields did not travel either -- from_wire stays a copy, and
- * submit_frame() fills them in, so the conversion and the derivation each do
- * one thing.
- *
- * Only compiled where frames are taken from elsewhere -- a unit doing its own
- * analysis never converts one back. */
 #if DF_TAKES_REMOTE_FRAMES
 void from_wire(const vis_frame_t *w, df::Frame &f)
 {
@@ -769,27 +260,12 @@ void from_wire(const vis_frame_t *w, df::Frame &f)
     f.index  = w->index;
     std::memcpy(f.band, w->band, sizeof(f.band));
     f.mag  = nullptr;
-    /* Neither of these travelled, and on this unit nothing reads either --
-     * DANCEFLOOR_ML cannot be selected alongside a remote source, which is the
-     * whole reason spec[] came off the wire. Zeroed regardless: a Frame handed
-     * onward should not be carrying stack garbage, and a future reader finding
-     * silence is a better failure than one finding the last packet's bytes. */
+
     std::memset(f.spec, 0, sizeof(f.spec));
     f.unit = 0;
 }
 #endif
 
-/*
- * Put a frame in the queue for the instant it names.
- *
- * One path for both sources, so a frame taken from the radio and a frame
- * computed here are treated identically from this point on -- which is what
- * makes them interchangeable rather than merely similar.
- *
- * Dropping the newest when full is deliberate. Evicting the oldest would
- * discard a frame about to be due in order to keep one that is not, so a strip
- * already behind skips forward instead of catching up.
- */
 bool enqueue(const df::Frame &f)
 {
     const uint32_t head = s_fq_head.load(std::memory_order_relaxed);
@@ -801,21 +277,6 @@ bool enqueue(const df::Frame &f)
     df::Frame &dst = s_fq[head % FRAME_RING];
     dst = f;
 
-    /*
-     * THE ANALYSERS RUN HERE, which is the one place both frame sources pass
-     * through -- see the note above. A frame computed from local audio and a
-     * frame taken off the radio carry the same spectrum, so an analyser reading
-     * it cannot tell them apart and neither caller has to remember to drive it.
-     *
-     * Fast-lane results belong to THIS frame -- their input is this frame's
-     * spectrum and their presentation delay is zero -- so they are carried with
-     * it rather than latched. Slow-lane slots are left empty here and filled by
-     * the render task when their show_at_us comes round.
-     *
-     * Overwritten unconditionally, including with result_none(), because the
-     * queue slot is reused and whatever a previous frame left in it describes
-     * audio 740 ms ago.
-     */
 #if DF_RUNS_ANALYSERS
     df::Result fast_ml[df::ML_SLOTS];
     run_fast_lane(f.spec, f.index, f.due_us, fast_ml);
@@ -830,62 +291,21 @@ bool enqueue(const df::Frame &f)
         dst.ml[i] = df::result_none();
     }
 #endif
-    /* Release, against the acquire on the reader: the frame must be fully
-     * written before the index that publishes it moves. */
+
     s_fq_head.store(head + 1, std::memory_order_release);
     return true;
 }
 
-/*
- * Where a slow analyser's answer waits for the moment it describes, and the
- * slots this unit fills itself rather than waiting for.
- *
- * The mechanism, and the argument for why it stays in step across units, is in
- * result_latch.hpp -- it is pure logic and lives where the host tests can drive
- * it, like the analysis it serves.
- */
 df::ResultLatch s_latch;
 
-/* Results produced by this unit, for the log line. Unused on a unit that is
- * given its results -- it produces none. */
 [[maybe_unused]] std::atomic<uint32_t> s_ml_results;
 
-/*
- * How early is close enough to draw now rather than sleep again.
- *
- * The audio marker busy-waits to hit its deadline within microseconds. This
- * does not need to: vTaskDelay resolves to 1 ms at CONFIG_FREERTOS_HZ=1000,
- * and an eye resolves 10-20 ms, so a millisecond is already an order of
- * magnitude better than the thing being served. Spinning for it would burn a
- * core to move an error nobody can see.
- */
 constexpr int64_t RENDER_SLACK_US = 1000;
 
-/* Sleep at most this long in one go, so a flush is acted on promptly even when
- * the frame at the head is not due for a while. */
 constexpr int64_t RENDER_NAP_MS = 20;
 
-/* Past this, the frame was not merely a little late -- something stalled. Drawn
- * anyway, because a stale frame is better than a gap, but counted. */
 constexpr int64_t RENDER_LATE_US = 20000;
 
-/*
- * How long the queue may stay empty before the strip goes dark.
- *
- * Only reachable on a unit that is GIVEN its frames: one doing its own analysis
- * notices a stopped stream itself and flushes, which blanks. A unit fed from
- * elsewhere has no analysis task to notice anything, so without this it holds
- * its last frame indefinitely -- a lit strip that looks like it is working
- * while the thing driving it has gone.
- *
- * Half a second is well past any gap normal delivery produces at 43 or more frames a
- * second, and short enough that a stopped floor reads as stopped.
- *
- * Going dark rather than falling back to local analysis is the deliberate
- * choice: a unit told to follow another should stop when it cannot, not start
- * improvising. Improvising is what a locally analysing unit is for, and that is
- * a build-time decision.
- */
 constexpr int64_t RENDER_IDLE_US = 500000;
 
 void show(const uint8_t *rgb)
@@ -895,8 +315,7 @@ void show(const uint8_t *rgb)
                       static_cast<uint8_t>(rgb[3 * i + 1] * BRIGHTNESS),
                       static_cast<uint8_t>(rgb[3 * i + 2] * BRIGHTNESS));
     }
-    /* Refresh failures are silent otherwise, and a wedged strip driver fails
-     * every single frame -- log the first rather than flooding the console. */
+
     if (const esp_err_t err = strip->show(); err != ESP_OK) {
         static bool reported = false;
         if (!reported) {
@@ -906,19 +325,8 @@ void show(const uint8_t *rgb)
     }
 }
 
-/* Above the DF_ANALYSES_AUDIO guard on purpose. This is driven from enqueue(),
- * which a unit given its frames reaches too -- putting it under that guard is
- * what made it declared-but-not-defined on exactly the build this whole change
- * exists to enable. */
 #if DF_RUNS_ANALYSERS
-/*
- * Run every fast-lane analyser over the frame's spectrum, counting what came
- * back.
- *
- * The lane itself is df::run_fast_lane() in analysers.cpp, so tools/pattern_lab
- * drives exactly this and not a copy of it. All that belongs here is which
- * slots this unit computes -- which is firmware state -- and the counter.
- */
+
 void run_fast_lane(const uint8_t (&spec)[df::SPEC_BINS], int64_t index,
                    int64_t due_us, df::Result out[df::ML_SLOTS])
 {
@@ -935,12 +343,8 @@ void run_fast_lane(const uint8_t (&spec)[df::SPEC_BINS], int64_t index,
         }
     }
 }
-#endif  /* DF_RUNS_ANALYSERS */
+#endif
 
-/* The FFT, the detectors and the task that drives them. Not built at all on a
- * unit that is given its frames -- there is no audio to analyse there, and they
- * would be pure cost. The analysers above are no longer part of this: they read
- * the spectrum, which such a unit has. */
 #if DF_ANALYSES_AUDIO
 
 void visualiser_task(void *arg)
@@ -955,49 +359,23 @@ void visualiser_task(void *arg)
     int64_t  last_report_us = esp_timer_get_time();
     bool     starved_shown = false;
     uint32_t seen_rate = s_rate.load(std::memory_order_relaxed);
-    /*
-     * What a frame costs, so a change to the analysis rate can be judged
-     * against a measurement rather than an expectation.
-     *
-     * Split because the two halves scale with different things and only one of
-     * them is CPU. `analysis` is the FFT and the detectors, and it doubles if
-     * the hop halves. `render` is mostly show(), which blocks in
-     * spi_device_transmit() for about 30 us per LED -- so it scales with strip
-     * length, not with the frame rate, and at the 8 LEDs on the bench it is
-     * nearly free. On a real floor it is the term that decides whether a faster
-     * analysis rate fits.
-     *
-     * Task-local: only this task writes or reads them.
-     */
+
     int64_t  cost_analysis = 0, cost_analysis_max = 0;
     uint32_t cost_n = 0;
-    /* The fast lane, kept apart from the FFT it runs beside. They share a task
-     * and a deadline, so the only useful question about a new analyser is how
-     * much of the frame period it took that the FFT was not already using. */
+
     int64_t  cost_fast = 0, cost_fast_max = 0;
 
     while (true) {
-        /*
-         * A rate change re-cuts the analysis bands, so every flux figure in the
-         * detector's history was measured against different frequencies and has
-         * to go. Handled here rather than in the setter because this task owns
-         * `analysis` and the setter can be called from anywhere.
-         */
+
         const uint32_t rate = s_rate.load(std::memory_order_relaxed);
         if (rate != seen_rate) {
             seen_rate = rate;
             analysis.init(static_cast<int>(rate));
-            /* Same argument one level up: an analyser's features were derived
-             * at the old rate and the state built from them describes different
-             * frequencies now. init() rather than reset() because the rate is
-             * the one thing an analyser is told about the stream. */
+
             for (int i = 0; i < df::ML_SLOTS; i++) {
                 if (df::Analyser *a = df::analyser_at(i);
                     a && !s_latch.latched(i) && !a->init(static_cast<int>(rate))) {
-                    /* Refused the new rate. Marking the slot latched retires it
-                     * cleanly -- the render task then reports result_none()
-                     * there rather than this unit publishing answers derived at
-                     * a rate the analyser has disowned. */
+
                     s_latch.set_latched(i, true);
                     ESP_LOGE(TAG, "analyser \"%s\" cannot run at %" PRIu32 " Hz -- retired",
                              a->spec().name, rate);
@@ -1014,26 +392,16 @@ void visualiser_task(void *arg)
         filled += got;
         recv_total += got;
 
-        /*
-         * Has the feed re-aligned? Everything before its published byte index is
-         * stale and must not contribute to a block, this partial block included.
-         * Dropping only the feed side leaves the boundaries offset by whatever
-         * is held here, and the re-alignment silently does nothing.
-         */
-        /* Acquire, against the release on the publishing side: the byte index
-         * and the block index must both be the ones this generation stored. */
         const uint32_t gen = s_align_gen.load(std::memory_order_acquire);
         if (gen != seen_gen) {
             const uint32_t align_at = s_align_at_byte.load(std::memory_order_relaxed);
             const int32_t ahead = static_cast<int32_t>(recv_total - align_at);
             if (ahead < 0) {
-                filled = 0;             /* still draining pre-alignment audio */
+                filled = 0;
                 continue;
             }
             seen_gen = gen;
-            /* The frames after this point do not continue the frames before
-             * them, so a slow analyser's accumulated context would span the
-             * join and describe audio that was never played in that order. */
+
 #if DF_RUNS_ANALYSERS
             df::ml_lane_restart();
 #endif
@@ -1046,72 +414,23 @@ void visualiser_task(void *arg)
 
         if (filled < sizeof(raw)) {
             if (got == 0 && !starved_shown) {
-                /* Genuinely starved rather than mid-block. Go dark once instead
-                 * of holding the last frame; bounded to one refresh per timeout,
-                 * so it cannot become a spin. */
-                /*
-                 * Genuinely starved rather than mid-block. Going dark is the
-                 * render task's job now -- the strip and the pattern belong to
-                 * it, and drawing to them from here would race it. A flush is
-                 * exactly the right request: what is queued describes a stream
-                 * that has stopped.
-                 */
+
                 starved_shown = true;
                 visualiser_flush();
-                /* the stream broke; re-align on return */
+
                 s_align_pending.store(true, std::memory_order_relaxed);
             }
             continue;
         }
         starved_shown = false;
 
-        /* due_us is derived from the hop index, not read from a clock, so it
-         * is the same value on every unit for this same audio -- at the rate
-         * this unit was told the audio is, which is the same rate its playback
-         * used to date the audio in the first place. It names the START of the
-         * window, which is what the grid is counted in. */
         const int64_t due_us = block_index * HOP_N * 1000000LL / rate;
         const int64_t t_in = esp_timer_get_time();
         const df::Frame &f = analysis.process(raw, block_index, due_us, 0);
         const int64_t t_analysed = esp_timer_get_time();
 
-        /*
-         * THE ANALYSERS ARE NOT DRIVEN HERE ANY MORE.
-         *
-         * They used to be: the fast lane ran on the window the FFT had just
-         * transformed, and the slow lane was fed the audio that was new in it,
-         * resampled to 16 kHz. Both took PCM, so both had to happen on the one
-         * path that had PCM -- this one.
-         *
-         * Analysers read the spectrum now, and every frame carries it whether
-         * this unit computed it or took it off the radio, so they are driven
-         * from enqueue() where the two paths meet. That is what lets a unit
-         * analysing no audio run a model, and it deletes the resampler, its
-         * tables and the decimation buffer from this function.
-         */
         const int64_t t_fast = esp_timer_get_time();
 
-        /*
-         * Advance by one HOP, keeping the newest TAIL_BYTES.
-         *
-         * This was `filled = 0`, and it sat ABOVE process() -- which was safe
-         * only because the window and the hop were the same thing, so resetting
-         * the counter discarded the whole window and moved nothing. A hop that
-         * is shorter than the window has to physically slide the tail down, so
-         * it has to happen after the window has been read, not before.
-         *
-         * The newest bytes, not the oldest. `raw` must remain a contiguous
-         * SUFFIX of what has been received, because that is the invariant the
-         * realign path above depends on -- it trims `raw` by a byte count
-         * measured from the far end. Keeping the oldest would leave the right
-         * number of bytes holding the wrong audio, and every check here looks at
-         * where a window starts rather than what is in it, so nothing on the
-         * board would report it. test_align.c grew a window-contiguity check for
-         * exactly that reason.
-         *
-         * `if constexpr` so that at TAIL_N == 0 this is absent rather than a
-         * zero-length memmove off the end of the buffer.
-         */
         if constexpr (TAIL_BYTES > 0) {
             std::memmove(raw, reinterpret_cast<uint8_t *>(raw) + HOP_BYTES, TAIL_BYTES);
         }
@@ -1127,24 +446,8 @@ void visualiser_task(void *arg)
             bump(s_marginal);
         }
 
-        /*
-         * Queue it for the instant it names, rather than drawing it now.
-         *
-         * Dropping the newest when full is deliberate. The alternative --
-         * evicting the oldest -- discards a frame that is about to be due in
-         * order to keep one that is not, so a strip that is already behind
-         * skips forward instead of catching up. Full means the render task is
-         * not keeping pace, and the honest response is to stop adding to its
-         * backlog.
-         */
         enqueue(f);
 
-        /*
-         * Onward, if anything is listening. After the local queue, so this
-         * unit's own strip never waits on a radio, and outside it, so a send
-         * that fails costs a neighbour a frame rather than costing this unit
-         * one too.
-         */
         if (const auto publish = s_publish.load(std::memory_order_relaxed)) {
             vis_frame_t w;
             to_wire(f, &w);
@@ -1160,22 +463,11 @@ void visualiser_task(void *arg)
             cost_n++;
         }
 
-        /*
-         * Quiet when nothing is wrong, immediate when something is.
-         *
-         * A healthy window reports the same ~215 frames and 0 dropped bytes
-         * every time, and two units doing that every 5 s is most of a console.
-         * A window that dropped audio, or re-aligned more than the one time a
-         * splice or retune explains, is worth seeing at once -- those are the
-         * two things that put the strips out of step with each other.
-         */
         const int64_t now = esp_timer_get_time();
         const uint32_t dropped = s_dropped.load(std::memory_order_relaxed);
         const uint32_t aligns  = s_aligns.load(std::memory_order_relaxed);
         const uint32_t drifts  = s_drifts.load(std::memory_order_relaxed);
-        /* A drift is always worth seeing at once: it means audio was gained or
-         * lost somewhere that does not know it has to say so, which is the one
-         * fault in here that used to be permanent and invisible. */
+
         if (dropped || drifts || aligns > 1 || now - last_report_us >= LED_LOG_PERIOD_US) {
             ESP_LOGI(TAG, "frames %" PRIu32 " | onsets %" PRIu32
                           " | booms %" PRIu32 " (marginal %" PRIu32 ")"
@@ -1185,36 +477,11 @@ void visualiser_task(void *arg)
                      take(s_dropped), take(s_aligns),
                      take(s_drifts), (long)s_last_drift_us.load(std::memory_order_relaxed),
                      pattern ? pattern->name() : "no pattern");
-            /*
-             * Its own line, so the one above stays comparable with every log
-             * ever captured from this component. `n` is printed because an
-             * anomaly can trigger this block early, and a mean over three
-             * frames is not a mean.
-             */
-            /* Taken unconditionally, then divided -- reading them inside the
-             * call would leave the sum uncleared on a window with no frames. */
+
             const uint32_t rn = take(s_render_n), rsum = take(s_render_sum);
             const uint32_t wn = take(s_wake_n), wsum = take(s_wake_sum);
             const uint32_t psum = take(s_pattern_sum), ssum = take(s_show_sum);
-            /*
-             * The pluggable analysers, on their own line for the same reason
-             * `cost:` is on its own: it must stay comparable with every log
-             * captured before analysers existed. `late` is the one that matters
-             * -- it counts results that missed the frame they named, and the
-             * only fix for it is a larger present_delay_us.
-             */
-            /*
-             * DF_RUNS_ANALYSERS, not just DF_ANALYSES_AUDIO. This was the one
-             * reference to the lane that carried no guard, and being the only
-             * one it decided the whole question: an undefined ml_lane_take_stats
-             * pulls ml_lane.cpp into the image on a unit that starts no lane,
-             * runs no analyser and has nothing to report. Every other ml_lane_*
-             * call already sat behind this symbol.
-             *
-             * A unit that takes results from elsewhere keeps the fast/latch half
-             * of the line below -- those are its own numbers -- and simply has no
-             * slow lane to describe.
-             */
+
 #if DF_RUNS_ANALYSERS
             const df::MlLaneStats ml = df::ml_lane_take_stats();
             ESP_LOGI(TAG, "ml: fast %lld/%lld us (mean/max) | slow %" PRIu32 "/%" PRIu32
@@ -1259,66 +526,30 @@ void visualiser_task(void *arg)
     }
 }
 
-#endif  /* DF_ANALYSES_AUDIO */
+#endif
 
-/*
- * Draw each frame at the instant it names.
- *
- * Nothing passes between the boards here and nothing is corrected against
- * anything: each unit converts due_us with its own offset and keeps its own
- * appointment, exactly as the audio does. That is what makes two strips agree
- * to the accuracy of the clocks rather than to the accuracy of the servo.
- */
 void render_task(void *arg)
 {
     (void)arg;
     uint32_t seen_flush = s_fq_flush.load(std::memory_order_relaxed);
-    int64_t  drawn_at = 0;      /* when the strip last showed something */
+    int64_t  drawn_at = 0;
 #if !DF_ANALYSES_AUDIO
     int64_t  last_report_us = esp_timer_get_time();
 #endif
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-    /*
-     * The marker's two edges, as LOCAL-clock deadlines, 0 when unarmed.
-     *
-     * flash_at is the next master second boundary put through this unit's
-     * conversion; lower_at is set from it when the pin goes up. Deadlines rather
-     * than the frame counters they replaced, because the loop that services them
-     * runs at the frame cadence -- and on a unit given its frames that cadence is
-     * the hub's beacon, not this build's hop. See LED_MARKER_HIGH_US.
-     */
+
     int64_t flash_at = 0;
     int64_t lower_at = 0;
-    /*
-     * The last master second this unit has armed a flash for, so it arms each
-     * one once. Never reset -- see the arming site for the late frame it is
-     * there to refuse, and note that resetting it on idle would re-open exactly
-     * that hole on the way back.
-     */
+
     int64_t last_flash_sec = -1;
-    /*
-     * When a frame was last drawn, and whether the marker has fallen back to
-     * showing the link because none has been for a while.
-     *
-     * Deliberately NOT drawn_at, which the strip's own idle path zeroes once it
-     * has blanked -- after that it can no longer say how long ago anything
-     * happened, which is precisely the question here. This one is only ever set
-     * forward, so "nothing for RENDER_IDLE_US" stays answerable indefinitely.
-     *
-     * Starts idle, at 0: at boot nothing has been drawn and the link is down,
-     * so the first thing the marker shows is dark, which is what a satellite
-     * still looking for the hub should look like.
-     */
+
     int64_t marker_at   = 0;
     bool    marker_idle = true;
 #endif
 
     while (true) {
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-        /* Before anything else, and on every path through this loop: the pin's
-         * edges are instants now, and nothing below is allowed to decide when
-         * one of them is noticed. Idle units have nothing armed, so this is two
-         * compares. */
+
         if (!marker_idle) {
             marker_service(esp_timer_get_time(), &flash_at, &lower_at);
         }
@@ -1326,60 +557,17 @@ void render_task(void *arg)
         const uint32_t flush = s_fq_flush.load(std::memory_order_acquire);
         if (flush != seen_flush) {
             seen_flush = flush;
-            /* Only this task writes the tail, so catching it up to the head is
-             * safe whatever the producer is doing. Frames added after this are
-             * on the new timeline and are kept. */
+
             s_fq_tail.store(s_fq_head.load(std::memory_order_acquire),
                             std::memory_order_release);
-            /*
-             * Dark, not the last frame held.
-             *
-             * A flush means the audio behind what is on the strip has stopped
-             * or moved to a new origin. Holding the last frame leaves a lit
-             * strip that looks like it is working; going dark says plainly that
-             * there is nothing to show, which is what the starve path did
-             * before rendering was deferred.
-             */
+
             if (pattern) pattern->reset();
-            /* Same reason the queue is emptied: a show_at_us established before
-             * the restart names an instant on a timeline that no longer exists,
-             * and latching it would put a stale answer on the strip at the
-             * moment the new timeline starts. */
+
             s_latch.flush();
             std::memset(pixels, 0, sizeof(pixels));
             show(pixels);
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-            /*
-             * ... and the second this pin last fired on, for the same reason.
-             *
-             * last_flash_sec is a MASTER second, and the arming test below only
-             * arms a second LATER than it. A flush says the timeline those
-             * seconds were counted on has been replaced -- and when the
-             * replacement is a hub that has just rebooted, the new timeline
-             * starts near zero, so every second the frames name is smaller than
-             * this and NOTHING is ever armed again. The strip recovers with the
-             * queue above; the marker stayed dark until the satellite itself was
-             * rebooted.
-             *
-             * This is the reset the declaration warns off -- "resetting it on
-             * idle would re-open exactly that hole" -- and the warning is about
-             * IDLE, which is a stream that stopped on a timeline still running.
-             * A flush is the other thing: the timeline is gone, so the late
-             * frame this guard exists to refuse cannot arrive, and the value
-             * guarding against it is meaningless.
-             *
-             * Any armed edge goes with it, for the reason the idle path drops
-             * one: it names a local instant computed through an offset that is
-             * being re-seeded, and firing it would pulse the pin against the
-             * old clock. The pin is then written rather than left, because
-             * dropping lower_at is dropping the only thing that would have
-             * ended a flash in progress -- the strip would go dark under a
-             * marker stuck on.
-             *
-             * Dark on a unit that was drawing, which is where the flashes
-             * resume from; the link level on one already idle, which is what
-             * the idle path below would re-assert anyway.
-             */
+
             last_flash_sec = -1;
             flash_at = 0;
             lower_at = 0;
@@ -1388,16 +576,7 @@ void render_task(void *arg)
         }
 
 #if !DF_ANALYSES_AUDIO
-        /*
-         * The periodic line lives in the analysis task, which is not built on a
-         * unit that analyses no audio -- so without this such a unit reports
-         * nothing at all, and the numbers that say whether frames are arriving
-         * are exactly the ones missing.
-         *
-         * Same cadence, and only the fields that mean anything here: no audio
-         * is being dropped, there is no block grid to re-align, and there is no
-         * analysis to time.
-         */
+
         {
             const int64_t now_us = esp_timer_get_time();
             if (now_us - last_report_us >= LED_LOG_PERIOD_US) {
@@ -1432,33 +611,14 @@ void render_task(void *arg)
         const uint32_t head = s_fq_head.load(std::memory_order_acquire);
         if (head == tail) {
             if (drawn_at && esp_timer_get_time() - drawn_at > RENDER_IDLE_US) {
-                drawn_at = 0;                /* once, not every nap */
+                drawn_at = 0;
                 if (pattern) pattern->reset();
                 std::memset(pixels, 0, sizeof(pixels));
                 show(pixels);
                 bump(s_idle_dark);
             }
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-            /*
-             * Nothing has been drawn for long enough to call it stopped, so the
-             * marker stops reporting the timeline and goes back to reporting
-             * the link.
-             *
-             * On MARKER_IDLE_US rather than the strip's RENDER_IDLE_US above:
-             * the two used to share the figure and no longer can -- see the
-             * constant. So the strip going dark and the LED going solid are two
-             * events now, a second apart, and that gap is the point rather than
-             * an oversight.
-             *
-             * Any armed flash is dropped with it. It was armed off a frame that
-             * is now old enough to call the stream stopped, and firing it would
-             * put a pulse on a pin that has just been handed to the link.
-             *
-             * Re-asserted every nap, not once, because the link can change
-             * while the unit sits here with nothing to draw -- which is exactly
-             * the case this whole state exists to show. marker_write() makes
-             * the repeat free.
-             */
+
             if (esp_timer_get_time() - marker_at > MARKER_IDLE_US) {
                 marker_idle = true;
                 flash_at = 0;
@@ -1469,8 +629,7 @@ void render_task(void *arg)
             {
                 int64_t nap_ms = RENDER_NAP_MS;
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-                /* A unit with nothing to draw still owes the pin its edges for
-                 * MARKER_IDLE_US after the last frame. */
+
                 nap_ms = marker_clamp_nap(nap_ms, flash_at, lower_at);
 #endif
                 vTaskDelay(pdMS_TO_TICKS(nap_ms));
@@ -1478,14 +637,6 @@ void render_task(void *arg)
             continue;
         }
 
-        /*
-         * How long until this frame is due, in local time.
-         *
-         * A label of 0 means the feed had no timeline to date the audio
-         * against, so there is nothing to wait for -- draw it and move on. An
-         * unset hook means master time IS local time, which is the hub's case
-         * and the safe default anywhere.
-         */
         const int64_t due = s_fq[tail % FRAME_RING].due_us;
         int64_t wait = 0;
         if (due > 0) {
@@ -1493,20 +644,16 @@ void render_task(void *arg)
             wait = (to_local ? to_local(due) : due) - esp_timer_get_time();
         }
         if (wait > RENDER_SLACK_US) {
-            /* Bounded, so a flush is acted on promptly even when the frame at
-             * the head is not due for a couple of hundred milliseconds. */
+
             int64_t nap = wait / 1000 < RENDER_NAP_MS ? wait / 1000 : RENDER_NAP_MS;
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-            /* The frame this is waiting for may be a hundred milliseconds out;
-             * the flash it was armed for may not be. */
+
             nap = marker_clamp_nap(nap, flash_at, lower_at);
 #endif
             const int64_t asked = nap ? nap : 1;
             const int64_t before = esp_timer_get_time();
             vTaskDelay(pdMS_TO_TICKS(asked));
-            /* Only the naps taken while a frame is waiting to come due. The
-             * idle nap above is a different question -- an empty queue, not a
-             * task that could not run. */
+
             const int64_t over = (esp_timer_get_time() - before) - asked * 1000;
             bump(s_wake_n);
             if (over > 0) {
@@ -1521,26 +668,12 @@ void render_task(void *arg)
 
         const int64_t t0 = esp_timer_get_time();
         df::Frame f = s_fq[tail % FRAME_RING];
-        /* Points into the Analysis that produced it and was overwritten several
-         * frames ago. Null rather than dangling -- see Frame::mag. */
+
         f.mag = nullptr;
         s_fq_tail.store(tail + 1, std::memory_order_release);
 
-        /*
-         * Bring the slow slots up to this frame.
-         *
-         * Here, at the moment of drawing, and not where the frame was produced
-         * -- that is what gives a slow analyser the whole presentation lead to
-         * work in. See ResultLatch for why it stays in step across units.
-         *
-         * Slots this unit fills itself in the fast lane are already in the
-         * frame and are left alone.
-         */
         {
-            /* One frame period, for the latch's own lateness check. Computed
-             * from the live rate rather than df::RATE: at 48 kHz a frame is
-             * 10.7 ms, not 11.6, and a check told the wrong period would report
-             * results as late that were not. */
+
             const int64_t hop_us =
                 (int64_t)HOP_N * 1000000LL /
                 (int64_t)s_rate.load(std::memory_order_relaxed);
@@ -1548,63 +681,18 @@ void render_task(void *arg)
         }
 
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
-        /*
-         * Arm the next flash. Nothing is written to the pin here -- the edges
-         * themselves belong to marker_service(), which runs whether or not a
-         * frame arrives.
-         *
-         * That split is the change. The pin used to be raised on the frame that
-         * crossed the boundary and lowered a fixed number of frames later, which
-         * ties both edges to delivery; on a unit fed by the hub delivery is the
-         * beacon, ~9.8 frames a second, and both edges inherited its 102 ms
-         * grain. What a drawn frame genuinely establishes is that audio is
-         * flowing and WHICH master second is next, and that is all it is asked
-         * for now.
-         */
+
         marker_at = t0;
         if (marker_idle) {
-            /*
-             * Audio has started. Leave the link level and drop to dark, so the
-             * flashes that follow are flashes against darkness rather than
-             * against a lit pin, where they would be invisible.
-             *
-             * The current second is skipped rather than fired on. Firing here
-             * would raise a pin that is already lit on a joined unit, and the
-             * only visible edge would be the LOWER 40 ms later -- a first
-             * "flash" that reads backwards, and against a neighbouring unit
-             * reads as a sync fault. The cost is waiting up to one second for
-             * the first real flash, which is the correct thing to wait for:
-             * every unit is waiting for the same boundary.
-             */
+
             marker_idle = false;
             lower_at = 0;
             marker_write(LED_MARKER_OFF);
         }
-        /*
-         * due_us <= 0 means the feed had no timeline to date this audio
-         * against, so there is no master second to fire on and nothing is
-         * armed: the pin stays dark while such a stream is drawn. The frame
-         * counting version did the same thing by never crossing a boundary.
-         *
-         * Armed through the same conversion the wait above uses, and re-armed
-         * by every frame that lands while the flash is still pending. So a
-         * clock offset that slews between the arming and the boundary corrects
-         * the pending instant rather than firing at a stale one.
-         */
+
         if (f.due_us > 0) {
             const int64_t next_sec = f.due_us / LED_MARKER_PERIOD_US + 1;
-            /*
-             * Each boundary is armed once, by whichever frame first names it,
-             * and re-armed after that only while it is still PENDING.
-             *
-             * A frame drawn late -- after the boundary its own second was
-             * flashed on -- names an instant that has already passed, and
-             * without this it would arm it again for a second pulse a few
-             * milliseconds behind the first. Frames are drawn in due order, so
-             * on a unit keeping up this never binds; it is the stall case, and
-             * the stall is reported by `late` rather than by a stutter on the
-             * one LED people read as a sync fault.
-             */
+
             if (next_sec > last_flash_sec || flash_at) {
                 last_flash_sec = next_sec;
                 const int64_t at = next_sec * LED_MARKER_PERIOD_US;
@@ -1615,11 +703,7 @@ void render_task(void *arg)
 #endif
 
         if (pattern) {
-            /* Split, because the two are different kinds of thing: the pattern
-             * is arithmetic over LED_COUNT pixels, and show() hands the buffer
-             * to a driver that may block. Their sum is still reported as
-             * `render`, unchanged, so the figure stays comparable with every
-             * log captured before this split existed. */
+
             const int64_t t_pat = esp_timer_get_time();
             pattern->render(f, pixels, LED_COUNT);
             const int64_t t_show = esp_timer_get_time();
@@ -1639,22 +723,14 @@ void render_task(void *arg)
     }
 }
 
-}  // namespace
+}
 
-/*
- * Start or stop the survey blink. See visualiser.h for what it means and why it
- * is kept out of the three-state scheme.
- *
- * Failure is silent and harmless: this is an indicator, and a board that cannot
- * create a timer still has a floor to run. It must never be the reason a hub
- * does not come up.
- */
 void visualiser_marker_busy(bool on)
 {
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
     if (on) {
         if (s_marker_busy_timer) {
-            return;                       /* already blinking */
+            return;
         }
         gpio_config_t m = {};
         m.pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_LED_MARKER_GPIO;
@@ -1678,8 +754,7 @@ void visualiser_marker_busy(bool on)
         esp_timer_stop(s_marker_busy_timer);
         esp_timer_delete(s_marker_busy_timer);
         s_marker_busy_timer = nullptr;
-        /* Dark, which is both "the survey is done" and the state
-         * visualiser_start() drives this pin to when it takes over. */
+
         s_marker_busy_level = LED_MARKER_OFF;
         gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
                        LED_MARKER_OFF);
@@ -1694,8 +769,7 @@ void visualiser_marker_set_link(bool up)
 #if CONFIG_DANCEFLOOR_ENABLE_LED_MARKER
     s_marker_link.store(up, std::memory_order_relaxed);
 #else
-    /* Nothing to show it on. Still callable, so the unit that knows about the
-     * link does not have to know whether this build has an LED. */
+
     (void)up;
 #endif
 }
@@ -1716,29 +790,7 @@ void visualiser_submit_frame(const vis_frame_t *f)
     if (!f) {
         return;
     }
-    /*
-     * Is the sender cutting the same grid this unit is built for?
-     *
-     * Nothing here analyses audio, so the hop is not a setting this unit obeys
-     * -- it is a statement about the unit SENDING the frames. It still has to be
-     * right, because FRAME_RING is sized from it: a hub at hop 256 feeding a
-     * satellite left at 1024 gives that satellite 186 ms of queue against
-     * ~200 ms of audio lead, so it silently overruns and drops frames it should
-     * have drawn.
-     *
-     * No protocol change is needed to check it. Consecutive frames are one hop
-     * apart by construction, so the difference of their due_us IS the sender's
-     * hop. The index test skips the first frame and any gap or flush, where the
-     * difference would be several hops and mean nothing.
-     *
-     * An eighth is a deliberately loose band. The sender's due_us comes from an
-     * integer division, so successive differences alternate by a microsecond,
-     * while the supported hops are a factor of two apart -- rounding cannot trip
-     * this and a real mismatch cannot hide under it.
-     *
-     * Said once, and not acted on: the sizes are compiled in, so the honest
-     * response is to name the fault rather than half-absorb it.
-     */
+
     {
         static int64_t prev_index = -1, prev_due = 0;
         const int64_t want = (int64_t)HOP_N * 1000000 /
@@ -1761,22 +813,6 @@ void visualiser_submit_frame(const vis_frame_t *f)
         prev_due   = f->due_us;
     }
 
-    /*
-     * A rate change re-cuts the sender's bands, so the flux history this unit's
-     * detector has built describes different frequencies now. The same argument
-     * the analysis task makes for its own detector at the top of its loop, and
-     * handled here rather than in visualiser_set_rate() for the same reason:
-     * that can be called from any task, and this state belongs to this one.
-     *
-     * seen_rate starts at 0, which no real rate is, so the first frame through
-     * here initialises the detector -- and that is load-bearing rather than
-     * tidy, because the boom tuning is three assignments in init() and static
-     * zero-initialisation would leave them unset.
-     *
-     * NOT on stream gaps. The analysis task spans those without resetting its
-     * own detector, and matching its reset points is part of matching its
-     * decisions.
-     */
     {
         static uint32_t seen_rate = 0;
         const uint32_t rate = s_rate.load(std::memory_order_relaxed);
@@ -1788,41 +824,23 @@ void visualiser_submit_frame(const vis_frame_t *f)
 
     df::Frame local;
     from_wire(f, local);
-    /*
-     * The detector's answers did not travel. Derived here from the same float
-     * bands the sender's own detector consumed, by the same code -- which is
-     * what makes this strip fire on the same pulses as the sender's without
-     * anything new being synchronised, and what keeps two strips taking the
-     * same frames bit-identical.
-     */
+
     s_remote_detect.process(local.band, local.due_us, &local);
-    /* A frame off the wire carries no results: this unit's slots are all
-     * latched, and the results that fill them arrive as their own messages. */
+
     if (enqueue(local)) {
         bump(s_frames);
         if (local.onset) bump(s_onsets);
         if (local.boom) bump(s_booms);
     }
 #else
-    /*
-     * Ignored, and silently, because it is configuration rather than a fault: a
-     * unit doing its own analysis has a complete timeline already, and drawing
-     * somebody else's alongside it would interleave two.
-     */
+
     (void)f;
 #endif
 }
 
 int visualiser_hop(void)
 {
-    /*
-     * Reported rather than merely compiled in, because two units on different
-     * hops cut different windows and reach different decisions -- and on the
-     * LOCAL path nothing crosses between the boards, so no unit can detect that
-     * for itself. Making it printable is the most that path can offer, and it
-     * is enough: it is the same way the audio's own agreement is checked, by
-     * putting two consoles side by side.
-     */
+
     return HOP_N;
 }
 
@@ -1837,40 +855,17 @@ const char *visualiser_source_name(void)
 
 void visualiser_flush(void)
 {
-    /* Release, so everything the caller did to establish the new timeline is
-     * visible to the render task before it acts on this. */
+
     s_fq_flush.fetch_add(1, std::memory_order_release);
 }
 
 void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
 {
-    /*
-     * Null on a unit built to take frames from elsewhere -- no stream buffer is
-     * created and no analysis task runs, so audio handed here has nothing to be
-     * handed to. Callers are not conditionalised on the source: the audio path
-     * should not have to know, and the check was already here for the case
-     * where the visualiser is disabled entirely.
-     */
+
     if (!pcm_stream) {
         return;
     }
 
-    /*
-     * Is the count still describing the timeline?
-     *
-     * Cheap, because both halves are already here: `due_master_us` is where the
-     * timeline says this audio is, and the byte count since the last alignment
-     * is where this file believes it is. Nothing else has to be told anything.
-     *
-     * Checked before the exchange below so a drift found here is served by the
-     * same alignment path as an explicitly requested one, in this same call.
-     *
-     * Not while one is already in flight: an alignment that is still discarding
-     * frames has not published its new origin yet, so this would measure the
-     * same drift against the old one and re-arm on every feed until the discard
-     * finished -- harmless, since the grid it recomputes is absolute, but it
-     * would make the counter report four events where there was one.
-     */
     const int64_t rate = s_rate.load(std::memory_order_relaxed);
 
     if (due_master_us > 0 && s_ref_valid && s_skip_frames <= 0 && !s_mark_align_point &&
@@ -1884,8 +879,6 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
         }
     }
 
-    /* Exchange rather than test-then-clear: a request raised by another task
-     * while this one is mid-alignment would otherwise be overwritten. */
     if (due_master_us > 0 && s_align_pending.exchange(false, std::memory_order_relaxed)) {
         const int64_t idx = (due_master_us * rate) / 1000000;
         const int32_t into_hop = static_cast<int32_t>(idx % HOP_N);
@@ -1906,27 +899,17 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
         }
     }
 
-    /* Publish where aligned audio begins, and which block that is. The
-     * generation goes last, and with release ordering: it is what the analysis
-     * task watches, so the two values must already be visible when it changes. */
     if (s_mark_align_point) {
         s_align_block_index.store(s_pending_block_index, std::memory_order_relaxed);
         s_align_at_byte.store(s_sent_total, std::memory_order_relaxed);
         s_align_gen.fetch_add(1, std::memory_order_release);
-        /* The same origin the reader is about to adopt, in the units the drift
-         * check needs: the scheduled instant of the first aligned frame, beside
-         * the byte it starts at. Plain stores -- the feed task is the only
-         * reader of these. */
+
         s_ref_due = s_pending_block_index * HOP_N * 1000000LL / rate;
         s_ref_byte = s_sent_total;
         s_ref_valid = true;
         s_mark_align_point = false;
     }
 
-    /* 0 ticks: never block the audio task. A short send means the analysis fell
-     * behind and audio was lost, which both breaks the alignment and makes this
-     * unit analyse different audio from its neighbours -- count it and re-align
-     * rather than losing it silently. */
     const size_t sent = xStreamBufferSend(pcm_stream, pcm, len, 0);
     s_sent_total += sent;
     if (sent < len) {
@@ -1937,32 +920,22 @@ void visualiser_feed(const uint8_t *pcm, uint32_t len, int64_t due_master_us)
 
 void visualiser_realign(void)
 {
-    /* Callable from any task: the flag is atomic and the audio task clears it
-     * with an exchange. The next feed carrying a scheduled instant re-derives
-     * the origin from it. */
+
     s_align_pending.store(true, std::memory_order_relaxed);
 }
 
 void visualiser_set_rate(uint32_t hz)
 {
-    /* Nothing computed from a stream field may divide the conversions below.
-     * Same guard as retune_dac(): a rate outside this is a broken number,
-     * whoever sent it, and using it would be worse than ignoring it. */
+
     if (hz < 8000 || hz > 192000) {
         ESP_LOGE(TAG, "ignoring a stream rate of %" PRIu32 " Hz -- not a sample rate", hz);
         return;
     }
-    /* Called from wherever each unit learns the rate, which is often and mostly
-     * says the same thing. */
+
     if (s_rate.exchange(hz, std::memory_order_relaxed) == hz) {
         return;
     }
-    /*
-     * The conversion between an instant and a sample position has just changed,
-     * so the origin derived under the old one describes nothing. The analysis
-     * task re-cuts its bands when it sees the new value; this side only has to
-     * ask for a fresh origin.
-     */
+
     s_align_pending.store(true, std::memory_order_relaxed);
     ESP_LOGW(TAG, "stream rate is %" PRIu32 " Hz", hz);
 }
@@ -1982,63 +955,18 @@ void visualiser_set_pattern(const char *name)
 void visualiser_start(void)
 {
 #if DF_ANALYSES_AUDIO
-    /* Trigger level is one HOP: waking the task for a handful of bytes at a time
-     * is pure overhead now that partial reads accumulate, and once the first
-     * window is held a frame needs only a hop of fresh audio to produce the
-     * next one. */
-    /*
-     * SAY WHAT THIS COSTS AND WHAT WAS THERE, because nothing else can.
-     *
-     * STREAM_BYTES is ONE contiguous ~32 kB block, and esp_wifi_init() has
-     * already taken its static TX buffers out of internal DRAM by the time this
-     * runs. That makes this allocation the ceiling on
-     * ESP_WIFI_STATIC_TX_BUFFER_NUM, and the ceiling was invisible: the HEALTH
-     * line's `internal ... (min N, largest M)` cannot show it, because `min` is
-     * a total where this needs contiguity, and `largest` is sampled long after
-     * this block is already held, so it describes the leftovers rather than what
-     * this had to choose from. Raising the buffer count 32 -> 40 on that
-     * arithmetic put the hub in a reboot loop on the assert below.
-     *
-     * The margin printed here is the number to size that decision on: it is how
-     * much contiguous internal memory was free at the one moment that matters,
-     * and buffers are ~1.6 kB each out of it.
-     */
+
     const size_t largest_before =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     const char *where = "internal";
 #if CONFIG_SPIRAM
-    /*
-     * PSRAM, ASKED FOR BY NAME.
-     *
-     * This is the whole 32 kB, and it is the largest single internal allocation
-     * on the hub -- so on a board with SPIRAM_USE_CAPS_ALLOC (where plain
-     * malloc() never returns PSRAM and everything therefore stays internal by
-     * default) it is the one worth moving. It frees the pool the WiFi static TX
-     * buffers come from, which hub_s3/sdkconfig.defaults calls the binding
-     * constraint on that board, and it removes the 32 kB CONTIGUOUS requirement
-     * that made a raised buffer count boot-loop.
-     *
-     * Safe to move, unlike the ring or the DMA buffers: nothing DMAs this. It is
-     * written by whatever feeds audio and read by the analysis task, both by
-     * memcpy from task context, so there is no cache-coherency question and no
-     * ISR touches it. Bandwidth is not close either -- 44.1 kHz stereo 16-bit is
-     * 176 kB/s against octal PSRAM at 80 MHz.
-     *
-     * What it CAN cost is cache pressure, which is not free even when nothing
-     * else moves. `cost: analysis mean/max` on the vis line is the instrument;
-     * the baseline before this moved was 1358/4287 us. If that climbs
-     * materially, put the caps back to MALLOC_CAP_INTERNAL -- it is one word.
-     */
+
     pcm_stream = xStreamBufferCreateWithCaps(STREAM_BYTES, HOP_BYTES,
                                              MALLOC_CAP_SPIRAM);
     if (pcm_stream) {
         where = "PSRAM";
     } else {
-        /* Fall back rather than go dark. A board whose PSRAM is absent or
-         * smaller than expected still analyses; it just spends the internal
-         * memory it was spending before -- which is why the warning names the
-         * buffer count, since that is what was raised on the strength of this
-         * allocation moving. */
+
         ESP_LOGW(TAG, "analysis stream: PSRAM refused %d bytes, falling back to "
                       "internal -- ESP_WIFI_STATIC_TX_BUFFER_NUM may now be too "
                       "high for this board", STREAM_BYTES);
@@ -2047,15 +975,7 @@ void visualiser_start(void)
 #else
     pcm_stream = xStreamBufferCreate(STREAM_BYTES, HOP_BYTES);
 #endif
-    /*
-     * NOT an assert, for the reason a satellite's task_start() is not one: a
-     * reboot loop on a dance floor is worse than a unit that comes up crippled
-     * and says so. A hub with no pcm_stream still streams audio to every
-     * satellite, still answers probes and still carries the timeline -- it draws
-     * nothing, which is the smaller half of what it does. visualiser_feed()
-     * has always returned early on a null stream, so nothing downstream needs
-     * changing to survive this.
-     */
+
     if (pcm_stream) {
         ESP_LOGI(TAG, "analysis stream: %d bytes in %s, largest internal block "
                       "%u -> %u -- the internal figure is the headroom for "
@@ -2077,25 +997,7 @@ void visualiser_start(void)
         m.pin_bit_mask = 1ULL << CONFIG_DANCEFLOOR_LED_MARKER_GPIO;
         m.mode = GPIO_MODE_OUTPUT;
         ESP_ERROR_CHECK(gpio_config(&m));
-        /*
-         * Drive it dark before anything else can look at it. gpio_config()
-         * leaves an output at 0, which on an active-low LED is LIT -- so
-         * without this the marker glows from boot and stays glowing until the
-         * render task gets far enough to take the pin over.
-         *
-         * Dark is also the correct FIRST state under the three-state scheme:
-         * nothing has been joined and nothing has been drawn, and dark is what
-         * both of those look like. It used to be the correct state for a much
-         * stronger reason -- a solid LED was what "no timeline" looked like and
-         * so was the one thing this pin must never do. That is no longer true:
-         * solid now means joined and idle, and only visualiser_marker_set_link()
-         * can produce it.
-         *
-         * Written directly rather than through marker_write(), because that
-         * belongs to the render task which does not exist yet. It leaves
-         * `shown` at -1, so the task's first call reaches the pin whatever it
-         * asks for.
-         */
+
         gpio_set_level(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_MARKER_GPIO),
                        LED_MARKER_OFF);
         ESP_LOGW(TAG, "LED marker on GPIO %d, active %s -- dark until joined, "
@@ -2107,29 +1009,13 @@ void visualiser_start(void)
 #endif
 
 #if DF_ANALYSES_AUDIO
-    /* Whatever has been set by now, which is the default unless the stream was
-     * already running when this was called. Either way the task re-inits if it
-     * changes. */
+
     analysis.init(static_cast<int>(s_rate.load(std::memory_order_relaxed)));
 #endif
 
-    /*
-     * Decide once, here, which slots this unit fills itself and which it waits
-     * for -- see ResultLatch::set_latched().
-     *
-     * Every slot is latched by default, so a slot with no analyser behind it,
-     * and every slot on a unit that is given its results, reports result_none()
-     * forever rather than whatever the array happened to hold. Only a fast-lane
-     * analyser this unit actually runs is cleared.
-     *
-     * Printed, because an unintended mismatch across a floor is the expensive
-     * bug and this is half of what decides it -- the same reasoning that puts
-     * the source and the hop on the startup line below.
-     */
     {
         const int rate = static_cast<int>(s_rate.load(std::memory_order_relaxed));
-        /* What an analyser is handed a second of, which is the only rate one can
-         * still meaningfully ask about -- see Analyser::init(). */
+
         const int frames_per_s = rate / HOP_N;
         for (int i = 0; i < df::ML_SLOTS; i++) {
             s_latch.set_latched(i, true);
@@ -2162,14 +1048,11 @@ void visualiser_start(void)
         }
 
 #if DF_RUNS_ANALYSERS
-        /* Starts nothing if no analyser is slow, so a build without one pays no
-         * task, no stack and no queue. */
+
         df::ml_lane_start(&s_latch, frames_per_s);
 #endif
     }
 
-    /* Configured name if it resolves, first pattern otherwise. A typo should
-     * cost a line in the log, not a dark floor. */
     pattern = df::pattern_at(0);
     if (df::Pattern *p = df::pattern_by_name(CONFIG_DANCEFLOOR_LED_PATTERN)) {
         pattern = p;
@@ -2178,42 +1061,13 @@ void visualiser_start(void)
                  CONFIG_DANCEFLOOR_LED_PATTERN, pattern ? pattern->name() : "none");
     }
 
-    /*
-     * SPI + DMA, not bit-banging and not RMT.
-     *
-     * Bit-banging disables interrupts for the whole strip update, starving the
-     * I2S DMA. RMT does not survive continuous refresh on the ESP32 -- see
-     * components/led_strip_wrapper/README.md for the failure and why SPI has no
-     * equivalent.
-     */
     strip.emplace(static_cast<gpio_num_t>(CONFIG_DANCEFLOOR_LED_GPIO), LED_COUNT,
                   STRIP_TYPE, LedStrip::Backend::SPI);
     strip->clear();
     strip->show();
 
-    /*
-     * Core 1 alongside playback, at a lower priority than it: a dropped frame
-     * here is invisible, dropped audio is not.
-     *
-     * Two tasks, because the two halves are paced by different things. Analysis
-     * runs when audio is available and may run well ahead of the sound; the
-     * render runs on the clock, and its whole job is to be late for nothing.
-     * Render sits one priority above analysis for that reason -- if the board is
-     * busy, a frame drawn on time from slightly stale analysis beats a frame
-     * drawn late from fresh analysis, and only one of the two is visible.
-     */
-    /* Checked. A strip that stays dark because a task never started looks
-     * exactly like a strip that is being fed silence, and the `started:` line
-     * below would claim everything was fine either way. */
 #if DF_ANALYSES_AUDIO
-    /*
-     * Only if there is something for it to read. visualiser_task() blocks in
-     * xStreamBufferReceive(pcm_stream, ...) with no null check -- there was no
-     * need for one while the allocation above was an assert, and starting the
-     * task without the buffer would turn a clean "this unit will not draw" into
-     * a null dereference inside FreeRTOS, which is strictly worse than the
-     * reboot loop the assert was removed to stop.
-     */
+
     if (!pcm_stream) {
         ESP_LOGE(TAG, "TASK \"vis\" NOT STARTED -- no analysis stream to read");
     } else if (xTaskCreatePinnedToCore(visualiser_task, "vis", 4096, nullptr, 4, nullptr, 1) != pdPASS) {
@@ -2224,10 +1078,7 @@ void visualiser_start(void)
     if (xTaskCreatePinnedToCore(render_task, "vis-draw", 3072, nullptr, 5, nullptr, 1) != pdPASS) {
         ESP_LOGE(TAG, "TASK \"vis-draw\" FAILED TO START -- the strip will stay dark");
     }
-    /* The source and the hop are on this line because an unintended mismatch
-     * across a floor is the expensive bug, and two consoles side by side should
-     * settle it. The frame rate is spelled out rather than left to be divided,
-     * since it is the number that actually changed. */
+
     ESP_LOGW(TAG, "started: %lu LEDs on GPIO %d at %d%% brightness, pattern %s, "
                   "frames %s | window %d, hop %d (%.1f frames/s at %" PRIu32 " Hz)",
              LED_COUNT, CONFIG_DANCEFLOOR_LED_GPIO, CONFIG_DANCEFLOOR_LED_BRIGHTNESS,

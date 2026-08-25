@@ -1,19 +1,4 @@
-/*
- * The strip pattern's geometry: where the bass edge sits and how sharply it
- * turns on. Pure arithmetic, so it is testable on the host even though the
- * renderer itself needs a strip.
- *
- * Two defects prompted this.
- *
- * pos was |i/COUNT - 0.5| * 2, which measures distance from the midpoint of the
- * strip's LENGTH rather than from the midpoint between the end PIXELS. That put
- * pixel 0 at exactly 1.0 and the last pixel at 1 - 2/COUNT -- lopsided -- and
- * since band values cannot exceed 1.0 and the test was a strict >, pixel 0 could
- * never light at any bass level, at any strip length.
- *
- * The test was also a hard on/off, turning an arbitrarily small difference in
- * bass between two units into a 4x brightness difference on the edge pixel.
- */
+
 #include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
@@ -43,8 +28,6 @@ static void check(const char *name, bool ok, const char *note) {
 int main(void) {
     const int counts[] = {8, 30, 60, 144};
 
-    /* band values are capped at just under 1.0 by beat_normalise(), so 1.0 is
-     * the least upper bound on bass. */
     const float bass_max = 0.999f;
 
     for (unsigned c = 0; c < sizeof counts / sizeof counts[0]; c++) {
@@ -62,8 +45,6 @@ int main(void) {
                  && fabsf(pos_new(n - 1, n) - 1.0f) < 1e-5f;
         check("both end pixels reach exactly 1.0", ends, note);
 
-        /* The actual bug: can the outermost pixel ever be brighter than the
-         * floor? Old formula, no. New formula, yes. */
         bool old_lights = k_old(bass_max, pos_old(0, n)) > 0.25f;
         bool new_lights = k_new(bass_max, pos_new(0, n)) > 0.25f;
         snprintf(note, sizeof note, "count=%d old=%s new=%s", n,
@@ -71,10 +52,9 @@ int main(void) {
         check("outermost pixel can light at full bass", new_lights && !old_lights, note);
     }
 
-    /* The amplification property, which is why the ramp exists. */
     {
         float pos = 0.5f;
-        float a = 0.500f, b = 0.505f;         /* two units, 1% apart in bass */
+        float a = 0.500f, b = 0.505f;
         float ratio_old = k_old(b, pos) / k_old(a, pos);
         float ratio_new = k_new(b, pos) / k_new(a, pos);
         char note[80];
@@ -83,7 +63,6 @@ int main(void) {
               ratio_old >= 3.9f && ratio_new < 1.1f, note);
     }
 
-    /* Monotonic and bounded, so nothing can exceed the brightness budget. */
     {
         bool ok = true;
         for (float bass = 0.0f; bass <= 1.0f; bass += 0.01f) {

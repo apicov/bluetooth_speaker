@@ -1,6 +1,4 @@
-/*
- * The slow lane. See ml_lane.hpp for what it is and why it is a separate task.
- */
+
 #include "ml_lane.hpp"
 
 #include <atomic>
@@ -24,17 +22,6 @@ Analyser    *s_slow = nullptr;
 int          s_slot = -1;
 ResultLatch *s_latch = nullptr;
 
-/*
- * One frame, as the lane carries it.
- *
- * `gen` is what makes a restart safe without any byte arithmetic. The feeder
- * stamps the current generation; the task drops anything stamped with an older
- * one and resets the analyser when it sees the number move. The audio lane this
- * replaces had to publish an origin and a byte count and compare against a
- * running total, because its grid was derived by counting -- visualiser.cpp
- * records how a byte-index reader mislabelled half its blocks. A frame carries
- * its own index and due_us, so none of that is needed.
- */
 struct LaneFrame {
     uint8_t  spec[SPEC_BINS];
     int64_t  index;
@@ -42,16 +29,6 @@ struct LaneFrame {
     uint32_t gen;
 };
 
-/*
- * How many frames of slack between the task producing one and this task getting
- * round to it, bounded by one inference.
- *
- * 32 frames is 372 ms at hop 512 and 44.1 kHz -- generous against a model that
- * must finish inside a presentation lead of 200 ms to be useful at all. At 88
- * bytes each that is 2.8 kB, against the 12.8 kB the decimated-audio buffer
- * cost for the same 400 ms of slack. That reduction is most of why this lane
- * now fits a unit which is also holding an 80 kB audio ring.
- */
 constexpr int QUEUE_FRAMES = 32;
 
 QueueHandle_t s_q = nullptr;
@@ -66,13 +43,6 @@ void bump(std::atomic<uint32_t> &c, uint32_t n = 1)
     c.fetch_add(n, std::memory_order_relaxed);
 }
 
-/*
- * One frame: run the analyser, time it, and publish anything it produced.
- *
- * show_at_us, analyser and model_id come from the spec rather than from the
- * analyser -- an analyser that could set them could date its own results, which
- * is the one thing the presentation-delay rule forbids.
- */
 void run_one(const AnalyserSpec &sp, const LaneFrame &f)
 {
     Result r{};
@@ -98,21 +68,6 @@ void run_one(const AnalyserSpec &sp, const LaneFrame &f)
     s_latch->publish(s_slot, r);
     bump(s_results);
 
-    /*
-     * Say what changed, and only what changed.
-     *
-     * This is what reaches the laptop collector, which forwards ESP_LOG, so it
-     * is also the record you read afterwards against the audio. Logging every
-     * result would be one line a second per analyser -- five times the rate of
-     * the periodic lines already here, for a value that mostly repeats. Logging
-     * the TRANSITIONS gives a track's shape in a dozen lines and stays silent
-     * through a steady passage.
-     *
-     * The instant printed is show_at_us, not now: it is the moment the strips
-     * act on this, which is the only one worth lining up against a recording.
-     * The counts in the periodic `ml:` line cover the results this does not
-     * print.
-     */
     static uint8_t last_label = 0xFF;
     static bool    have_last;
     if (!have_last || r.label[0] != last_label) {
@@ -143,17 +98,12 @@ void ml_task(void *arg)
             continue;
         }
 
-        /*
-         * A frame from before a restart. Drop it, and reset the analyser once
-         * on the transition: a context spanning a splice describes audio that
-         * was never played in that order.
-         */
         if (f.gen != seen_gen) {
             if ((int32_t)(f.gen - seen_gen) > 0) {
                 seen_gen = f.gen;
                 s_slow->reset();
             } else {
-                continue;               /* older than the current timeline */
+                continue;
             }
         }
 
@@ -161,7 +111,7 @@ void ml_task(void *arg)
     }
 }
 
-}  // namespace
+}
 
 int ml_lane_slot()
 {
@@ -178,15 +128,13 @@ void ml_lane_start(ResultLatch *latch, int frames_per_s)
 {
     s_slot = ml_lane_slot();
     if (s_slot < 0) {
-        return;                     /* no slow analyser in this build */
+        return;
     }
     s_slow  = analyser_at(s_slot);
     s_latch = latch;
 
     const AnalyserSpec &sp = s_slow->spec();
 
-    /* One only -- see the note in ml_lane.hpp. Said out loud, because a second
-     * one silently never running is the kind of absence that costs an evening. */
     for (int i = s_slot + 1; i < ML_SLOTS; i++) {
         Analyser *a = analyser_at(i);
         if (a && a->spec().lane == Lane::Slow) {
@@ -215,22 +163,8 @@ void ml_lane_start(ResultLatch *latch, int frames_per_s)
              (long long)sp.present_delay_us,
              (unsigned)QUEUE_FRAMES, (unsigned)(QUEUE_FRAMES * sizeof(LaneFrame)));
 
-    /*
-     * Core 0, priority 3.
-     *
-     * Core 1 carries playback (8), the render task (5) and the analysis task
-     * (4), and the whole reason this lane exists is that an inference does not
-     * fit between two of the analysis task's frames. Putting it on the same core
-     * would trade a late frame for late audio, which is the one exchange this
-     * project never makes.
-     *
-     * Core 0 carries lwIP at 18 on the hub, which is bursty and far above this.
-     * 4 kB of stack because a model's working set is in its arena, not here.
-     */
     if (xTaskCreatePinnedToCore(ml_task, "mlan", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
-        /* Checked: without it the lane's queue fills once and every feed is
-         * refused from then on, which reads as a starved model rather than a
-         * missing one. */
+
         ESP_LOGE(TAG, "TASK \"mlan\" FAILED TO START -- the slow lane will "
                       "report nothing");
     }
@@ -276,4 +210,4 @@ MlLaneStats ml_lane_take_stats()
     return st;
 }
 
-}  // namespace df
+}

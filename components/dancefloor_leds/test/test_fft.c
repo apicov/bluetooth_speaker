@@ -1,15 +1,9 @@
-/*
- * The host FFT against a directly evaluated DFT.
- *
- * It backs a claim the whole harness rests on -- that a pattern designed on a
- * laptop behaves the same on the board -- so it is worth more than the twenty
- * lines it costs.
- */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
-#ifndef M_PI                      /* -std=c11 is strict enough to hide it */
+#ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 #include <string.h>
@@ -23,7 +17,7 @@ static void check(const char *name, int ok, const char *note) {
 }
 
 int main(void) {
-    enum { N = 256 };                 /* small enough for an O(N^2) reference */
+    enum { N = 256 };
     static float in[N], buf[2 * N];
     double worst = 0.0;
 
@@ -48,7 +42,6 @@ int main(void) {
     char m[64]; snprintf(m, sizeof m, "worst relative error %.2e", worst);
     check("matches a direct DFT on random input", worst < 1e-4, m);
 
-    /* A pure bin should land entirely in that bin. */
     {
         const int K = 17;
         for (int i = 0; i < N; i++) {

@@ -1,31 +1,15 @@
-/*
- * Radix-2 complex FFT for the host harness.
- *
- * The firmware uses esp-dsp, which is hardware-assisted and stays as it is --
- * this exists so tools/pattern_lab can run the identical analysis pipeline on a
- * laptop without pulling in the ESP-IDF.
- *
- * Two correct FFTs of the same input agree to float rounding, not bit for bit,
- * so a threshold decision sitting on a knife edge could in principle differ
- * between the harness and the board. That is fine for designing patterns and
- * would not be fine for anything claiming exact equivalence -- if that is ever
- * needed, compile this on the target too and drop esp-dsp.
- *
- * Output is in natural bin order, matching dsps_fft2r_fc32 followed by
- * dsps_bit_rev_fc32, and matching numpy.fft.fft. test_fft.c checks that against
- * a directly evaluated DFT.
- */
+
 #ifndef ESP_PLATFORM
 
 #include <math.h>
 
-#ifndef M_PI                      /* -std=c11 is strict enough to hide it */
+#ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 void df_fft_radix2(float *d, int n)
 {
-    /* Decimation in time: bit-reverse the input, then combine in place. */
+
     for (int i = 1, j = 0; i < n; i++) {
         int bit = n >> 1;
         for (; j & bit; bit >>= 1) {
@@ -63,4 +47,4 @@ void df_fft_radix2(float *d, int n)
     }
 }
 
-#endif /* !ESP_PLATFORM */
+#endif

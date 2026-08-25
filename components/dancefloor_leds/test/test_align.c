@@ -1,25 +1,4 @@
-/*
- * The block aligner, on the host.
- *
- * Exists because the first version of it was broken in a way that looked like
- * it worked: the feed side discarded frames to land on a block boundary, but
- * the analysis task held a partially accumulated block and completing it with
- * freshly aligned data left the boundaries offset by whatever it happened to be
- * holding. Both units started aligned and the first dropped feed on either one
- * un-aligned it permanently -- visible as one strip firing on a beat while the
- * other stayed dark.
- *
- * The property under test is the one that matters on hardware: every window a
- * unit analyses must start at a stream position that is a multiple of HOP_N in
- * master-clock samples, because that is what makes two units analyse identical
- * windows and therefore reach identical onset decisions.
- *
- * Both the old and new logic are here, so the test demonstrates the difference
- * rather than merely asserting the new one is fine.
- *
- * The lengths come from the shared header rather than being restated, so that
- * `make check-hops` sweeps this model and the firmware from one -DDF_HOP_N.
- */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -34,10 +13,8 @@
 #define FRAME_BYTES  (CHANNELS * (int)sizeof(int16_t))
 #define BLOCK_BYTES  (FFT_N * FRAME_BYTES)
 #define STREAM_BYTES (BLOCK_BYTES * 4)
-#define CHUNK_FRAMES 256                    /* AUDIO_FRAMES, one feed call */
+#define CHUNK_FRAMES 256
 
-/* A byte-accurate FIFO whose contents are the ABSOLUTE frame index each frame
- * came from, so the reader can be checked against ground truth. */
 typedef struct {
     int64_t frame[STREAM_BYTES / FRAME_BYTES];
     int n;
@@ -51,7 +28,7 @@ static int fifo_push(fifo_t *f, const int64_t *src, int nframes) {
     int take = nframes < room ? nframes : room;
     memcpy(f->frame + f->n, src, (size_t)take * sizeof(int64_t));
     f->n += take;
-    return take;                            /* short push == dropped audio */
+    return take;
 }
 static int fifo_pop(fifo_t *f, int64_t *dst, int nframes) {
     int take = nframes < f->n ? nframes : f->n;
@@ -61,39 +38,30 @@ static int fifo_pop(fifo_t *f, int64_t *dst, int nframes) {
     return take;
 }
 
-/*
- * How far the counted position may sit from the scheduled one before the origin
- * is re-derived without being asked -- ALIGN_DRIFT_US in visualiser.cpp, in
- * frames at 44.1 kHz.
- */
-#define DRIFT_FRAMES (2 * 44100 / 1000)     /* 2 ms */
+#define DRIFT_FRAMES (2 * 44100 / 1000)
 
-/* Off only to demonstrate what the check is for. */
 static int g_drift_check = 1;
 
 typedef struct {
     fifo_t   fifo;
-    /* feed side */
+
     int      align_pending, mark_align_point, skip_frames;
     uint32_t sent_total, align_at;
     int64_t  pending_block_index, align_block_index;
     uint32_t align_gen;
-    /* the origin the count is measured from, kept beside the scheduled instant
-     * it came from, so the two can be compared on every feed */
+
     int64_t  ref_frame;
     uint32_t ref_byte;
     int      ref_valid, drifts;
-    /* reader side */
+
     int64_t  raw[FFT_N];
     int      filled;
     uint32_t recv_total, epoch, seen_gen;
     int64_t  block_index;
-    /* results */
+
     int      blocks, misaligned, mislabelled, drops, discontiguous;
     int64_t  last_block_start, last_block_index;
-    /* Worst label error seen, in frames. A count of mislabelled blocks says how
-     * OFTEN the origin was wrong; this says by how MUCH, which is the number
-     * that decides whether two strips visibly disagree. */
+
     int64_t  worst_err;
 } unit_t;
 
@@ -102,18 +70,9 @@ static void unit_init(unit_t *u) {
     u->align_pending = 1;
 }
 
-/*
- * Label mode. LABEL_CLOCK reads this board's clock at the moment of the feed,
- * which is what the second version of the aligner did; LABEL_DUE uses the
- * instant the audio is scheduled to be heard, which every unit derives from the
- * same per-packet play_at and therefore agrees on.
- */
 #define LABEL_CLOCK 0
 #define LABEL_DUE   1
 
-/* One feed call: `nframes` frames starting at absolute index `first`.
- * `skew_frames` is how far this board's clock reading sits from the content it
- * is actually holding -- audio phase error plus task wake jitter. */
 static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_frames) {
     int64_t buf[CHUNK_FRAMES];
     for (int i = 0; i < nframes; i++) buf[i] = first + i;
@@ -121,14 +80,6 @@ static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_
 
     const int64_t label = (mode == LABEL_DUE) ? first : first + skew_frames;
 
-    /*
-     * The count against the timeline, on every feed.
-     *
-     * Both halves are already here and nothing else has to be told anything:
-     * `label` is where the timeline says this audio is, `sent_total` is where
-     * the count says it is. They part company whenever audio is gained or lost
-     * by something that does not know it has to report it -- see hole_case().
-     */
     if (g_drift_check && u->ref_valid && u->skip_frames <= 0 && !u->mark_align_point &&
         !u->align_pending) {
         int64_t since = (int64_t)(uint32_t)(u->sent_total - u->ref_byte) / FRAME_BYTES;
@@ -163,35 +114,13 @@ static void feed_mode(unit_t *u, int64_t first, int nframes, int mode, int skew_
     }
     int took = fifo_push(&u->fifo, p, nframes);
     u->sent_total += (uint32_t)(took * FRAME_BYTES);
-    if (took < nframes) { u->align_pending = 1; u->drops++; }   /* forces re-align */
+    if (took < nframes) { u->align_pending = 1; u->drops++; }
 }
 
 static void feed(unit_t *u, int64_t first, int nframes) {
     feed_mode(u, first, nframes, LABEL_DUE, 0);
 }
 
-/*
- * One reader pass. `variant` selects how the reader notices a re-alignment:
- *
- *   READER_NONE  feed-side discard only, as the first version shipped
- *   READER_BYTE  compare the published byte index against the last one seen
- *   READER_GEN   compare a generation counter
- *
- * READER_BYTE fixed the boundaries but not the labelling, because a byte count
- * does not identify a publish. While the reader is behind, the buffer is full
- * and feeds are rejected entirely, so sent_total does not move: each rejected
- * feed re-arms the alignment and republishes the SAME byte index with a LATER
- * block index. The reader adopts the first and cannot see the rest, so it
- * labels from an origin several blocks stale -- for good, and again at every
- * burst of drops.
- *
- * Boundaries survive it, which is exactly why it hid: the discard arithmetic
- * still lands on a multiple of FFT_N, so two units cut identical windows and
- * merely date them differently. due_us carries the date.
- *
- * The first publish is missed as well, for the duller reason that a byte count
- * of zero equals the value it is compared against.
- */
 #define READER_NONE 0
 #define READER_BYTE 1
 #define READER_GEN  2
@@ -224,39 +153,22 @@ static void reader(unit_t *u, int variant) {
 
     if (u->filled < FFT_N) return;
     u->blocks++;
-    if (u->raw[0] % HOP_N != 0) u->misaligned++;   /* single-unit property */
-    /*
-     * The label, which is the half the boundary check cannot see. due_us is
-     * block_index * HOP_N / RATE, so the index must be the hop number of the
-     * content in the window -- otherwise two units cutting identical windows
-     * still date them differently, and every animation keyed to due_us runs at
-     * a different point of its cycle on each strip.
-     */
+    if (u->raw[0] % HOP_N != 0) u->misaligned++;
+
     if (u->raw[0] != u->block_index * HOP_N) u->mislabelled++;
     {
         int64_t e = u->raw[0] - u->block_index * HOP_N;
         if (e < 0) e = -e;
         if (e > u->worst_err) u->worst_err = e;
     }
-    /*
-     * What is IN the window, not just where it claims to start.
-     *
-     * Every other check here reads raw[0] alone, which was sufficient while the
-     * window was discarded whole: there was no way to have the right first
-     * sample and the wrong rest. Once a hop is shorter than the window the tail
-     * is slid down and re-used, and sliding it the wrong way -- keeping the
-     * oldest TAIL_N instead of the newest, which is the natural mistake --
-     * leaves raw[0] correct, the label correct, both units agreeing, and the
-     * audio being analysed wrong. Nothing above would notice.
-     */
+
     for (int j = 0; j < FFT_N; j++) {
         if (u->raw[j] != u->raw[0] + j) { u->discontiguous++; break; }
     }
     u->last_block_start = u->raw[0];
     u->last_block_index = u->block_index;
     u->block_index++;
-    /* Advance by one hop, keeping the newest TAIL_N -- the reader half of the
-     * memmove in visualiser.cpp's analysis task. */
+
     if (TAIL_N > 0) {
         memmove(u->raw, u->raw + HOP_N, (size_t)TAIL_N * sizeof(u->raw[0]));
     }
@@ -266,16 +178,13 @@ static void reader(unit_t *u, int variant) {
 static void run(int variant, const char *name) {
     unit_t u; unit_init(&u);
     srand(12345);
-    int64_t pos = 7777;                    /* arbitrary start, not on a boundary */
+    int64_t pos = 7777;
     int stall_left = 0;
 
     for (int step = 0; step < 200000; step++) {
         feed(&u, pos, CHUNK_FRAMES);
         pos += CHUNK_FRAMES;
-        /* The reader normally keeps up. Occasionally it stalls for long enough
-         * that the FIFO fills and the feed drops -- which is the whole case the
-         * fix exists for. A single missed pass is not enough: the FIFO holds 16
-         * feeds, so the stall has to be a burst. */
+
         if (stall_left > 0) { stall_left--; }
         else {
             reader(&u, variant); reader(&u, variant);
@@ -289,17 +198,6 @@ static void run(int variant, const char *name) {
                ? "<-- BROKEN" : "aligned and labelled");
 }
 
-/*
- * A splice -- the correction every unit applies at a track boundary to null its
- * phase error -- takes samples out of the stream the reader is counting, or puts
- * samples in that the timeline does not account for. Either way the origin
- * established at the last alignment stops describing the audio, and since each
- * unit splices by its own error, the strips step apart at every track change and
- * stay apart.
- *
- * 6045 frames is 137 ms, a plausible correction and deliberately not a whole
- * number of blocks, so it breaks the boundaries as well as the labels.
- */
 static void splice_case(int realign, int check, const char *name) {
     unit_t u; unit_init(&u);
     int64_t pos = 4096;
@@ -308,7 +206,7 @@ static void splice_case(int realign, int check, const char *name) {
     g_drift_check = check;
     for (int step = 0; step < 20000; step++) {
         if (step == 5000 || step == 12000) {
-            pos += 6045;                    /* content skipped at the boundary */
+            pos += 6045;
             splices++;
             if (realign) u.align_pending = 1;
         }
@@ -324,24 +222,6 @@ static void splice_case(int realign, int check, const char *name) {
                ? "<-- BROKEN" : "aligned and labelled");
 }
 
-/*
- * Audio that goes missing, or appears, with NOBODY reporting it.
- *
- * The three events above are the three the callers know to report. The list was
- * never closed, and the ones outside it fail silently: a ring that drops when
- * full loses audio the timeline still accounts for, and a short read from the
- * playback ring zero-filled to a whole chunk invents audio it does not. Neither
- * calls visualiser_realign(), because neither knows it is doing anything to the
- * visualiser at all.
- *
- * The result is the same as an unreported splice -- boundaries and labels offset
- * for good, on one unit only -- except that it happens under load rather than at
- * a track change, so the two strips separate mid-song and stay separated.
- *
- * `size` is deliberately not a whole number of blocks, so it breaks the
- * boundaries as well as the labels, and both signs appear: content lost, and
- * content invented.
- */
 static void hole_case(int check, int size, int alternate, const char *name) {
     unit_t u; unit_init(&u);
     int64_t pos = 4096;
@@ -350,7 +230,7 @@ static void hole_case(int check, int size, int alternate, const char *name) {
     g_drift_check = check;
     for (int step = 0; step < 20000; step++) {
         if (step > 0 && step % 2500 == 0) {
-            pos += (alternate && (holes % 2)) ? -size : size;  /* lost, or invented */
+            pos += (alternate && (holes % 2)) ? -size : size;
             holes++;
         }
         feed(&u, pos, CHUNK_FRAMES);
@@ -358,9 +238,7 @@ static void hole_case(int check, int size, int alternate, const char *name) {
         reader(&u, READER_GEN); reader(&u, READER_GEN);
     }
     g_drift_check = 1;
-    /* The verdict is the WORST error, not whether there was one: below the
-     * threshold the check deliberately leaves things alone, and what matters is
-     * that the error stays bounded instead of accumulating for ever. */
+
     printf("  %-28s holes %d  found %2d  mislabelled %6d  worst %5lld frames "
            "(%4.1f ms)  %s\n",
            name, holes, u.drifts, u.mislabelled, (long long)u.worst_err,
@@ -369,15 +247,9 @@ static void hole_case(int check, int size, int alternate, const char *name) {
                   : (u.worst_err > DRIFT_FRAMES + size ? "<-- UNBOUNDED" : "bounded"));
 }
 
-/*
- * The property that actually matters: TWO units, whose feed calls land a few ms
- * apart, must cut their analysis blocks at the same CONTENT positions. If they
- * do not, a transient near a boundary is split on one and centred on the other,
- * and the marginal onsets are detected by one unit and missed by the other.
- */
 static void two_units(int mode, const char *name, int skew_ms) {
     unit_t a, b; unit_init(&a); unit_init(&b);
-    int skew = skew_ms * 44100 / 1000;      /* B's clock reads this far off A's */
+    int skew = skew_ms * 44100 / 1000;
     int64_t pos = 4242;
     int mismatch = 0, compared = 0;
 
@@ -410,10 +282,7 @@ int main(void) {
     printf("\naudio gained or lost with nobody reporting it:\n");
     hole_case(0, 1500, 1, "1500 frames, no check");
     hole_case(1, 1500, 1, "1500 frames, drift check");
-    /* Under the threshold, so a single one is left alone. They accumulate, and
-     * the check takes them out once they add up to something that matters --
-     * the guarantee is a BOUND on how far the count can be from the timeline,
-     * not that every lost frame is caught the moment it goes. */
+
     hole_case(0, 60, 0, "60 frames, no check");
     hole_case(1, 60, 0, "60 frames, drift check");
 
@@ -423,7 +292,6 @@ int main(void) {
     two_units(LABEL_DUE,   "labelled by scheduled time", 3);
     two_units(LABEL_DUE,   "labelled by scheduled time", 5);
 
-    /* Re-run the fixed version and fail the build if it ever misaligns. */
     unit_t u; unit_init(&u); srand(999);
     int64_t pos = 31; int stall_left = 0;
     for (int step = 0; step < 200000; step++) {
@@ -442,8 +310,6 @@ int main(void) {
     if (u.mislabelled)   { printf("FAIL: blocks carry the wrong index\n"); return 1; }
     if (u.discontiguous) { printf("FAIL: window content is not contiguous audio\n"); return 1; }
 
-    /* A splice must not leave the reader labelling audio against an origin the
-     * splice invalidated. */
     {
         unit_t s; unit_init(&s);
         int64_t p = 4096;
@@ -459,10 +325,6 @@ int main(void) {
         if (s.discontiguous) { printf("FAIL: splice tore the window content\n"); return 1; }
     }
 
-    /*
-     * An unreported hole must not be permanent. Nothing calls for a re-align
-     * here; the check has to find it from the label it is handed anyway.
-     */
     {
         unit_t h; unit_init(&h);
         int64_t p = 4096;
@@ -483,16 +345,10 @@ int main(void) {
         if (h.discontiguous)   { printf("FAIL: unreported hole tore the window content\n"); return 1; }
     }
 
-    /*
-     * Holes too small to trip the check individually must not add up without
-     * limit. This is the guarantee the threshold actually buys: not that every
-     * lost frame is caught, but that the count cannot wander away from the
-     * timeline by more than one of them past the threshold.
-     */
     {
         unit_t h; unit_init(&h);
         int64_t p = 4096;
-        const int size = 60;                /* 1.4 ms, under DRIFT_FRAMES */
+        const int size = 60;
         int holes = 0;
         for (int step = 0; step < 40000; step++) {
             if (step > 0 && step % 500 == 0) { p += size; holes++; }
@@ -509,7 +365,6 @@ int main(void) {
         }
     }
 
-    /* And the cross-unit property, which is the one the LEDs actually show. */
     {
         unit_t a, b; unit_init(&a); unit_init(&b);
         int64_t pos = 4242; int mismatch = 0, compared = 0;

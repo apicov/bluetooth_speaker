@@ -1,32 +1,4 @@
-/*
- * The determinism rule, enforced mechanically.
- *
- * analysis.hpp states it: a pattern may use only what is in the Frame it is
- * handed. Two units cut the same blocks out of the same audio and derive the
- * same due_us for them -- test_align.c pins that half -- so if what they render
- * depends only on the Frame stream, they light identically without exchanging
- * anything at all. That is the whole design: nothing about the lights is
- * transmitted, because nothing needs to be.
- *
- * A violation does not look like a bug. Both strips work, agree at first, and
- * separate over minutes into something that reads as a hardware fault. That is
- * expensive to find on a dance floor and nearly free to catch here.
- *
- * Three ways it has actually been broken, and what catches each:
- *
- *   accumulating per render call      a unit that renders a block twice, or one
- *                                     that joined late, never converges
- *   state not derived from the Frames replaying identical blocks gives a
- *                                     different answer the second time
- *   history that outlives a gap       a unit that missed blocks stays different
- *                                     once the stream is identical again
- *
- * DriftPattern below is deliberately wrong in the first way -- the hue advances
- * per render and the envelope decays per render, both of which look perfectly
- * reasonable in isolation. The test REQUIRES it to fail. A run where it passes
- * means these checks have stopped being able to see the fault, which is worth
- * knowing before they are trusted to guard a real pattern.
- */
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -50,40 +22,10 @@ void check(const char *name, bool cond, const std::string &detail)
 }
 
 constexpr int LEDS   = 30;
-/*
- * A fixed amount of AUDIO, not a fixed number of frames.
- *
- * 900 frames is ~21 s at hop 1024 but only ~10 s at hop 512, and the signal
- * below is kicks at a fixed rate -- so holding the frame count fixed would quietly
- * halve the number of kicks the detector is shown every time the hop halved, and
- * the "signal actually produces onsets" guard would fail for a reason that has
- * nothing to do with what it is guarding. Scaling by FFT_N / HOP_N keeps every
- * hop looking at the same ~21 s of the same music, which is also the only way a
- * result at one hop can be compared with a result at another.
- */
-constexpr int BLOCKS = 900 * (df::FFT_N / df::HOP_N);   /* ~21 s at 44.1 kHz */
-constexpr int KICK_EVERY = df::RATE / 2;        /* 120 BPM */
 
-/*
- * Convergence allowance.
- *
- * A unit that joined late or missed audio carries different history for a
- * while: the detector holds BEAT_HIST frames of flux, and the pattern's
- * envelope is whatever the last onset left. Both are bounded, so the units are
- * required to agree EXACTLY after this many identical blocks -- not to agree
- * approximately, and not to agree eventually.
- *
- * One residual risk these checks cannot rule out. beat_det_update() sums its
- * flux history in ARRAY order, and hist_next depends on how many frames that
- * unit has pushed, so two units holding identical history at different
- * rotations sum the same numbers in a different order and can differ in the
- * last bits of the threshold. An onset flips only if flux lands within ~1e-7 of
- * it, which nothing here comes close to, so these pass -- but they pass because
- * the margin is wide, not because the arithmetic is rotation-independent.
- * Summing from the oldest entry rather than from index 0 would make it so.
- */
-/* Derived, not 80: BEAT_HIST is swept by `make HIST=...` and a fixed allowance
- * would stop covering the history it exists to outlast. */
+constexpr int BLOCKS = 900 * (df::FFT_N / df::HOP_N);
+constexpr int KICK_EVERY = df::RATE / 2;
+
 constexpr int CONVERGE = BEAT_HIST * 2;
 
 uint32_t rng = 0x1234abcdu;
@@ -93,13 +35,9 @@ float noise()
     return ((float)(rng >> 8) / 8388608.0f - 1.0f) * 0.01f;
 }
 
-/* Kicks over a quiet bed: the detector needs something to find, and the bed
- * keeps the bands from sitting at zero where flux is trivially zero too. */
 std::vector<int16_t> make_audio()
 {
-    /* BLOCKS windows starting every HOP_N, so the last one runs FFT_N past its
-     * own start -- not BLOCKS * FFT_N, which is only the same while the windows
-     * do not overlap. */
+
     const int SAMPLES = (BLOCKS - 1) * df::HOP_N + df::FFT_N;
     std::vector<int16_t> pcm((size_t)SAMPLES * df::CHANNELS);
     int last_kick = -KICK_EVERY;
@@ -120,7 +58,6 @@ std::vector<int16_t> make_audio()
     return pcm;
 }
 
-/* One speaker: its own analysis state, its own pattern state, its own pixels. */
 struct Unit {
     df::Analysis    an;
     df::Pattern    *pat;
@@ -134,8 +71,6 @@ struct Unit {
         rgb.assign(LEDS * 3, 0);
     }
 
-    /* Analyse one block and render it. `renders` > 1 is a unit that rendered
-     * the same frame more than once, which must make no difference. */
     void block(const int16_t *audio, int64_t index, int renders = 1)
     {
         const int64_t due = index * df::HOP_N * 1000000LL / df::RATE;
@@ -146,12 +81,6 @@ struct Unit {
     }
 };
 
-/*
- * Wrong on purpose: hue advances once per render and the envelope decays once
- * per render, so both are functions of how many times this unit has been
- * called rather than of the audio. Every unit calls a different number of
- * times.
- */
 class DriftPattern : public df::Pattern {
 public:
     const char *name() const override { return "drift"; }
@@ -180,10 +109,6 @@ bool same(const Unit &a, const Unit &b)
     return std::memcmp(a.rgb.data(), b.rgb.data(), a.rgb.size()) == 0;
 }
 
-/* ---------------------------------------------------------------- scenarios */
-
-/* Both units see every block. Any disagreement at all is state that did not
- * come from the audio. */
 int replay(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb)
 {
     Unit a, b;
@@ -202,8 +127,6 @@ int replay(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb)
     return differ;
 }
 
-/* B joins at block `join`, having never seen anything before it. Compared only
- * once both have had CONVERGE identical blocks. */
 int late_join(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb, int join)
 {
     Unit a, b;
@@ -225,8 +148,6 @@ int late_join(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
     return differ;
 }
 
-/* B renders every block twice -- a unit whose render loop ran more often than
- * its neighbour's, which the firmware has done before and may do again. */
 int double_render(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb)
 {
     Unit a, b;
@@ -245,8 +166,6 @@ int double_render(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern 
     return differ;
 }
 
-/* B loses a run of blocks in the middle -- a burst of dropped feeds -- and then
- * carries on with the same audio as A. */
 int gap(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
         int from, int len)
 {
@@ -259,7 +178,7 @@ int gap(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
         const int16_t *blk = &pcm[(size_t)i * df::HOP_N * df::CHANNELS];
         a.block(blk, i);
         if (i >= from && i < from + len) {
-            continue;                       /* B never sees these */
+            continue;
         }
         b.block(blk, i);
         if (i >= from + len + CONVERGE && !same(a, b)) {
@@ -269,14 +188,12 @@ int gap(const std::vector<int16_t> &pcm, df::Pattern *pa, df::Pattern *pb,
     return differ;
 }
 
-}  // namespace
+}
 
 int main(void)
 {
     const std::vector<int16_t> pcm = make_audio();
 
-    /* Sanity: the audio has to contain onsets, or every check below passes by
-     * rendering nothing interesting. */
     {
         Unit u;
         df::PulsePattern p;
@@ -317,16 +234,6 @@ int main(void)
               d ? std::to_string(d) + " blocks differ after convergence" : "converged");
     }
 
-    /*
-     * The same scenarios against boom, which is what the firmware is actually
-     * configured to run (CONFIG_DANCEFLOOR_LED_PATTERN) and which had no
-     * coverage here at all -- every check above ran pulse.
-     *
-     * It is also the pattern where a disagreement is worst to look at. Pulse
-     * ramps its pixels, so two units differing slightly differ slightly; boom
-     * writes full brightness inside `reach` and 15% outside it, so the same
-     * disagreement is one strip lit and the other dark.
-     */
     std::printf("\nboom -- the pattern the firmware ships, must agree exactly:\n");
     {
         Unit u;
@@ -365,11 +272,6 @@ int main(void)
               d ? std::to_string(d) + " blocks differ after convergence" : "converged");
     }
 
-    /*
-     * The same scenarios against a pattern that breaks the rule. Each must be
-     * CAUGHT, or the checks above are agreeing with the code rather than
-     * testing it.
-     */
     std::printf("\ndrift -- accumulates per render, must be caught:\n");
     {
         DriftPattern a, b;

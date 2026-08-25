@@ -3,17 +3,13 @@
 #include <math.h>
 #include <string.h>
 
-/* Bass-weighted: on a dance floor the kick is what the lights should follow.
- * Higher bands still contribute so that snares and hats register, just less. */
 static const float BAND_WEIGHT[BEAT_BANDS] = { 1.0f, 0.6f, 0.3f, 0.15f };
 
-/* How many standard deviations above recent mean flux counts as an onset.
- * Lower fires on texture, higher misses soft kicks. */
 #define BEAT_THRESHOLD_K 1.8f
 
 float beat_normalise(float raw)
 {
-    if (!(raw > 0.0f)) {        /* also catches NaN */
+    if (!(raw > 0.0f)) {
         return 0.0f;
     }
     return raw / (1.0f + raw);
@@ -22,7 +18,7 @@ float beat_normalise(float raw)
 void beat_det_init(beat_det_t *d)
 {
     memset(d, 0, sizeof(*d));
-    d->last_onset_us = INT64_MIN / 2;   /* halved: leaves room to subtract without overflow */
+    d->last_onset_us = INT64_MIN / 2;
     d->threshold_k   = BEAT_THRESHOLD_K;
     d->refractory_us = BEAT_REFRACTORY_US;
     d->flux_floor    = BEAT_FLUX_FLOOR;
@@ -44,8 +40,6 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
         *strength = 0.0f;
     }
 
-    /* Spectral flux: only energy *increases* matter. A band decaying is not an
-     * onset, and including the decay would smear the transient. */
     float flux = 0.0f;
     if (d->primed) {
         for (int i = 0; i < BEAT_BANDS; i++) {
@@ -62,25 +56,6 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
         return false;
     }
 
-    /* Threshold is computed from history *excluding* this frame, so a large
-     * onset cannot raise the bar it is being judged against. */
-    /*
-     * Summed oldest first, not in array order.
-     *
-     * Float addition is not associative, so the same history summed from a
-     * different starting index gives a slightly different total. Two units
-     * holding identical flux can sit at different rotations of the ring -- they
-     * start analysing at whatever grid point their own alignment landed on -- so
-     * array order made the threshold depend on something the units do not share.
-     * Iterating from hist_next makes the sum a function of the history alone.
-     *
-     * The difference is in the last bits, and test_pattern_sync passes today
-     * because the margin between flux and threshold is wide compared to it. That
-     * is passing on margin rather than on the arithmetic being right, which the
-     * test's own comment admits. Overlapping windows shrink the margin from both
-     * sides -- flux gets smaller and there are twice as many near-threshold
-     * frames -- so this stops being free before it stops being invisible.
-     */
     float mean = 0.0f, var = 0.0f;
     if (d->hist_n > 0) {
         const int base = (d->hist_n < BEAT_HIST) ? 0 : d->hist_next;
@@ -103,34 +78,16 @@ bool beat_det_update(beat_det_t *d, const float band[BEAT_BANDS],
 
     hist_push(d, flux);
 
-    /* Needs a little history before the threshold means anything. */
     if (d->hist_n < BEAT_HIST / 4) {
         return false;
     }
     if (flux <= threshold) {
         return false;
     }
-    /*
-     * The refractory window, and the one case where it must not apply.
-     *
-     * now_us is MASTER time -- the hub's esp_timer, which counts from the hub's
-     * boot. Reset the hub and it restarts near zero, so every frame that
-     * follows names an instant hours BEFORE the last onset this detector fired
-     * on. The subtraction then goes large and negative, which is smaller than
-     * any refractory, and the gate below swallows every onset for as long as it
-     * takes master time to climb back past the old value: the strip stops
-     * following the music until the satellite itself is rebooted, which is
-     * exactly the fault this handles.
-     *
-     * A negative interval is not a short one. It says the timeline restarted
-     * under us, so the stored instant belongs to a clock that no longer exists
-     * and is dropped rather than compared against. Not init(): the flux history
-     * is still about the same audio and still valid -- see the class comment on
-     * RemoteDetect for why the reset points matter.
-     */
+
     const int64_t since_onset = now_us - d->last_onset_us;
     if (since_onset < 0) {
-        d->last_onset_us = INT64_MIN / 2;   /* as init() leaves it */
+        d->last_onset_us = INT64_MIN / 2;
     } else if (since_onset < d->refractory_us) {
         return false;
     }

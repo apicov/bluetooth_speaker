@@ -1,10 +1,4 @@
-/*
- * Host-side tests for onset detection.
- *   make check
- *
- * Frames are 512 samples at 44.1 kHz -> 11.61 ms hop, so 43 frames is ~0.5 s,
- * which is one beat at 120 BPM.
- */
+
 #include "beat_detect.h"
 
 #include <stdio.h>
@@ -29,7 +23,6 @@ static float noise(float amp)
     return ((float)((rng_state >> 8) & 0xffff) / 65535.0f - 0.5f) * 2.0f * amp;
 }
 
-/* A kick: low bands spike, then decay over the following frames. */
 static void kick_frame(float band[BEAT_BANDS], int frames_since, float level)
 {
     float env = (frames_since < 0) ? 0.0f : level / (1.0f + (float)frames_since * 1.5f);
@@ -41,8 +34,7 @@ static void kick_frame(float band[BEAT_BANDS], int frames_since, float level)
 
 int main(void)
 {
-    /* 1. Silence must never produce onsets, even though flux variance is zero
-     *    and the adaptive threshold collapses. This is what BEAT_FLUX_FLOOR is for. */
+
     {
         beat_det_t d; beat_det_init(&d);
         int onsets = 0;
@@ -54,7 +46,6 @@ int main(void)
         check("silence produces no onsets", onsets == 0, s);
     }
 
-    /* 2. Near-silence with dither noise must also stay quiet. */
     {
         beat_det_t d; beat_det_init(&d);
         int onsets = 0;
@@ -67,7 +58,6 @@ int main(void)
         check("dither noise produces no onsets", onsets == 0, s);
     }
 
-    /* 3. A sustained tone is one onset at its start, not a continuous stream. */
     {
         beat_det_t d; beat_det_init(&d);
         int onsets = 0;
@@ -81,7 +71,6 @@ int main(void)
         check("sustained tone gives a single onset", onsets == 1, s);
     }
 
-    /* 4. The real case: a 120 BPM kick over ~20 s should find ~40 beats. */
     {
         beat_det_t d; beat_det_init(&d);
         int onsets = 0, total_beats = 0;
@@ -94,11 +83,10 @@ int main(void)
             if (beat_det_update(&d, band, (int64_t)i * HOP_US, NULL)) onsets++;
         }
         char s[80]; snprintf(s, sizeof s, "found %d of %d beats", onsets, total_beats);
-        /* The first few frames are spent priming the history, so allow a small miss. */
+
         check("120 BPM kick detected", onsets >= total_beats - 2 && onsets <= total_beats, s);
     }
 
-    /* 5. Refractory: a doubled hit 2 frames apart must count once, not twice. */
     {
         beat_det_t d; beat_det_init(&d);
         int onsets = 0;
@@ -113,8 +101,6 @@ int main(void)
         check("refractory suppresses a double hit", onsets == 1, s);
     }
 
-    /* 6. A slow fade-in is not an onset. This is the adaptive threshold's job:
-     *    a fixed threshold would fire somewhere on the way up. */
     {
         beat_det_t d; beat_det_init(&d);
         int onsets = 0;
@@ -128,7 +114,6 @@ int main(void)
         check("slow fade-in produces no onsets", onsets == 0, s);
     }
 
-    /* 7. Strength must be populated and in range, since it scales LED brightness. */
     {
         beat_det_t d; beat_det_init(&d);
         float max_s = -1.0f;
@@ -148,13 +133,8 @@ int main(void)
         check("strength stays within 0..1", any && max_s >= 0.0f && max_s <= 1.0f, s);
     }
 
-    /* ---- beat_normalise(): the band scaling the visualiser feeds in ---- */
-
     {
-        /* The bug this replaced: a hard clamp at 1.0. Flux counts increases, so
-         * once a band pinned, a louder kick produced a rise of exactly zero and
-         * vanished from the detector. Measured against the real FFT and gain,
-         * the bass band clamped above about -11 dBFS -- most mastered music. */
+
         bool ok = true;
         float worst = 1e9f;
         for (float v = 0.5f; v < 40.0f; v *= 1.3f) {
@@ -165,7 +145,6 @@ int main(void)
         char m[64]; snprintf(m, sizeof m, "smallest rise=%.5f", worst);
         check("a 20 pct louder band always rises, however loud", ok, m);
 
-        /* The same case stated as the old code would have failed it. */
         float clamped_lo = 3.0f > 1.0f ? 1.0f : 3.0f;
         float clamped_hi = 3.6f > 1.0f ? 1.0f : 3.6f;
         check("hard clamp would have given zero rise here",
@@ -187,33 +166,18 @@ int main(void)
               beat_normalise(0.0f) == 0.0f && beat_normalise(-5.0f) == 0.0f, "");
     }
 
-    /*
-     * flux_floor is per-instance, and this pins that it does what it claims.
-     *
-     * Note what it is NOT: the zabumba detector ships with the same floor as
-     * the wideband one, 0.02. A raised floor was tried first, on synthetic
-     * material where a drum swung the low band from silence -- and measured
-     * against ten real forró recordings it was an order of magnitude too high
-     * and left the strip dark. Real music has continuous bass, so a stroke
-     * rises from ~0.03 rather than from nothing.
-     *
-     * The field still earns its place: the boom detector overrides k and the
-     * refractory through the same mechanism, and a future detector may well
-     * want a different floor. This checks the knob turns.
-     */
     {
         beat_det_t leaky, floored;
-        beat_det_init(&leaky);                  /* default floor, 0.02 */
+        beat_det_init(&leaky);
         beat_det_init(&floored);
-        floored.flux_floor = 0.15f;             /* what the boom detector uses */
+        floored.flux_floor = 0.15f;
 
         int leaky_hits = 0, floored_hits = 0;
         float band[BEAT_BANDS] = {0};
         for (int i = 0; i < 600; i++) {
-            /* Low band twitching at the level pure leakage produces: a rise of
-             * ~0.09, well above the default floor and well below a drum. */
+
             band[0] = (i % 12 == 0) ? 0.09f + noise(0.004f) : noise(0.004f);
-            int64_t t = (int64_t)i * 23220;     /* one analysis frame at 44.1 kHz */
+            int64_t t = (int64_t)i * 23220;
             float s;
             if (beat_det_update(&leaky, band, t, &s))   leaky_hits++;
             if (beat_det_update(&floored, band, t, &s)) floored_hits++;
@@ -225,8 +189,7 @@ int main(void)
         check("raising the floor rejects them", floored_hits == 0, d);
     }
     {
-        /* And it must not reject a real drum: the same detector, fed rises the
-         * size a zabumba actually produced, still fires on every one. */
+
         beat_det_t floored;
         beat_det_init(&floored);
         floored.flux_floor = 0.15f;
@@ -246,23 +209,11 @@ int main(void)
         check("a raised floor still finds large rises", hits >= strokes - 2, d);
     }
 
-    /*
-     * The hub reboots and master time restarts near zero.
-     *
-     * now_us is the hub's clock, so every frame after such a reset names an
-     * instant far BEFORE the last onset this detector fired on. A refractory
-     * gate that only asks "is the interval smaller than the window" reads that
-     * negative interval as too soon and swallows every onset until master time
-     * climbs back past the old value -- an hour of dark strips on a satellite
-     * that is otherwise playing audio perfectly, ended only by rebooting the
-     * satellite. That was the fault; this is the test that says it is gone.
-     */
     {
         beat_det_t d; beat_det_init(&d);
         float band[BEAT_BANDS] = {0};
         int before = 0, after = 0;
 
-        /* An hour into the hub's uptime, kicks at 120 BPM. */
         const int64_t hub_up_us = 3600LL * 1000000LL;
         for (int i = 0; i < 400; i++) {
             const int since = i % FRAMES_PER_BEAT_120;
@@ -273,7 +224,6 @@ int main(void)
             }
         }
 
-        /* The hub reboots. Same audio, same detector, timeline back at zero. */
         for (int i = 0; i < 400; i++) {
             const int since = i % FRAMES_PER_BEAT_120;
             kick_frame(band, since, 0.6f);
@@ -290,10 +240,7 @@ int main(void)
               before > 5 && after >= before - 1, det);
     }
     {
-        /* ... and the window is not simply disarmed by it: once the new
-         * timeline is running, two kicks inside the refractory period are still
-         * one onset. A backwards jump is a discontinuity to absorb, not a
-         * licence to fire twice. */
+
         beat_det_t d; beat_det_init(&d);
         float band[BEAT_BANDS] = {0};
         for (int i = 0; i < 200; i++) {
@@ -304,21 +251,14 @@ int main(void)
         int hits = 0;
         int64_t prev = 0, closest = -1;
         for (int i = 0; i < 200; i++) {
-            /* A rise every other frame -- 23 ms apart, so five times faster
-             * than BEAT_REFRACTORY_US allows. Alternating rather than held,
-             * because flux is a RISE: a band pinned high produces none, and a
-             * gate that had stopped working would still read as quiet. */
+
             kick_frame(band, (i % 2) ? -1 : 0, 0.6f);
             const int64_t t = (int64_t)i * HOP_US;
             float s;
             if (!beat_det_update(&d, band, t, &s)) {
                 continue;
             }
-            /* The SPACING, not the count. A count is the wrong instrument here:
-             * the adaptive threshold rejects most of these rises on its own, so
-             * a detector with no refractory at all still comes in under any
-             * count this could plausibly allow. What only the gate can promise
-             * is that no two onsets land closer together than the window. */
+
             if (hits++ && (closest < 0 || t - prev < closest)) {
                 closest = t - prev;
             }
