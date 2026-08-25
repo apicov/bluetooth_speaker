@@ -1280,12 +1280,37 @@ extern volatile bool playing;
  */
 #define MUTE_RSSI_FLOOR  (-85)
 
-/* How often a muted unit tries again. Every 10 s it probes for MUTE_TRIAL_US to
- * find out whether the link came back, which is what makes plugging an antenna
- * back in enough to recover with no intervention. The cost while a unit is
- * genuinely broken is one short burst of airtime every 10 s, against the
- * continuous drain it replaces. */
-#define MUTE_RETRY_US   10000000
+/*
+ * When a muted unit comes back: WHEN THE SIGNAL RETURNS, not on a timer.
+ *
+ * It was a 10 s timer, and that flapped. Each retry re-registers the unit, so
+ * the hub resumes unicasting to it for the trial window plus the three seconds
+ * needed to establish it is still deaf -- roughly eight seconds of renewed
+ * airtime theft out of every eighteen. On the 2026-08-25 17:05 run it cycled
+ * eight times, and that is what "connects and disconnects many times before
+ * really disconnecting" looks like from the room.
+ *
+ * The waste was blind guessing, and the answer sat in the mute's own log line
+ * the whole time: `MUTING ... at -96 dBm`, then -98, -99, -100. A muted unit can
+ * still read the AP's beacon -- esp_wifi_sta_get_ap_info() needs association,
+ * not a place on the send list -- so it can watch for the antenna coming back
+ * without rejoining to find out. While the signal stays down that costs the
+ * floor nothing at all.
+ *
+ * MUTE_RSSI_REJOIN sits above MUTE_RSSI_FLOOR deliberately: 5 dB of hysteresis,
+ * so a unit hovering at the threshold cannot chatter across it. Sustained for
+ * MUTE_REJOIN_TICKS, so one lucky beacon does not count.
+ */
+#define MUTE_RSSI_REJOIN  (-80)
+#define MUTE_REJOIN_TICKS 8         /* ~2 s at PROBE_PERIOD_MS */
+
+/*
+ * The fallback, and only that. If the signal never recovers the unit tries
+ * anyway once a minute, because an RSSI that cannot be read -- or one that lies
+ * -- must not be able to wedge a working speaker off the floor forever. Long,
+ * because this is the case where retrying is known to be futile.
+ */
+#define MUTE_RETRY_US   60000000
 
 /*
  * Grace after un-muting, before starvation counts again.

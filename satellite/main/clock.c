@@ -77,6 +77,7 @@ static bool mute_tick(void)
     static uint32_t hist_sum;           /* their total, kept incrementally */
     static int      slot;
     static int64_t  s_muted_at;         /* when it went off the air; 0 = on */
+    static int      s_good_ticks;       /* consecutive ticks of a workable signal */
     static int64_t  s_trial_until;      /* grace after coming back */
 
     const int64_t now = esp_timer_get_time();
@@ -91,9 +92,24 @@ static bool mute_tick(void)
     slot = (slot + 1) % MUTE_SLOTS;
 
     if (s_muted_at) {
-        if (now - s_muted_at < MUTE_RETRY_US) {
+        /*
+         * Watch the beacon rather than guessing. A muted unit is still
+         * associated, so the AP's signal is readable without costing the floor
+         * a single frame -- and while the antenna is off it reads -96 and this
+         * returns immediately, every tick, forever.
+         */
+        wifi_ap_record_t back;
+        if (esp_wifi_sta_get_ap_info(&back) == ESP_OK &&
+            back.rssi >= MUTE_RSSI_REJOIN) {
+            s_good_ticks++;
+        } else {
+            s_good_ticks = 0;
+        }
+        if (s_good_ticks < MUTE_REJOIN_TICKS &&
+            now - s_muted_at < MUTE_RETRY_US) {
             return true;
         }
+        s_good_ticks = 0;
         /*
          * Try again. The history is cleared with the timers: while muted this
          * unit is off the send list and receiving nothing BY DESIGN, so
@@ -133,8 +149,7 @@ static bool mute_tick(void)
         sync_est_init(&est);
         est_newest_at = 0;
         tsf_publish(0, 0);
-        ESP_LOGW(TAG, "trying the floor again after %d s off it",
-                 (int)(MUTE_RETRY_US / 1000000));
+        ESP_LOGW(TAG, "signal back -- rejoining the floor");
         return false;
     }
 
