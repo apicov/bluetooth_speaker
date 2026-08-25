@@ -1,3 +1,12 @@
+/**
+ * @file led_strip_wrapper.hpp
+ * @brief One C++ face over the managed led_strip driver.
+ *
+ * The strip model and the peripheral that clocks it are constructor arguments
+ * rather than preprocessor conditionals, so a board can be rewired without the
+ * code around it changing shape. See LedStrip::Backend for the one choice that is
+ * not merely cosmetic.
+ */
 #pragma once
 #include <cstdint>
 #include "driver/gpio.h"
@@ -49,6 +58,8 @@ public:
      */
     LedStrip(gpio_num_t pin, uint32_t num_leds, Type type = Type::WS2812,
              Backend backend = Backend::RMT);
+
+    /** @brief Release the strip handle. */
     ~LedStrip();
 
     /// Not copyable: the handle is owned, and a double free would follow.

@@ -1,34 +1,46 @@
+/**
+ * @file led_strip_wrapper.cpp
+ * @brief Constructing the driver handle, and the byte orders each strip wants.
+ *
+ * led_strip_wrapper.hpp owns the contract; what is here is the peripheral
+ * setup and the wire-format constants, which is the only part of this
+ * component that carries anything worth knowing.
+ */
 #include "led_strip_wrapper.hpp"
 #include "led_strip.h"
 #include "led_strip_rmt.h"
 #include "led_strip_spi.h"
 #include "esp_log.h"
 
+/** @brief Log tag. */
 static const char *TAG = "led_strip";
 
-// ─── GRBW format_id for SK6812 ────────────────────────────────────────────────
-//
-// led_color_component_format_t is a union of a bitfield struct and uint32_t.
-// We set format_id directly to avoid C compound literals, which are unreliable
-// in C++ aggregate initialisation.
-//
-// Bit layout (from led_strip_types.h):
-//   [1:0]  r_pos  = 1  (red is 2nd byte on the wire)
-//   [3:2]  g_pos  = 0  (green is 1st byte on the wire)
-//   [5:4]  b_pos  = 2  (blue is 3rd byte)
-//   [7:6]  w_pos  = 3  (white is 4th byte)
-//   [26:8] reserved = 0
-//   [28:27] bytes_per_color = 1
-//   [31:29] num_components  = 4  (RGBW has 4 channels)
-//
-// Resulting format_id = 0x880000E1
+/**
+ * @brief GRBW wire order for SK6812, as a packed format_id.
+ *
+ * led_color_component_format_t is a union of a bitfield struct and a uint32_t,
+ * and format_id is set directly rather than through the fields: C compound
+ * literals are unreliable in C++ aggregate initialisation, so the packed value
+ * is the portable way to say this.
+ *
+ * Bit layout, from led_strip_types.h:
+ *
+ *     [1:0]   r_pos           = 1   red is the 2nd byte on the wire
+ *     [3:2]   g_pos           = 0   green is the 1st
+ *     [5:4]   b_pos           = 2   blue is the 3rd
+ *     [7:6]   w_pos           = 3   white is the 4th
+ *     [26:8]  reserved        = 0
+ *     [28:27] bytes_per_color = 1
+ *     [31:29] num_components  = 4   RGBW
+ */
 static constexpr uint32_t FORMAT_ID_GRBW = 0x880000E1u;
 
 LedStrip::LedStrip(gpio_num_t pin, uint32_t num_leds, Type type, Backend backend)
     : num_leds_(num_leds), type_(type)
 {
-    // Zero-init both config structs so all unset fields take their
-    // driver-defined defaults (clk_src=0 → APB, format_id=0 → GRB fallback).
+    // Zero-init both config structs so every unset field takes its
+    // driver-defined default: clk_src 0 is APB, format_id 0 is the GRB
+    // fallback, which is what a WS2812 wants.
     led_strip_config_t strip_config{};
     strip_config.strip_gpio_num = static_cast<int>(pin);
     strip_config.max_leds       = num_leds;
@@ -38,10 +50,9 @@ LedStrip::LedStrip(gpio_num_t pin, uint32_t num_leds, Type type, Backend backend
         strip_config.color_component_format.format_id = FORMAT_ID_GRBW;
     } else if (type == Type::WS2811) {
         strip_config.led_model = LED_MODEL_WS2811;
-        // This strip is BRG wired (OUT1→Blue, OUT2→Red, OUT3→Green).
-        // r_pos=1, g_pos=2, b_pos=0, w_pos=3, bytes_per_color=1, num_components=3
-        //   bits[31:29]=011, bits[28:27]=01, bits[7:6]=11, bits[5:4]=00, bits[3:2]=10, bits[1:0]=01
-        //   → 0x680000C9
+        // BRG as this strip is wired: OUT1 drives blue, OUT2 red, OUT3 green.
+        // Packed the same way as FORMAT_ID_GRBW above -- r_pos 1, g_pos 2,
+        // b_pos 0, w_pos 3, one byte per colour, three components.
         strip_config.color_component_format.format_id = 0x680000C9u; // BRG, 3-ch
     } else {
         strip_config.led_model = LED_MODEL_WS2812;

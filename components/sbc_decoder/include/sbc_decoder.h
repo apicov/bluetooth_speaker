@@ -1,13 +1,20 @@
-/*
- * SBC decoding for the dancefloor.
+/**
+ * @file sbc_decoder.h
+ * @brief SBC decoding for the dancefloor.
  *
- * Wraps the OI decoder vendored from Bluedroid so callers deal in "here is an
- * SBC frame, give me PCM" rather than the codec's own conventions.
+ * Wraps the OI decoder vendored in oi/ so callers deal in "here is an SBC
+ * frame, give me PCM" rather than in the codec's own conventions.
  *
- * Why this exists: the bridge forwards SBC frames untouched instead of decoding
- * them, so the inter-chip link and the WiFi stream carry ~330 kbps rather than
- * 1.4 Mbps. Each unit decodes at the point of playback. Quality is unaffected --
- * it is the same SBC, decoded once, just later.
+ * Why this exists: the bridge forwards SBC frames untouched instead of
+ * decoding them, so the inter-chip link and the WiFi stream carry the codec's
+ * bitrate rather than the PCM one -- roughly a quarter of the bytes. Each unit
+ * decodes at the point of playback instead. Quality is unaffected: it is the
+ * same SBC, decoded once, just later.
+ *
+ * The decoder keeps state across calls, so both the stream format and the last
+ * decode's outcome are recovered through getters rather than returned. That
+ * keeps the common call site a plain `if (!sbc_decode_frame(...))` and makes
+ * every caller that does not need the detail pay nothing for it.
  */
 #pragma once
 
@@ -15,52 +22,77 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* One SBC frame is 128 samples per channel at the usual 8-subband, 16-block
- * settings -- 2.9 ms at 44.1 kHz. Sized generously so unusual settings fit. */
+/**
+ * @brief Ceiling on the int16 values one decoded frame can produce.
+ *
+ * One SBC frame is 128 samples per channel at the usual 8-subband, 16-block
+ * settings. Sized generously above that so unusual settings still fit, since
+ * the buffer is the caller's and overrunning it is not a failure the codec
+ * would report.
+ */
 #define SBC_MAX_PCM_SAMPLES 512     /* interleaved stereo int16 */
 
+/** @brief What the stream turned out to be, read off the frames as they
+ *         decode. See sbc_decoder_get_info(). */
 typedef struct {
-    uint32_t sample_rate;   /* from the last frame decoded, 0 until then */
-    uint8_t  channels;
+    uint32_t sample_rate;   /**< From the last frame decoded; 0 until then. */
+    uint8_t  channels;      /**< Likewise: 1 or 2. */
 } sbc_stream_info_t;
 
-/*
- * The outcome of the last decode, kept distinct because the distinction is
- * diagnostic. CRC is the SBC frame's own CRC-8, not the link's CRC-16: a CRC
- * result means the link check passed but the payload it carried was still
- * corrupt, which is a path the link CRC does not cover. Recovered through a
- * getter rather than returned so callers that don't care (the satellite, the
- * classic hub) keep their existing `if (!sbc_decode_frame(...))` test unchanged.
+/**
+ * @brief The outcome of the last decode, kept distinct because the distinction
+ *        is diagnostic.
+ *
+ * CRC here is the SBC frame's own CRC-8, not the link's CRC-16. A CRC result
+ * therefore means the link check PASSED and the payload it carried was still
+ * corrupt -- a path the link CRC does not cover, and the reason this is not
+ * folded into the general error.
  */
 typedef enum {
-    SBC_DECODE_OK,    /* decoded; pcm_out holds the samples */
-    SBC_DECODE_CRC,   /* OI_CODEC_SBC_CHECKSUM_MISMATCH: the SBC frame's CRC-8 failed */
-    SBC_DECODE_ERR,   /* anything else: no syncword, truncated header/body, bad bitpool */
+    SBC_DECODE_OK,    /**< Decoded; pcm_out holds the samples. */
+    SBC_DECODE_CRC,   /**< OI_CODEC_SBC_CHECKSUM_MISMATCH: the frame's CRC-8 failed. */
+    SBC_DECODE_ERR,   /**< Anything else: no syncword, truncated header or body,
+                       *   bad bitpool. */
 } sbc_decode_result_t;
 
-/* Call once before the first frame, and again to recover after a hard error. */
+/**
+ * @brief Reset the codec. Call once before the first frame, and again to
+ *        recover after a hard error.
+ *
+ * @return false if the codec refused the reset, which is a build or
+ *         configuration fault rather than a stream one.
+ */
 bool sbc_decoder_init(void);
 
-/*
- * Decode one frame.
+/**
+ * @brief Decode one frame.
  *
- * `in`/`in_len` point at a complete SBC frame; on return `in_consumed` says how
- * many bytes were used, so a caller holding several concatenated frames can
- * advance through them.
- *
- * `pcm_out` receives interleaved 16-bit stereo, `*pcm_samples` the count of
- * int16 values written (frames x channels).
+ * @param in                A complete SBC frame.
+ * @param in_len            Bytes available at @p in.
+ * @param[out] in_consumed  Bytes actually used, so a caller holding several
+ *                          concatenated frames can advance through them.
+ * @param[out] pcm_out      Interleaved 16-bit stereo; must have room for
+ *                          SBC_MAX_PCM_SAMPLES values.
+ * @param[out] pcm_samples  Count of int16 values written (frames x channels).
+ * @return true on success. On false nothing is written to @p pcm_out and
+ *         sbc_decoder_last_result() says whether the frame failed its CRC or
+ *         was malformed.
  */
 bool sbc_decode_frame(const uint8_t *in, size_t in_len, size_t *in_consumed,
                       int16_t *pcm_out, size_t *pcm_samples);
 
+/**
+ * @brief What the stream has turned out to be.
+ *
+ * @param[out] out  Filled from the last frame decoded; zeroed by
+ *                  sbc_decoder_init() and so all-zero until the first success.
+ */
 void sbc_decoder_get_info(sbc_stream_info_t *out);
 
-/*
- * The result of the most recent sbc_decode_frame(); SBC_DECODE_OK before the
- * first call, after sbc_decoder_init(), and after a successful decode. Mirrors
- * sbc_decoder_get_info(): the decoder keeps state across calls, so a getter is
- * how a caller that needs the detail recovers it without every caller paying
- * for an extra out-parameter.
+/**
+ * @brief The result of the most recent sbc_decode_frame().
+ *
+ * @return SBC_DECODE_OK before the first call, after sbc_decoder_init(), and
+ *         after any successful decode; otherwise which way the last one failed.
  */
 sbc_decode_result_t sbc_decoder_last_result(void);
