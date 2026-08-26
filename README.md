@@ -44,6 +44,9 @@ it works, but unicast is what proved stable in use and it is what ships.
 | `tools/gen_vol_table.py` | Regenerates the volume taper table in `audio_out.h`. |
 | `tools/syntax_check.py` | Syntax-checks firmware sources from `compile_commands.json`, with no working IDF environment. |
 
+[`tools/README.md`](tools/README.md) covers all of those: what each one needs
+installed, and the four workflows they group into.
+
 The master is two chips because Bluetooth and WiFi on one ESP32 fight over the
 radio, the memory and the CPU.
 
@@ -364,6 +367,7 @@ them in `tools/soak/`.
 | [`docs/open-questions.md`](docs/open-questions.md) | Things the firmware does not yet know, each with the test that would settle it and the decision that follows from each outcome. |
 | [`hub_s3/README.md`](hub_s3/README.md) | The S3 hub: pin map, the two-port flash recipe, what the board is configured to use, measured size. |
 | [`satellite/README.md`](satellite/README.md) | The satellite: source layout, the two-target build, wiring, playback timing, reading its log. |
+| [`tools/README.md`](tools/README.md) | The host-side tools: what each is for, what it needs installed before you start, and the four workflows they group into. |
 | [`components/led_strip_wrapper/README.md`](components/led_strip_wrapper/README.md) | The strip driver. |
 
 Every component and app also carries a `Doxyfile` configured to *check* the

@@ -4,6 +4,10 @@ Everything that runs on the laptop rather than on a board: building and
 flashing, designing patterns, tuning the beat detector, loading the hub, and
 reading what a long run did.
 
+[`README.md`](../README.md) is the hardware and the operating story;
+[`docs/architecture.md`](../docs/architecture.md) is what the firmware does.
+This is what runs beside it.
+
 **Where a tool needs the firmware's own logic, it compiles the firmware's own
 source.** `pattern_lab` and `converge` build `analysis.cpp`, `patterns.cpp`,
 `analysers.cpp`, `beat_detect.c` and `fft_host.c` straight out of
@@ -93,7 +97,8 @@ dead pixel is a blank column.
 
 `--dump` writes the same frames as binary for a notebook, and
 [`pipeline.py`](pattern_lab/pipeline.py) is a numpy port of the same analysis
-for looping over a corpus. The two are kept honest against each other:
+for looping over a corpus — [`docs/notebook.md`](../docs/notebook.md) is the
+tutorial for both. The two are kept honest against each other:
 
 ```
 tools/pattern_lab/pipeline.py track.wav
@@ -148,7 +153,11 @@ parsing reach the sessions it was measured against.
 
 `analyse.py` answers nine questions in the order they matter, from "did anything
 break" to "was it the source rather than a unit". [`ab.py`](soak/ab.py) is the
-narrow version for a two-run comparison where one setting changed.
+narrow version for a two-run comparison where one setting changed. For what a
+counter means once you have found it,
+[§17](../docs/architecture.md#17-what-each-counter-was-born-from) and
+[§20](../docs/architecture.md#20-symptom-to-counter-to-file) of the
+architecture guide go from a symptom to the file that owns it.
 
 `satsim.py` makes the hub believe N more speakers are on the floor:
 
