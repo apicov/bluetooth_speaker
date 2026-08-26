@@ -666,10 +666,10 @@ def cmd_baseline(args):
     """
     @brief The gate: reproduce the hop-1024 figures the tuning was set from.
 
-    Nothing after this means anything if it does not land on the record, since
-    a harness that disagrees with it is not measuring what the record
-    measured. The expected ranges are printed beside the measured ones so the
-    comparison needs no second document.
+    Nothing after this means anything if it does not land on BASELINE_RECORD,
+    since a harness that disagrees with it is not measuring what those figures
+    measured. They are printed beside the measured ones, so the comparison
+    needs no second document.
 
     @param args  Parsed arguments; unused, the anchor set is fixed.
     """
@@ -682,13 +682,15 @@ def cmd_baseline(args):
               f"{100*r['marginal_boom']:.1f}% | {r['flux_p50']:.4f} | "
               f"{r['flux_p90']:.4f} | {r['flux_p99']:.4f} |")
     print()
+    rec = BASELINE_RECORD
     print(f"booms/min range   {rng_str([r['booms_min'] for r in rows], '{:.0f}')}   "
-          f"(record: 68-134)")
+          f"(record: {rec['booms_min'][0]:.0f}-{rec['booms_min'][1]:.0f})")
     print(f"flux p90 range    {rng_str([r['flux_p90'] for r in rows], '{:.4f}')}   "
-          f"(record: 0.016-0.019)")
+          f"(record: {rec['flux_p90'][0]:.4f}-{rec['flux_p90'][1]:.4f})")
     print(f"flux p99 range    {rng_str([r['flux_p99'] for r in rows], '{:.4f}')}   "
-          f"(record: 0.038-0.131)")
-    print(f"flux p50 max      {max(r['flux_p50'] for r in rows):.4f}   (record: 0.0000)")
+          f"(record: {rec['flux_p99'][0]:.4f}-{rec['flux_p99'][1]:.4f})")
+    print(f"flux p50 max      {max(r['flux_p50'] for r in rows):.4f}   "
+          f"(record: {rec['flux_p50_max']:.4f})")
 
 
 def zab_seconds(binary, wav, window=1.0):
@@ -799,6 +801,21 @@ def cmd_segments(args):
                 continue
             print(f"{src.stem},{a * args.window:g},{b * args.window:g},{k}")
 
+
+## @brief The hop-1024 figures cmd_baseline() reproduces, over the anchor set.
+#
+# THIS FILE IS THE RECORD. They were measured over the ten anchor tracks at the
+# shipped floor, and cmd_baseline() prints them beside what it measures so the
+# comparison needs no second document -- which matters, because the comment in
+# analysis.cpp that used to carry them does not any more. A harness that does
+# not land here is not measuring what they measured, and nothing after it means
+# anything.
+BASELINE_RECORD = {
+    "booms_min": (68, 134),
+    "flux_p90": (0.016, 0.019),
+    "flux_p99": (0.038, 0.131),
+    "flux_p50_max": 0.0000,
+}
 
 ## @brief Two candidates closer together than this are treated as one stroke.
 CAND_REFRACTORY_S = 0.060
