@@ -487,10 +487,9 @@ def main():
         print(f"  under 3 ms: {(v <= 3).mean() * 100:.0f}%    under 6 ms:"
               f" {(v <= 6).mean() * 100:.0f}%")
         print()
-        print("  Reference: 0.5-2.5 ms is the best this project has recorded.")
+        print("  Reference: 0.5-2.5 ms is what a healthy floor reads.")
         if v.median() > 4:
-            print("  Sitting well above that -- tightening the deadband is the lever,")
-            print("  and the rate trim removed both things that made it unaffordable.")
+            print("  Sitting well above that -- PHASE_DEADBAND_US is the lever.")
 
     # ---- 3. the rate trim ---------------------------------------------------
     head("RATE TRIM")
@@ -656,9 +655,9 @@ def main():
             print("        transit small (both leads collapsed together)"
                   " -> stamped late; the fault is upstream of the radio.")
             print("        Check the hub's sbc_in `max gap` for the same window"
-                  " first: a source stall makes both collapse and is not a")
-            print("        delivery fault at all -- it was half the starvation"
-                  " on the 2026-08-19 20:04 soak.")
+                  " first: a source stall makes both leads collapse,")
+            print("        is not a delivery fault at all, and is a large share"
+                  " of the starvation a run reports. See SOURCE below.")
 
     fec_units = sorted({u for u in met[met["kind"] == "rx5s"]["unit"].unique()})
     fec_rows = []
@@ -971,10 +970,10 @@ def main():
             print("        long stretches far apart -- the drain, not the fill."
                   " See hub_s3/main/net.c.")
             if tot[2] <= max(1, sum(tot) // 20):
-                print("        75-150 is the 102.4 ms beacon. Near-empty here is"
-                      " the DTIM drain STAYING fixed;")
-                print("        the group lanes went unicast and the signature"
-                      " went with them. Do not re-open it.")
+                print("        75-150 is the 102.4 ms beacon, and near-empty"
+                      " here means the beacon-locked signature is")
+                print("        ABSENT -- whatever is holding the pool, it is not"
+                      " the DTIM drain. Look at the other buckets.")
 
         near = gauge(met, "hub", "status", "refuse-near-frame")
         rtry = gauge(met, "hub", "status", "audio-retry")
@@ -984,8 +983,8 @@ def main():
         # Both gauges are absent from a hub built before they were added, so
         # their absence is reported as "not measured" rather than as a zero.
         if near is None or near.empty:
-            print("\n      No refuse-near-frame gauge -- this hub predates the"
-                  " 2026-08-23 instrumentation.")
+            print("\n      No refuse-near-frame gauge in this build, so who"
+                  " held the pool cannot be answered from this run.")
         else:
             n_near, n_ref = near["value"].sum(), windows["value"].sum()
             print(f"\n      WHO HELD THE POOL: {n_near:,.0f} of {n_ref:,.0f}"
@@ -1007,9 +1006,10 @@ def main():
         if rtry is not None and not rtry.empty and (rok is None or rok.empty):
             n_t = rtry["value"].sum()
             aud_f = window_sum(met, "hub", "tx_fail_audio")
-            print(f"\n      THE RETRY: {n_t:,.0f} attempts, and audio-retry-ok"
-                  " was TRUNCATED off the status line by servo.c's 96-byte")
-            print(f"      burst buffer (fixed since). Derived instead:"
+            print(f"\n      THE RETRY: {n_t:,.0f} attempts, and no"
+                  " audio-retry-ok beside them -- this capture's status line"
+                  " was truncated")
+            print(f"      before it. Derived instead:"
                   f" {max(n_t - aud_f, 0):,.0f} went"
                   f" -- attempts minus the {aud_f:,.0f} audio refusals still"
                   " counted.")
@@ -1228,19 +1228,17 @@ def main():
                   " rather than loud. A channel")
             print("  that LOSES its networks is the thing to look at, not one"
                   " that gets busier.")
-            print("  BUT DO NOT CALL IT THE CAUSE. The 2026-08-23 01:38 run"
-                  " went 8.42 h and 1,008")
-            print("  sweeps without a single blind sweep and still had two"
-                  " major episodes, larger")
-            print("  than either of the run that suggested this. A blackout is"
-                  " not necessary for an")
-            print("  episode; check whether the deaf channel had more than one"
-                  " or two networks to")
-            print("  lose before reading anything into a zero. All three"
-                  " channels moving together is")
-            print("  the whole band. A few dB is sweep noise -- capture.py"
-                  " measures ~10 dB of it on a")
-            print("  busy channel; see air_scan() there.")
+            print("  BUT DO NOT CALL IT THE CAUSE. A long clean run with no"
+                  " blind sweep at all can still")
+            print("  have major episodes, so a blackout is not NECESSARY for"
+                  " one -- and a channel with")
+            print("  only a network or two to lose goes blind for reasons that"
+                  " have nothing to do with")
+            print("  the hub. Check how much it had to lose before reading"
+                  " anything into a zero. All")
+            print("  three channels moving together is the whole band. A few dB"
+                  " is sweep noise; see")
+            print("  air_scan() in capture.py.")
 
     # ---- 8. heap ------------------------------------------------------------
     head("HEAP  (the long-run question: does anything leak)")
