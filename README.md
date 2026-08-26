@@ -329,6 +329,11 @@ WAVs come from the desktop client, which lives in its own repository —
 [`dancefloor-tools`](../dancefloor-tools) — and joins the hub's WiFi like any
 other satellite.
 
+The same frames are reachable from a Python notebook —
+`tools/pattern_lab/pipeline.py` either runs that binary or reproduces it in
+numpy, chunked exactly as the strips are. [`docs/notebook.md`](docs/notebook.md)
+is the tutorial.
+
 ## Reading a running system
 
 Both firmwares print a `HEALTH` line every 60 s with uptime, heap (current,
@@ -353,7 +358,9 @@ them in `tools/soak/`.
 
 | | |
 |---|---|
+| [`docs/architecture.md`](docs/architecture.md) | The firmware as code: the task graph, one audio packet end to end, the synchronisation chain, the LED pipeline, and what each counter was born from. Start here to read the source. |
 | [`docs/wifi.md`](docs/wifi.md) | WiFi from the band up: 802.11 fundamentals, the ESP32 driver and every configuration option, then this link read as a worked example. |
+| [`docs/notebook.md`](docs/notebook.md) | The firmware's audio analysis from a Python notebook: the same frames a speaker computes, cut on the same grid — chunk by chunk or over a whole file, and how the numpy port is held to the compiled one. |
 | [`docs/open-questions.md`](docs/open-questions.md) | Things the firmware does not yet know, each with the test that would settle it and the decision that follows from each outcome. |
 | [`hub_s3/README.md`](hub_s3/README.md) | The S3 hub: pin map, the two-port flash recipe, what the board is configured to use, measured size. |
 | [`satellite/README.md`](satellite/README.md) | The satellite: source layout, the two-target build, wiring, playback timing, reading its log. |
