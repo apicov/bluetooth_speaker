@@ -85,6 +85,21 @@ FFMPEG = ["ffmpeg", "-v", "error", "-i", "{src}",
 # boom count nearly constant.
 MARGIN = 0.1
 
+## @brief The hop-1024 figures cmd_baseline() reproduces, over the anchor set.
+#
+# THIS FILE IS THE RECORD. They were measured over the ten anchor tracks at the
+# shipped floor, and cmd_baseline() prints them beside what it measures so the
+# comparison needs no second document -- which matters, because the comment in
+# analysis.cpp that used to carry them does not any more. A harness that does
+# not land here is not measuring what they measured, and nothing after it means
+# anything.
+BASELINE_RECORD = {
+    "booms_min": (68, 134),
+    "flux_p90": (0.016, 0.019),
+    "flux_p99": (0.038, 0.131),
+    "flux_p50_max": 0.0000,
+}
+
 
 class Track:
     """
@@ -801,21 +816,6 @@ def cmd_segments(args):
                 continue
             print(f"{src.stem},{a * args.window:g},{b * args.window:g},{k}")
 
-
-## @brief The hop-1024 figures cmd_baseline() reproduces, over the anchor set.
-#
-# THIS FILE IS THE RECORD. They were measured over the ten anchor tracks at the
-# shipped floor, and cmd_baseline() prints them beside what it measures so the
-# comparison needs no second document -- which matters, because the comment in
-# analysis.cpp that used to carry them does not any more. A harness that does
-# not land here is not measuring what they measured, and nothing after it means
-# anything.
-BASELINE_RECORD = {
-    "booms_min": (68, 134),
-    "flux_p90": (0.016, 0.019),
-    "flux_p99": (0.038, 0.131),
-    "flux_p50_max": 0.0000,
-}
 
 ## @brief Two candidates closer together than this are treated as one stroke.
 CAND_REFRACTORY_S = 0.060
